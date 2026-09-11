@@ -56,9 +56,9 @@ using PFun_slEvaluateFeature = sl::Result(sl::Feature feature, const sl::FrameTo
 using PFun_slAllocateResources = sl::Result(sl::CommandBuffer* cmdBuffer, sl::Feature feature, const sl::ViewportHandle& viewport);
 using PFun_slFreeResources = sl::Result(sl::Feature feature, const sl::ViewportHandle& viewport);
 using PFun_slSetTag
-/*#if __cplusplus >= 201402L
+#if __cplusplus >= 201402L
 [[deprecated("Use the version of this function that takes a sl::FrameToken instead - slSetTagForFrame and set sl::PreferenceFlags::eUseFrameBasedResourceTagging.")]]
-#endif*/
+#endif
 = sl::Result(const sl::ViewportHandle& viewport, const sl::ResourceTag* tags, uint32_t numTags, sl::CommandBuffer* cmdBuffer);
 using PFun_slSetTagForFrame = sl::Result(const sl::FrameToken& frame, const sl::ViewportHandle& viewport, const sl::ResourceTag* tags, uint32_t numTags, sl::CommandBuffer* cmdBuffer);
 using PFun_slGetFeatureRequirements = sl::Result(sl::Feature feature, sl::FeatureRequirements& requirements);

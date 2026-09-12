@@ -318,6 +318,13 @@ struct RTViewportState {
 	RID params_buffer;
 	RID scene_uniform_set;
 
+	// Camera-relative tracing: the anchor every position uploaded to the trace
+	// is relative to (world minus rt_origin), and the scene UBO copy whose
+	// camera carries the relative origin. See `RenderRaytracing::build_tlas`.
+	Vector3 rt_origin;
+	bool rt_origin_valid = false;
+	RID scene_uniform_buffer;
+
 	uint32_t frame_counter = 0;
 };
 
@@ -453,6 +460,7 @@ class RenderRaytracing {
 	void build_acceleration_structures(RTViewportState *p_state, const LocalVector<RID> &p_dirty_blas_list, const LocalVector<RID> &p_dirty_blas_update_list);
 	void finalize_buffers(RTViewportState *p_state);
 	void prepare_frame();
+	void _update_scene_uniform_buffer(RTViewportState *p_state, const RenderDataRD *p_render_data);
 
 public:
 	void initialize(RenderForwardClustered *p_owner);
@@ -460,7 +468,7 @@ public:
 	void cleanup_caches();
 
 	RTViewportState *build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags);
-	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights);
+	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, const Vector3 &p_origin);
 	RID update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags);
 
 	void copy_output_texture(const RenderDataRD *p_render_data);

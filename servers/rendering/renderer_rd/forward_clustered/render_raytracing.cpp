@@ -139,6 +139,9 @@ void RenderRaytracing::_free_viewport_state_internal(RTViewportState *p_state) {
 	if (p_state->params_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->params_buffer);
 	}
+	if (p_state->scene_uniform_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->scene_uniform_buffer);
+	}
 	if (p_state->scene_uniform_set.is_valid() && RD::get_singleton()->uniform_set_is_valid(p_state->scene_uniform_set)) {
 		RD::get_singleton()->free_rid(p_state->scene_uniform_set);
 	}
@@ -1785,6 +1788,7 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 		RD::AccelerationStructureInstance &inst = instances[i];
 		inst.id = i;
 		inst.transform = blas_transforms[i];
+		inst.transform.origin -= p_state->rt_origin;
 		inst.blas = blass[i];
 		inst.flags = BitField<RD::AccelerationStructureInstanceFlagBits>(instance_flags[i]);
 		inst.mask = (i < instance_masks.size()) ? instance_masks[i] : 0xFF;
@@ -2242,6 +2246,24 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 	prepare_frame();
 
+	// Camera-relative tracing: the trace runs in world space minus an anchor
+	// snapped to a grid on x and z, so float32 stays precise kilometers from
+	// the origin. The anchor moves only when the camera leaves its cell, and
+	// every instance, light and camera upload below subtracts it in double
+	// before narrowing to float. Its y stays 0 so world height (fog height,
+	// user shaders) is exact. A grid of 0 disables it (absolute world).
+	{
+		static const double RT_ORIGIN_GRID = (double)GLOBAL_GET("rendering/pathtracing/relative_origin_grid");
+		const Vector3 cam_pos = p_render_data->scene_data->cam_transform.origin;
+		if (RT_ORIGIN_GRID <= 0.0) {
+			state->rt_origin = Vector3();
+			state->rt_origin_valid = true;
+		} else if (!state->rt_origin_valid || Math::abs(cam_pos.x - state->rt_origin.x) > RT_ORIGIN_GRID || Math::abs(cam_pos.z - state->rt_origin.z) > RT_ORIGIN_GRID) {
+			state->rt_origin = Vector3(Math::floor(cam_pos.x / RT_ORIGIN_GRID) * RT_ORIGIN_GRID, 0.0, Math::floor(cam_pos.z / RT_ORIGIN_GRID) * RT_ORIGIN_GRID);
+			state->rt_origin_valid = true;
+		}
+	}
+
 	// Builds bundle if needed; live_ready_mask drives TLAS inclusion below.
 	SceneShaderRaytracing *rt_shader_singleton = SceneShaderRaytracing::get_singleton();
 	rt_shader_singleton->ensure_pipeline_bundle(p_rt_flags);
@@ -2347,7 +2369,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				if (inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED) {
 					motion_indices.push_back((int32_t)motion_transforms.size());
 					RT_InstanceMotionData motion = {};
-					RendererRD::MaterialStorage::store_transform_transposed_3x4(prev_instance_transform, motion.prev_object_to_world);
+					Transform3D prev_relative = prev_instance_transform;
+					prev_relative.origin -= state->rt_origin;
+					RendererRD::MaterialStorage::store_transform_transposed_3x4(prev_relative, motion.prev_object_to_world);
 					motion_transforms.push_back(motion);
 				} else {
 					motion_indices.push_back(-1);
@@ -2561,6 +2585,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				if (surf_data->is_compressed) {
 					prev_final = prev_instance_transform * surf_data->aabb_transform;
 				}
+				prev_final.origin -= state->rt_origin;
 				RendererRD::MaterialStorage::store_transform_transposed_3x4(prev_final, motion.prev_object_to_world);
 				motion_transforms.push_back(motion);
 			} else {
@@ -2713,6 +2738,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					}
 					motion_indices.push_back((int32_t)motion_transforms.size());
 					RT_InstanceMotionData motion = {};
+					prev_final.origin -= state->rt_origin;
 					RendererRD::MaterialStorage::store_transform_transposed_3x4(prev_final, motion.prev_object_to_world);
 					motion_transforms.push_back(motion);
 				} else {
@@ -2767,7 +2793,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 // Light gathering
 // ---------------------------------------------------------------------------
 
-uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights) {
+uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, const Vector3 &p_origin) {
 	uint32_t rt_light_count = 0;
 
 	if (!p_render_data || !p_render_data->lights) {
@@ -2906,9 +2932,10 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 
 		RT_LightData &ld = r_light_data[rt_light_count];
 		Transform3D xform = ls->light_instance_get_base_transform(light_instance);
-		ld.position[0] = xform.origin.x;
-		ld.position[1] = xform.origin.y;
-		ld.position[2] = xform.origin.z;
+		const Vector3 relative_pos = xform.origin - p_origin;
+		ld.position[0] = relative_pos.x;
+		ld.position[1] = relative_pos.y;
+		ld.position[2] = relative_pos.z;
 		ld.type = (type == RSE::LIGHT_SPOT) ? RT_LIGHT_TYPE_SPOT : RT_LIGHT_TYPE_OMNI;
 
 		Color linear_col = ls->light_get_color(base).srgb_to_linear();
@@ -2954,6 +2981,42 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 // Uniform set update
 // ---------------------------------------------------------------------------
 
+void RenderRaytracing::_update_scene_uniform_buffer(RTViewportState *p_state, const RenderDataRD *p_render_data) {
+	// A copy of the raster scene UBO whose cameras are relative to rt_origin:
+	// the trace's world is world minus the anchor, so inv_view and view carry
+	// the relative origin as plain floats (no precision split) for the current
+	// and the previous frame. Everything else in the UBO is copied as is.
+	const uint32_t size = RenderSceneDataRD::get_uniform_buffer_size_bytes();
+	if (!p_state->scene_uniform_buffer.is_valid()) {
+		p_state->scene_uniform_buffer = RD::get_singleton()->uniform_buffer_create(size);
+		RD::get_singleton()->set_resource_name(p_state->scene_uniform_buffer, "RT Scene Data Buffer");
+	}
+
+	struct CameraBlock {
+		float inv_view_matrix[12];
+		float view_matrix[12];
+#ifdef REAL_T_IS_DOUBLE
+		float inv_view_precision[4];
+#endif
+	};
+	static_assert(offsetof(RenderSceneDataRD::UBO, view_matrix) == offsetof(RenderSceneDataRD::UBO, inv_view_matrix) + 12 * sizeof(float));
+#ifdef REAL_T_IS_DOUBLE
+	static_assert(offsetof(RenderSceneDataRD::UBO, inv_view_precision) == offsetof(RenderSceneDataRD::UBO, view_matrix) + 12 * sizeof(float));
+#endif
+	RenderSceneDataRD::UBODATA ubo_data = p_render_data->scene_data->ubo_data;
+	RenderSceneDataRD::UBO *ubos[2] = { &ubo_data.ubo, &ubo_data.prev_ubo };
+	const Transform3D *cameras[2] = { &p_render_data->scene_data->cam_transform, &p_render_data->scene_data->prev_cam_transform };
+	for (uint32_t i = 0; i < 2; i++) {
+		Transform3D relative = *cameras[i];
+		relative.origin -= p_state->rt_origin;
+		CameraBlock block = {};
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(relative, block.inv_view_matrix);
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(relative.affine_inverse(), block.view_matrix);
+		memcpy(ubos[i]->inv_view_matrix, &block, sizeof(CameraBlock));
+	}
+	RD::get_singleton()->buffer_update(p_state->scene_uniform_buffer, 0, size, &ubo_data);
+}
+
 RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags) {
 	ERR_FAIL_NULL_V(p_state, RID());
 
@@ -2995,7 +3058,8 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		RD::Uniform u;
 		u.binding = 2;
 		u.uniform_type = RD::UNIFORM_TYPE_UNIFORM_BUFFER;
-		u.append_id(owner->scene_state.uniform_buffers[0]);
+		_update_scene_uniform_buffer(p_state, p_render_data);
+		u.append_id(p_state->scene_uniform_buffer);
 		uniforms.push_back(u);
 	}
 
@@ -3058,8 +3122,9 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			float params[16];
 			float prev_vp_unjittered[16];
 			float curr_vp_unjittered[16];
+			float rt_origin[4];
 		} rt_ubo = {};
-		static_assert(sizeof(rt_ubo) == 48 * sizeof(float));
+		static_assert(sizeof(rt_ubo) == 52 * sizeof(float));
 
 		if (p_render_data && p_render_data->environment.is_valid()) {
 			RendererEnvironmentStorage *env_storage = RendererEnvironmentStorage::get_singleton();
@@ -3080,18 +3145,30 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			Projection correction;
 			correction.set_depth_correction(true);
 
-			Projection prev_vp = (correction * p_render_data->scene_data->prev_cam_projection) * Projection(p_render_data->scene_data->prev_cam_transform.affine_inverse());
+			// Both cameras relative to this frame's anchor, so the previous
+			// frame reprojects correctly across an anchor change.
+			Transform3D prev_cam = p_render_data->scene_data->prev_cam_transform;
+			prev_cam.origin -= p_state->rt_origin;
+			Transform3D curr_cam = p_render_data->scene_data->cam_transform;
+			curr_cam.origin -= p_state->rt_origin;
+
+			Projection prev_vp = (correction * p_render_data->scene_data->prev_cam_projection) * Projection(prev_cam.affine_inverse());
 			RendererRD::MaterialStorage::store_camera(prev_vp, rt_ubo.prev_vp_unjittered);
 
-			Projection curr_vp = (correction * p_render_data->scene_data->cam_projection) * Projection(p_render_data->scene_data->cam_transform.affine_inverse());
+			Projection curr_vp = (correction * p_render_data->scene_data->cam_projection) * Projection(curr_cam.affine_inverse());
 			RendererRD::MaterialStorage::store_camera(curr_vp, rt_ubo.curr_vp_unjittered);
+
+			rt_ubo.rt_origin[0] = (float)p_state->rt_origin.x;
+			rt_ubo.rt_origin[1] = (float)p_state->rt_origin.y;
+			rt_ubo.rt_origin[2] = (float)p_state->rt_origin.z;
+			rt_ubo.rt_origin[3] = 0.0f;
 		}
 
 		// --- Light gathering ---
 		uint32_t rt_light_count = 0;
 		RT_LightData rt_light_data[RT_LIGHTS_MAX] = {};
 
-		rt_light_count = gather_lights(p_render_data, rt_light_data, RT_LIGHTS_MAX);
+		rt_light_count = gather_lights(p_render_data, rt_light_data, RT_LIGHTS_MAX, p_state->rt_origin);
 
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_LIGHT_COUNT] = float(rt_light_count);
 

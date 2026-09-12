@@ -51,6 +51,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		rb_data = rb->get_custom_data(RB_SCOPE_FORWARD_CLUSTERED);
 	}
 	bool is_reflection_probe = p_render_data->reflection_probe.is_valid();
+	upscaler_world_offset = Vector3();
 
 	const bool use_rt = !is_reflection_probe && p_render_data->environment.is_valid() &&
 			RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_enabled(p_render_data->environment) &&
@@ -182,6 +183,8 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		RTViewportState *rt_state = raytracing->build_tlas(p_render_data, rt_flags);
 		if (rt_state) {
 			rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags);
+			// DLSS gets the same camera-relative frame the trace rendered.
+			upscaler_world_offset = rt_state->rt_origin;
 		}
 	} else if (rb_data.is_valid() && raytracing && raytracing->dlss_rr_has_buffers(rb.ptr())) {
 		// No RT shader available: free DLSS RR buffers so DLSS falls back to SR.
@@ -511,6 +514,10 @@ bool RenderForwardClusteredPT::_setup_rt() {
 		if (is_using_radiance_octmap_array()) {
 			rt_defines += "\n#define USE_RADIANCE_OCTMAP_ARRAY \n";
 		}
+#ifdef REAL_T_IS_DOUBLE
+		// The RT stages read the raster SceneData layout, which carries the precision split field in double builds.
+		rt_defines += "\n#define USE_DOUBLE_PRECISION\n";
+#endif
 		raytracing->shader->init(rt_defines);
 	}
 

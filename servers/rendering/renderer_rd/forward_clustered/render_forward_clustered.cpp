@@ -1888,8 +1888,10 @@ void RenderForwardClustered::_render_3d_upscaling(const RenderDataRD *p_render_d
 
 			const Projection &prev_proj = p_render_data->scene_data->prev_cam_projection;
 			const Projection &cur_proj = p_render_data->scene_data->cam_projection;
-			const Transform3D &prev_transform = p_render_data->scene_data->prev_cam_transform;
-			const Transform3D &cur_transform = p_render_data->scene_data->cam_transform;
+			Transform3D prev_transform = p_render_data->scene_data->prev_cam_transform;
+			Transform3D cur_transform = p_render_data->scene_data->cam_transform;
+			prev_transform.origin -= upscaler_world_offset;
+			cur_transform.origin -= upscaler_world_offset;
 			params.reprojection = (correction * prev_proj) * prev_transform.affine_inverse() * cur_transform * (correction * cur_proj).inverse();
 			params.cam_projection = cur_proj;
 			params.cam_transform = cur_transform;

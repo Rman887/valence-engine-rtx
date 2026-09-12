@@ -33,6 +33,11 @@ inv_view_matrix = transpose(mat4(scene_data_block.data.inv_view_matrix[0],
 		scene_data_block.data.inv_view_matrix[1],
 		scene_data_block.data.inv_view_matrix[2],
 		vec4(0.0, 0.0, 0.0, 1.0)));
+// The trace runs in world space minus rt_origin; user shader code gets the
+// absolute matrices it expects (view_abs = view_rel * translate(-rt_origin)).
+read_model_matrix[3].xyz += rt_origin.xyz;
+inv_view_matrix[3].xyz += rt_origin.xyz;
+read_view_matrix[3].xyz -= mat3(read_view_matrix) * rt_origin.xyz;
 projection_matrix = scene_data_block.data.projection_matrix;
 inv_projection_matrix = scene_data_block.data.inv_projection_matrix;
 read_viewport_size = scene_data_block.data.viewport_size;
@@ -56,7 +61,7 @@ rt_frag_coord = vec4(gl_LaunchIDEXT.xy, 0.0, 1.0);
 /* RT_CUSTOM_VERTEX_CALL */
 
 // Post-vertex transform: object-space -> view-space (mirrors rasterizer post-vertex).
-mat4 rt_modelview = rt_view_matrix * read_model_matrix;
+mat4 rt_modelview = read_view_matrix * read_model_matrix;
 vertex = (rt_modelview * vec4(vertex, 1.0)).xyz;
 normal = normalize(mat3(rt_modelview) * normal);
 tangent = normalize(mat3(rt_modelview) * tangent);

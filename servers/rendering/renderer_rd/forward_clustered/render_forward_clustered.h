@@ -64,6 +64,10 @@ class RenderForwardClustered : public RendererSceneRenderRD {
 	friend class RenderRaytracing;
 
 protected:
+	// World-space anchor the current frame's color, depth and motion vectors are relative to
+	// (camera-relative tracing in RenderForwardClusteredPT); zero for a raster frame.
+	Vector3 upscaler_world_offset;
+
 	enum {
 		SCENE_UNIFORM_SET = 0,
 		RENDER_PASS_UNIFORM_SET = 1,

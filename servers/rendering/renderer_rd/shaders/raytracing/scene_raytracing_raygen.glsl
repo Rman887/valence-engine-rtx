@@ -688,6 +688,12 @@ void main() {
 	get_aabb_compression_xforms(rt_geom, rt_aabb_xform, rt_inv_aabb_xform);
 	read_model_matrix = mat4(gl_ObjectToWorldEXT) * rt_inv_aabb_xform;
 	m_INV_MODEL_MATRIX = rt_aabb_xform * mat4(gl_WorldToObjectEXT);
+	// Absolute world for user code; the trace itself is relative to rt_origin.
+	read_model_matrix[3].xyz += rt_origin.xyz;
+	m_INV_MODEL_MATRIX[3].xyz -= mat3(m_INV_MODEL_MATRIX) * rt_origin.xyz;
+	inv_view_matrix[3].xyz += rt_origin.xyz;
+	read_view_matrix[3].xyz -= mat3(read_view_matrix) * rt_origin.xyz;
+	m_WORLD_ORIGIN += rt_origin.xyz;
 
 	/* RT_CUSTOM_INTERSECTION_CODE */
 

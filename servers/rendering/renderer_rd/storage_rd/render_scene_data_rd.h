@@ -36,8 +36,13 @@
 // This is a container for data related to rendering a single frame of a viewport where we load this data into a UBO
 // that can be used by the main scene shader but also by various effects.
 
+namespace RendererSceneRenderImplementation {
+class RenderRaytracing;
+}
+
 class RenderSceneDataRD : public RenderSceneData {
 	GDCLASS(RenderSceneDataRD, RenderSceneData);
+	friend class RendererSceneRenderImplementation::RenderRaytracing; // Camera-relative tracing patches the camera fields of a UBO copy.
 
 public:
 	bool calculate_motion_vectors = false;
@@ -191,4 +196,6 @@ private:
 		UBO ubo;
 		UBO prev_ubo;
 	};
+
+	UBODATA ubo_data; // What update_ubo() last uploaded; the ray-tracing path patches a copy of it.
 };

@@ -30,12 +30,12 @@ layout(set = 0, binding = 14, std430) readonly buffer GlobalShaderUniformData {
 }
 global_shader_uniforms;
 
-#ifndef RT_STAGE_ANY_HIT
-
 layout(set = 0, binding = 6, std140) uniform RaytracingParams {
 	vec4 rt_params[4];
 	mat4 prev_vp_unjittered;
 	mat4 curr_vp_unjittered;
+	// World-space anchor the trace is relative to (camera-relative tracing).
+	vec4 rt_origin;
 };
 
 float get_rt_param(uint idx) {
@@ -47,6 +47,8 @@ vec2 project_uv(vec3 world_pos, mat4 vp) {
 	vec4 clip = vp * vec4(world_pos, 1.0);
 	return clip.xy / clip.w * 0.5 + 0.5;
 }
+
+#ifndef RT_STAGE_ANY_HIT
 
 #ifdef DLSS_RR_ENABLED
 layout(set = 0, binding = 9, rgba16f) uniform image2D dlss_rr_diffuse_albedo;

@@ -5214,6 +5214,10 @@ bool Main::iteration() {
 #endif
 
 	if (fixed_fps != -1) {
+		// This path returns before the end-of-iteration marker below; DLSS needs a new frame token every frame.
+		if (Streamline::get_singleton()) {
+			Streamline::get_singleton()->emit_marker(STREAMLINE_MARKER_BEFORE_MESSAGE_LOOP);
+		}
 		return exit;
 	}
 

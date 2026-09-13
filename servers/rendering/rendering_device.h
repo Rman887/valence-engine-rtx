@@ -1294,6 +1294,10 @@ public:
 
 	RID raytracing_pipeline_create(Span<PipelineShader> p_raygen_shaders, Span<PipelineShader> p_miss_shaders, Span<HitGroup> p_hit_groups, uint32_t p_max_trace_recursion_depth);
 	bool raytracing_pipeline_is_valid(RID p_pipeline);
+	// Whether the acceleration structure still exists: a BLAS is freed with
+	// the buffers it depends on (free_rid cascades), so a cache that keeps
+	// the RID must ask before freeing it again.
+	bool acceleration_structure_is_valid(RID p_acceleration_structure);
 
 	void update_pipeline_cache(bool p_closing = false);
 

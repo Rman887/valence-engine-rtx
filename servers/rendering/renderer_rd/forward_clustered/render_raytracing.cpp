@@ -349,9 +349,7 @@ void RenderRaytracing::cleanup_caches() {
 				continue;
 			}
 			if (e->ptr) {
-				if (e->ptr->blas.is_valid()) {
-					rd->free_rid(e->ptr->blas);
-				}
+				_release_deformed_blas(*e);
 				memdelete(e->ptr);
 				e->ptr = nullptr;
 			}
@@ -502,6 +500,22 @@ RTDeformedCacheEntry *RenderRaytracing::_access_deformed_slot(RID &r_handle) {
 	return entry;
 }
 
+// The deformed BLAS depends on the mesh's index buffer (only the vertex
+// buffer is overridden), so RenderingDevice cascade-frees it with the mesh
+// or its surfaces: free it only while it still exists, and forget the RID
+// either way.
+void RenderRaytracing::_release_deformed_blas(RTDeformedCacheEntry &p_entry) {
+	if (!p_entry.ptr || !p_entry.ptr->blas.is_valid()) {
+		return;
+	}
+	RD *rd = RD::get_singleton();
+	if (rd->acceleration_structure_is_valid(p_entry.ptr->blas)) {
+		rd->free_rid(p_entry.ptr->blas);
+	}
+	p_entry.ptr->blas = RID();
+	p_entry.blas_built_once = false;
+}
+
 RTMergedMMEntry *RenderRaytracing::_access_merged_mm_slot(RID &r_handle) {
 	RTMergedMMEntry *entry = merged_mm_pool.get_or_null(r_handle);
 	if (!entry) {
@@ -545,9 +559,7 @@ void RenderRaytracing::prepare_frame() {
 				continue;
 			}
 			if (e->ptr) {
-				if (e->ptr->blas.is_valid()) {
-					rd->free_rid(e->ptr->blas);
-				}
+				_release_deformed_blas(*e);
 				memdelete(e->ptr);
 				e->ptr = nullptr;
 			}
@@ -652,11 +664,11 @@ RTSurfaceData *RenderRaytracing::process_surface(
 	if (!entry->ptr) {
 		entry->ptr = memnew(RTSurfaceData);
 	} else if (entry->ptr->blas.is_valid()) {
-		if (entry->cached_rid_version == mesh_version) {
-			// Same mesh, surface data changed: BLAS is still live, free explicitly.
+		// Surface data changed on a live mesh: the BLAS is still there, free it.
+		// A deleted mesh or cleared surface cascade-freed it through its buffers.
+		if (RD::get_singleton()->acceleration_structure_is_valid(entry->ptr->blas)) {
 			RD::get_singleton()->free_rid(entry->ptr->blas);
 		}
-		// Version mismatch: old mesh was deleted, BLAS already cascade-freed by RD.
 		entry->ptr->blas = RID();
 	}
 
@@ -735,11 +747,7 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 
 	// Reallocate owned storage if the surface grew.
 	if (entry.owned_vb_full_capacity < full_size) {
-		if (entry.ptr && entry.ptr->blas.is_valid()) {
-			rd->free_rid(entry.ptr->blas);
-			entry.ptr->blas = RID();
-			entry.blas_built_once = false;
-		}
+		_release_deformed_blas(entry);
 		if (entry.owned_vb_full.is_valid()) {
 			rd->free_rid(entry.owned_vb_full);
 		}
@@ -782,10 +790,7 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 		if (!entry.ptr) {
 			entry.ptr = memnew(RTSurfaceData);
 		}
-		if (entry.ptr->blas.is_valid()) {
-			rd->free_rid(entry.ptr->blas);
-			entry.ptr->blas = RID();
-		}
+		_release_deformed_blas(entry);
 		_populate_surface_blas(p_mesh_surface, entry.owned_vb_full, true, true, true,
 				static_cast<uint32_t>(p_source.cache_key), entry.ptr, r_dirty_blas_list);
 		entry.blas_built_once = entry.ptr->blas.is_valid();

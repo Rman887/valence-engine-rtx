@@ -376,6 +376,7 @@ class RenderRaytracing {
 	LocalVector<RID> merged_mm_active_this_frame;
 
 	RTDeformedCacheEntry *_access_deformed_slot(RID &r_handle);
+	void _release_deformed_blas(RTDeformedCacheEntry &p_entry);
 	RTMergedMMEntry *_access_merged_mm_slot(RID &r_handle);
 
 	LocalVector<uint32_t> material_free_slots;

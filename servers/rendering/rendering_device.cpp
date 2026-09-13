@@ -5447,6 +5447,10 @@ bool RenderingDevice::raytracing_pipeline_is_valid(RID p_pipeline) {
 	return raytracing_pipeline_owner.owns(p_pipeline);
 }
 
+bool RenderingDevice::acceleration_structure_is_valid(RID p_acceleration_structure) {
+	return acceleration_structure_owner.owns(p_acceleration_structure);
+}
+
 /****************/
 /**** SCREEN ****/
 /****************/

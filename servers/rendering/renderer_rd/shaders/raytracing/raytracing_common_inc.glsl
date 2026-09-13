@@ -19,6 +19,11 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 // Cull back faces by default; double-sided instances override via CULL_DISABLE flag.
 #define RT_RAY_FLAGS gl_RayFlagsCullBackFacingTrianglesEXT
 
+// Instance masks: every instance carries all bits (camera and bounce rays
+// trace with 0xFF); one whose cast_shadows setting is off lacks bit 1, the
+// only bit the shadow rays test (RT_INSTANCE_MASK_NO_SHADOW in render_raytracing.h).
+#define RT_MASK_SHADOW 0x02u
+
 layout(set = 0, binding = 2, std140) uniform SceneDataBlock {
 	SceneData data;
 	SceneData prev_data;

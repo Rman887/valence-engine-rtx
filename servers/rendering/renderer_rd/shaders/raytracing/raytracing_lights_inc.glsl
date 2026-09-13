@@ -194,7 +194,7 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 	rayQueryEXT shadow_rq;
 	rayQueryInitializeEXT(shadow_rq, tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT,
-			0xFF, origin, 0.001, direction, max_dist - 0.001);
+			RT_MASK_SHADOW, origin, 0.001, direction, max_dist - 0.001);
 
 	while (rayQueryProceedEXT(shadow_rq)) {
 		if (rayQueryGetIntersectionTypeEXT(shadow_rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
@@ -214,7 +214,7 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 	hitObjectEXT hitObject;
 	hitObjectTraceRayEXT(hitObject, tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			0xFF, 0, 0, 0,
+			RT_MASK_SHADOW, 0, 0, 0,
 			origin, 0.001, direction, max_dist - 0.001, 0);
 
 	return !(hitObjectIsHitEXT(hitObject));
@@ -236,7 +236,7 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 
 	traceRayEXT(tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-			0xFF, 0, 0, 0,
+			RT_MASK_SHADOW, 0, 0, 0,
 			origin, 0.001, direction, max_dist - 0.001, 0);
 
 	// Unpack to check visibility (miss shader packs radiance = 1.0).

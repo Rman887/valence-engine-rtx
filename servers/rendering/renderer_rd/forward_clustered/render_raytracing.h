@@ -393,6 +393,12 @@ class RenderRaytracing {
 	LocalVector<Transform3D> blas_transforms;
 	LocalVector<uint32_t> instance_flags;
 	LocalVector<uint8_t> instance_masks; // Per-instance ray mask (0x00 = invisible to rays, 0xFF = normal)
+	// Bit 1 of the mask is the shadow bit: the shadow rays' cull mask
+	// (RT_MASK_SHADOW in raytracing_common_inc.glsl) selects it, so an
+	// instance whose cast_shadows setting is off is seen by camera and
+	// bounce rays and skipped by shadow rays.
+	static constexpr uint8_t RT_INSTANCE_MASK_ALL = 0xFF;
+	static constexpr uint8_t RT_INSTANCE_MASK_NO_SHADOW = 0xFD;
 	LocalVector<uint32_t> sbt_offsets; // 0 = default material hit group
 
 	HashMap<RenderSceneBuffersRD *, RTViewportState *> viewport_states;

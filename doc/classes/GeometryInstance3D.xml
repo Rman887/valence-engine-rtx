@@ -93,6 +93,7 @@
 	<constants>
 		<constant name="SHADOW_CASTING_SETTING_OFF" value="0" enum="ShadowCastingSetting">
 			Will not cast any shadows. Use this to improve performance for small geometry that is unlikely to cast noticeable shadows (such as debris).
+			Under path tracing the instance stays visible to camera and bounce rays and is skipped by the shadow rays, so light passes through it (a water surface over a sunlit seabed).
 		</constant>
 		<constant name="SHADOW_CASTING_SETTING_ON" value="1" enum="ShadowCastingSetting">
 			Will cast shadows from all visible faces in the GeometryInstance3D.

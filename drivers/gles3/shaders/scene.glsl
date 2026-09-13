@@ -2201,6 +2201,8 @@ void main() {
 	highp mat4 model_matrix = world_transform;
 	vec3 albedo = vec3(1.0);
 	vec3 backlight = vec3(0.0);
+	vec3 transmission = vec3(0.0); // Path tracer only; accepted and ignored here.
+	float ior = 1.5;
 	vec4 transmittance_color = vec4(0.0, 0.0, 0.0, 1.0);
 	float transmittance_depth = 0.0;
 	float transmittance_boost = 0.0;

@@ -263,6 +263,32 @@ float specular_to_f0(float specular) {
 	return 0.16 * specular * specular;
 }
 
+/// Exact Fresnel reflectance of a dielectric interface for unpolarised light.
+/// p_eta is the ratio of the refractive indices, incident over transmitted;
+/// returns 1.0 beyond the critical angle (total internal reflection).
+float fresnel_dielectric(float p_cos_i, float p_eta) {
+	float sin2_t = p_eta * p_eta * (1.0 - p_cos_i * p_cos_i);
+	if (sin2_t >= 1.0) {
+		return 1.0;
+	}
+	float cos_t = sqrt(1.0 - sin2_t);
+	float r_s = (p_eta * p_cos_i - cos_t) / (p_eta * p_cos_i + cos_t);
+	float r_p = (p_cos_i - p_eta * cos_t) / (p_cos_i + p_eta * cos_t);
+	return 0.5 * (r_s * r_s + r_p * r_p);
+}
+
+/// The F0 at which Schlick's approximation reproduces p_fresnel at p_cos_i, so
+/// the microfacet lobe (Schlick on the half vector) follows an exact dielectric
+/// Fresnel, total internal reflection included.
+float schlick_f0_for_fresnel(float p_fresnel, float p_cos_i) {
+	float w = pow(1.0 - p_cos_i, 5.0);
+	if (w >= 0.999) {
+		// Grazing: Schlick gives its F90 whatever F0 is, so hand back the exact value.
+		return p_fresnel;
+	}
+	return clamp((p_fresnel - w) / (1.0 - w), 0.0, 1.0);
+}
+
 // ============================================================================
 // DEBUG VISUALIZATION
 // ============================================================================
@@ -475,6 +501,25 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	brdf_mat.transmissivness = 0.0;
 	brdf_mat.opacity = 1.0;
 
+	// Transmission: the surface is a dielectric interface. TRANSMISSION is the
+	// fraction (per channel) of the unreflected light that continues through
+	// it, IOR gives the refracted direction and the exact Fresnel of the
+	// interface (total internal reflection from inside), which replaces the
+	// SPECULAR-derived F0 so the reflection and the refraction agree. The
+	// diffuse lobe keeps the rest. The transmitted lobe is chosen after NEE
+	// with its own probability; opaque materials never draw for it, so their
+	// random sequence is unchanged.
+	float transmit_max = max(m.transmission.r, max(m.transmission.g, m.transmission.b));
+	float transmit_p = 0.0;
+	float refract_eta = 1.0;
+	if (transmit_max > 0.0) {
+		refract_eta = h.is_front_face ? (1.0 / m.ior) : m.ior;
+		float fresnel = fresnel_dielectric(NdotV, refract_eta);
+		brdf_mat.dielectricF0 = schlick_f0_for_fresnel(fresnel, NdotV);
+		brdf_mat.baseColor *= (vec3(1.0) - m.transmission);
+		transmit_p = (1.0 - fresnel) * transmit_max;
+	}
+
 	vec3 specularF0 = baseColorToSpecularF0(brdf_mat.baseColor, brdf_mat.metalness, brdf_mat.dielectricF0);
 	vec3 diffuseReflectance = baseColorToDiffuseReflectance(brdf_mat.baseColor, brdf_mat.metalness);
 
@@ -485,7 +530,8 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 	if (total_bounces == 0u && is_sample_zero(ps.packed_bounces_flags)) {
 		ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
 
-		vec3 diffuse_albedo = DLSSRR_encodeDiffuseAlbedo(DLSSRR_computeDiffuseAlbedo(m.albedo, m.metalness));
+		// The transmitted radiance is demodulated as diffuse: the guide carries the transmitted fraction on top of the diffuse remainder.
+		vec3 diffuse_albedo = DLSSRR_encodeDiffuseAlbedo(DLSSRR_computeDiffuseAlbedo(brdf_mat.baseColor + m.transmission, m.metalness));
 		imageStore(dlss_rr_diffuse_albedo, pixel, vec4(diffuse_albedo, 1.0));
 
 		vec3 specular_albedo = DLSSRR_computeSpecularAlbedo(m.albedo, m.metalness, brdf_mat.dielectricF0, m.roughness, NdotV);
@@ -532,6 +578,34 @@ void shade_and_bounce(HitData h, MaterialResult m) {
 		vec3 direct_light = lights_evaluate_direct_lighting(
 				hit_pos_offset, N, V, brdf_mat, ps.rng_state, is_indirect, rt_light_count);
 		ps.radiance += ps.throughput * direct_light;
+	}
+
+	// =================================================================
+	// Transmission: refract through the surface with probability transmit_p
+	// =================================================================
+	if (transmit_p > 0.0) {
+		if (rand(ps.rng_state) < transmit_p) {
+			vec3 refracted = refract(-V, N, refract_eta);
+			if (dot(refracted, refracted) < 0.5) {
+				// No refracted direction (total internal reflection leaves transmit_p at zero, so only a degenerate normal gets here).
+				ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+				path_pack(payload, ps);
+				return;
+			}
+			// A shading normal tilted far from the geometry can bend the direction back above the surface; mirror it under the plane.
+			float above = dot(refracted, h.geometry_normal);
+			if (above > 0.0) {
+				refracted = normalize(refracted - 2.0 * above * h.geometry_normal);
+			}
+			ps.throughput *= m.transmission / transmit_max;
+			ps.packed_bounces_flags = inc_total_bounce(ps.packed_bounces_flags);
+			ps.hit_t = gl_HitTEXT;
+			ps.offset_normal = -h.geometry_normal;
+			ps.next_ray_dir = refracted;
+			path_pack(payload, ps);
+			return;
+		}
+		ps.throughput /= (1.0 - transmit_p);
 	}
 
 	// =================================================================

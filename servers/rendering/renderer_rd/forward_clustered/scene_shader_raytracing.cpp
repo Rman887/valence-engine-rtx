@@ -1531,6 +1531,8 @@ void SceneShaderRaytracing::init(const String p_defines) {
 		actions.renames["SSS_TRANSMITTANCE_DEPTH"] = "transmittance_depth";
 		actions.renames["SSS_TRANSMITTANCE_BOOST"] = "transmittance_boost";
 		actions.renames["BACKLIGHT"] = "backlight";
+		actions.renames["TRANSMISSION"] = "transmission";
+		actions.renames["IOR"] = "ior";
 		actions.renames["AO"] = "ao";
 		actions.renames["AO_LIGHT_AFFECT"] = "ao_light_affect";
 		actions.renames["EMISSION"] = "emission";

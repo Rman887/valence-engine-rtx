@@ -705,6 +705,8 @@ void SceneShaderForwardMobile::init(const String p_defines) {
 		actions.renames["SSS_TRANSMITTANCE_DEPTH"] = "transmittance_depth_highp";
 		actions.renames["SSS_TRANSMITTANCE_BOOST"] = "transmittance_boost_highp";
 		actions.renames["BACKLIGHT"] = "backlight_highp";
+		actions.renames["TRANSMISSION"] = "transmission";
+		actions.renames["IOR"] = "ior";
 		actions.renames["AO"] = "ao_highp";
 		actions.renames["AO_LIGHT_AFFECT"] = "ao_light_affect_highp";
 		actions.renames["EMISSION"] = "emission_highp";

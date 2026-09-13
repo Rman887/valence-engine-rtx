@@ -1675,7 +1675,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 						: "pool exhausted";
 				WARN_PRINT_ONCE(vformat(
 						"RT Material UBO falling back to dedicated buffer (%s): "
-						"sbt_offset=%u, uniform_total_size=%u, slot_size=%u.",
+						"sbt_offset=%d, uniform_total_size=%d, slot_size=%d.",
 						String(reason), mat_data->rt_sbt_offset,
 						cse->uniform_total_size, MAT_UBO_POOL_SLOT_SIZE));
 

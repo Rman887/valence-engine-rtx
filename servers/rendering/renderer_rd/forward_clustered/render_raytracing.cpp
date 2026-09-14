@@ -33,6 +33,7 @@
 #include "servers/rendering/renderer_rd/environment/sky.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
+#include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
@@ -193,6 +194,63 @@ bool RenderRaytracing::rt_has_depth_texture(RenderSceneBuffersRD *p_render_buffe
 RID RenderRaytracing::rt_get_depth_texture(RenderSceneBuffersRD *p_render_buffers) const {
 	ERR_FAIL_NULL_V(p_render_buffers, RID());
 	return p_render_buffers->get_texture(RB_SCOPE_FORWARD_CLUSTERED, RB_TEX_RT_DEPTH);
+}
+
+static_assert(RenderRaytracing::RT_GBUFFER_TARGETS == RenderForwardClustered::RenderBufferDataForwardClustered::GBUFFER_TARGETS, "The G-buffer target count must match the render buffer data's.");
+
+StringName RenderRaytracing::rt_gbuffer_texture_name(int p_target) {
+	switch (p_target) {
+		case 0:
+			return SNAME("albedo_specular");
+		case 1:
+			return SNAME("normal_roughness");
+		case 2:
+			return SNAME("geo_normal_metallic");
+		case 3:
+			return SNAME("emission_ior");
+		default:
+			return SNAME("transmission_flags");
+	}
+}
+
+void RenderRaytracing::rt_ensure_gbuffer_textures(RenderSceneBuffersRD *p_render_buffers) {
+	ERR_FAIL_NULL(p_render_buffers);
+
+	if (p_render_buffers->has_texture(RB_SCOPE_RT_GBUFFER, rt_gbuffer_texture_name(0))) {
+		return;
+	}
+
+	// The format and usage are the render buffer data's, shared with the precompiled pipelines' framebuffer format.
+	for (int i = 0; i < RT_GBUFFER_TARGETS; i++) {
+		p_render_buffers->create_texture(RB_SCOPE_RT_GBUFFER, rt_gbuffer_texture_name(i), RenderForwardClustered::RenderBufferDataForwardClustered::get_gbuffer_format(), RenderForwardClustered::RenderBufferDataForwardClustered::get_gbuffer_usage_bits(), RD::TEXTURE_SAMPLES_1);
+	}
+}
+
+void RenderRaytracing::rt_free_gbuffer_textures(RenderSceneBuffersRD *p_render_buffers) {
+	ERR_FAIL_NULL(p_render_buffers);
+	p_render_buffers->clear_context(RB_SCOPE_RT_GBUFFER);
+}
+
+bool RenderRaytracing::rt_has_gbuffer_textures(RenderSceneBuffersRD *p_render_buffers) const {
+	return p_render_buffers && p_render_buffers->has_texture(RB_SCOPE_RT_GBUFFER, rt_gbuffer_texture_name(0));
+}
+
+RID RenderRaytracing::rt_get_gbuffer_framebuffer(RenderSceneBuffersRD *p_render_buffers) {
+	ERR_FAIL_NULL_V(p_render_buffers, RID());
+	ERR_FAIL_COND_V(!rt_has_gbuffer_textures(p_render_buffers), RID());
+
+	// The five targets, then the velocity buffer the variant writes at location 5, on the
+	// single-sample depth buffer the raygen and DLSS read.
+	p_render_buffers->ensure_velocity();
+	RID velocity = p_render_buffers->get_velocity_buffer(false);
+	RID depth = p_render_buffers->get_depth_texture();
+	return FramebufferCacheRD::get_singleton()->get_cache_multiview(1,
+			p_render_buffers->get_texture(RB_SCOPE_RT_GBUFFER, rt_gbuffer_texture_name(0)),
+			p_render_buffers->get_texture(RB_SCOPE_RT_GBUFFER, rt_gbuffer_texture_name(1)),
+			p_render_buffers->get_texture(RB_SCOPE_RT_GBUFFER, rt_gbuffer_texture_name(2)),
+			p_render_buffers->get_texture(RB_SCOPE_RT_GBUFFER, rt_gbuffer_texture_name(3)),
+			p_render_buffers->get_texture(RB_SCOPE_RT_GBUFFER, rt_gbuffer_texture_name(4)),
+			velocity, depth);
 }
 
 void RenderRaytracing::dlss_rr_ensure_buffers(RenderSceneBuffersRD *p_render_buffers) {
@@ -3024,7 +3082,7 @@ void RenderRaytracing::_update_scene_uniform_buffer(RTViewportState *p_state, co
 	RD::get_singleton()->buffer_update(p_state->scene_uniform_buffer, 0, size, &ubo_data);
 }
 
-RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags) {
+RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_primary_from_gbuffer) {
 	ERR_FAIL_NULL_V(p_state, RID());
 
 	Ref<RenderForwardClustered::RenderBufferDataForwardClustered> rb_data;
@@ -3141,6 +3199,8 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_MAX_BOUNCES] = (float)env_storage->environment_get_pathtracing_max_bounces(env);
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_DENOISER] = (float)(int)env_storage->environment_get_pathtracing_denoiser(env);
 		}
+		// The frame decides (the Environment's choice, unless MSAA forced the traced primary ray).
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_PRIMARY_SURFACE] = p_primary_from_gbuffer ? (float)RSE::PT_PRIMARY_SURFACE_GBUFFER : (float)RSE::PT_PRIMARY_SURFACE_TRACED;
 
 		// rt_params layout (see RaytracingParamIndex enum):
 		// [0] = VIS_MODE, [1] = SAMPLE_COUNT, [2] = MAX_BOUNCES,
@@ -3327,6 +3387,26 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		u.binding = 28;
 		u.uniform_type = RD::UNIFORM_TYPE_IMAGE;
 		u.append_id(rb->get_velocity_buffer(false));
+		uniforms.push_back(u);
+	}
+
+	// Bindings 33-38: the G-buffer primary surface and the depth it was rasterized with, read by
+	// the raygen when the frame shades from the G-buffer. The raygen declares them in every
+	// variant, so a traced frame binds black stand-ins.
+	{
+		bool has_gbuffer = p_primary_from_gbuffer && rt_has_gbuffer_textures(rb);
+		RID black = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
+		for (int i = 0; i < RT_GBUFFER_TARGETS; i++) {
+			RD::Uniform u;
+			u.binding = 33 + i;
+			u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+			u.append_id(has_gbuffer ? rb->get_texture(RB_SCOPE_RT_GBUFFER, rt_gbuffer_texture_name(i)) : black);
+			uniforms.push_back(u);
+		}
+		RD::Uniform u;
+		u.binding = 38;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u.append_id(has_gbuffer ? rb->get_depth_texture() : black);
 		uniforms.push_back(u);
 	}
 

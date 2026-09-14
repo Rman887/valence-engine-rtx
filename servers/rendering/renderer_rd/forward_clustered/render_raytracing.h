@@ -49,6 +49,9 @@
 #define RB_TEX_DLSS_RR_NORMAL_ROUGHNESS SNAME("normal_roughness")
 #define RB_TEX_DLSS_RR_SPECULAR_HIT_DIST SNAME("specular_hit_dist")
 
+// The G-buffer primary surface (Environment.pathtracing_primary_surface), one scope so it frees as a unit.
+#define RB_SCOPE_RT_GBUFFER SNAME("rt_gbuffer")
+
 class RenderDataRD;
 class RenderSceneBuffersRD;
 
@@ -476,7 +479,7 @@ public:
 
 	RTViewportState *build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags);
 	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, const Vector3 &p_origin);
-	RID update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags);
+	RID update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_primary_from_gbuffer);
 
 	void copy_output_texture(const RenderDataRD *p_render_data);
 	void free_viewport_state(RenderSceneBuffersRD *p_render_buffers);
@@ -487,6 +490,16 @@ public:
 	RID rt_get_texture(RenderSceneBuffersRD *p_render_buffers) const;
 	bool rt_has_depth_texture(RenderSceneBuffersRD *p_render_buffers) const;
 	RID rt_get_depth_texture(RenderSceneBuffersRD *p_render_buffers) const;
+
+	// The G-buffer primary surface: five RGBA16F targets the scene shader's G-buffer variant writes
+	// (albedo + specular, normal + roughness, geometry normal + metallic, emission + IOR, transmission + flags),
+	// rasterized with the render buffers' velocity and depth, read by the raygen.
+	static constexpr int RT_GBUFFER_TARGETS = 5; // Pinned to RenderBufferDataForwardClustered::GBUFFER_TARGETS in the source.
+	static StringName rt_gbuffer_texture_name(int p_target);
+	void rt_ensure_gbuffer_textures(RenderSceneBuffersRD *p_render_buffers);
+	void rt_free_gbuffer_textures(RenderSceneBuffersRD *p_render_buffers);
+	bool rt_has_gbuffer_textures(RenderSceneBuffersRD *p_render_buffers) const;
+	RID rt_get_gbuffer_framebuffer(RenderSceneBuffersRD *p_render_buffers);
 
 	// DLSS Ray Reconstruction guide buffers (stored on the render buffers).
 	void dlss_rr_ensure_buffers(RenderSceneBuffersRD *p_render_buffers);

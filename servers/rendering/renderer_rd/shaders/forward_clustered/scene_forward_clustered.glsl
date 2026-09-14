@@ -1059,7 +1059,20 @@ layout(location = 1) out uvec2 voxel_gi_buffer;
 #endif //MODE_RENDER_NORMAL
 #else // RENDER DEPTH
 
-#ifdef MODE_SEPARATE_SPECULAR
+#ifdef MODE_RENDER_GBUFFER
+
+// The path tracer's primary surface (RenderForwardClusteredPT): the material at the
+// visible surface with world-space normals, for the trace to start from.
+layout(location = 0) out vec4 gbuffer_albedo_specular;
+layout(location = 1) out vec4 gbuffer_normal_roughness;
+layout(location = 2) out vec4 gbuffer_geo_normal_metallic;
+layout(location = 3) out vec4 gbuffer_emission_ior;
+layout(location = 4) out vec4 gbuffer_transmission_flags;
+#ifdef MOTION_VECTORS
+layout(location = 5) out vec2 motion_vector;
+#endif
+
+#elif defined(MODE_SEPARATE_SPECULAR)
 
 layout(location = 0) out vec4 diffuse_buffer; //diffuse (rgb) and roughness
 layout(location = 1) out vec4 specular_buffer; //specular and SSS (subsurface scatter)
@@ -1070,7 +1083,7 @@ layout(location = 0) out vec4 frag_color;
 
 #endif // RENDER DEPTH
 
-#ifdef MOTION_VECTORS
+#if defined(MOTION_VECTORS) && !defined(MODE_RENDER_GBUFFER)
 layout(location = 2) out vec2 motion_vector;
 #endif
 
@@ -1236,6 +1249,10 @@ void fragment_shader(in SceneData scene_data) {
 		normal_highp = -normal_highp;
 	}
 #endif // DO_SIDE_CHECK
+#ifdef MODE_RENDER_GBUFFER
+	// The mesh's normal after the side flip and before the fragment's NORMAL write: the hit shaders' geometry normal.
+	vec3 gbuffer_geo_normal = normal_highp;
+#endif
 #endif // NORMAL_USED
 
 #ifdef UV_USED
@@ -1625,7 +1642,8 @@ void fragment_shader(in SceneData scene_data) {
 #endif //not render depth
 	/////////////////////// LIGHTING //////////////////////////////
 
-#ifdef NORMAL_USED
+#if defined(NORMAL_USED) && !defined(MODE_RENDER_GBUFFER)
+	// The G-buffer variant leaves the roughness as the material wrote it, as the hit shaders do.
 	if (bool(scene_data.flags & SCENE_DATA_FLAGS_USE_ROUGHNESS_LIMITER)) {
 		//https://www.jp.square-enix.com/tech/library/pdf/ImprovedGeometricSpecularAA.pdf
 		float roughness2 = roughness * roughness;
@@ -3015,6 +3033,22 @@ void fragment_shader(in SceneData scene_data) {
 //nothing happens, so a tree-ssa optimizer will result in no fragment shader :)
 #else
 
+#ifdef MODE_RENDER_GBUFFER
+
+	{
+		// Everything the hit shader's MaterialResult carries, in the trace's world space
+		// (inv_view_matrix is the fragment's untransposed local, not the UBO's 3x4 rows).
+		// Emission is exposure-normalised here because MODE_UNSHADED skipped it above.
+		mat3 view_to_world = mat3(inv_view_matrix);
+		gbuffer_albedo_specular = vec4(albedo, specular);
+		gbuffer_normal_roughness = vec4(normalize(view_to_world * normal), roughness);
+		gbuffer_geo_normal_metallic = vec4(normalize(view_to_world * gbuffer_geo_normal), metallic);
+		gbuffer_emission_ior = vec4(emission * scene_data.emissive_exposure_normalization, ior);
+		gbuffer_transmission_flags = vec4(clamp(transmission, vec3(0.0), vec3(1.0)), gl_FrontFacing ? 1.0 : 0.0);
+	}
+
+#else // MODE_RENDER_GBUFFER
+
 	// multiply by albedo
 	diffuse_light *= albedo; // ambient must be multiplied by albedo at the end
 
@@ -3072,6 +3106,7 @@ void fragment_shader(in SceneData scene_data) {
 
 #endif //MODE_SEPARATE_SPECULAR
 
+#endif // MODE_RENDER_GBUFFER
 #endif //MODE_RENDER_DEPTH
 #ifdef MOTION_VECTORS
 	vec2 position_clip = (screen_position.xy / screen_position.w) - scene_data.taa_jitter;

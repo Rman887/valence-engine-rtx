@@ -13,18 +13,145 @@
 
 #pragma shader_stage(raygen)
 #extension GL_EXT_ray_tracing : enable
+#extension GL_EXT_ray_query : enable
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_ARB_gpu_shader_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
 #ifdef USE_SER
 #extension GL_EXT_shader_invocation_reorder : enable
 #endif
 
 #define GLSL 1
 #define RT_STAGE_RAYGEN 1
+// clang-format off
+#include "brdf_inc.glsl"
 #include "raytracing_common_inc.glsl"
+#include "raytracing_hit_inc.glsl"
+// clang-format on
 
 layout(set = 0, binding = 0, rgba32f) uniform image2D image;
 layout(set = 0, binding = 1) uniform accelerationStructureEXT tlas;
 
 layout(location = 0) rayPayloadEXT PathPayload payload;
+
+// The G-buffer primary surface (Environment.pathtracing_primary_surface): the
+// raster pass's material at the visible surface and the depth it was
+// rasterized with, shaded here with the hit shaders' shade_and_bounce. The
+// bindings below are what shade_and_bounce needs from the raygen stage.
+layout(set = 1, binding = 0) uniform texture2D bindless_textures[];
+
+#include "raytracing_samplers_inc.glsl"
+
+// clang-format off
+layout(set = 0, binding = 3, std430) readonly buffer GeometryBuffer {
+	GeometryData geometries[];
+};
+
+layout(set = 0, binding = 5, std430) readonly buffer MaterialBuffer {
+	MaterialData materials[];
+};
+// clang-format on
+
+#include "raytracing_lights_inc.glsl"
+
+#ifdef USE_RADIANCE_OCTMAP_ARRAY
+
+layout(set = 0, binding = 7) uniform texture2DArray radiance_octmap;
+layout(set = 0, binding = 8) uniform sampler radiance_sampler;
+
+vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
+	float layer;
+	float blend = modf(clamp(p_roughness, 0.0, 1.0) * MAX_ROUGHNESS_LOD, layer);
+	vec3 a = textureLod(sampler2DArray(radiance_octmap, radiance_sampler), vec3(p_oct_uv, layer), 0.0).rgb;
+	vec3 b = textureLod(sampler2DArray(radiance_octmap, radiance_sampler), vec3(p_oct_uv, layer + 1.0), 0.0).rgb;
+	return mix(a, b, blend);
+}
+
+#else
+
+layout(set = 0, binding = 7) uniform texture2D radiance_octmap;
+layout(set = 0, binding = 8) uniform sampler radiance_sampler;
+
+vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
+	return textureLod(sampler2D(radiance_octmap, radiance_sampler), p_oct_uv, clamp(p_roughness, 0.0, 1.0) * MAX_ROUGHNESS_LOD).rgb;
+}
+
+#endif // USE_RADIANCE_OCTMAP_ARRAY
+
+// clang-format off
+#include "raytracing_material_eval_inc.glsl"
+#include "raytracing_shade_inc.glsl"
+// clang-format on
+
+layout(set = 0, binding = 33) uniform texture2D gbuffer_albedo_specular;
+layout(set = 0, binding = 34) uniform texture2D gbuffer_normal_roughness;
+layout(set = 0, binding = 35) uniform texture2D gbuffer_geo_normal_metallic;
+layout(set = 0, binding = 36) uniform texture2D gbuffer_emission_ior;
+layout(set = 0, binding = 37) uniform texture2D gbuffer_transmission_flags;
+layout(set = 0, binding = 38) uniform texture2D gbuffer_depth;
+
+/// Shades the G-buffer's surface at this pixel as the primary hit, or returns
+/// false when the raster pass drew nothing here (the sky, or procedural
+/// geometry that is only in the TLAS) so the caller traces the primary ray.
+/// ray_origin and ray_dir are the raygen's own primary ray, anchor-relative;
+/// the hit is rebuilt along it from the raster's reverse-Z depth, never from
+/// a written position, so it sits on the same float grid as the TLAS.
+bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir) {
+	float depth = texelFetch(sampler2D(gbuffer_depth, SAMPLER_NEAREST_CLAMP), pixel, 0).r;
+	if (depth <= 0.0) {
+		return false;
+	}
+
+	vec4 view_pos = scene_data_block.data.inv_projection_matrix * vec4(ndc, depth, 1.0);
+	float hit_t = length(view_pos.xyz / view_pos.w);
+
+	// The RT depth image is the frame's depth after the trace (a hole in the G-buffer, procedural
+	// geometry or the sky, gets the traced value there), so the raster's depth goes in for this pixel.
+	if (is_sample_zero(payload.packed_bounces_flags)) {
+		imageStore(rt_depth_image, pixel, vec4(depth));
+	}
+
+	vec4 albedo_specular = texelFetch(sampler2D(gbuffer_albedo_specular, SAMPLER_NEAREST_CLAMP), pixel, 0);
+	vec4 normal_roughness = texelFetch(sampler2D(gbuffer_normal_roughness, SAMPLER_NEAREST_CLAMP), pixel, 0);
+	vec4 geo_normal_metallic = texelFetch(sampler2D(gbuffer_geo_normal_metallic, SAMPLER_NEAREST_CLAMP), pixel, 0);
+	vec4 emission_ior = texelFetch(sampler2D(gbuffer_emission_ior, SAMPLER_NEAREST_CLAMP), pixel, 0);
+	vec4 transmission_flags = texelFetch(sampler2D(gbuffer_transmission_flags, SAMPLER_NEAREST_CLAMP), pixel, 0);
+
+	HitData h;
+	h.hit_pos = ray_origin + ray_dir * hit_t;
+	h.geometry_normal = normalize(geo_normal_metallic.xyz);
+	h.tangent = vec3(0.0);
+	h.bitangent = vec3(0.0);
+	h.uv = vec2(0.0);
+	h.color = vec4(1.0);
+	h.is_front_face = transmission_flags.a > 0.5;
+	h.geometry_idx = 0u;
+
+	MaterialResult m;
+	m.albedo = albedo_specular.rgb;
+	m.alpha = 1.0;
+	m.roughness = normal_roughness.a;
+	m.metalness = geo_normal_metallic.a;
+	m.specular = albedo_specular.a;
+	m.emissive = emission_ior.rgb;
+	m.normal = normalize(normal_roughness.xyz);
+	m.transmission = clamp(transmission_flags.rgb, vec3(0.0), vec3(1.0));
+	m.ior = max(emission_ior.a, 1.0);
+
+#ifdef RT_DEBUG_ENABLED
+	int vis_mode = int(get_rt_param(RT_PARAM_VIS_MODE));
+	if (vis_mode != 0) {
+		vec3 V = -ray_dir;
+		float NdotV = max(dot(m.normal, V), 0.0001);
+		debug_visualize(vis_mode, h.geometry_normal, m.normal, vec3(0.5, 0.5, 1.0),
+				h.tangent, h.bitangent, h.uv, m.albedo, vec3(1.0, m.roughness, m.metalness), m.metalness, m.roughness, m.specular, m.emissive, V, NdotV, hit_t, h.is_front_face);
+		return true;
+	}
+#endif // RT_DEBUG_ENABLED
+	shade_and_bounce(h, m, ray_dir, hit_t);
+	return true;
+}
 
 void main() {
 	uvec2 pixel = gl_LaunchIDEXT.xy;
@@ -50,6 +177,10 @@ void main() {
 
 	const uint max_bounces = RT_GET_MAX_BOUNCES();
 
+	// The primary surface comes from the G-buffer unless the Environment asks
+	// for the traced reference (RT_PARAM_PRIMARY_SURFACE, 0 = G-buffer).
+	const bool primary_from_gbuffer = get_rt_param(RT_PARAM_PRIMARY_SURFACE) < 0.5;
+
 	// TODO: when we have a spp > 0 the first raycast is always identical,
 	// we should move it out of the loop
 
@@ -65,6 +196,17 @@ void main() {
 
 		[[dont_unroll]] for (uint bounce = 0u; bounce <= max_bounces; bounce++) {
 			path_pack(payload, ps);
+
+			if (bounce == 0u && primary_from_gbuffer && shade_gbuffer_primary(ivec2(pixel), d, ray_origin, ray_dir)) {
+				ps = path_unpack(payload);
+				if (is_path_terminated(ps.packed_bounces_flags)) {
+					break;
+				}
+				vec3 hit_pos = ray_origin + ray_dir * ps.hit_t;
+				ray_origin = offset_ray_origin(hit_pos, ps.offset_normal);
+				ray_dir = ps.next_ray_dir;
+				continue;
+			}
 
 #ifdef USE_SER
 			hitObjectEXT hitObject;
@@ -400,12 +542,12 @@ void main() {
 			float NdotV = max(dot(m.normal, V), 0.0001);
 			vec3 orm = vec3(1.0, m.roughness, m.metalness);
 			debug_visualize(VIS_MODE, h.geometry_normal, m.normal, normal_map,
-					h.tangent, h.bitangent, h.uv, m.albedo, orm, m.metalness, m.roughness, m.specular, m.emissive, V, NdotV);
+					h.tangent, h.bitangent, h.uv, m.albedo, orm, m.metalness, m.roughness, m.specular, m.emissive, V, NdotV, gl_HitTEXT, h.is_front_face);
 			return;
 		}
 	}
 #endif // RT_DEBUG_ENABLED
-	shade_and_bounce(h, m);
+	shade_and_bounce(h, m, gl_WorldRayDirectionEXT, gl_HitTEXT);
 #else
 	// HG0: StandardMaterial3D evaluation.
 	MaterialData mat = materials[h.geometry_idx];
@@ -455,12 +597,12 @@ void main() {
 			vec3 V = -gl_WorldRayDirectionEXT;
 			float NdotV = max(dot(m.normal, V), 0.0001);
 			debug_visualize(VIS_MODE, h.geometry_normal, final_normal, tangent_space_normal,
-					h.tangent, h.bitangent, uv, albedo, orm, metalness, roughness, mat.specular, emissive, V, NdotV);
+					h.tangent, h.bitangent, uv, albedo, orm, metalness, roughness, mat.specular, emissive, V, NdotV, gl_HitTEXT, h.is_front_face);
 			return;
 		}
 	}
 #endif // RT_DEBUG_ENABLED
-	shade_and_bounce(h, m);
+	shade_and_bounce(h, m, gl_WorldRayDirectionEXT, gl_HitTEXT);
 #endif
 }
 

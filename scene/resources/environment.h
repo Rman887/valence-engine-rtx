@@ -196,6 +196,7 @@ private:
 	int pathtracing_samples_per_pixel = 1;
 	int pathtracing_max_bounces = 3;
 	RSE::PathtracingDenoiser pathtracing_denoiser = RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION;
+	RSE::PathtracingPrimarySurface pathtracing_primary_surface = RSE::PT_PRIMARY_SURFACE_GBUFFER;
 	void _update_pathtracing();
 
 	// Glow
@@ -396,6 +397,8 @@ public:
 	int get_pathtracing_max_bounces() const;
 	void set_pathtracing_denoiser(RSE::PathtracingDenoiser p_denoiser);
 	RSE::PathtracingDenoiser get_pathtracing_denoiser() const;
+	void set_pathtracing_primary_surface(RSE::PathtracingPrimarySurface p_primary_surface);
+	RSE::PathtracingPrimarySurface get_pathtracing_primary_surface() const;
 
 	// Glow
 	void set_glow_enabled(bool p_enabled);

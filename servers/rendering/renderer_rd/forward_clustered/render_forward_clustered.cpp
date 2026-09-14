@@ -288,6 +288,16 @@ RD::DataFormat RenderForwardClustered::RenderBufferDataForwardClustered::get_vox
 	return RD::DATA_FORMAT_R8G8_UINT;
 }
 
+RD::DataFormat RenderForwardClustered::RenderBufferDataForwardClustered::get_gbuffer_format() {
+	// Half floats throughout: albedo and emission stay linear and HDR, the normals keep their
+	// direction to well under the RR guide's 8-bit quantization.
+	return RD::DATA_FORMAT_R16G16B16A16_SFLOAT;
+}
+
+uint32_t RenderForwardClustered::RenderBufferDataForwardClustered::get_gbuffer_usage_bits() {
+	return RD::TEXTURE_USAGE_SAMPLING_BIT | RD::TEXTURE_USAGE_COLOR_ATTACHMENT_BIT;
+}
+
 uint32_t RenderForwardClustered::RenderBufferDataForwardClustered::get_voxelgi_usage_bits(bool p_resolve, bool p_msaa, bool p_storage) {
 	return RenderSceneBuffersRD::get_color_usage_bits(p_resolve, p_msaa, p_storage);
 }
@@ -497,6 +507,12 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 				ERR_FAIL_COND_MSG(p_params->view_count > 1, "Multiview not supported for SDF pass");
 				pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_SDF;
 			} break;
+			case PASS_MODE_GBUFFER: {
+				ERR_FAIL_COND_MSG(p_params->view_count > 1, "Multiview not supported for G-buffer pass");
+				// The variant writes motion vectors, so the vertex format must carry the previous positions.
+				pipeline_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS;
+				pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_GBUFFER_PASS;
+			} break;
 		}
 
 		pipeline_key.framebuffer_format_id = framebuffer_format;
@@ -688,6 +704,9 @@ void RenderForwardClustered::_render_list(RenderingDevice::DrawListID p_draw_lis
 		} break;
 		case PASS_MODE_SDF: {
 			_render_list_template<PASS_MODE_SDF>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
+		} break;
+		case PASS_MODE_GBUFFER: {
+			_render_list_template<PASS_MODE_GBUFFER>(p_draw_list, p_framebuffer_Format, p_params, p_from_element, p_to_element);
 		} break;
 		default: {
 			// Unknown pass mode.
@@ -1027,7 +1046,7 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 			// Alpha-only (RT path): skip instances with no transparent/fading
 			// surfaces; opaque geometry is in the TLAS. Uses rt_pass_flags so
 			// `#if defined(RT)` overrides are honored.
-			if (p_alpha_only && fade_alpha >= FADE_ALPHA_PASS_THRESHOLD) {
+			if (p_alpha_only && !rt_gbuffer_opaque_list && fade_alpha >= FADE_ALPHA_PASS_THRESHOLD) {
 				bool has_alpha_surface = false;
 				const GeometryInstanceSurfaceDataCache *s = inst->surface_caches;
 				while (s) {
@@ -1181,7 +1200,7 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 				// surfaces stay out of the raster overlay; raster path uses flags.
 				const uint32_t pass_flags = p_alpha_only ? surf->rt_pass_flags : surf->flags;
 
-				if (!p_alpha_only && !force_alpha && (pass_flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE))) {
+				if ((!p_alpha_only || rt_gbuffer_opaque_list) && !force_alpha && (pass_flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE))) {
 					rl->add_element(surf);
 				}
 
@@ -4773,6 +4792,43 @@ static RD::FramebufferFormatID _get_depth_framebuffer_format_for_pipeline(bool p
 	return RD::get_singleton()->framebuffer_format_create_multipass(Vector<RD::AttachmentFormat>(attachments), passes);
 }
 
+// The path tracer's G-buffer pass (RenderForwardClusteredPT): the five targets, the velocity
+// buffer and the depth buffer, single sample, one view; must match RenderRaytracing::rt_get_gbuffer_framebuffer.
+static RD::FramebufferFormatID _get_gbuffer_framebuffer_format_for_pipeline(bool p_can_be_storage) {
+	RD::AttachmentFormat attachment;
+	attachment.samples = RD::TEXTURE_SAMPLES_1;
+
+	thread_local Vector<RD::AttachmentFormat> attachments;
+	attachments.clear();
+
+	attachment.format = RenderForwardClustered::RenderBufferDataForwardClustered::get_gbuffer_format();
+	attachment.usage_flags = RenderForwardClustered::RenderBufferDataForwardClustered::get_gbuffer_usage_bits();
+	for (int i = 0; i < RenderForwardClustered::RenderBufferDataForwardClustered::GBUFFER_TARGETS; i++) {
+		attachments.push_back(attachment);
+	}
+
+	attachment.format = RenderSceneBuffersRD::get_velocity_format();
+	attachment.usage_flags = RenderSceneBuffersRD::get_velocity_usage_bits(false, false, p_can_be_storage);
+	attachments.push_back(attachment);
+
+	attachment.format = RenderSceneBuffersRD::get_depth_format(false, false, p_can_be_storage);
+	attachment.usage_flags = RenderSceneBuffersRD::get_depth_usage_bits(false, false, p_can_be_storage);
+	attachments.push_back(attachment);
+
+	thread_local Vector<RD::FramebufferPass> passes;
+	passes.resize(1);
+	passes.ptrw()[0].color_attachments.resize(attachments.size() - 1);
+
+	int *color_attachments = passes.ptrw()[0].color_attachments.ptrw();
+	for (int64_t i = 0; i < attachments.size() - 1; i++) {
+		color_attachments[i] = i;
+	}
+
+	passes.ptrw()[0].depth_attachment = attachments.size() - 1;
+
+	return RD::get_singleton()->framebuffer_format_create_multipass(attachments, passes, 1);
+}
+
 static RD::FramebufferFormatID _get_shadow_cubemap_framebuffer_format_for_pipeline() {
 	thread_local LocalVector<RD::AttachmentFormat> attachments;
 	attachments.clear();
@@ -4914,6 +4970,15 @@ void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePi
 		_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 	}
 
+	if (p_global.use_gbuffer && p_surface.uses_rt_opaque) {
+		// The path tracer's G-buffer pass draws the opaque surfaces in the variant that writes motion vectors.
+		pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_GBUFFER_PASS;
+		pipeline_key.color_pass_flags = SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS;
+		pipeline_key.framebuffer_format_id = _get_gbuffer_framebuffer_format_for_pipeline(buffers_can_be_storage);
+		_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
+		pipeline_key.color_pass_flags = 0;
+	}
+
 	if (p_global.use_voxelgi) {
 		// Depth pass with VoxelGI support.
 		pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI;
@@ -4982,6 +5047,7 @@ void RenderForwardClustered::_mesh_generate_all_pipelines_for_surface_cache(Geom
 	surface.shader_shadow = p_surface_cache->shader_shadow;
 	surface.instanced = p_surface_cache->owner->mesh_instance.is_valid();
 	surface.uses_opaque = !uses_alpha_pass;
+	surface.uses_rt_opaque = (p_surface_cache->rt_pass_flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) == 0;
 	surface.uses_transparent = uses_alpha_pass || uses_fade;
 	surface.uses_depth = (p_surface_cache->flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE | GeometryInstanceSurfaceDataCache::FLAG_PASS_SHADOW)) != 0;
 	surface.can_use_lightmap = p_surface_cache->owner->lightmap_instance.is_valid() || p_surface_cache->owner->lightmap_sh;
@@ -5230,6 +5296,7 @@ void RenderForwardClustered::mesh_generate_pipelines(RID p_mesh, bool p_backgrou
 		surface.shader_shadow = shader_shadow;
 		surface.instanced = mesh_storage->mesh_needs_instance(p_mesh, true);
 		surface.uses_opaque = !material->shader_data->uses_alpha_pass();
+		surface.uses_rt_opaque = !material->shader_data->rt_uses_alpha_pass();
 		surface.uses_transparent = material->shader_data->uses_alpha_pass();
 		surface.uses_depth = surface.uses_opaque || (surface.uses_transparent && material->shader_data->uses_depth_in_alpha_pass());
 		surface.can_use_lightmap = mesh_storage->mesh_surface_get_format(mesh_surface) & RSE::ARRAY_FORMAT_TEX_UV2;

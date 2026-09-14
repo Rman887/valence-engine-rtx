@@ -67,6 +67,9 @@ protected:
 	// World-space anchor the current frame's color, depth and motion vectors are relative to
 	// (camera-relative tracing in RenderForwardClusteredPT); zero for a raster frame.
 	Vector3 upscaler_world_offset;
+	// Set by RenderForwardClusteredPT while it fills its lists for a G-buffer primary surface: the
+	// alpha-only fill then also adds the surfaces the TLAS holds to the opaque list, for the G-buffer pass.
+	bool rt_gbuffer_opaque_list = false;
 
 	enum {
 		SCENE_UNIFORM_SET = 0,
@@ -177,6 +180,10 @@ public:
 		static uint32_t get_normal_roughness_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
 		static RD::DataFormat get_voxelgi_format();
 		static uint32_t get_voxelgi_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
+		// The path tracer's G-buffer primary surface (RenderForwardClusteredPT): five single-sample targets.
+		static constexpr int GBUFFER_TARGETS = 5;
+		static RD::DataFormat get_gbuffer_format();
+		static uint32_t get_gbuffer_usage_bits();
 	};
 
 protected:
@@ -221,6 +228,7 @@ protected:
 		PASS_MODE_DEPTH_NORMAL_ROUGHNESS_VOXEL_GI,
 		PASS_MODE_DEPTH_MATERIAL,
 		PASS_MODE_SDF,
+		PASS_MODE_GBUFFER,
 		PASS_MODE_MAX
 	};
 
@@ -659,6 +667,7 @@ protected:
 		SceneShaderForwardClustered::ShaderData *shader_shadow = nullptr;
 		bool instanced = false;
 		bool uses_opaque = false;
+		bool uses_rt_opaque = false; // Opaque to the path tracer (rt_pass_flags), which is what the G-buffer pass draws.
 		bool uses_transparent = false;
 		bool uses_depth = false;
 		bool can_use_lightmap = false;
@@ -682,6 +691,7 @@ protected:
 				uint32_t use_32_bit_shadows : 1;
 				uint32_t use_shadow_cubemaps : 1;
 				uint32_t use_shadow_dual_paraboloid : 1;
+				uint32_t use_gbuffer : 1;
 			};
 		};
 	};

@@ -117,6 +117,22 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		global_pipeline_data_required.use_motion_vectors = true;
 	}
 
+	// The primary surface (Environment.pathtracing_primary_surface): a G-buffer pass finds the
+	// visible surface and the trace starts from it; the traced primary ray is the reference view.
+	// MSAA has no meaning under path tracing and the G-buffer pass draws into the single-sample
+	// depth buffer, so a viewport with MSAA on falls back to the traced primary ray.
+	const bool gbuffer_requested = environment_get_pathtracing_primary_surface(p_render_data->environment) == RSE::PT_PRIMARY_SURFACE_GBUFFER;
+	const bool use_gbuffer = gbuffer_requested && rb->get_msaa_3d() == RSE::VIEWPORT_MSAA_DISABLED && p_render_data->scene_data->view_count == 1;
+	if (gbuffer_requested && !use_gbuffer) {
+		WARN_PRINT_ONCE("Path tracing from a G-buffer needs MSAA off and a single view; tracing the primary ray instead.");
+	}
+	if (use_gbuffer) {
+		// The G-buffer variant of the scene shader is in the advanced group, and its pipelines are
+		// precompiled per surface like every other pass's.
+		scene_shader.enable_advanced_shader_group();
+		global_pipeline_data_required.use_gbuffer = true;
+	}
+
 	// Free GPU resources for the screen-space effects the path tracer replaces.
 	rb->clear_context(RB_SCOPE_SSIL);
 	rb->clear_context(RB_SCOPE_SSAO);
@@ -149,11 +165,18 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	RENDER_TIMESTAMP("Fill Render Lists");
 
 	// TLAS is built from rt_instances and the path tracer writes velocity itself,
-	// so this collapses to populating the ALPHA (transparent) list only.
+	// so this collapses to populating the ALPHA (transparent) list only; with a
+	// G-buffer primary surface the opaque list gets the TLAS's surfaces as well.
+	rt_gbuffer_opaque_list = use_gbuffer;
 	_fill_render_list(RENDER_LIST_OPAQUE, p_render_data, PASS_MODE_COLOR, false, false, false, false, true);
+	rt_gbuffer_opaque_list = false;
 
 	int *render_info = p_render_data->render_info ? p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE] : (int *)nullptr;
 
+	if (use_gbuffer) {
+		render_list[RENDER_LIST_OPAQUE].sort_by_key();
+		_fill_instance_data(RENDER_LIST_OPAQUE, render_info);
+	}
 	render_list[RENDER_LIST_ALPHA].sort_by_reverse_depth_and_priority();
 	_fill_instance_data(RENDER_LIST_ALPHA, render_info);
 
@@ -180,9 +203,15 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 			raytracing->dlss_rr_free_buffers(rb.ptr());
 		}
 
+		if (use_gbuffer) {
+			raytracing->rt_ensure_gbuffer_textures(rb.ptr());
+		} else if (raytracing->rt_has_gbuffer_textures(rb.ptr())) {
+			raytracing->rt_free_gbuffer_textures(rb.ptr());
+		}
+
 		RTViewportState *rt_state = raytracing->build_tlas(p_render_data, rt_flags);
 		if (rt_state) {
-			rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags);
+			rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags, use_gbuffer);
 			// DLSS gets the same camera-relative frame the trace rendered.
 			upscaler_world_offset = rt_state->rt_origin;
 		}
@@ -321,6 +350,31 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		_setup_lights_cluster_decals(p_render_data, pt_directional_light_count, pt_positional_light_count);
 	}
 
+	// The G-buffer pass: the opaque list into the five G-buffer targets, the velocity buffer and
+	// the depth buffer, with the lights, decals and cluster of the frame bound (decals land in
+	// the G-buffer). The raygen then starts every path from that surface.
+	if (use_gbuffer && rb_data.is_valid() && raytracing && raytracing->get_shader()) {
+		RENDER_TIMESTAMP("Render G-Buffer");
+		RD::get_singleton()->draw_command_begin_label("Render G-Buffer");
+
+		uint32_t gbuffer_uniform_buffer_index = _setup_environment(p_render_data, false, screen_size, screen_size, p_default_bg_color, false);
+		RID rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, p_render_data, radiance_texture, samplers, gbuffer_uniform_buffer_index, true);
+
+		RID gbuffer_framebuffer = raytracing->rt_get_gbuffer_framebuffer(rb.ptr());
+		if (gbuffer_framebuffer.is_valid()) {
+			Vector<Color> gbuffer_clear;
+			for (int i = 0; i < RenderRaytracing::RT_GBUFFER_TARGETS + 1; i++) {
+				gbuffer_clear.push_back(Color(0, 0, 0, 0));
+			}
+			RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, PASS_MODE_GBUFFER, 0, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
+			_render_list_with_draw_list(&render_list_params, gbuffer_framebuffer, RD::DRAW_CLEAR_ALL, gbuffer_clear, 0.0f, 0u, p_render_data->render_region);
+		} else {
+			ERR_PRINT_ONCE("The G-buffer framebuffer is missing; the raygen reads stale targets this frame.");
+		}
+
+		RD::get_singleton()->draw_command_end_label();
+	}
+
 	// Execute raytracing (replaces the opaque + motion vector pass).
 	if (rb_data.is_valid() && raytracing && raytracing->get_shader()) {
 		RD::get_singleton()->draw_command_begin_label("Raytracing");
@@ -358,7 +412,9 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 
 		RD::get_singleton()->draw_command_end_label();
 
-		// Copy RT depth (R32F storage image) to D32F depth buffer after tracing.
+		// Copy RT depth (R32F storage image) to D32F depth buffer after tracing. With a G-buffer
+		// primary surface the raygen wrote the raster's depth into it for every surface it shaded and
+		// the trace filled the holes (procedural geometry, the sky), so the copy is the frame's depth.
 		if (rb_data.is_valid() && raytracing->rt_has_depth_texture(rb.ptr())) {
 			RENDER_TIMESTAMP("Copy RT Depth (R32F -> D32F)");
 			RD::get_singleton()->draw_command_begin_label("Copy RT Depth");
@@ -556,6 +612,7 @@ void RenderForwardClusteredPT::_age_out_motion_vectors(const RenderDataRD *p_ren
 void RenderForwardClusteredPT::_free_rt_viewport_state(RenderSceneBuffersRD *p_render_buffers) {
 	ERR_FAIL_NULL(p_render_buffers);
 	p_render_buffers->clear_context(RB_SCOPE_DLSS_RR);
+	p_render_buffers->clear_context(RB_SCOPE_RT_GBUFFER);
 	if (raytracing) {
 		raytracing->free_viewport_state(p_render_buffers);
 	}

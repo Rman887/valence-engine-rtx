@@ -1410,6 +1410,14 @@
 			<description>
 			</description>
 		</method>
+		<method name="environment_set_pathtracing_primary_surface">
+			<return type="void" />
+			<param index="0" name="env" type="RID" />
+			<param index="1" name="primary_surface" type="int" enum="RenderingServer.PathtracingPrimarySurface" />
+			<description>
+				Selects how the path tracer finds the visible surface for the specified environment RID. See [member Environment.pathtracing_primary_surface].
+			</description>
+		</method>
 		<method name="environment_set_sdfgi">
 			<return type="void" />
 			<param index="0" name="env" type="RID" />
@@ -6000,6 +6008,12 @@
 		</constant>
 		<constant name="PT_DENOISER_DLSS_RAY_RECONSTRUCTION" value="1" enum="PathtracingDenoiser">
 			Uses NVIDIA DLSS Ray Reconstruction to denoise the path-traced image. DLSS Ray Reconstruction is a neural temporal denoiser that accumulates information across frames to produce a clean, high-quality result at low sample counts. Requires an NVIDIA RTX GPU and the Streamline plugin to be active.
+		</constant>
+		<constant name="PT_PRIMARY_SURFACE_GBUFFER" value="0" enum="PathtracingPrimarySurface">
+			The visible surface comes from a rasterized G-buffer; the path tracer starts from it.
+		</constant>
+		<constant name="PT_PRIMARY_SURFACE_TRACED" value="1" enum="PathtracingPrimarySurface">
+			The visible surface comes from tracing the primary ray. A reference view for the G-buffer path.
 		</constant>
 		<constant name="SUB_SURFACE_SCATTERING_QUALITY_DISABLED" value="0" enum="SubSurfaceScatteringQuality">
 			Disables subsurface scattering entirely, even on materials that have [member BaseMaterial3D.subsurf_scatter_enabled] set to [code]true[/code]. This has the lowest GPU requirements.

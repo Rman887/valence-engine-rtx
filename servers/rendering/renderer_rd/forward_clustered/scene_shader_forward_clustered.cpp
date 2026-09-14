@@ -404,6 +404,8 @@ uint16_t SceneShaderForwardClustered::ShaderData::_get_shader_version(PipelineVe
 			return ShaderVersion::SHADER_VERSION_DEPTH_PASS_WITH_MATERIAL + ubershader_base;
 		case PIPELINE_VERSION_DEPTH_PASS_WITH_SDF:
 			return ShaderVersion::SHADER_VERSION_DEPTH_PASS_WITH_SDF + ubershader_base;
+		case PIPELINE_VERSION_GBUFFER_PASS:
+			return ShaderVersion::SHADER_VERSION_GBUFFER_PASS + ubershader_base;
 		case PIPELINE_VERSION_COLOR_PASS: {
 			int shader_flags = 0;
 
@@ -578,6 +580,10 @@ void SceneShaderForwardClustered::ShaderData::_create_pipeline(PipelineKey p_pip
 			case PIPELINE_VERSION_DEPTH_PASS_WITH_MATERIAL:
 				// Writes to normal and roughness in opaque way.
 				blend_state = RD::PipelineColorBlendState::create_disabled(5);
+				break;
+			case PIPELINE_VERSION_GBUFFER_PASS:
+				// Five G-buffer targets and the motion vector, all opaque.
+				blend_state = RD::PipelineColorBlendState::create_disabled(6);
 				break;
 			case PIPELINE_VERSION_DEPTH_PASS:
 			case PIPELINE_VERSION_DEPTH_PASS_DP:
@@ -767,6 +773,8 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 			shader_versions.push_back(ShaderRD::VariantDefine(SHADER_GROUP_ADVANCED_MULTIVIEW, base_define + "\n#define USE_MULTIVIEW\n#define MODE_RENDER_DEPTH\n#define MODE_RENDER_NORMAL_ROUGHNESS\n#define MODE_RENDER_VOXEL_GI\n", false)); // SHADER_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI_MULTIVIEW
 			shader_versions.push_back(ShaderRD::VariantDefine(SHADER_GROUP_ADVANCED, base_define + "\n#define MODE_RENDER_DEPTH\n#define MODE_RENDER_MATERIAL\n", false)); // SHADER_VERSION_DEPTH_PASS_WITH_MATERIAL
 			shader_versions.push_back(ShaderRD::VariantDefine(SHADER_GROUP_ADVANCED, base_define + "\n#define MODE_RENDER_DEPTH\n#define MODE_RENDER_SDF\n", false)); // SHADER_VERSION_DEPTH_PASS_WITH_SDF
+			// The path tracer's primary surface: the material at the visible surface and its motion vector, no lighting (MODE_UNSHADED skips it).
+			shader_versions.push_back(ShaderRD::VariantDefine(SHADER_GROUP_ADVANCED, base_define + "\n#define MODE_RENDER_GBUFFER\n#define MODE_UNSHADED\n#define MOTION_VECTORS\n", false)); // SHADER_VERSION_GBUFFER_PASS
 		}
 
 		Vector<String> color_pass_flags = {

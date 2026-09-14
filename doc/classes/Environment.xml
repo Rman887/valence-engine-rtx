@@ -216,6 +216,10 @@
 			Maximum number of times a ray is allowed to bounce off surfaces before it is terminated. Higher values produce more accurate indirect lighting and inter-reflections at the cost of GPU performance. A value of [code]0[/code] produces direct illumination only.
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
 		</member>
+		<member name="pathtracing_primary_surface" type="int" setter="set_pathtracing_primary_surface" getter="get_pathtracing_primary_surface" enum="RenderingServer.PathtracingPrimarySurface" default="0">
+			How the path tracer finds the surface visible at each pixel. [constant RenderingServer.PT_PRIMARY_SURFACE_GBUFFER] rasterizes the opaque geometry into a G-buffer (albedo, normals, roughness, metallic, emission, transmission, motion vectors and depth) and the tracer starts from that surface, so every material feature of the rasterizer (decals, alpha scissor, cutout particles) reaches the traced image and alpha-tested geometry costs no any-hit shading. [constant RenderingServer.PT_PRIMARY_SURFACE_TRACED] traces the primary ray instead, as a reference. Lighting, shadows, bounces and denoising are identical in both.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code]. Procedural ray-tracing geometry ([RTProceduralInstance3D]) is only visible through the G-buffer path where no rasterized surface covers it.
+		</member>
 		<member name="pathtracing_samples_per_pixel" type="int" setter="set_pathtracing_samples_per_pixel" getter="get_pathtracing_samples_per_pixel" default="1">
 			Number of ray samples cast per pixel per frame. Higher values reduce noise but increase GPU cost proportionally. When using a temporal denoiser such as DLSS Ray Reconstruction, a low sample count (1-2) is typically sufficient since the denoiser accumulates information across frames.
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].

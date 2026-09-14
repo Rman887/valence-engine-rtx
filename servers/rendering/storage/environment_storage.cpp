@@ -908,6 +908,12 @@ void RendererEnvironmentStorage::environment_set_pathtracing(RID p_env, bool p_e
 	env->pathtracing_denoiser = p_denoiser;
 }
 
+void RendererEnvironmentStorage::environment_set_pathtracing_primary_surface(RID p_env, RSE::PathtracingPrimarySurface p_primary_surface) {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL(env);
+	env->pathtracing_primary_surface = p_primary_surface;
+}
+
 bool RendererEnvironmentStorage::environment_get_pathtracing_enabled(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, false);
@@ -936,6 +942,12 @@ RSE::PathtracingDenoiser RendererEnvironmentStorage::environment_get_pathtracing
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, RSE::PT_DENOISER_NONE);
 	return env->pathtracing_denoiser;
+}
+
+RSE::PathtracingPrimarySurface RendererEnvironmentStorage::environment_get_pathtracing_primary_surface(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, RSE::PT_PRIMARY_SURFACE_GBUFFER);
+	return env->pathtracing_primary_surface;
 }
 
 // Adjustments

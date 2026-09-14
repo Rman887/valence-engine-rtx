@@ -1113,264 +1113,6 @@ void RenderRaytracing::_populate_surface_blas(
 }
 
 // ---------------------------------------------------------------------------
-// Uniform packing (file-local helpers)
-// ---------------------------------------------------------------------------
-
-static float _def_real(const ShaderLanguage::ShaderNode::Uniform &u, int idx) {
-	return (int)u.default_value.size() > idx ? u.default_value[idx].real : 0.0f;
-}
-
-static int32_t _def_sint(const ShaderLanguage::ShaderNode::Uniform &u, int idx) {
-	return (int)u.default_value.size() > idx ? u.default_value[idx].sint : 0;
-}
-
-static uint32_t _def_uint(const ShaderLanguage::ShaderNode::Uniform &u, int idx) {
-	return (int)u.default_value.size() > idx ? u.default_value[idx].uint : 0u;
-}
-
-static uint32_t _def_bool(const ShaderLanguage::ShaderNode::Uniform &u, int idx) {
-	return (int)u.default_value.size() > idx ? (uint32_t)u.default_value[idx].boolean : 0u;
-}
-
-static void pack_uniform(const ShaderLanguage::ShaderNode::Uniform &u, const Variant &val, uint8_t *dst) {
-	using SL = ShaderLanguage;
-
-	switch (u.type) {
-		case SL::TYPE_FLOAT: {
-			float v = val.get_type() == Variant::FLOAT ? (float)(double)val : _def_real(u, 0);
-			memcpy(dst, &v, 4);
-		} break;
-		case SL::TYPE_INT: {
-			int32_t v = val.get_type() == Variant::INT ? (int32_t)(int64_t)val : _def_sint(u, 0);
-			memcpy(dst, &v, 4);
-		} break;
-		case SL::TYPE_UINT: {
-			uint32_t v = val.get_type() == Variant::INT ? (uint32_t)(int64_t)val : _def_uint(u, 0);
-			memcpy(dst, &v, 4);
-		} break;
-		case SL::TYPE_BOOL: {
-			uint32_t v = val.get_type() == Variant::BOOL ? (uint32_t)(bool)val : _def_bool(u, 0);
-			memcpy(dst, &v, 4);
-		} break;
-		case SL::TYPE_VEC2: {
-			float fv[2];
-			if (val.get_type() == Variant::VECTOR2) {
-				Vector2 v = val;
-				fv[0] = (float)v.x;
-				fv[1] = (float)v.y;
-			} else {
-				fv[0] = _def_real(u, 0);
-				fv[1] = _def_real(u, 1);
-			}
-			memcpy(dst, fv, 8);
-		} break;
-		case SL::TYPE_VEC3: {
-			float fv[3] = {};
-			if (val.get_type() == Variant::VECTOR3) {
-				Vector3 v = val;
-				fv[0] = (float)v.x;
-				fv[1] = (float)v.y;
-				fv[2] = (float)v.z;
-			} else if (val.get_type() == Variant::COLOR) {
-				Color c = val;
-				if (u.hint == SL::ShaderNode::Uniform::HINT_SOURCE_COLOR) {
-					c = c.srgb_to_linear();
-				}
-				fv[0] = c.r;
-				fv[1] = c.g;
-				fv[2] = c.b;
-			} else {
-				fv[0] = _def_real(u, 0);
-				fv[1] = _def_real(u, 1);
-				fv[2] = _def_real(u, 2);
-			}
-			memcpy(dst, fv, 12);
-		} break;
-		case SL::TYPE_VEC4: {
-			float fv[4] = {};
-			if (val.get_type() == Variant::COLOR) {
-				Color c = val;
-				if (u.hint == SL::ShaderNode::Uniform::HINT_SOURCE_COLOR) {
-					c = c.srgb_to_linear();
-				}
-				fv[0] = c.r;
-				fv[1] = c.g;
-				fv[2] = c.b;
-				fv[3] = c.a;
-			} else if (val.get_type() == Variant::VECTOR4) {
-				Vector4 v = val;
-				fv[0] = (float)v.x;
-				fv[1] = (float)v.y;
-				fv[2] = (float)v.z;
-				fv[3] = (float)v.w;
-			} else {
-				for (int i = 0; i < 4; i++) {
-					fv[i] = _def_real(u, i);
-				}
-			}
-			memcpy(dst, fv, 16);
-		} break;
-		case SL::TYPE_IVEC2: {
-			int32_t iv[2];
-			if (val.get_type() == Variant::VECTOR2I) {
-				Vector2i v = val;
-				iv[0] = v.x;
-				iv[1] = v.y;
-			} else {
-				iv[0] = _def_sint(u, 0);
-				iv[1] = _def_sint(u, 1);
-			}
-			memcpy(dst, iv, 8);
-		} break;
-		case SL::TYPE_IVEC3: {
-			int32_t iv[3] = {};
-			if (val.get_type() == Variant::VECTOR3I) {
-				Vector3i v = val;
-				iv[0] = v.x;
-				iv[1] = v.y;
-				iv[2] = v.z;
-			} else {
-				for (int i = 0; i < 3; i++) {
-					iv[i] = _def_sint(u, i);
-				}
-			}
-			memcpy(dst, iv, 12);
-		} break;
-		case SL::TYPE_IVEC4: {
-			int32_t iv[4] = {};
-			if (val.get_type() == Variant::VECTOR4I) {
-				Vector4i v = val;
-				iv[0] = v.x;
-				iv[1] = v.y;
-				iv[2] = v.z;
-				iv[3] = v.w;
-			} else {
-				for (int i = 0; i < 4; i++) {
-					iv[i] = _def_sint(u, i);
-				}
-			}
-			memcpy(dst, iv, 16);
-		} break;
-		case SL::TYPE_UVEC2: {
-			uint32_t uv[2];
-			if (val.get_type() == Variant::VECTOR2I) {
-				Vector2i v = val;
-				uv[0] = (uint32_t)v.x;
-				uv[1] = (uint32_t)v.y;
-			} else {
-				uv[0] = _def_uint(u, 0);
-				uv[1] = _def_uint(u, 1);
-			}
-			memcpy(dst, uv, 8);
-		} break;
-		case SL::TYPE_UVEC3: {
-			uint32_t uv[3] = {};
-			if (val.get_type() == Variant::VECTOR3I) {
-				Vector3i v = val;
-				uv[0] = (uint32_t)v.x;
-				uv[1] = (uint32_t)v.y;
-				uv[2] = (uint32_t)v.z;
-			} else {
-				for (int i = 0; i < 3; i++) {
-					uv[i] = _def_uint(u, i);
-				}
-			}
-			memcpy(dst, uv, 12);
-		} break;
-		case SL::TYPE_UVEC4: {
-			uint32_t uv[4] = {};
-			if (val.get_type() == Variant::VECTOR4I) {
-				Vector4i v = val;
-				uv[0] = (uint32_t)v.x;
-				uv[1] = (uint32_t)v.y;
-				uv[2] = (uint32_t)v.z;
-				uv[3] = (uint32_t)v.w;
-			} else {
-				for (int i = 0; i < 4; i++) {
-					uv[i] = _def_uint(u, i);
-				}
-			}
-			memcpy(dst, uv, 16);
-		} break;
-		case SL::TYPE_BVEC2: {
-			uint32_t bv[2] = { _def_bool(u, 0), _def_bool(u, 1) };
-			memcpy(dst, bv, 8);
-		} break;
-		case SL::TYPE_BVEC3: {
-			uint32_t bv[3] = { _def_bool(u, 0), _def_bool(u, 1), _def_bool(u, 2) };
-			memcpy(dst, bv, 12);
-		} break;
-		case SL::TYPE_BVEC4: {
-			uint32_t bv[4] = { _def_bool(u, 0), _def_bool(u, 1), _def_bool(u, 2), _def_bool(u, 3) };
-			memcpy(dst, bv, 16);
-		} break;
-		case SL::TYPE_MAT2: {
-			// std140: mat2 = 2 column vec2s, each padded to vec4 (2x16 = 32 bytes).
-			float m[8] = {};
-			if (val.get_type() == Variant::TRANSFORM2D) {
-				Transform2D t = val;
-				m[0] = (float)t[0].x;
-				m[1] = (float)t[0].y;
-				m[4] = (float)t[1].x;
-				m[5] = (float)t[1].y;
-			} else {
-				for (int i = 0; i < 4; i++) {
-					m[(i / 2) * 4 + (i % 2)] = _def_real(u, i);
-				}
-			}
-			memcpy(dst, m, 32);
-		} break;
-		case SL::TYPE_MAT3: {
-			// std140: mat3 = 3 column vec3s, each padded to vec4 (3x16 = 48 bytes).
-			float m[12] = {};
-			if (val.get_type() == Variant::BASIS) {
-				Basis b = val;
-				for (int col = 0; col < 3; col++) {
-					Vector3 c = b.get_column(col);
-					m[col * 4 + 0] = (float)c.x;
-					m[col * 4 + 1] = (float)c.y;
-					m[col * 4 + 2] = (float)c.z;
-				}
-			} else {
-				for (int i = 0; i < 9; i++) {
-					m[(i / 3) * 4 + (i % 3)] = _def_real(u, i);
-				}
-			}
-			memcpy(dst, m, 48);
-		} break;
-		case SL::TYPE_MAT4: {
-			// std140: mat4 = 4 column vec4s (4x16 = 64 bytes).
-			float m[16] = {};
-			if (val.get_type() == Variant::PROJECTION) {
-				Projection p = val;
-				for (int col = 0; col < 4; col++) {
-					m[col * 4 + 0] = (float)p.columns[col].x;
-					m[col * 4 + 1] = (float)p.columns[col].y;
-					m[col * 4 + 2] = (float)p.columns[col].z;
-					m[col * 4 + 3] = (float)p.columns[col].w;
-				}
-			} else if (val.get_type() == Variant::TRANSFORM3D) {
-				Transform3D t = val;
-				Projection p(t);
-				for (int col = 0; col < 4; col++) {
-					m[col * 4 + 0] = (float)p.columns[col].x;
-					m[col * 4 + 1] = (float)p.columns[col].y;
-					m[col * 4 + 2] = (float)p.columns[col].z;
-					m[col * 4 + 3] = (float)p.columns[col].w;
-				}
-			} else {
-				for (int i = 0; i < 16; i++) {
-					m[i] = _def_real(u, i);
-				}
-			}
-			memcpy(dst, m, 64);
-		} break;
-		default:
-			break;
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Procedural geometry processing
 // ---------------------------------------------------------------------------
 
@@ -1615,12 +1357,15 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 				if (ShaderLanguage::is_sampler_type(u.type)) {
 					continue;
 				}
+				if (u.scope == ShaderLanguage::ShaderNode::Uniform::SCOPE_INSTANCE) {
+					continue; // Not in the block, and its order is not an offset.
+				}
 				if (u.order < 0 || u.order >= (int)cse->uniform_offsets.size()) {
 					continue;
 				}
 
 				uint32_t offset = cse->uniform_offsets[u.order];
-				uint32_t size = ShaderLanguage::get_datatype_size(u.type);
+				uint32_t size = SceneShaderRaytracing::uniform_std140_size(u);
 				if (offset + size > cse->uniform_total_size) {
 					continue;
 				}
@@ -1632,8 +1377,11 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 					uint32_t uidx = (idx >= 0) ? (uint32_t)idx : 0;
 					memcpy(dst, &uidx, sizeof(uint32_t));
 				} else {
+					// The same std140 packer as the raster's material buffer, so a
+					// source_color default, an unhinted color and an array read the
+					// same bytes in the hit shader as in the fragment shader.
 					Variant val = material_storage->material_get_param(p_material_rid, kv.key);
-					pack_uniform(u, val, dst);
+					RendererRD::MaterialStorage::fill_std140_uniform(u, val, dst, true);
 				}
 			}
 

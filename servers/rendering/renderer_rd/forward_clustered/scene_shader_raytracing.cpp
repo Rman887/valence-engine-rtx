@@ -432,6 +432,24 @@ void SceneShaderRaytracing::_strip_texture_globals(String &r_globals, const Stri
 	r_globals = r_globals.substr(0, line_start) + r_globals.substr(line_end);
 }
 
+// The bytes one uniform occupies in the std140 block, as ShaderCompiler lays
+// it out: a global is an index into the global buffer and an array pads every
+// element to 16 bytes.
+uint32_t SceneShaderRaytracing::uniform_std140_size(const ShaderLanguage::ShaderNode::Uniform &p_uniform) {
+	if (p_uniform.scope == ShaderLanguage::ShaderNode::Uniform::SCOPE_GLOBAL) {
+		return ShaderLanguage::get_datatype_size(ShaderLanguage::TYPE_UINT);
+	}
+	uint32_t size = ShaderLanguage::get_datatype_size(p_uniform.type);
+	if (p_uniform.array_size > 0) {
+		size *= p_uniform.array_size;
+		uint32_t m = 16 * p_uniform.array_size;
+		if (size % m != 0) {
+			size += m - (size % m);
+		}
+	}
+	return size;
+}
+
 void SceneShaderRaytracing::_finalize_uniforms_with_textures(
 		CustomShaderEntry &r_entry,
 		const ShaderCompiler::GeneratedCode &p_gen_code,
@@ -443,10 +461,10 @@ void SceneShaderRaytracing::_finalize_uniforms_with_textures(
 	uint32_t raw_uniform_end = 0;
 	for (const KeyValue<StringName, ShaderLanguage::ShaderNode::Uniform> &kv : p_uniforms) {
 		const ShaderLanguage::ShaderNode::Uniform &uu = kv.value;
-		if (ShaderLanguage::is_sampler_type(uu.type) || uu.order < 0 || uu.order >= (int)p_gen_code.uniform_offsets.size()) {
+		if (ShaderLanguage::is_sampler_type(uu.type) || uu.scope == ShaderLanguage::ShaderNode::Uniform::SCOPE_INSTANCE || uu.order < 0 || uu.order >= (int)p_gen_code.uniform_offsets.size()) {
 			continue;
 		}
-		uint32_t end = p_gen_code.uniform_offsets[uu.order] + ShaderLanguage::get_datatype_size(uu.type);
+		uint32_t end = p_gen_code.uniform_offsets[uu.order] + uniform_std140_size(uu);
 		if (end > raw_uniform_end) {
 			raw_uniform_end = end;
 		}

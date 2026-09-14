@@ -518,6 +518,11 @@ public:
 	virtual void material_set_param(RID p_material, const StringName &p_param, const Variant &p_value) override;
 	virtual Variant material_get_param(RID p_material, const StringName &p_param) const override;
 
+	// One uniform's std140 bytes as update_uniform_buffer writes them (the value,
+	// else the shader default, else the type's zero), for a material buffer built
+	// outside MaterialData: the ray tracer's material slot.
+	static void fill_std140_uniform(const ShaderLanguage::ShaderNode::Uniform &p_uniform, const Variant &p_value, uint8_t *r_data, bool p_use_linear_color);
+
 	virtual void material_set_next_pass(RID p_material, RID p_next_material) override;
 	virtual void material_set_render_priority(RID p_material, int priority) override;
 

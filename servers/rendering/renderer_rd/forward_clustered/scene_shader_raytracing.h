@@ -322,6 +322,7 @@ public:
 	}
 
 	static SceneShaderRaytracing *get_singleton();
+	static uint32_t uniform_std140_size(const ShaderLanguage::ShaderNode::Uniform &p_uniform);
 
 	struct MaterialData : public RendererRD::MaterialStorage::MaterialData {
 		ShaderData *shader_data = nullptr;

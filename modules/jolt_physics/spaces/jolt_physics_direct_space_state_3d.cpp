@@ -76,97 +76,144 @@ bool JoltPhysicsDirectSpaceState3D::_cast_motion_impl(const JPH::Shape &p_jolt_s
 	JPH::AABox aabb_translated = aabb;
 	aabb_translated.Translate(motion);
 	aabb.Encapsulate(aabb_translated);
-
-	JoltQueryCollectorAnyMulti<JPH::CollideShapeBodyCollector, 1024> aabb_collector;
-	space->get_broad_phase_query().CollideAABox(aabb, aabb_collector, p_broad_phase_layer_filter, p_object_layer_filter);
-
-	if (!aabb_collector.had_hit()) {
-		return false;
-	}
+	aabb.ExpandBy(JPH::Vec3::sReplicate(MAX(p_settings.mMaxSeparationDistance, 0.0f)));
 
 	const JPH::RVec3 base_offset = transform_com.GetTranslation();
 
 	JoltCustomMotionShape motion_shape(static_cast<const JPH::ConvexShape &>(p_jolt_shape));
-
-	auto collides = [&](const JPH::Body &p_other_body, float p_fraction) {
-		motion_shape.set_motion(motion_local * p_fraction);
-
-		const JPH::TransformedShape other_shape = p_other_body.GetTransformedShape();
-
-		JoltQueryCollectorAny<JPH::CollideShapeCollector> collector;
-
-		if (p_use_edge_removal) {
-			JPH::CollideShapeSettings eier_settings = p_settings;
-			eier_settings.mActiveEdgeMode = JPH::EActiveEdgeMode::CollideWithAll;
-			eier_settings.mCollectFacesMode = JPH::ECollectFacesMode::CollectFaces;
-
-			JPH::InternalEdgeRemovingCollector eier_collector(collector, JPH::cDefaultInternalEdgeRemovalVertexToleranceSq);
-			other_shape.CollideShape(&motion_shape, scale, transform_com, eier_settings, base_offset, eier_collector, p_shape_filter);
-			eier_collector.Flush();
-		} else {
-			other_shape.CollideShape(&motion_shape, scale, transform_com, p_settings, base_offset, collector, p_shape_filter);
-		}
-
-		return collector.had_hit();
-	};
 
 	// Figure out the number of steps we need in our binary search in order to achieve millimeter precision, within reason.
 	const int step_count = CLAMP(int(std::log(1000.0f * motion_length) / (float)Math::LN2), 4, 16);
 
 	bool collided = false;
 
-	for (int i = 0; i < aabb_collector.get_hit_count(); ++i) {
-		const JPH::BodyID other_jolt_id = aabb_collector.get_hit(i);
-		if (!p_body_filter.ShouldCollide(other_jolt_id)) {
-			continue;
-		}
+	// Adjudicate each body as the broadphase produces it. Collecting the candidates
+	// into a bounded list first discarded the closest hit before the body filters
+	// and the narrowphase ever ran. This is the shape Jolt's own NarrowPhaseQuery
+	// collectors take, through this module's no-lock body interface rather than a
+	// BodyLockRead, as the rest of the module does.
+	class MotionCollector final : public JPH::CollideShapeBodyCollector {
+		const JoltSpace3D &space;
+		const JPH::CollideShapeSettings &settings;
+		const JPH::BodyFilter &body_filter;
+		const JPH::ShapeFilter &shape_filter;
+		JoltCustomMotionShape &motion_shape;
+		const JPH::Vec3 &motion_local;
+		const JPH::RMat44 &transform_com;
+		const JPH::Vec3 &scale;
+		const JPH::RVec3 &base_offset;
+		bool use_edge_removal;
+		bool ignore_overlaps;
+		int step_count;
+		bool &collided;
+		real_t &closest_safe;
+		real_t &closest_unsafe;
 
-		const JPH::Body *other_jolt_body = space->try_get_jolt_body(other_jolt_id);
-		if (!p_body_filter.ShouldCollideLocked(*other_jolt_body)) {
-			continue;
-		}
+		bool _collides(const JPH::Body &p_other_body, float p_fraction) {
+			motion_shape.set_motion(motion_local * p_fraction);
 
-		if (!collides(*other_jolt_body, 1.0f)) {
-			continue;
-		}
+			const JPH::TransformedShape other_shape = p_other_body.GetTransformedShape();
 
-		if (p_ignore_overlaps && collides(*other_jolt_body, 0.0f)) {
-			continue;
-		}
+			JoltQueryCollectorAny<JPH::CollideShapeCollector> collector;
 
-		float lo = 0.0f;
-		float hi = 1.0f;
-		float coeff = 0.5f;
+			if (use_edge_removal) {
+				JPH::CollideShapeSettings eier_settings = settings;
+				eier_settings.mActiveEdgeMode = JPH::EActiveEdgeMode::CollideWithAll;
+				eier_settings.mCollectFacesMode = JPH::ECollectFacesMode::CollectFaces;
 
-		for (int j = 0; j < step_count; ++j) {
-			const float fraction = lo + (hi - lo) * coeff;
-
-			if (collides(*other_jolt_body, fraction)) {
-				collided = true;
-
-				hi = fraction;
-
-				if (j == 0 || lo > 0.0f) {
-					coeff = 0.5f;
-				} else {
-					coeff = 0.25f;
-				}
+				JPH::InternalEdgeRemovingCollector eier_collector(collector, JPH::cDefaultInternalEdgeRemovalVertexToleranceSq);
+				other_shape.CollideShape(&motion_shape, scale, transform_com, eier_settings, base_offset, eier_collector, shape_filter);
+				eier_collector.Flush();
 			} else {
-				lo = fraction;
+				other_shape.CollideShape(&motion_shape, scale, transform_com, settings, base_offset, collector, shape_filter);
+			}
 
-				if (j == 0 || hi < 1.0f) {
-					coeff = 0.5f;
+			return collector.had_hit();
+		}
+
+	public:
+		MotionCollector(const JoltSpace3D &p_space, const JPH::CollideShapeSettings &p_settings, const JPH::BodyFilter &p_body_filter, const JPH::ShapeFilter &p_shape_filter, JoltCustomMotionShape &p_motion_shape, const JPH::Vec3 &p_motion_local, const JPH::RMat44 &p_transform_com, const JPH::Vec3 &p_scale, const JPH::RVec3 &p_base_offset, bool p_use_edge_removal, bool p_ignore_overlaps, int p_step_count, bool &r_collided, real_t &r_closest_safe, real_t &r_closest_unsafe) :
+				space(p_space),
+				settings(p_settings),
+				body_filter(p_body_filter),
+				shape_filter(p_shape_filter),
+				motion_shape(p_motion_shape),
+				motion_local(p_motion_local),
+				transform_com(p_transform_com),
+				scale(p_scale),
+				base_offset(p_base_offset),
+				use_edge_removal(p_use_edge_removal),
+				ignore_overlaps(p_ignore_overlaps),
+				step_count(p_step_count),
+				collided(r_collided),
+				closest_safe(r_closest_safe),
+				closest_unsafe(r_closest_unsafe) {}
+
+		virtual void AddHit(const JPH::BodyID &p_other_jolt_id) override {
+			if (!body_filter.ShouldCollide(p_other_jolt_id)) {
+				return;
+			}
+
+			const JPH::Body *other_jolt_body = space.try_get_jolt_body(p_other_jolt_id);
+			ERR_FAIL_NULL(other_jolt_body);
+
+			if (!body_filter.ShouldCollideLocked(*other_jolt_body)) {
+				return;
+			}
+
+			if (!_collides(*other_jolt_body, 1.0f)) {
+				return;
+			}
+
+			if (ignore_overlaps && _collides(*other_jolt_body, 0.0f)) {
+				return;
+			}
+
+			float lo = 0.0f;
+			float hi = 1.0f;
+			float coeff = 0.5f;
+
+			for (int j = 0; j < step_count; ++j) {
+				const float fraction = lo + (hi - lo) * coeff;
+
+				if (_collides(*other_jolt_body, fraction)) {
+					collided = true;
+
+					hi = fraction;
+
+					if (j == 0 || lo > 0.0f) {
+						coeff = 0.5f;
+					} else {
+						coeff = 0.25f;
+					}
 				} else {
-					coeff = 0.75f;
+					lo = fraction;
+
+					if (j == 0 || hi < 1.0f) {
+						coeff = 0.5f;
+					} else {
+						coeff = 0.75f;
+					}
+				}
+			}
+
+			if (lo < closest_safe) {
+				closest_safe = lo;
+				closest_unsafe = hi;
+
+				if (closest_safe == 0.0f) {
+					// A contact at the start of the motion cannot be improved on: the
+					// test above is strict and a safe fraction is never below zero, so no
+					// later body can write either fraction, and reaching zero means this
+					// body already collided at the first step.
+					ForceEarlyOut();
 				}
 			}
 		}
+	};
 
-		if (lo < r_closest_safe) {
-			r_closest_safe = lo;
-			r_closest_unsafe = hi;
-		}
-	}
+	MotionCollector aabb_collector(*space, p_settings, p_body_filter, p_shape_filter, motion_shape, motion_local, transform_com, scale, base_offset, p_use_edge_removal, p_ignore_overlaps, step_count, collided, r_closest_safe, r_closest_unsafe);
+	space->get_broad_phase_query().CollideAABox(aabb, aabb_collector, p_broad_phase_layer_filter, p_object_layer_filter);
 
 	return collided;
 }

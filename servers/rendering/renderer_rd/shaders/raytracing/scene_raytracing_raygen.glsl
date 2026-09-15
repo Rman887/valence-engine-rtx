@@ -90,6 +90,9 @@ layout(set = 0, binding = 35) uniform texture2D gbuffer_geo_normal_metallic;
 layout(set = 0, binding = 36) uniform texture2D gbuffer_emission_ior;
 layout(set = 0, binding = 37) uniform texture2D gbuffer_transmission_flags;
 layout(set = 0, binding = 38) uniform texture2D gbuffer_depth;
+// The frame's froxel volumetric fog (Environment.volumetric_fog_*), built in the path-traced
+// frame and shadowed against the TLAS; composed over the camera segment in apply_camera_media.
+layout(set = 0, binding = 39) uniform texture3D volumetric_fog_texture;
 
 /// Shades the G-buffer's surface at this pixel as the primary hit, or returns
 /// false when the raster pass drew nothing here (the sky, or procedural
@@ -153,6 +156,46 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	return true;
 }
 
+/// The camera segment's media (D37): the Environment's analytic fog at the primary hit and the
+/// froxel volumetric fog, composed as the raster composes them, over the radiance of the whole
+/// path. A primary miss keeps the miss stage's sky tint for the analytic fog and takes the
+/// froxel's far slice scaled by volumetric_fog_sky_affect, as the sky pass does. Every later
+/// segment is charged in shade_and_bounce.
+vec3 apply_camera_media(vec3 radiance, vec2 uv, vec3 ray_origin, vec3 ray_dir, float hit_t, bool primary_miss) {
+	vec4 fog = vec4(0.0, 0.0, 0.0, 1.0); // Premultiplied in-scatter, transmittance.
+	float depth_z = scene_data_block.data.z_far;
+	if (!primary_miss) {
+		mat4 view_mat = transpose(mat4(
+				scene_data_block.data.view_matrix[0],
+				scene_data_block.data.view_matrix[1],
+				scene_data_block.data.view_matrix[2],
+				vec4(0.0, 0.0, 0.0, 1.0)));
+		vec3 vertex = (view_mat * vec4(ray_origin + ray_dir * hit_t, 1.0)).xyz;
+		depth_z = -vertex.z;
+		if ((RT_FLAGS & RT_FLAG_FOG_ENABLED) != 0u) {
+			vec4 f = fog_process(scene_data_block.data, vertex);
+			fog = vec4(f.rgb * f.a, 1.0 - f.a);
+		}
+	}
+	if (get_rt_param(RT_PARAM_VFOG_ENABLED) > 0.5) {
+		vec4 vf = vec4(0.0, 0.0, 0.0, 1.0);
+		// A miss takes the far slice outright, as the sky pass does; mapping z_far through the
+		// volume's own length would land mid-volume whenever the volume is shorter than the far plane.
+		vec3 fog_pos = vec3(uv, primary_miss ? 1.0 : depth_z * get_rt_param(RT_PARAM_VFOG_INV_LENGTH));
+		if (fog_pos.z >= 0.0) {
+			if (fog_pos.z < 1.0) {
+				fog_pos.z = pow(fog_pos.z, get_rt_param(RT_PARAM_VFOG_INV_SPREAD));
+			}
+			vf = textureLod(sampler3D(volumetric_fog_texture, SAMPLER_LINEAR_CLAMP), fog_pos, 0.0);
+		}
+		if (primary_miss) {
+			vf = mix(vec4(0.0, 0.0, 0.0, 1.0), vf, get_rt_param(RT_PARAM_VFOG_SKY_AFFECT));
+		}
+		fog = vec4(fog.rgb * vf.a + vf.rgb, fog.a * vf.a);
+	}
+	return radiance * fog.a + fog.rgb;
+}
+
 void main() {
 	uvec2 pixel = gl_LaunchIDEXT.xy;
 	const vec2 pixel_center = vec2(pixel) + vec2(0.5);
@@ -174,6 +217,9 @@ void main() {
 
 	// Accumulate multiple samples per pixel
 	vec3 total_radiance = vec3(0.0);
+	// The camera segment every sample shares: its hit distance, or a miss (D37).
+	float primary_t = 0.0;
+	bool primary_miss = false;
 
 	const uint max_bounces = RT_GET_MAX_BOUNCES();
 
@@ -190,6 +236,7 @@ void main() {
 		ps.throughput = vec3(1.0);
 		ps.packed_bounces_flags = (sample_idx == 0u) ? set_sample_zero(0u) : 0u;
 		ps.rng_state = init_rng(pixel, frame_index, sample_idx);
+		ps.hit_t = 0.0;
 
 		vec3 ray_origin = origin.xyz;
 		vec3 ray_dir = direction.xyz;
@@ -199,6 +246,7 @@ void main() {
 
 			if (bounce == 0u && primary_from_gbuffer && shade_gbuffer_primary(ivec2(pixel), d, ray_origin, ray_dir)) {
 				ps = path_unpack(payload);
+				primary_t = ps.hit_t;
 				if (is_path_terminated(ps.packed_bounces_flags)) {
 					break;
 				}
@@ -226,6 +274,10 @@ void main() {
 #endif
 
 			ps = path_unpack(payload);
+			if (bounce == 0u) {
+				primary_t = ps.hit_t;
+				primary_miss = (ps.packed_bounces_flags & PRIMARY_MISS_FLAG) != 0u;
+			}
 			if (is_path_terminated(ps.packed_bounces_flags)) {
 				break;
 			}
@@ -239,6 +291,13 @@ void main() {
 	}
 
 	vec3 final_radiance = total_radiance / float(samples_per_pixel);
+
+#ifdef RT_DEBUG_ENABLED
+	if (int(get_rt_param(RT_PARAM_VIS_MODE)) == 0)
+#endif
+	{
+		final_radiance = apply_camera_media(final_radiance, in_uv, origin.xyz, direction.xyz, primary_t, primary_miss);
+	}
 
 	imageStore(image, ivec2(pixel), vec4(final_radiance, 1.0));
 }
@@ -307,6 +366,9 @@ void main() {
 
 	// Miss always ends the path.
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+	if (get_total_bounces(ps.packed_bounces_flags) == 0u) {
+		ps.packed_bounces_flags |= PRIMARY_MISS_FLAG;
+	}
 
 #ifdef RT_DEBUG_ENABLED
 	{

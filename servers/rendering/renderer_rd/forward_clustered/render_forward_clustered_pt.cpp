@@ -180,6 +180,13 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	render_list[RENDER_LIST_ALPHA].sort_by_reverse_depth_and_priority();
 	_fill_instance_data(RENDER_LIST_ALPHA, render_info);
 
+	// The lights, decals, reflection probes and the cluster grid of the frame: the transparent and
+	// the G-buffer passes draw with them and the froxel fog is lit from them. Set up before the TLAS
+	// so the froxel can be built between the TLAS it is shadowed against and the RT set that reads it.
+	uint32_t pt_directional_light_count = 0;
+	uint32_t pt_positional_light_count = 0;
+	_setup_lights_cluster_decals(p_render_data, pt_directional_light_count, pt_positional_light_count);
+
 	// RT pipeline flags (packed with sample count / max bounces). Computed once
 	// here and reused at trace-dispatch time below so the uniform set and the
 	// pipeline agree on spec-constant values.
@@ -211,6 +218,14 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 
 		RTViewportState *rt_state = raytracing->build_tlas(p_render_data, rt_flags);
 		if (rt_state) {
+			// The froxel volumetric fog (D37): the frame renders no shadow map, so the froxel's lights are
+			// shadowed by ray queries against the TLAS just built, and the raygen composes the result over
+			// the camera segment through the RT set created next.
+			{
+				RENDER_TIMESTAMP("Update Volumetric Fog");
+				bool directional_shadows = RendererRD::LightStorage::get_singleton()->has_directional_shadows(pt_directional_light_count);
+				_update_volumetric_fog(rb, p_render_data->environment, p_render_data->scene_data->cam_projection, p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform.affine_inverse(), p_render_data->shadow_atlas, pt_directional_light_count, directional_shadows, pt_positional_light_count, p_render_data->voxel_gi_count, *p_render_data->fog_volumes, rt_state->tlas, p_render_data->scene_data->cam_transform.origin - rt_state->rt_origin);
+			}
 			rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags, use_gbuffer);
 			// DLSS gets the same camera-relative frame the trace rendered.
 			upscaler_world_offset = rt_state->rt_origin;
@@ -339,15 +354,6 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 
 		RENDER_TIMESTAMP("Process Pre Opaque Compositor Effects");
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_OPAQUE, p_render_data);
-	}
-
-	// The path tracer produces the opaque color, but transparents are still
-	// rasterized on top, which needs the reflection-probe / light / decal buffers
-	// and the cluster grid to be valid for the current frame.
-	{
-		uint32_t pt_directional_light_count = 0;
-		uint32_t pt_positional_light_count = 0;
-		_setup_lights_cluster_decals(p_render_data, pt_directional_light_count, pt_positional_light_count);
 	}
 
 	// The G-buffer pass: the opaque list into the five G-buffer targets, the velocity buffer and

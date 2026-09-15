@@ -20,7 +20,12 @@
 #define RT_PARAM_MAX_BOUNCES 2 // rt_params[0].z - Maximum ray bounces
 #define RT_PARAM_DENOISER 3 // rt_params[0].w - Denoiser selection (0=none, 1=DLSS RR)
 #define RT_PARAM_PRIMARY_SURFACE 4 // rt_params[1].x - Primary surface (0=G-buffer, 1=traced)
-// Indices 5-13 reserved for future use
+// The froxel volumetric fog composed over the camera segment (D37).
+#define RT_PARAM_VFOG_ENABLED 5 // rt_params[1].y - 1 when the frame carries a froxel volume
+#define RT_PARAM_VFOG_INV_LENGTH 6 // rt_params[1].z - 1 / volumetric_fog_length
+#define RT_PARAM_VFOG_INV_SPREAD 7 // rt_params[1].w - 1 / volumetric_fog_detail_spread
+#define RT_PARAM_VFOG_SKY_AFFECT 8 // rt_params[2].x - volumetric_fog_sky_affect
+// Indices 9-13 reserved for future use
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation
 
@@ -121,6 +126,9 @@ bool is_shadow_ray(uint packed) {
 }
 
 const uint PATH_TERMINATED_FLAG = (1u << 26);
+// The primary ray missed (bit 27): the raygen composes the camera segment's media over the sky
+// as the sky pass does, not over a hit distance (D37).
+const uint PRIMARY_MISS_FLAG = (1u << 27);
 uint set_path_terminated(uint packed) {
 	return packed | PATH_TERMINATED_FLAG;
 }

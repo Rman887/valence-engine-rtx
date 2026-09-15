@@ -30,6 +30,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/math/math_funcs.h"
+#include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/environment/sky.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
@@ -2950,6 +2951,24 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		// The frame decides (the Environment's choice, unless MSAA forced the traced primary ray).
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_PRIMARY_SURFACE] = p_primary_from_gbuffer ? (float)RSE::PT_PRIMARY_SURFACE_GBUFFER : (float)RSE::PT_PRIMARY_SURFACE_TRACED;
 
+		// The froxel volumetric fog the raygen composes over the camera segment (D37): the froxel's
+		// depth mapping as the raster's fragment reads it, and the Environment's sky affect.
+		{
+			Ref<RendererRD::Fog::VolumetricFog> vfog;
+			if (rb->has_custom_data(RB_SCOPE_FOG)) {
+				vfog = rb->get_custom_data(RB_SCOPE_FOG);
+			}
+			// Gate on the integrated map, not on the object: a VolumetricFog whose map failed to
+			// allocate would otherwise have the raygen compose the stand-in texture over the frame.
+			const bool has_vfog = vfog.is_valid() && vfog->fog_map.is_valid();
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VFOG_ENABLED] = has_vfog ? 1.0f : 0.0f;
+			if (has_vfog) {
+				rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VFOG_INV_LENGTH] = vfog->length > 0.0f ? 1.0f / vfog->length : 1.0f;
+				rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VFOG_INV_SPREAD] = vfog->spread > 0.0f ? 1.0f / vfog->spread : 1.0f;
+				rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VFOG_SKY_AFFECT] = (p_render_data && p_render_data->environment.is_valid()) ? RendererEnvironmentStorage::get_singleton()->environment_get_volumetric_fog_sky_affect(p_render_data->environment) : 0.0f;
+			}
+		}
+
 		// rt_params layout (see RaytracingParamIndex enum):
 		// [0] = VIS_MODE, [1] = SAMPLE_COUNT, [2] = MAX_BOUNCES,
 		// [3] = DLSS_RR_ENABLED, [14] = LIGHT_COUNT, [15] = FRAME_INDEX
@@ -3155,6 +3174,23 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		u.binding = 38;
 		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 		u.append_id(has_gbuffer ? rb->get_depth_texture() : black);
+		uniforms.push_back(u);
+	}
+
+	// Binding 39: the froxel volumetric fog (in-scatter and transmittance per froxel) the raygen
+	// composes over the camera segment (D37); a transparent stand-in when the Environment has none.
+	{
+		RID fog_map;
+		if (rb->has_custom_data(RB_SCOPE_FOG)) {
+			Ref<RendererRD::Fog::VolumetricFog> vfog = rb->get_custom_data(RB_SCOPE_FOG);
+			fog_map = vfog->fog_map;
+		}
+		RD::Uniform u;
+		u.binding = 39;
+		u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		// The same stand-in the raster binds when a frame carries no froxel volume; neither samples
+		// it, since both gate on the volume existing first.
+		u.append_id(fog_map.is_valid() ? fog_map : RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE));
 		uniforms.push_back(u);
 	}
 

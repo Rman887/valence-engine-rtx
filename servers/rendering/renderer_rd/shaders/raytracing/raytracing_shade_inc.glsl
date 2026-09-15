@@ -58,25 +58,34 @@ vec3 fog_sample_radiance(vec3 vertex, float mip_level) {
 
 #include "../fog_inc.glsl"
 
-/// Apply environment fog for the ray segment that ends at world_hit.
-/// Attenuates throughput and adds in-scattered fog color.
-void apply_segment_fog(vec3 world_hit, inout vec3 radiance, inout vec3 throughput) {
+/// Media on a path segment after the camera's (D37): the Environment's exponential fog charged
+/// over the segment's own length, with the fog colour and the sun scatter along the segment's
+/// direction. The camera segment is composed in the raygen over the whole path from the froxel
+/// volume and the analytic fog at the primary hit, and the miss stage tints a sky seen after a
+/// bounce by fog_sky_affect. Named simplifications on these later segments: depth-mode fog and
+/// the height term are camera-anchored and carry no per-metre density; aerial perspective is not
+/// sampled, so the fog colour stays flat instead of tinting toward the sky; and neither the
+/// froxel volume nor any fog volume is evaluated, both existing only inside the camera frustum.
+/// The directional lights are the first directional_light_count entries of rt_lights, which is
+/// the order gather_lights packs them in and what fog_process already assumed.
+void apply_segment_fog(vec3 ray_dir, float segment_length, inout vec3 radiance, inout vec3 throughput) {
 	if ((RT_FLAGS & RT_FLAG_FOG_ENABLED) == 0u) {
 		return;
 	}
-
-	// Build a view-space vertex at the hit position.
-	// fog_process needs view-space position for distance and height calculations.
-	mat4 view_mat = transpose(mat4(
-			scene_data_block.data.view_matrix[0],
-			scene_data_block.data.view_matrix[1],
-			scene_data_block.data.view_matrix[2],
-			vec4(0.0, 0.0, 0.0, 1.0)));
-	vec3 vertex = (view_mat * vec4(world_hit, 1.0)).xyz;
-
-	vec4 fog = fog_process(scene_data_block.data, vertex);
-	radiance += throughput * fog.rgb * fog.a;
-	throughput *= (1.0 - fog.a);
+	if ((scene_data_block.data.flags & SCENE_DATA_FLAGS_USE_DEPTH_FOG) != 0u) {
+		return;
+	}
+	float transmittance = exp(min(0.0, -segment_length * scene_data_block.data.fog_density));
+	vec3 fog_color = scene_data_block.data.fog_light_color;
+	if (scene_data_block.data.fog_sun_scatter > 0.001) {
+		for (uint i = 0u; i < scene_data_block.data.directional_light_count; i++) {
+			vec3 light_dir = -normalize(rt_lights[i].position);
+			float light_amount = pow(max(dot(ray_dir, light_dir), 0.0), 8.0);
+			fog_color += rt_lights[i].emission * light_amount * scene_data_block.data.fog_sun_scatter;
+		}
+	}
+	radiance += throughput * fog_color * (1.0 - transmittance);
+	throughput *= transmittance;
 }
 
 /// Converts specular parameter [0..1] to dielectric F0.
@@ -292,6 +301,9 @@ void debug_visualize(
 /// built-ins, or the raygen's own primary ray for a G-buffer surface.
 void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	PathState ps = path_unpack(payload);
+	// Every exit below packs the payload, and the raygen reads hit_t for the camera segment's
+	// length before it checks for termination, so the distance is recorded once, here.
+	ps.hit_t = hit_t;
 
 	vec3 V = -ray_dir;
 
@@ -302,8 +314,11 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	uint total_bounces = get_total_bounces(ps.packed_bounces_flags);
 	uint diffuse_bounces = get_diffuse_bounces(ps.packed_bounces_flags);
 
-	// Environment fog for this ray segment (before surface contribution).
-	apply_segment_fog(h.hit_pos, ps.radiance, ps.throughput);
+	// Media on this segment (D37): the camera segment is composed in the raygen over the whole
+	// path; every later segment is charged here, over its own length.
+	if (total_bounces > 0u) {
+		apply_segment_fog(ray_dir, hit_t, ps.radiance, ps.throughput);
+	}
 
 	// Emissive contribution.
 	ps.radiance += ps.throughput * m.emissive;

@@ -144,6 +144,7 @@ private:
 			VOLUMETRIC_FOG_PROCESS_SHADER_FILTER,
 			VOLUMETRIC_FOG_PROCESS_SHADER_FOG,
 			VOLUMETRIC_FOG_PROCESS_SHADER_COPY,
+			VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY_RT_SHADOWS,
 			VOLUMETRIC_FOG_PROCESS_SHADER_MAX,
 		};
 
@@ -188,6 +189,9 @@ private:
 			float cam_rotation[12];
 			float to_prev_view[16];
 			float radiance_inverse_xform[12];
+
+			float rt_cam_offset[3];
+			float rt_pad;
 		};
 
 		VolumetricFogProcessShaderRD process_shader;
@@ -329,6 +333,14 @@ public:
 		RID sdfgi_uniform_set;
 		RID sky_uniform_set;
 
+		// The sky radiance the cached process sets were built against; they are rebuilt when it
+		// changes, so a frame that updates the fog before its sky exists cannot bake in the default.
+		RID sky_texture_used;
+
+		// The trace's TLAS the froxel is shadowed against in a path-traced frame (D37).
+		RID rt_shadow_uniform_set;
+		RID rt_shadow_tlas;
+
 		int last_shadow_filter = -1;
 
 		// If the device doesn't support image atomics, use storage buffers instead.
@@ -370,6 +382,11 @@ public:
 		Ref<GI::RenderBuffersGI> rbgi;
 		RID env;
 		SkyRD *sky;
+
+		// A path-traced frame renders no shadow map (D37): the froxel's lights are shadowed by ray
+		// queries against this TLAS, in whose frame the camera sits at rt_cam_offset.
+		RID rt_tlas;
+		Vector3 rt_cam_offset;
 	};
 	void volumetric_fog_update(const VolumetricFogSettings &p_settings, const Projection &p_cam_projection, const Transform3D &p_cam_transform, const Transform3D &p_prev_cam_inv_transform, RID p_shadow_atlas, int p_directional_light_count, bool p_use_directional_shadows, int p_positional_light_count, int p_voxel_gi_count, const PagedArray<RID> &p_fog_volumes);
 };

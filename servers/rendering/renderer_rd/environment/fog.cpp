@@ -317,6 +317,9 @@ ALBEDO = vec3(1.0);
 				volumetric_fog_modes.push_back(ShaderRD::VariantDefine(shader_group, base_define + "\n#define MODE_FILTER\n", false));
 				volumetric_fog_modes.push_back(ShaderRD::VariantDefine(shader_group, base_define + "\n#define MODE_FOG\n", false));
 				volumetric_fog_modes.push_back(ShaderRD::VariantDefine(shader_group, base_define + "\n#define MODE_COPY\n", false));
+				// A path-traced frame shadows the froxel by ray queries against the trace's TLAS (D37); a
+				// device without ray query gets a plain density variant in that slot, which is never bound.
+				volumetric_fog_modes.push_back(ShaderRD::VariantDefine(shader_group, base_define + (RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY) ? "\n#define MODE_DENSITY\n#define USE_RT_SHADOWS\n" : "\n#define MODE_DENSITY\n"), false));
 				shader_group++;
 			}
 		}
@@ -542,6 +545,9 @@ Fog::VolumetricFog::~VolumetricFog() {
 
 	if (sdfgi_uniform_set.is_valid() && RD::get_singleton()->uniform_set_is_valid(sdfgi_uniform_set)) {
 		RD::get_singleton()->free_rid(sdfgi_uniform_set);
+	}
+	if (rt_shadow_uniform_set.is_valid() && RD::get_singleton()->uniform_set_is_valid(rt_shadow_uniform_set)) {
+		RD::get_singleton()->free_rid(rt_shadow_uniform_set);
 	}
 	if (sky_uniform_set.is_valid() && RD::get_singleton()->uniform_set_is_valid(sky_uniform_set)) {
 		RD::get_singleton()->free_rid(sky_uniform_set);
@@ -795,6 +801,26 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 		RD::get_singleton()->compute_list_end();
 	}
 
+	// The process sets bind the sky's radiance at binding 20 and are cached for the life of the
+	// render buffers, so a frame that updates the fog before its sky is set up would hold the black
+	// default forever. The path-traced frame is such a frame: it needs the TLAS first, and the sky
+	// is set up after. Rebuild the sets whenever the radiance they were built against changes.
+	RID sky_radiance;
+	{
+		RID sky_rid = RendererSceneRenderRD::get_singleton()->environment_get_sky(p_settings.env);
+		if (sky_rid.is_valid()) {
+			sky_radiance = p_settings.sky->sky_get_radiance_texture_rd(sky_rid);
+		}
+	}
+	if (fog->sky_texture_used != sky_radiance) {
+		fog->sync_gi_dependent_sets_validity(true);
+		if (fog->copy_uniform_set.is_valid() && RD::get_singleton()->uniform_set_is_valid(fog->copy_uniform_set)) {
+			RD::get_singleton()->free_rid(fog->copy_uniform_set);
+		}
+		fog->copy_uniform_set = RID();
+		fog->sky_texture_used = sky_radiance;
+	}
+
 	bool gi_dependent_sets_valid = fog->sync_gi_dependent_sets_validity();
 	if (!fog->copy_uniform_set.is_null() && !RD::get_singleton()->uniform_set_is_valid(fog->copy_uniform_set)) {
 		fog->copy_uniform_set = RID();
@@ -931,7 +957,15 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 			u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 			u.binding = 13;
 			for (int i = 0; i < RendererRD::GI::MAX_VOXEL_GI_INSTANCES; i++) {
-				u.append_id(p_settings.rbgi->voxel_gi_textures[i]);
+				// A slot the GI setup never filled is a null RID, which contributes no id and leaves
+				// the array short of its declared size, so the whole set fails to create. GI's own
+				// setup substitutes the same default; a frame that runs no GI at all (the path
+				// tracer) reaches here with every slot null.
+				RID voxel_gi_texture = p_settings.rbgi->voxel_gi_textures[i];
+				if (voxel_gi_texture.is_null()) {
+					voxel_gi_texture = texture_storage->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE);
+				}
+				u.append_id(voxel_gi_texture);
 			}
 			uniforms.push_back(u);
 			copy_uniforms.push_back(u);
@@ -987,8 +1021,7 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 			u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 			u.binding = 20;
 			RID radiance_texture = texture_storage->texture_rd_get_default(p_settings.is_using_radiance_octmap_array ? RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_2D_ARRAY_BLACK : RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
-			RID sky_texture = RendererSceneRenderRD::get_singleton()->environment_get_sky(p_settings.env).is_valid() ? p_settings.sky->sky_get_radiance_texture_rd(RendererSceneRenderRD::get_singleton()->environment_get_sky(p_settings.env)) : RID();
-			u.append_id(sky_texture.is_valid() ? sky_texture : radiance_texture);
+			u.append_id(sky_radiance.is_valid() ? sky_radiance : radiance_texture);
 			uniforms.push_back(u);
 		}
 
@@ -1062,6 +1095,25 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 		}
 	}
 
+	// A path-traced frame (D37): no shadow map was rendered, the density pass shadows its lights by
+	// ray queries against the trace's TLAS, bound as its own set; the set follows the TLAS RID.
+	bool using_rt_shadows = p_settings.rt_tlas.is_valid() && RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY);
+	if (using_rt_shadows) {
+		if (fog->rt_shadow_uniform_set.is_null() || fog->rt_shadow_tlas != p_settings.rt_tlas || !RD::get_singleton()->uniform_set_is_valid(fog->rt_shadow_uniform_set)) {
+			if (fog->rt_shadow_uniform_set.is_valid() && RD::get_singleton()->uniform_set_is_valid(fog->rt_shadow_uniform_set)) {
+				RD::get_singleton()->free_rid(fog->rt_shadow_uniform_set);
+			}
+			Vector<RD::Uniform> uniforms;
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_ACCELERATION_STRUCTURE;
+			u.binding = 0;
+			u.append_id(p_settings.rt_tlas);
+			uniforms.push_back(u);
+			fog->rt_shadow_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, volumetric_fog.process_shader.version_get_shader(volumetric_fog.process_shader_version, _get_fog_process_variant(VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY_RT_SHADOWS)), 1);
+			fog->rt_shadow_tlas = p_settings.rt_tlas;
+		}
+	}
+
 	fog->length = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_length(p_settings.env);
 	fog->spread = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_detail_spread(p_settings.env);
 
@@ -1132,6 +1184,10 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 	params.cam_rotation[10] = p_cam_transform.basis[2][2];
 	params.cam_rotation[11] = 0;
 	params.filter_axis = 0;
+	params.rt_cam_offset[0] = p_settings.rt_cam_offset.x;
+	params.rt_cam_offset[1] = p_settings.rt_cam_offset.y;
+	params.rt_cam_offset[2] = p_settings.rt_cam_offset.z;
+	params.rt_pad = 0.0f;
 	params.max_voxel_gi_instances = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_gi_inject(p_settings.env) > 0.001 ? p_voxel_gi_count : 0;
 	params.temporal_frame = RSG::rasterizer->get_frame_number() % VolumetricFog::MAX_TEMPORAL_FRAMES;
 
@@ -1173,11 +1229,19 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 
 	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 
-	RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, volumetric_fog.process_pipelines[using_sdfgi ? VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY_WITH_SDFGI : VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY].get_rid());
+	int density_variant = VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY;
+	if (using_rt_shadows) {
+		density_variant = VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY_RT_SHADOWS;
+	} else if (using_sdfgi) {
+		density_variant = VolumetricFogShader::VOLUMETRIC_FOG_PROCESS_SHADER_DENSITY_WITH_SDFGI;
+	}
+	RD::get_singleton()->compute_list_bind_compute_pipeline(compute_list, volumetric_fog.process_pipelines[density_variant].get_rid());
 
 	RD::get_singleton()->compute_list_bind_uniform_set(compute_list, fog->gi_dependent_sets.process_uniform_set_density, 0);
 
-	if (using_sdfgi) {
+	if (using_rt_shadows) {
+		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, fog->rt_shadow_uniform_set, 1);
+	} else if (using_sdfgi) {
 		RD::get_singleton()->compute_list_bind_uniform_set(compute_list, fog->sdfgi_uniform_set, 1);
 	}
 	RD::get_singleton()->compute_list_dispatch_threads(compute_list, fog->width, fog->height, fog->depth);

@@ -1,8 +1,16 @@
 #[compute]
 
-#version 450
+#version 460
 
 #VERSION_DEFINES
+
+// The RT-shadow variant below needs GLSL 460: glslang gates the rayQueryEXT keyword on
+// version >= 460 with GL_EXT_ray_query on, where accelerationStructureEXT has no version
+// gate, so at 450 the type parses and the query object does not. The fork's raytracing
+// shaders are 460 for the same reason; 460 is a superset for the other variants here.
+#ifdef USE_RT_SHADOWS
+#extension GL_EXT_ray_query : enable
+#endif
 
 #ifdef USE_VULKAN_MEMORY_MODEL
 #pragma use_vulkan_memory_model
@@ -192,8 +200,36 @@ layout(set = 0, binding = 15, std140) uniform Params {
 	mat4 to_prev_view;
 
 	mat3 radiance_inverse_xform;
+
+	vec3 rt_cam_offset;
+	float rt_pad;
 }
 params;
+
+#ifdef USE_RT_SHADOWS
+// A path-traced frame renders no shadow map (D37): the froxel's lights are shadowed by ray
+// queries against the trace's TLAS, in the trace's anchor-relative frame (rt_cam_offset is the
+// camera in that frame). Every occluder is opaque to these rays: the froxel has no material
+// access for an alpha test, and the volume is far coarser than a leaf. Instances that cast no
+// shadow lack the mask bit, as for the trace's own shadow rays. Procedural RT geometry casts no
+// fog shadow: its AABB candidates are never committed, since the froxel runs no intersection shader.
+layout(set = 1, binding = 0) uniform accelerationStructureEXT rt_tlas;
+// The trace's own shadow-ray mask, duplicated because this shader cannot include the raytracing
+// headers; the other definition is RT_MASK_SHADOW in raytracing_common_inc.glsl.
+#define RT_MASK_SHADOW 0x02u
+
+float rt_shadow(vec3 view_pos, vec3 dir_view, float max_dist) {
+	mat3 cam_rotation = mat3(params.cam_rotation);
+	vec3 origin = cam_rotation * view_pos + params.rt_cam_offset;
+	rayQueryEXT rq;
+	rayQueryInitializeEXT(rq, rt_tlas, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, RT_MASK_SHADOW, origin, 0.05, cam_rotation * dir_view, max_dist);
+	// Traversal completes in one step for opaque triangles; the loop is for a procedural AABB
+	// candidate, which this query never commits (the froxel cannot run an intersection shader).
+	while (rayQueryProceedEXT(rq)) {
+	}
+	return rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 1.0 : 0.0;
+}
+#endif // USE_RT_SHADOWS
 #ifndef MODE_COPY
 layout(set = 0, binding = 16) uniform texture3D prev_density_texture;
 
@@ -401,6 +437,9 @@ void main() {
 				vec3 shadow_attenuation = vec3(1.0);
 
 				if (directional_lights.data[i].shadow_opacity > 0.001) {
+#ifdef USE_RT_SHADOWS
+					float shadow = rt_shadow(view_pos, directional_lights.data[i].direction, 10000.0);
+#else
 					float depth_z = -view_pos.z;
 
 					vec4 pssm_coord;
@@ -433,6 +472,7 @@ void main() {
 					float shadow = exp(min(0.0, (pssm_coord.z - depth)) * z_range * INV_FOG_FADE);
 
 					shadow = mix(shadow, 1.0, smoothstep(directional_lights.data[i].fade_from, directional_lights.data[i].fade_to, view_pos.z)); //done with negative values for performance
+#endif
 
 					shadow_attenuation = mix(vec3(1.0 - directional_lights.data[i].shadow_opacity), vec3(1.0), shadow);
 				}
@@ -498,6 +538,9 @@ void main() {
 						vec3 light = omni_lights.data[light_index].color;
 
 						if (omni_lights.data[light_index].shadow_opacity > 0.001) {
+#ifdef USE_RT_SHADOWS
+							shadow_attenuation = mix(1.0 - omni_lights.data[light_index].shadow_opacity, 1.0, rt_shadow(view_pos, safe_normalize(light_pos - view_pos), max(d - 0.05, 0.0)));
+#else
 							//has shadow
 							vec4 uv_rect = omni_lights.data[light_index].atlas_rect;
 							vec2 flip_offset = omni_lights.data[light_index].direction.xy;
@@ -522,6 +565,7 @@ void main() {
 							float depth = texture(sampler2D(shadow_atlas, linear_sampler), pos.xy).r;
 
 							shadow_attenuation = mix(1.0 - omni_lights.data[light_index].shadow_opacity, 1.0, exp(min(0.0, (pos.z - depth)) / omni_lights.data[light_index].inv_radius * INV_FOG_FADE));
+#endif
 						}
 						total_light += light * attenuation * shadow_attenuation * henyey_greenstein(dot(safe_normalize(light_pos - view_pos), safe_normalize(view_pos)), params.phase_g) * omni_lights.data[light_index].volumetric_fog_energy;
 					}
@@ -572,6 +616,9 @@ void main() {
 						vec3 light = spot_lights.data[light_index].color;
 
 						if (spot_lights.data[light_index].shadow_opacity > 0.001) {
+#ifdef USE_RT_SHADOWS
+							shadow_attenuation = mix(1.0 - spot_lights.data[light_index].shadow_opacity, 1.0, rt_shadow(view_pos, safe_normalize(light_rel_vec), max(d - 0.05, 0.0)));
+#else
 							//has shadow
 							vec4 uv_rect = spot_lights.data[light_index].atlas_rect;
 
@@ -587,6 +634,7 @@ void main() {
 							float depth = texture(sampler2D(shadow_atlas, linear_sampler), pos.xy).r;
 
 							shadow_attenuation = mix(1.0 - spot_lights.data[light_index].shadow_opacity, 1.0, exp(min(0.0, (pos.z - depth)) / spot_lights.data[light_index].inv_radius * INV_FOG_FADE));
+#endif
 						}
 						total_light += light * attenuation * shadow_attenuation * henyey_greenstein(dot(safe_normalize(light_rel_vec), safe_normalize(view_pos)), params.phase_g) * spot_lights.data[light_index].volumetric_fog_energy;
 					}
@@ -669,6 +717,9 @@ void main() {
 							vec3 light_color = area_lights.data[light_index].color * texture_color;
 
 							if (area_lights.data[light_index].shadow_opacity > 0.001) {
+#ifdef USE_RT_SHADOWS
+								shadow_attenuation = mix(1.0 - area_lights.data[light_index].shadow_opacity, 1.0, rt_shadow(view_pos, light_vec, max(length(light_rel_vec) - 0.05, 0.0)));
+#else
 								//has shadow
 								vec4 uv_rect = area_lights.data[light_index].atlas_rect;
 
@@ -688,6 +739,7 @@ void main() {
 								float depth = texture(sampler2D(shadow_atlas, linear_sampler), pos.xy).r;
 
 								shadow_attenuation = mix(1.0 - area_lights.data[light_index].shadow_opacity, 1.0, exp(min(0.0, (pos.z - depth)) / inv_center_range * INV_FOG_FADE));
+#endif
 							}
 							float cos_theta = 0.0;
 							if (dot(light_rel_vec, light_rel_vec) > EPSILON) {

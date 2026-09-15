@@ -99,7 +99,12 @@ public:
 	static constexpr int RT_PARAM_MAX_BOUNCES = 2;
 	static constexpr int RT_PARAM_DENOISER = 3;
 	static constexpr int RT_PARAM_PRIMARY_SURFACE = 4;
-	// Indices 5-13 reserved for future use.
+	// The froxel volumetric fog the raygen composes over the camera segment (D37).
+	static constexpr int RT_PARAM_VFOG_ENABLED = 5;
+	static constexpr int RT_PARAM_VFOG_INV_LENGTH = 6;
+	static constexpr int RT_PARAM_VFOG_INV_SPREAD = 7;
+	static constexpr int RT_PARAM_VFOG_SKY_AFFECT = 8;
+	// Indices 9-13 reserved for future use.
 	static constexpr int RT_PARAM_LIGHT_COUNT = 14;
 	static constexpr int RT_PARAM_FRAME_INDEX = 15;
 

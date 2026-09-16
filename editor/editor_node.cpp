@@ -6625,8 +6625,10 @@ bool EditorNode::immediate_confirmation_dialog(const String &p_text, const Strin
 }
 
 bool EditorNode::is_cmdline_mode() {
-	ERR_FAIL_NULL_V(singleton, false);
-	return singleton->cmdline_mode;
+	// Deferred static callables (the script doc cache) and the cmdline API dump tools
+	// reach this with no EditorNode, before one is built or after it is gone; without
+	// one there is no interactive editor.
+	return !singleton || singleton->cmdline_mode;
 }
 
 void EditorNode::cleanup() {

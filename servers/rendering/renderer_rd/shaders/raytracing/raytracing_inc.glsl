@@ -25,7 +25,8 @@
 #define RT_PARAM_VFOG_INV_LENGTH 6 // rt_params[1].z - 1 / volumetric_fog_length
 #define RT_PARAM_VFOG_INV_SPREAD 7 // rt_params[1].w - 1 / volumetric_fog_detail_spread
 #define RT_PARAM_VFOG_SKY_AFFECT 8 // rt_params[2].x - volumetric_fog_sky_affect
-// Indices 9-13 reserved for future use
+#define RT_PARAM_HAS_PROCEDURAL_INSTANCES 9 // rt_params[2].y - TLAS contains procedural geometry
+// Indices 10-13 reserved for future use
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation
 
@@ -129,6 +130,9 @@ const uint PATH_TERMINATED_FLAG = (1u << 26);
 // The primary ray missed (bit 27): the raygen composes the camera segment's media over the sky
 // as the sky pass does, not over a hit distance (D37).
 const uint PRIMARY_MISS_FLAG = (1u << 27);
+// A bounded procedural primary probe. A miss clears this flag without touching
+// the path or its images, so the raygen can shade the raster surface instead.
+const uint PRIMARY_PROBE_FLAG = (1u << 28);
 uint set_path_terminated(uint packed) {
 	return packed | PATH_TERMINATED_FLAG;
 }

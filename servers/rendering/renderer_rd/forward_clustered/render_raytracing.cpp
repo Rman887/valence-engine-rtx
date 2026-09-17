@@ -1603,7 +1603,7 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 		inst.transform.origin -= p_state->rt_origin;
 		inst.blas = blass[i];
 		inst.flags = BitField<RD::AccelerationStructureInstanceFlagBits>(instance_flags[i]);
-		inst.mask = (i < instance_masks.size()) ? instance_masks[i] : 0xFF;
+		inst.mask = (i < instance_masks.size()) ? instance_masks[i] : (RT_INSTANCE_MASK_GEOMETRY | RT_INSTANCE_MASK_SHADOW);
 		uint32_t sbt_off = (i < sbt_offsets.size()) ? sbt_offsets[i] : 0;
 		inst.hit_sbt_range = RD::HitShaderBindingTableRange((1ULL << 32) | uint64_t(sbt_off));
 	}
@@ -2057,6 +2057,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	}
 
 	prepare_frame();
+	state->has_procedural_instances = false;
 
 	// Camera-relative tracing: the trace runs in world space minus an anchor
 	// snapped to a grid on x and z, so float32 stays precise kilometers from
@@ -2199,7 +2200,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				uint32_t inst_flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT |
 						RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				instance_flags.push_back(inst_flags);
-				instance_masks.push_back(inst->data->cast_shadows ? RT_INSTANCE_MASK_ALL : RT_INSTANCE_MASK_NO_SHADOW);
+				instance_masks.push_back(RT_INSTANCE_MASK_GEOMETRY | RT_INSTANCE_MASK_PROCEDURAL | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0));
+				state->has_procedural_instances = true;
 			}
 			continue;
 		}
@@ -2301,7 +2303,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				pending.transform_moved = transform_moved;
 				pending.mat_data = mat_data;
 				pending.inst_flags = inst_flags;
-				pending.inst_mask = inst->data->cast_shadows ? RT_INSTANCE_MASK_ALL : RT_INSTANCE_MASK_NO_SHADOW;
+				pending.inst_mask = RT_INSTANCE_MASK_GEOMETRY | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0);
 				pending_mm_surfaces.push_back(pending);
 
 				mm_surf = mm_surf->next;
@@ -2458,7 +2460,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 			}
 			instance_flags.push_back(inst_flags);
-			instance_masks.push_back(inst->data->cast_shadows ? RT_INSTANCE_MASK_ALL : RT_INSTANCE_MASK_NO_SHADOW);
+			instance_masks.push_back(RT_INSTANCE_MASK_GEOMETRY | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0));
 
 			surf = surf->next;
 		}
@@ -2950,6 +2952,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		}
 		// The frame decides (the Environment's choice, unless MSAA forced the traced primary ray).
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_PRIMARY_SURFACE] = p_primary_from_gbuffer ? (float)RSE::PT_PRIMARY_SURFACE_GBUFFER : (float)RSE::PT_PRIMARY_SURFACE_TRACED;
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_HAS_PROCEDURAL_INSTANCES] = p_state->has_procedural_instances ? 1.0f : 0.0f;
 
 		// The froxel volumetric fog the raygen composes over the camera segment (D37): the froxel's
 		// depth mapping as the raster's fragment reads it, and the Environment's sky affect.

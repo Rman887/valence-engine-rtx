@@ -94,9 +94,28 @@ layout(set = 0, binding = 38) uniform texture2D gbuffer_depth;
 // frame and shadowed against the TLAS; composed over the camera segment in apply_camera_media.
 layout(set = 0, binding = 39) uniform texture3D volumetric_fog_texture;
 
-/// Shades the G-buffer's surface at this pixel as the primary hit, or returns
-/// false when the raster pass drew nothing here (the sky, or procedural
-/// geometry that is only in the TLAS) so the caller traces the primary ray.
+void trace_path_ray(vec3 ray_origin, vec3 ray_dir, uint mask, float max_distance) {
+#ifdef USE_SER
+	hitObjectEXT hitObject;
+	hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS, mask, 0, 0, 0, ray_origin, 0.001, ray_dir, max_distance, 0);
+
+	// Reorder with a coherence hint that has 8 bits.
+	uint hint = 0;
+	if (hitObjectIsHitEXT(hitObject)) {
+		// TODO: This hint barely does anything. There is a lot of untapped potential here.
+		hint = hitObjectGetInstanceIdEXT(hitObject);
+	}
+	reorderThreadEXT(hitObject, hint, 8);
+
+	hitObjectExecuteShaderEXT(hitObject, 0);
+#else
+	traceRayEXT(tlas, RT_RAY_FLAGS, mask, 0, 0, 0, ray_origin, 0.001, ray_dir, max_distance, 0);
+#endif
+}
+
+/// Shades the G-buffer's surface or a nearer procedural surface as the primary
+/// hit. Returns false when the raster drew nothing so the caller traces the
+/// full primary ray (sky and procedural geometry without a raster backdrop).
 /// ray_origin and ray_dir are the raygen's own primary ray, anchor-relative;
 /// the hit is rebuilt along it from the raster's reverse-Z depth, never from
 /// a written position, so it sits on the same float grid as the TLAS.
@@ -108,6 +127,19 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 
 	vec4 view_pos = scene_data_block.data.inv_projection_matrix * vec4(ndc, depth, 1.0);
 	float hit_t = length(view_pos.xyz / view_pos.w);
+
+	// Procedural surfaces have no raster representation. Shade the nearest one
+	// before the raster surface, using its normal closest-hit depth/velocity/RR
+	// writes. A miss must leave all of those images and the path untouched.
+	if (get_rt_param(RT_PARAM_HAS_PROCEDURAL_INSTANCES) > 0.5 && hit_t > 0.001) {
+		payload.packed_bounces_flags |= PRIMARY_PROBE_FLAG;
+		trace_path_ray(ray_origin, ray_dir, RT_MASK_PROCEDURAL, min(hit_t, 10000.0));
+		bool procedural_hit = (payload.packed_bounces_flags & PRIMARY_PROBE_FLAG) != 0u;
+		payload.packed_bounces_flags &= ~PRIMARY_PROBE_FLAG;
+		if (procedural_hit) {
+			return true;
+		}
+	}
 
 	// The RT depth image is the frame's depth after the trace (a hole in the G-buffer, procedural
 	// geometry or the sky, gets the traced value there), so the raster's depth goes in for this pixel.
@@ -256,22 +288,7 @@ void main() {
 				continue;
 			}
 
-#ifdef USE_SER
-			hitObjectEXT hitObject;
-			hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
-
-			// Reorder with a coherence hint that has 8 bits
-			uint hint = 0;
-			if (hitObjectIsHitEXT(hitObject)) {
-				// TODO: This hint barely does anything. There is a lot of untapped potential here.
-				hint = hitObjectGetInstanceIdEXT(hitObject);
-			}
-			reorderThreadEXT(hitObject, hint, 8);
-
-			hitObjectExecuteShaderEXT(hitObject, 0);
-#else
-			traceRayEXT(tlas, RT_RAY_FLAGS, 0xFF, 0, 0, 0, ray_origin, 0.001, ray_dir, 10000.0, 0);
-#endif
+			trace_path_ray(ray_origin, ray_dir, 0xFF, 10000.0);
 
 			ps = path_unpack(payload);
 			if (bounce == 0u) {
@@ -353,6 +370,11 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 #endif // USE_RADIANCE_OCTMAP_ARRAY
 
 void main() {
+	if ((payload.packed_bounces_flags & PRIMARY_PROBE_FLAG) != 0u) {
+		payload.packed_bounces_flags &= ~PRIMARY_PROBE_FLAG;
+		return;
+	}
+
 	PathState ps = path_unpack(payload);
 
 #if !defined(USE_SER)

@@ -104,7 +104,8 @@ public:
 	static constexpr int RT_PARAM_VFOG_INV_LENGTH = 6;
 	static constexpr int RT_PARAM_VFOG_INV_SPREAD = 7;
 	static constexpr int RT_PARAM_VFOG_SKY_AFFECT = 8;
-	// Indices 9-13 reserved for future use.
+	static constexpr int RT_PARAM_HAS_PROCEDURAL_INSTANCES = 9;
+	// Indices 10-13 reserved for future use.
 	static constexpr int RT_PARAM_LIGHT_COUNT = 14;
 	static constexpr int RT_PARAM_FRAME_INDEX = 15;
 

@@ -307,6 +307,7 @@ struct RTMaterialCacheEntry {
 struct RTViewportState {
 	RID tlas;
 	uint32_t tlas_max_instances = 0;
+	bool has_procedural_instances = false;
 
 	RID geometry_buffer;
 	uint32_t geometry_buffer_capacity = 0;
@@ -396,13 +397,13 @@ class RenderRaytracing {
 	LocalVector<RID> blass;
 	LocalVector<Transform3D> blas_transforms;
 	LocalVector<uint32_t> instance_flags;
-	LocalVector<uint8_t> instance_masks; // Per-instance ray mask (0x00 = invisible to rays, 0xFF = normal)
-	// Bit 1 of the mask is the shadow bit: the shadow rays' cull mask
-	// (RT_MASK_SHADOW in raytracing_common_inc.glsl) selects it, so an
-	// instance whose cast_shadows setting is off is seen by camera and
-	// bounce rays and skipped by shadow rays.
-	static constexpr uint8_t RT_INSTANCE_MASK_ALL = 0xFF;
-	static constexpr uint8_t RT_INSTANCE_MASK_NO_SHADOW = 0xFD;
+	LocalVector<uint8_t> instance_masks;
+	// Camera and bounce rays select all geometry. Shadow rays select bit 1;
+	// the G-buffer primary probe selects only procedural geometry (bit 2).
+	// Keep these in sync with RT_MASK_* in raytracing_common_inc.glsl.
+	static constexpr uint8_t RT_INSTANCE_MASK_GEOMETRY = 0x01;
+	static constexpr uint8_t RT_INSTANCE_MASK_SHADOW = 0x02;
+	static constexpr uint8_t RT_INSTANCE_MASK_PROCEDURAL = 0x04;
 	LocalVector<uint32_t> sbt_offsets; // 0 = default material hit group
 
 	HashMap<RenderSceneBuffersRD *, RTViewportState *> viewport_states;

@@ -30,7 +30,7 @@
 #include "raytracing_hit_inc.glsl"
 // clang-format on
 
-layout(set = 0, binding = 0, rgba32f) uniform image2D image;
+layout(set = 0, binding = 0, rgba16f) uniform image2D image;
 layout(set = 0, binding = 1) uniform accelerationStructureEXT tlas;
 
 layout(location = 0) rayPayloadEXT PathPayload payload;

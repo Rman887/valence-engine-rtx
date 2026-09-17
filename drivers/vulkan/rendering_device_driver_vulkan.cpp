@@ -1589,6 +1589,16 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, ERR_CANT_CREATE, vformat("Couldn't create Vulkan device (VkResult error %d).", err));
 	}
 
+	if (Engine::get_singleton()->is_raytracing_validation_enabled()) {
+		if (!raytracing_capabilities.validation) {
+			WARN_PRINT("Vulkan: Ray tracing validation was requested, but VK_NV_ray_tracing_validation is unavailable or unsupported.");
+		} else if (!context_driver->is_debug_utils_enabled()) {
+			WARN_PRINT("Vulkan: Ray tracing validation is enabled, but its debug messenger is unavailable.");
+		} else {
+			print_line("Vulkan: Ray tracing validation enabled (VK_NV_ray_tracing_validation), debug messenger active.");
+		}
+	}
+
 	for (uint32_t i = 0; i < queue_families.size(); i++) {
 		for (uint32_t j = 0; j < queue_families[i].size(); j++) {
 			vkGetDeviceQueue(vk_device, i, j, &queue_families[i][j].queue);

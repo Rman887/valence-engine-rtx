@@ -452,7 +452,7 @@ Error RenderingContextDriverVulkan::_initialize_instance_extensions() {
 	_register_requested_instance_extension(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME, true);
 #endif
 
-	// Only enable debug utils in verbose mode or DEV_ENABLED.
+	// Enable debug utils for development, verbose output, GPU markers or RT validation.
 	// End users would get spammed with messages of varying verbosity due to the
 	// mess that thirdparty layers/extensions and drivers seem to leave in their
 	// wake, making the Windows registry a bottomless pit of broken layer JSON.
@@ -461,7 +461,7 @@ Error RenderingContextDriverVulkan::_initialize_instance_extensions() {
 #else
 	bool want_debug_utils = OS::get_singleton()->is_stdout_verbose();
 #endif
-	if (Engine::get_singleton() && Engine::get_singleton()->is_gpu_markers_enabled()) {
+	if (Engine::get_singleton() && (Engine::get_singleton()->is_gpu_markers_enabled() || Engine::get_singleton()->is_raytracing_validation_enabled())) {
 		want_debug_utils = true;
 	}
 	if (want_debug_utils) {

@@ -1330,11 +1330,6 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	if (emission_rd.is_valid() && shader_declares("texture_emission")) {
 		mat.emission_texture_idx = bindless_block->add_texture(emission_rd);
 		mat.flags |= RT_MAT_FLAG_HAS_EMISSION_TEX;
-		// Set sensible defaults for emission when texture is present
-		mat.emission_color[0] = 1.0f;
-		mat.emission_color[1] = 1.0f;
-		mat.emission_color[2] = 1.0f;
-		mat.emission_strength = 1.0f;
 	}
 
 	// Material properties
@@ -1534,6 +1529,12 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	Variant emission_energy_var = material_storage->material_get_param(p_material_rid, "emission_energy");
 	if (emission_energy_var.get_type() == Variant::FLOAT) {
 		mat.emission_strength = emission_energy_var;
+	}
+
+	// The operator is not a uniform; BaseMaterial3D publishes it as a parameter beside the ones its shader bakes it into.
+	Variant emission_operator_var = material_storage->material_get_param(p_material_rid, "emission_operator");
+	if (emission_operator_var.get_type() == Variant::INT && (int)emission_operator_var == 1) { // 1 = BaseMaterial3D::EMISSION_OP_MULTIPLY.
+		mat.flags |= RT_MAT_FLAG_EMISSION_MULTIPLY;
 	}
 
 	// UV1 scale and offset (vec3 in Godot, we only use xy).

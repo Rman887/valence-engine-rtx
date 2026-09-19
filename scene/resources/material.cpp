@@ -566,6 +566,7 @@ void BaseMaterial3D::init_shaders() {
 	shader_names->metallic = "metallic";
 	shader_names->emission = "emission";
 	shader_names->emission_energy = "emission_energy";
+	shader_names->emission_operator = "emission_operator";
 	shader_names->normal_scale = "normal_scale";
 	shader_names->rim = "rim";
 	shader_names->rim_tint = "rim_tint";
@@ -3114,6 +3115,8 @@ void BaseMaterial3D::set_emission_operator(EmissionOperator p_op) {
 		return;
 	}
 	emission_op = p_op;
+	// Baked into the shader for the raster; published as a parameter for a renderer that evaluates the material itself.
+	_material_set_param(shader_names->emission_operator, (int)p_op);
 	_queue_shader_change();
 }
 

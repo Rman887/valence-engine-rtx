@@ -654,13 +654,14 @@ void main() {
 	float roughness = saturate(orm.g * mat.roughness);
 	float metalness = saturate(orm.b * mat.metallic);
 
-	// Emission with or without a texture: a material without one keeps its colour and energy
-	// (they are zero unless the material set them), as the raster's fragment does.
-	vec3 emissive = mat.emission_color * mat.emission_strength;
+	// Emission as the raster's fragment computes it: the texture (black when there is none) is added to
+	// or multiplied with the colour by the material's emission operator, then scaled by the energy.
+	vec3 emission_tex = vec3(0.0);
 	if ((mat.flags & 2u) != 0u) {
-		emissive *= sample_material_texture(mat.emission_texture_idx, uv, mat.flags).rgb;
+		emission_tex = sample_material_texture(mat.emission_texture_idx, uv, mat.flags).rgb;
 	}
-	emissive *= scene_data_block.data.emissive_exposure_normalization;
+	vec3 emissive = ((mat.flags & 8u) != 0u) ? mat.emission_color * emission_tex : mat.emission_color + emission_tex;
+	emissive *= mat.emission_strength * scene_data_block.data.emissive_exposure_normalization;
 
 	// Build MaterialResult.
 	MaterialResult m;

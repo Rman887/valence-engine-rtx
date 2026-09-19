@@ -468,6 +468,7 @@ private:
 		StringName roughness;
 		StringName emission;
 		StringName emission_energy;
+		StringName emission_operator;
 		StringName normal_scale;
 		StringName rim;
 		StringName rim_tint;

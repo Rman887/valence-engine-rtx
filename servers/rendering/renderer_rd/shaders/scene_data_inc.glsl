@@ -21,6 +21,7 @@ struct SceneData {
 
 #ifdef USE_DOUBLE_PRECISION
 	vec4 inv_view_precision;
+	vec4 camera_position_world;
 #endif
 
 	// only used for multiview

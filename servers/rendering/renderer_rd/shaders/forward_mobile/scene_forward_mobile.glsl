@@ -258,6 +258,7 @@ void vertex_shader(in vec3 vertex,
 #ifdef USE_DOUBLE_PRECISION
 		in vec3 model_precision,
 		in vec3 view_precision,
+		in vec3 in_camera_position_world,
 #endif
 #ifdef MODE_DUAL_PARABOLOID
 		in float dual_paraboloid_side,
@@ -285,6 +286,11 @@ void vertex_shader(in vec3 vertex,
 			in_inv_view_matrix[1],
 			in_inv_view_matrix[2],
 			vec4(0.0, 0.0, 0.0, 1.0)));
+#ifdef USE_DOUBLE_PRECISION
+	vec3 camera_position_world = in_camera_position_world;
+#else
+	vec3 camera_position_world = inv_view_matrix[3].xyz;
+#endif
 
 	mat4 model_matrix = transpose(mat4(in_model_matrix[0],
 			in_model_matrix[1],
@@ -732,6 +738,7 @@ void main() {
 #ifdef USE_DOUBLE_PRECISION
 			instances.data[draw_call.instance_index].prev_model_precision.xyz,
 			scene_data_block.prev_data.inv_view_precision,
+			scene_data_block.prev_data.camera_position_world.xyz,
 #endif
 
 #ifdef MODE_DUAL_PARABOLOID
@@ -794,6 +801,7 @@ void main() {
 #ifdef USE_DOUBLE_PRECISION
 			instances.data[draw_call.instance_index].model_precision.xyz,
 			scene_data_block.data.inv_view_precision,
+			scene_data_block.data.camera_position_world.xyz,
 #endif
 #ifdef MODE_DUAL_PARABOLOID
 			scene_data_block.data.dual_paraboloid_side,
@@ -1236,6 +1244,11 @@ void main() {
 			instances.data[draw_call.instance_index].transform[1],
 			instances.data[draw_call.instance_index].transform[2],
 			vec4(0.0, 0.0, 0.0, 1.0)));
+#ifdef USE_DOUBLE_PRECISION
+	vec3 camera_position_world = scene_data.camera_position_world.xyz;
+#else
+	vec3 camera_position_world = inv_view_matrix[3].xyz;
+#endif
 
 #ifdef LIGHT_VERTEX_USED
 	vec3 light_vertex = vertex;

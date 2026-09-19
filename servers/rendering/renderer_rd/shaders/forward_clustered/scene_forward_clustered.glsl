@@ -253,6 +253,12 @@ void vertex_shader(vec3 vertex_input,
 	vec3 view_precision = scene_data.inv_view_precision.xyz;
 #endif
 
+#ifdef USE_DOUBLE_PRECISION
+	vec3 camera_position_world = scene_data.camera_position_world.xyz;
+#else
+	vec3 camera_position_world = inv_view_matrix[3].xyz;
+#endif
+
 	mat3 model_normal_matrix;
 	if (bool(instances.data[instance_index].flags & INSTANCE_FLAGS_NON_UNIFORM_SCALE)) {
 		model_normal_matrix = transpose(inverse(mat3(model_matrix)));
@@ -1304,6 +1310,11 @@ void fragment_shader(in SceneData scene_data) {
 			instances.data[instance_index].transform[1],
 			instances.data[instance_index].transform[2],
 			vec4(0.0, 0.0, 0.0, 1.0)));
+#ifdef USE_DOUBLE_PRECISION
+	vec3 camera_position_world = scene_data.camera_position_world.xyz;
+#else
+	vec3 camera_position_world = inv_view_matrix[3].xyz;
+#endif
 
 #ifdef LIGHT_VERTEX_USED
 	vec3 light_vertex = vertex;

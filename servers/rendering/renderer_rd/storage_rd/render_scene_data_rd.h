@@ -129,6 +129,8 @@ private:
 
 #ifdef REAL_T_IS_DOUBLE
 		float inv_view_precision[4];
+		// The camera origin narrowed to float, for CAMERA_POSITION_WORLD: inv_view_matrix[3] holds the negated split origin in a double build.
+		float camera_position_world[4];
 #endif
 
 		float projection_matrix_view[RendererSceneRender::MAX_RENDER_VIEWS][16];

@@ -908,7 +908,7 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 		actions.renames["LIGHT_VERTEX"] = "light_vertex";
 
 		actions.renames["NODE_POSITION_WORLD"] = "read_model_matrix[3].xyz";
-		actions.renames["CAMERA_POSITION_WORLD"] = "inv_view_matrix[3].xyz";
+		actions.renames["CAMERA_POSITION_WORLD"] = "camera_position_world";
 		actions.renames["CAMERA_DIRECTION_WORLD"] = "inv_view_matrix[2].xyz";
 		actions.renames["CAMERA_VISIBLE_LAYERS"] = "scene_data.camera_visible_layers";
 		actions.renames["NODE_POSITION_VIEW"] = "(read_view_matrix * read_model_matrix)[3].xyz";

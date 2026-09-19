@@ -1276,6 +1276,14 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
 
+	// A parameter is read only when the material's shader declares its uniform: BaseMaterial3D keeps every
+	// parameter it was ever given, but the raster evaluates a feature (normal map, emission) only while it
+	// is enabled, and the two evaluations of a material must agree.
+	const RendererRD::MaterialStorage::ShaderData *shader_data = material_storage->material_get_shader_data(p_material_rid);
+	auto shader_declares = [&](const StringName &p_uniform) -> bool {
+		return shader_data && shader_data->uniforms.has(p_uniform);
+	};
+
 	// Helper lambda to get texture from material parameter
 	// p_srgb should be true for color textures (albedo, emission) that need sRGB->linear conversion
 	auto get_material_texture = [&](const StringName &p_param, bool p_srgb = false) -> RID {
@@ -1297,7 +1305,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	}
 
 	RID normal_rd = get_material_texture("texture_normal");
-	if (normal_rd.is_valid()) {
+	if (normal_rd.is_valid() && shader_declares("texture_normal")) {
 		mat.normal_texture_idx = bindless_block->add_texture(normal_rd);
 		mat.flags |= RT_MAT_FLAG_HAS_NORMAL_MAP;
 
@@ -1319,7 +1327,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 
 	// Emission is a color texture - needs sRGB->linear conversion
 	RID emission_rd = get_material_texture("texture_emission", true);
-	if (emission_rd.is_valid()) {
+	if (emission_rd.is_valid() && shader_declares("texture_emission")) {
 		mat.emission_texture_idx = bindless_block->add_texture(emission_rd);
 		mat.flags |= RT_MAT_FLAG_HAS_EMISSION_TEX;
 		// Set sensible defaults for emission when texture is present
@@ -1515,7 +1523,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat.specular = specular_var;
 	}
 
-	Variant emission_var = material_storage->material_get_param(p_material_rid, "emission");
+	Variant emission_var = shader_declares("emission") ? material_storage->material_get_param(p_material_rid, "emission") : Variant();
 	if (emission_var.get_type() == Variant::COLOR) {
 		Color c = ((Color)emission_var).srgb_to_linear();
 		mat.emission_color[0] = c.r;

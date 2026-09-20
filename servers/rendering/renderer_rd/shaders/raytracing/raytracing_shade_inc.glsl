@@ -6,7 +6,7 @@
 //
 // Required includes (before this file):
 //   raytracing_inc.glsl, brdf_inc.glsl, raytracing_hit_inc.glsl, raytracing_lights_inc.glsl,
-//   raytracing_material_eval_inc.glsl, radiance_octmap_sample()
+//   raytracing_emissive_inc.glsl, raytracing_material_eval_inc.glsl, radiance_octmap_sample()
 //
 // Required bindings (before this file):
 //   tlas, payload, scene_data_block, geometries[], materials[], bindless_textures[],
@@ -25,6 +25,7 @@ struct HitData {
 	vec4 color; // Vertex color (white if not present).
 	bool is_front_face;
 	uint geometry_idx;
+	uint primitive_id; // The triangle hit; 0 for a G-buffer surface, which never weighs its emission (D50).
 };
 
 // ============================================================================
@@ -354,8 +355,16 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		apply_segment_fog(ray_dir, hit_t, ps.radiance, ps.throughput);
 	}
 
-	// Emissive contribution.
-	ps.radiance += ps.throughput * m.emissive;
+	// Emissive contribution, weighed against the emissive light sampling that competes for it
+	// after a scatter (D50): the camera ray and a delta lobe keep the whole weight, and so does
+	// a surface the emissive list does not carry, since light sampling never reaches it.
+	uint rt_emissive_count = uint(get_rt_param(RT_PARAM_EMISSIVE_COUNT));
+	float emissive_weight = 1.0;
+	if (total_bounces > 0u && rt_emissive_count > 0u && ps.bsdf_pdf != RT_BSDF_PDF_DELTA && any(greaterThan(m.emissive, vec3(0.0)))) {
+		float pdf_light = get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY) * emissive_hit_pdf(h.geometry_idx, h.primitive_id, ray_dir, hit_t, h.is_front_face, rt_emissive_count);
+		emissive_weight = emissive_mis_weight(ps.bsdf_pdf, pdf_light);
+	}
+	ps.radiance += ps.throughput * m.emissive * emissive_weight;
 
 	// Bounce limit check.
 	if (total_bounces >= RT_GET_MAX_BOUNCES() || diffuse_bounces >= MAX_DIFFUSE_BOUNCES) {
@@ -445,22 +454,44 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	path_pack(payload, ps);
 
 	uint rt_light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
-	if (rt_light_count > 0u) {
+	if (rt_light_count > 0u || rt_emissive_count > 0u) {
 		vec3 hit_pos_offset = offset_ray_origin(h.hit_pos, h.geometry_normal);
 		bool is_indirect = (diffuse_bounces > 0u);
-		vec3 light_dir;
-		float light_dist;
-		vec3 direct_light = lights_evaluate_direct_lighting(
-				hit_pos_offset, N, V, brdf_mat, ps.rng_state, is_indirect, rt_light_count, light_dir, light_dist);
-		if (in_medium) {
-			// The light's own leg through the medium (D49): to the light, or up to the medium's
-			// top, the horizontal plane through the point the path entered at, whichever is
-			// nearer. The shadow ray is a visibility test that does not resolve the interface, so
-			// the leg is this estimate (a named limit); a light under the plane takes its distance.
-			float leg = min(light_dist, max(ps.medium_entry_height - h.hit_pos.y, 0.0) / max(light_dir.y, 0.1));
-			direct_light *= exp(-ps.medium_absorption * leg);
+		// One light sample per hit (D50): the analytic lights or the emissive list, chosen by the
+		// per-frame share, the contribution divided by its share. Nothing is drawn for the choice
+		// when the emissive list is empty, so such a frame keeps its random sequence. Only the
+		// sample's generation diverges; the shadow ray and the BRDF below are shared, so a warp
+		// whose threads chose differently traces once.
+		bool sample_emissive = rt_emissive_count > 0u;
+		float strategy_probability = 1.0;
+		if (rt_light_count > 0u && rt_emissive_count > 0u) {
+			float p_emissive = get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY);
+			sample_emissive = rand(ps.rng_state) < p_emissive;
+			strategy_probability = sample_emissive ? p_emissive : (1.0 - p_emissive);
 		}
-		ps.radiance += ps.throughput * direct_light;
+		LightSampleNEE light_sample;
+		bool have_sample;
+		if (sample_emissive) {
+			have_sample = emissive_sample_direct(hit_pos_offset, N, V, brdf_mat, ps.rng_state, strategy_probability, rt_emissive_count, light_sample);
+		} else {
+			have_sample = lights_sample_direct(hit_pos_offset, N, brdf_mat, ps.rng_state, is_indirect, rt_light_count, light_sample);
+		}
+		if (have_sample && lights_trace_shadow_ray(hit_pos_offset, light_sample.direction, light_sample.shadow_distance, ps.rng_state)) {
+			// Evaluate BRDF (diffuse + specular separately for specular_amount control).
+			vec3 brdf_diffuse, brdf_specular;
+			evalCombinedBRDFSeparate(N, light_sample.direction, V, brdf_mat, brdf_diffuse, brdf_specular);
+			// NdotL is already included in the BRDF value (evalLambertian/evalMicrofacet bake it in).
+			vec3 direct_light = (brdf_diffuse + brdf_specular * light_sample.specular_multiplier) * light_sample.radiance * (light_sample.weight / strategy_probability);
+			if (in_medium) {
+				// The light's own leg through the medium (D49): to the light, or up to the medium's
+				// top, the horizontal plane through the point the path entered at, whichever is
+				// nearer. The shadow ray is a visibility test that does not resolve the interface, so
+				// the leg is this estimate (a named limit); a light under the plane takes its distance.
+				float leg = min(light_sample.leg_distance, max(ps.medium_entry_height - h.hit_pos.y, 0.0) / max(light_sample.direction.y, 0.1));
+				direct_light *= exp(-ps.medium_absorption * leg);
+			}
+			ps.radiance += ps.throughput * direct_light;
+		}
 	}
 
 	// =================================================================
@@ -497,6 +528,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			ps.hit_t = hit_t;
 			ps.offset_normal = -h.geometry_normal;
 			ps.next_ray_dir = refracted;
+			ps.bsdf_pdf = RT_BSDF_PDF_DELTA;
 			path_pack(payload, ps);
 			return;
 		}
@@ -506,16 +538,13 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// =================================================================
 	// BRDF importance sampling for next bounce
 	// =================================================================
-	float specularLum = luminance(specularF0);
-	float diffuseLum = luminance(diffuseReflectance);
-
 	int brdfType;
-	if (diffuseLum < 0.0001) {
+	float brdfProbability = brdfSpecularProbability(specularF0, diffuseReflectance);
+	if (brdfProbability >= 1.0) {
 		brdfType = SPECULAR_TYPE;
-	} else if (specularLum < 0.0001) {
+	} else if (brdfProbability <= 0.0) {
 		brdfType = DIFFUSE_TYPE;
 	} else {
-		float brdfProbability = clamp(specularLum / (specularLum + diffuseLum), 0.01, 0.99);
 		if (rand(ps.rng_state) < brdfProbability) {
 			brdfType = SPECULAR_TYPE;
 			ps.throughput /= brdfProbability;
@@ -551,6 +580,20 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		ps.packed_bounces_flags = inc_diffuse_bounce(ps.packed_bounces_flags);
 	} else {
 		ps.packed_bounces_flags = inc_total_bounce(ps.packed_bounces_flags);
+	}
+
+	// The density of the direction just chosen, for the next hit's emission weight (D50): a
+	// zero-roughness specular lobe is a delta light sampling cannot hit, so it keeps the whole
+	// weight; every other direction is weighed with the density brdf_pdf assigns it, which is
+	// the same function light sampling evaluates for its own directions.
+	if (rt_emissive_count == 0u || (brdfType == SPECULAR_TYPE && brdf_mat.roughness * brdf_mat.roughness <= 0.0)) {
+		// With no emitter listed no hit reads the density, so the feature off costs no ALU here.
+		ps.bsdf_pdf = RT_BSDF_PDF_DELTA;
+	} else {
+		float pdf = brdf_pdf(N, next_dir, V, brdf_mat);
+		// A direction the density cannot own (the below-hemisphere recovery) is one light
+		// sampling rejects too, so the BSDF strategy keeps the whole weight.
+		ps.bsdf_pdf = pdf > 0.0 ? pdf : RT_BSDF_PDF_DELTA;
 	}
 
 	// Hand the next ray back to raygen. PATH_TERMINATED_FLAG stays clear so

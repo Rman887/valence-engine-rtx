@@ -319,6 +319,7 @@ public:
 	// Pathtracing
 	virtual void environment_set_pathtracing(RID p_env, bool p_enable, int p_debug_mode, int p_samples_per_pixel, int p_max_bounces, RSE::PathtracingDenoiser p_denoiser) = 0;
 	virtual void environment_set_pathtracing_primary_surface(RID p_env, RSE::PathtracingPrimarySurface p_primary_surface) = 0;
+	virtual void environment_set_pathtracing_emissive_lights(RID p_env, bool p_enable) = 0;
 	virtual void environment_set_camera_medium(RID p_env, bool p_enable, const Color &p_absorption, const Color &p_scattering, float p_height) = 0;
 
 	virtual bool environment_get_pathtracing_enabled(RID p_env) const = 0;
@@ -327,6 +328,7 @@ public:
 	virtual int environment_get_pathtracing_max_bounces(RID p_env) const = 0;
 	virtual RSE::PathtracingDenoiser environment_get_pathtracing_denoiser(RID p_env) const = 0;
 	virtual RSE::PathtracingPrimarySurface environment_get_pathtracing_primary_surface(RID p_env) const = 0;
+	virtual bool environment_get_pathtracing_emissive_lights(RID p_env) const = 0;
 
 	virtual void environment_set_adjustment(RID p_env, bool p_enable, float p_brightness, float p_contrast, float p_saturation, bool p_use_1d_color_correction, RID p_color_correction) = 0;
 

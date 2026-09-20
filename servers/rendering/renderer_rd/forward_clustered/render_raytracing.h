@@ -150,6 +150,25 @@ enum {
 	RT_LIGHTS_INDIRECT_BUDGET = RT_LIGHTS_MAX - RT_LIGHTS_FRUSTUM_BUDGET,
 };
 
+// An emissive mesh light (D50): a TLAS instance whose material emits a constant radiance, listed
+// for the trace's next-event estimation. Must match GLSL RTEmissiveInstance (std430, 80 bytes).
+struct alignas(16) RT_EmissiveInstance {
+	float xform[12]; // Object-to-world, trace space (mat3x4, transposed 3x4).
+	float radiance[3]; // Linear emission before the exposure normalisation.
+	float cdf; // Inclusive; the last entry reads 1.0.
+	uint32_t instance_index; // The TLAS instance: its geometries[] entry.
+	uint32_t primitive_count;
+	uint32_t flags;
+	float pdf; // This entry's selection probability.
+};
+static_assert(sizeof(RT_EmissiveInstance) == 80, "RT_EmissiveInstance must be 80 bytes for std430");
+
+enum {
+	RT_EMISSIVE_MAX = 1024,
+	RT_EMISSIVE_FLAG_TWO_SIDED = 1u,
+	RT_EMISSIVE_FLAG_FLIP_FACING = 2u, // The instance flips the winding: its lit face winds clockwise as seen (Godot front faces).
+};
+
 enum {
 	RT_OFFSET_NONE = 0xFFFFFFFFu,
 	RT_CACHE_CHUNK_SIZE = 256,
@@ -163,6 +182,7 @@ enum {
 	RT_MAT_FLAG_HAS_EMISSION_TEX = 2u,
 	RT_MAT_FLAG_POINT_FILTER = 4u,
 	RT_MAT_FLAG_EMISSION_MULTIPLY = 8u, // BaseMaterial3D emission_operator Multiply; Add otherwise.
+	RT_MAT_FLAG_EMISSIVE_CONSTANT = 16u, // Emits a non-zero constant radiance with no texture: an emissive mesh light (D50).
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).
@@ -320,6 +340,8 @@ struct RTViewportState {
 	uint32_t motion_transform_buffer_capacity = 0;
 
 	RID light_buffer;
+	RID emissive_buffer; // The emissive mesh lights of the frame (D50), RT_EMISSIVE_MAX entries.
+	uint32_t emissive_count_logged = 0; // The last count printed for this viewport.
 	RID params_buffer;
 	RID scene_uniform_set;
 
@@ -399,6 +421,13 @@ class RenderRaytracing {
 	LocalVector<Transform3D> blas_transforms;
 	LocalVector<uint32_t> instance_flags;
 	LocalVector<uint8_t> instance_masks;
+	struct EmissiveCandidate {
+		uint32_t index;
+		float weight;
+		float score;
+	};
+	LocalVector<EmissiveCandidate> emissive_candidates; ///< The emissive gather's ranking (D50).
+	LocalVector<RT_EmissiveInstance> emissive_scratch;
 	// Camera and bounce rays select all geometry. Shadow rays select bit 1;
 	// the G-buffer primary probe selects only procedural geometry (bit 2).
 	// Keep these in sync with RT_MASK_* in raytracing_common_inc.glsl.
@@ -464,6 +493,7 @@ class RenderRaytracing {
 			uint32_t p_mm_count,
 			uint32_t p_surface_index,
 			uint32_t p_surface_counter,
+			const AABB &p_mm_aabb,
 			RD::ComputeListID p_compute_list,
 			LocalVector<RID> &r_dirty_blas_list,
 			LocalVector<RID> &r_dirty_blas_update_list,
@@ -480,7 +510,8 @@ public:
 	void cleanup_caches();
 
 	RTViewportState *build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags);
-	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, const Vector3 &p_origin);
+	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, const Vector3 &p_origin, float &r_score_sum);
+	uint32_t gather_emissive(const RenderDataRD *p_render_data, const RTViewportState *p_state, RT_EmissiveInstance *r_emissive_data, uint32_t p_max_emissive, float &r_score_sum);
 	RID update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_primary_from_gbuffer);
 
 	void copy_output_texture(const RenderDataRD *p_render_data);

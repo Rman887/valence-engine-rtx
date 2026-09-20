@@ -224,6 +224,10 @@
 			The denoiser used to reduce noise in the path-traced image. [constant RenderingServer.PT_DENOISER_DLSS_RAY_RECONSTRUCTION] uses NVIDIA DLSS Ray Reconstruction for high-quality temporal denoising and requires an NVIDIA RTX GPU. Use [constant RenderingServer.PT_DENOISER_NONE] to disable denoising.
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
 		</member>
+		<member name="pathtracing_emissive_lights" type="bool" setter="set_pathtracing_emissive_lights" getter="is_pathtracing_emissive_lights" default="true">
+			If [code]true[/code], the path tracer samples emissive surfaces as lights: a surface whose material emits a constant, untextured colour ([member BaseMaterial3D.emission] with [member BaseMaterial3D.emission_energy_multiplier] and no emission texture) lights its surroundings through the same shadowed light sampling the light nodes use, weighed against the bounce that may land on it so nothing is counted twice. If [code]false[/code], emission only reaches the image where a path happens to hit the surface, as before. Textured emission, the [constant BaseMaterial3D.EMISSION_OP_MULTIPLY] operator, materials with alpha and custom shaders that write [code]EMISSION[/code] are not sampled either way.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
+		</member>
 		<member name="pathtracing_enabled" type="bool" setter="set_pathtracing_enabled" getter="is_pathtracing_enabled" default="false">
 			If [code]true[/code], enables hardware-accelerated path tracing for this environment. Path tracing produces physically accurate global illumination, reflections, and shadows by simulating light rays bouncing through the scene. Requires a GPU with ray tracing support.
 			[b]Note:[/b] Path tracing is mutually exclusive with rasterization-based rendering. When enabled, features such as SDFGI, screen-space reflections, and shadow maps are bypassed.

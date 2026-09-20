@@ -54,6 +54,7 @@ layout(set = 0, binding = 5, std430) readonly buffer MaterialBuffer {
 // clang-format on
 
 #include "raytracing_lights_inc.glsl"
+#include "raytracing_emissive_inc.glsl"
 
 #ifdef USE_RADIANCE_OCTMAP_ARRAY
 
@@ -167,6 +168,7 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	h.color = vec4(1.0);
 	h.is_front_face = transmission_flags.a > 0.5;
 	h.geometry_idx = 0u;
+	h.primitive_id = 0u;
 
 	MaterialResult m;
 	m.albedo = albedo_specular.rgb;
@@ -296,6 +298,7 @@ void main() {
 		ps.packed_bounces_flags = (sample_idx == 0u) ? set_sample_zero(0u) : 0u;
 		ps.rng_state = init_rng(pixel, frame_index, sample_idx);
 		ps.hit_t = 0.0;
+		ps.bsdf_pdf = 0.0;
 		path_clear_medium(ps);
 		if (camera_in_medium) {
 			// The camera is inside a medium (D49): the path starts in it and leaves it through the
@@ -574,6 +577,7 @@ layout(set = 0, binding = 5, std430) readonly buffer MaterialBuffer {
 // clang-format on
 
 #include "raytracing_lights_inc.glsl"
+#include "raytracing_emissive_inc.glsl"
 
 // clang-format off
 layout(set = 0, binding = 32, std430) readonly buffer MotionTransforms {

@@ -230,6 +230,7 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 	shadow_ps.packed_bounces_flags = set_shadow_ray(0u);
 	shadow_ps.rng_state = 0u;
 	shadow_ps.hit_t = 0.0;
+	shadow_ps.bsdf_pdf = 0.0;
 	shadow_ps.offset_normal = vec3(0.0, 0.0, 1.0);
 	shadow_ps.next_ray_dir = vec3(0.0, 0.0, 1.0);
 	path_clear_medium(shadow_ps);
@@ -254,24 +255,41 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 // Next Event Estimation (NEE) - Direct Light Sampling
 // ============================================================================
 
-// Evaluate direct lighting using NEE with stochastic light selection.
+// A light sample before its shadow ray (D50): the direction, the distance the shadow ray is
+// traced over, the distance a medium charges the light's leg over (unbounded for a directional
+// light, D49), the light's radiance at the receiver with its attenuation, the specular multiplier
+// and the weight the contribution is multiplied by (the reciprocal of the selection density, and
+// for a mesh light its MIS weight too). The shadow ray and the BRDF are the caller's, shared by
+// every strategy, so a warp whose threads chose different strategies traces once.
+struct LightSampleNEE {
+	vec3 direction;
+	float shadow_distance;
+	float leg_distance;
+	vec3 radiance;
+	float weight;
+	float specular_multiplier;
+};
+
+// Sample one analytic light for NEE with stochastic light selection.
 // Uses mini-batch reservoir sampling for importance-weighted light selection.
-// r_light_dir and r_light_dist name the sampled light's direction and distance (unbounded for a
-// directional light) so a medium can charge the light's own leg (D49).
-vec3 lights_evaluate_direct_lighting(
+// Returns false when the sample carries nothing (no valid light, out of range, outside the spot
+// cone, below the horizon); the random draws are the same either way.
+bool lights_sample_direct(
 		vec3 hit_pos,
 		vec3 N,
-		vec3 V,
 		MaterialProperties material,
 		inout uint rng_state,
 		bool is_indirect_bounce,
 		uint light_count,
-		out vec3 r_light_dir,
-		out float r_light_dist) {
-	r_light_dir = vec3(0.0, 1.0, 0.0);
-	r_light_dist = 0.0;
+		out LightSampleNEE r_sample) {
+	r_sample.direction = vec3(0.0, 1.0, 0.0);
+	r_sample.shadow_distance = 0.0;
+	r_sample.leg_distance = 0.0;
+	r_sample.radiance = vec3(0.0);
+	r_sample.weight = 0.0;
+	r_sample.specular_multiplier = 1.0;
 	if (light_count == 0u) {
-		return vec3(0.0);
+		return false;
 	}
 
 	// Mini-batch reservoir sampling: sample k lights, pick the best valid one.
@@ -301,7 +319,7 @@ vec3 lights_evaluate_direct_lighting(
 	}
 
 	if (valid_found == 0u) {
-		return vec3(0.0);
+		return false;
 	}
 
 	// Estimate valid count from sample ratio, PDF = 1/validCount.
@@ -310,6 +328,9 @@ vec3 lights_evaluate_direct_lighting(
 
 	RTLightData light = rt_lights[selected_idx];
 	vec2 u = rand2(rng_state);
+	float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
+	r_sample.weight = 1.0 / max(light_select_pdf, 1e-10);
+	r_sample.specular_multiplier = lights_get_specular_multiplier(light.specular_amount, material.roughness);
 
 	// === POSITIONAL LIGHT PATH (omni + spot) ===
 	if (light.type == RT_LIGHT_TYPE_OMNI || light.type == RT_LIGHT_TYPE_SPOT) {
@@ -318,7 +339,7 @@ vec3 lights_evaluate_direct_lighting(
 
 		// Early out: outside max range.
 		if (light.max_range_squared != 0.0 && dist_sq > light.max_range_squared) {
-			return vec3(0.0);
+			return false;
 		}
 
 		float dist = sqrt(dist_sq);
@@ -341,67 +362,44 @@ vec3 lights_evaluate_direct_lighting(
 			shadow_dist = max(0.0, t_center - dt);
 		}
 
-		r_light_dir = L;
-		r_light_dist = shadow_dist;
+		r_sample.direction = L;
+		r_sample.shadow_distance = shadow_dist;
+		r_sample.leg_distance = shadow_dist;
 
 		// Spot cone early-out.
 		float spot_atten = 1.0;
 		if (light.type == RT_LIGHT_TYPE_SPOT) {
 			float scos = dot(-L, light.spot_direction);
 			if (scos <= light.cos_spot_angle) {
-				return vec3(0.0);
+				return false;
 			}
 			float spot_rim = max(1e-4, (1.0 - scos) / (1.0 - light.cos_spot_angle));
 			spot_atten = 1.0 - pow(spot_rim, light.inv_spot_attenuation);
 		}
-
-		if (!lights_trace_shadow_ray(hit_pos, L, shadow_dist, rng_state)) {
-			return vec3(0.0);
-		}
-
-		// Evaluate BRDF (diffuse + specular separately for specular_amount control).
-		vec3 brdf_diffuse, brdf_specular;
-		evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular);
 
 		// Distance attenuation.
 		LightSample ls_atten;
 		ls_atten.distance_sq = dist_sq;
 		float atten = lights_get_attenuation(ls_atten, light.inv_max_range, light.attenuation) * spot_atten;
 
-		float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
-		vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul;
-
-		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
-
-		// NdotL is already included in brdf_value (evalLambertian/evalMicrofacet bake it in).
-		vec3 contribution = brdf_value * light.emission * atten * indirect_mul;
-		return contribution / max(light_select_pdf, 1e-10);
+		r_sample.radiance = light.emission * atten * indirect_mul;
+		return true;
 	}
 	// === CONE LIGHT PATH (directional) ===
 	else {
 		LightSample ls = lights_prepare_sample(hit_pos, light);
 		float light_pdf;
 		vec3 L = lights_sample_cone(ls, u, light_pdf);
-		r_light_dir = L;
-		r_light_dist = 1e30;
+		r_sample.direction = L;
+		r_sample.shadow_distance = ls.max_distance;
+		r_sample.leg_distance = 1e30;
 
 		float NdotL = dot(N, L);
 		if (NdotL <= 0.0) {
-			return vec3(0.0);
+			return false;
 		}
 
-		if (!lights_trace_shadow_ray(hit_pos, L, ls.max_distance, rng_state)) {
-			return vec3(0.0);
-		}
-
-		vec3 brdf_diffuse, brdf_specular;
-		evalCombinedBRDFSeparate(N, L, V, material, brdf_diffuse, brdf_specular);
-
-		float spec_mul = lights_get_specular_multiplier(light.specular_amount, material.roughness);
-		vec3 brdf_value = brdf_diffuse + brdf_specular * spec_mul;
-
-		float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
-
-		return brdf_value * light.emission * indirect_mul / max(light_select_pdf, 1e-10);
+		r_sample.radiance = light.emission * indirect_mul;
+		return true;
 	}
 }

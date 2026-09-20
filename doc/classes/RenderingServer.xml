@@ -1421,6 +1421,14 @@
 			<description>
 			</description>
 		</method>
+		<method name="environment_set_pathtracing_emissive_lights">
+			<return type="void" />
+			<param index="0" name="env" type="RID" />
+			<param index="1" name="enable" type="bool" />
+			<description>
+				Turns the path tracer's sampling of emissive surfaces as lights on or off for the specified environment RID. See [member Environment.pathtracing_emissive_lights].
+			</description>
+		</method>
 		<method name="environment_set_pathtracing_primary_surface">
 			<return type="void" />
 			<param index="0" name="env" type="RID" />

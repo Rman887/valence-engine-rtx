@@ -135,6 +135,9 @@ void RenderRaytracing::_free_viewport_state_internal(RTViewportState *p_state) {
 	if (p_state->motion_transform_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->motion_transform_buffer);
 	}
+	if (p_state->emissive_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->emissive_buffer);
+	}
 	if (p_state->light_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->light_buffer);
 	}
@@ -985,7 +988,9 @@ static void _fill_surface_geometry_data(
 	geom.tangent_stride = tangent_stride;
 	geom.flags = compressed ? RT_GEOM_FLAG_COMPRESSED : 0;
 
-	if (compressed) {
+	// The surface's box for every surface: the shader decodes compressed positions through it
+	// (gated on the flag) and the emissive gather (D50) reads it as an area proxy for both.
+	{
 		AABB surface_aabb = mesh_storage->mesh_surface_get_aabb(p_mesh_surface);
 		geom.aabb_size_x = surface_aabb.size.x;
 		geom.aabb_size_y = surface_aabb.size.y;
@@ -993,13 +998,6 @@ static void _fill_surface_geometry_data(
 		geom.aabb_pos_x = surface_aabb.position.x;
 		geom.aabb_pos_y = surface_aabb.position.y;
 		geom.aabb_pos_z = surface_aabb.position.z;
-	} else {
-		geom.aabb_size_x = 1.0f;
-		geom.aabb_size_y = 1.0f;
-		geom.aabb_size_z = 1.0f;
-		geom.aabb_pos_x = 0.0f;
-		geom.aabb_pos_y = 0.0f;
-		geom.aabb_pos_z = 0.0f;
 	}
 
 	// Attribute buffer layout
@@ -1545,6 +1543,15 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat.flags |= RT_MAT_FLAG_EMISSION_MULTIPLY;
 	}
 
+	// An emissive mesh light (D50): a constant, untextured, non-zero emission the trace can sample
+	// without evaluating the material. A textured emission varies over the surface and a custom
+	// shader's is unknown until it runs, so neither is listed; nor is the Multiply operator
+	// without a texture, whose hit-side emission is the colour times a black default.
+	if (!mat_data->is_custom_shader && mat.emission_strength > 0.0f && !(mat.flags & (RT_MAT_FLAG_HAS_EMISSION_TEX | RT_MAT_FLAG_EMISSION_MULTIPLY)) &&
+			(mat.emission_color[0] > 0.0f || mat.emission_color[1] > 0.0f || mat.emission_color[2] > 0.0f)) {
+		mat.flags |= RT_MAT_FLAG_EMISSIVE_CONSTANT;
+	}
+
 	// UV1 scale and offset (vec3 in Godot, we only use xy).
 	Variant uv1_scale_var = material_storage->material_get_param(p_material_rid, "uv1_scale");
 	if (uv1_scale_var.get_type() == Variant::VECTOR3) {
@@ -1669,6 +1676,7 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		uint32_t p_mm_count,
 		uint32_t p_surface_index,
 		uint32_t p_surface_counter,
+		const AABB &p_mm_aabb,
 		RD::ComputeListID p_compute_list,
 		LocalVector<RID> &r_dirty_blas_list,
 		LocalVector<RID> &r_dirty_blas_update_list,
@@ -2019,6 +2027,14 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	geom.vertex_count = p_mm_count * vertex_count;
 	geom.position_stride = 12; // float3, uncompressed
 	geom.flags &= ~RT_GEOM_FLAG_COMPRESSED;
+	// The merged buffer spans every instance, so its box is the MultiMesh's own (the emissive gather's area proxy, D50),
+	// read in Phase 1 because fetching it may flush dirty multimesh buffers, which the open compute list forbids.
+	geom.aabb_size_x = p_mm_aabb.size.x;
+	geom.aabb_size_y = p_mm_aabb.size.y;
+	geom.aabb_size_z = p_mm_aabb.size.z;
+	geom.aabb_pos_x = p_mm_aabb.position.x;
+	geom.aabb_pos_y = p_mm_aabb.position.y;
+	geom.aabb_pos_z = p_mm_aabb.position.z;
 
 	// TBN section starts after all positions in the merged vertex buffer.
 	if (has_tbn) {
@@ -2130,6 +2146,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		RTMaterialData *mat_data;
 		uint32_t inst_flags;
 		uint8_t inst_mask;
+		AABB mm_aabb;
 	};
 	LocalVector<PendingMMSurface> pending_mm_surfaces;
 
@@ -2326,6 +2343,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				pending.mat_data = mat_data;
 				pending.inst_flags = inst_flags;
 				pending.inst_mask = RT_INSTANCE_MASK_GEOMETRY | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0);
+				pending.mm_aabb = mesh_storage->_multimesh_get_aabb(mm_rid);
 				pending_mm_surfaces.push_back(pending);
 
 				mm_surf = mm_surf->next;
@@ -2506,7 +2524,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		RTSurfaceData merged_sd;
 		bool use_merged = pending.mm_gpu_buffer.is_valid() &&
 				_build_merged_mm_blas(pending.mm_rid, pending.mm_gpu_buffer, pending.mesh_surface,
-						pending.mm_count, pending.surface_index, pending.surface_counter,
+						pending.mm_count, pending.surface_index, pending.surface_counter, pending.mm_aabb,
 						compute_list, dirty_blas_list, dirty_blas_update_list, &merged_sd);
 
 		if (use_merged) {
@@ -2636,7 +2654,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 // Light gathering
 // ---------------------------------------------------------------------------
 
-uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, const Vector3 &p_origin) {
+uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, const Vector3 &p_origin, float &r_score_sum) {
+	r_score_sum = 0.0f;
 	uint32_t rt_light_count = 0;
 
 	if (!p_render_data || !p_render_data->lights) {
@@ -2672,6 +2691,7 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 	struct LightScore {
 		RID light_instance;
 		float score;
+		float share; // The light's weight in the split between the analytic and the emissive list (D50).
 	};
 
 	LocalVector<LightScore> positional_lights;
@@ -2709,6 +2729,11 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		LightScore ls_entry = {};
 		ls_entry.light_instance = light_instance;
 		ls_entry.score = score;
+		// The share in the split with the emissive list (D50): the irradiance at the camera in the
+		// shader's units, unlike the score above, which is a ranking with a range preference.
+		Color linear_col = color.srgb_to_linear();
+		float lum_linear = linear_col.r * 0.2126f + linear_col.g * 0.7152f + linear_col.b * 0.0722f;
+		ls_entry.share = compute_light_energy(base, ls->light_get_type(base)) * lum_linear / dist_sq;
 		positional_lights.push_back(ls_entry);
 	};
 
@@ -2737,6 +2762,9 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		ld.emission[0] = linear_col.r * energy;
 		ld.emission[1] = linear_col.g * energy;
 		ld.emission[2] = linear_col.b * energy;
+		// Its share of the light samples (D50): the irradiance it delivers at the camera, in the
+		// units the emissive list scores in (the same energy and exposure the shader multiplies).
+		r_score_sum += (linear_col.r * 0.2126f + linear_col.g * 0.7152f + linear_col.b * 0.0722f) * energy;
 		ld.radius = Math::deg_to_rad(ls->light_get_param(base, RSE::LIGHT_PARAM_SIZE) * 0.5f); // Half-angle in radians.
 		ld.attenuation = 0.0f; // No distance attenuation.
 		ld.inv_max_range = -1.0f; // Infinite range.
@@ -2770,6 +2798,7 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 	// Fill remaining slots with top positional lights.
 	for (uint32_t i = 0; i < positional_lights.size() && rt_light_count < p_max_lights; i++) {
 		RID light_instance = positional_lights[i].light_instance;
+		r_score_sum += positional_lights[i].share;
 		RID base = ls->light_instance_get_base_light(light_instance);
 		RSE::LightType type = ls->light_get_type(base);
 
@@ -2818,6 +2847,120 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 	}
 
 	return rt_light_count;
+}
+
+// ---------------------------------------------------------------------------
+// Emissive mesh lights (D50)
+// ---------------------------------------------------------------------------
+
+/// Lists the frame's emissive mesh lights from the TLAS instances build_tlas just pushed: every
+/// triangle instance on the standard hit group whose material carries RT_MAT_FLAG_EMISSIVE_CONSTANT.
+/// The selection weight is the emission's luminance times an area proxy, half the surface area of
+/// the instance's box in the trace (a quad reads about its area, a sphere within a factor of two);
+/// it only shapes the importance, since the shader divides by the probability the CDF assigns.
+/// Over the cap the entries weighted nearest the camera are kept; the list is sorted by instance
+/// index so a hit can find its entry by binary search.
+uint32_t RenderRaytracing::gather_emissive(const RenderDataRD *p_render_data, const RTViewportState *p_state, RT_EmissiveInstance *r_emissive_data, uint32_t p_max_emissive, float &r_score_sum) {
+	r_score_sum = 0.0f;
+	if (!p_render_data || !p_render_data->scene_data) {
+		return 0;
+	}
+
+	LocalVector<EmissiveCandidate> &candidates = emissive_candidates;
+	candidates.clear();
+	const Vector3 cam_pos = p_render_data->scene_data->cam_transform.origin - p_state->rt_origin;
+	// The shader scales emission by the exposure normalisation; the split's shares must too.
+	float exposure = p_render_data->camera_attributes.is_valid() ? RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes) : 1.0f;
+
+	for (uint32_t i = 0; i < blass.size(); i++) {
+		if (i >= material_data.size() || i >= geometry_data.size() || i >= sbt_offsets.size() || i >= instance_flags.size()) {
+			break;
+		}
+		const RT_MaterialData &mat = material_data[i];
+		const RT_GeometryData &geom = geometry_data[i];
+		if (!(mat.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT) || sbt_offsets[i] != 0 || (geom.flags & RT_GEOM_FLAG_PROCEDURAL) || geom.primitive_count == 0) {
+			continue;
+		}
+		if (!(instance_flags[i] & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT)) {
+			// An alpha-tested or blended emitter's any-hit skips texels a sampled point would credit; it keeps chance-hit emission.
+			continue;
+		}
+		// The instance transform already folds a compressed surface's box in (its positions are then a unit cube).
+		AABB local_box = (geom.flags & RT_GEOM_FLAG_COMPRESSED) ? AABB(Vector3(), Vector3(1, 1, 1)) : AABB(Vector3(geom.aabb_pos_x, geom.aabb_pos_y, geom.aabb_pos_z), Vector3(geom.aabb_size_x, geom.aabb_size_y, geom.aabb_size_z));
+		Transform3D relative = blas_transforms[i];
+		relative.origin -= p_state->rt_origin;
+		AABB box = relative.xform(local_box);
+		const Vector3 &sz = box.size;
+		float area_proxy = (float)(sz.x * sz.y + sz.y * sz.z + sz.z * sz.x); // Half the box's surface area.
+		float lum = (0.2126f * mat.emission_color[0] + 0.7152f * mat.emission_color[1] + 0.0722f * mat.emission_color[2]) * mat.emission_strength;
+		float weight = lum * area_proxy;
+		if (!(weight > 0.0f)) {
+			continue;
+		}
+		float dist_sq = (float)(box.get_center() - cam_pos).length_squared();
+		EmissiveCandidate c;
+		c.index = i;
+		c.weight = weight;
+		c.score = weight * exposure / (dist_sq + area_proxy);
+		candidates.push_back(c);
+	}
+
+	if (candidates.size() > p_max_emissive) {
+		struct ScoreComparator {
+			bool operator()(const EmissiveCandidate &a, const EmissiveCandidate &b) const {
+				return a.score > b.score;
+			}
+		};
+		candidates.sort_custom<ScoreComparator>();
+		candidates.resize(p_max_emissive);
+	}
+	struct IndexComparator {
+		bool operator()(const EmissiveCandidate &a, const EmissiveCandidate &b) const {
+			return a.index < b.index;
+		}
+	};
+	candidates.sort_custom<IndexComparator>();
+
+	double total = 0.0;
+	for (const EmissiveCandidate &c : candidates) {
+		total += c.weight;
+		r_score_sum += c.score;
+	}
+	if (!(total > 0.0)) {
+		return 0;
+	}
+
+	double running = 0.0;
+	uint32_t count = candidates.size();
+	for (uint32_t n = 0; n < count; n++) {
+		const EmissiveCandidate &c = candidates[n];
+		RT_EmissiveInstance &e = r_emissive_data[n];
+		Transform3D relative = blas_transforms[c.index];
+		relative.origin -= p_state->rt_origin;
+		RendererRD::MaterialStorage::store_transform_transposed_3x4(relative, e.xform);
+		const RT_MaterialData &mat = material_data[c.index];
+		e.radiance[0] = mat.emission_color[0] * mat.emission_strength;
+		e.radiance[1] = mat.emission_color[1] * mat.emission_strength;
+		e.radiance[2] = mat.emission_color[2] * mat.emission_strength;
+		running += c.weight;
+		e.cdf = (n + 1 == count) ? 1.0f : (float)(running / total);
+		e.instance_index = c.index;
+		e.primitive_count = geometry_data[c.index].primitive_count;
+		e.flags = 0;
+		if (instance_flags[c.index] & RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT) {
+			e.flags |= RT_EMISSIVE_FLAG_TWO_SIDED;
+		}
+		if (instance_flags[c.index] & RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT) {
+			e.flags |= RT_EMISSIVE_FLAG_FLIP_FACING;
+		}
+		if (relative.basis.determinant() < 0.0) {
+			// The hardware decides the facing from the object-space winding; the sampler's normal is
+			// world-space, which a mirroring transform flips.
+			e.flags ^= RT_EMISSIVE_FLAG_FLIP_FACING;
+		}
+		e.pdf = (float)(c.weight / total);
+	}
+	return count;
 }
 
 // ---------------------------------------------------------------------------
@@ -3053,7 +3196,8 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		uint32_t rt_light_count = 0;
 		RT_LightData rt_light_data[RT_LIGHTS_MAX] = {};
 
-		rt_light_count = gather_lights(p_render_data, rt_light_data, RT_LIGHTS_MAX, p_state->rt_origin);
+		float light_score_sum = 0.0f;
+		rt_light_count = gather_lights(p_render_data, rt_light_data, RT_LIGHTS_MAX, p_state->rt_origin, light_score_sum);
 
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_LIGHT_COUNT] = float(rt_light_count);
 
@@ -3065,6 +3209,45 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 				RD::get_singleton()->set_resource_name(p_state->light_buffer, "RT Light Buffer");
 			}
 			RD::get_singleton()->buffer_update(p_state->light_buffer, 0, buf_size, rt_light_data);
+		}
+
+		// --- Emissive mesh lights (D50) ---
+		{
+			bool emissive_enabled = true;
+			if (p_render_data && p_render_data->environment.is_valid()) {
+				emissive_enabled = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_emissive_lights(p_render_data->environment);
+			}
+			uint32_t buf_size = RT_EMISSIVE_MAX * sizeof(RT_EmissiveInstance);
+			if (!p_state->emissive_buffer.is_valid()) {
+				p_state->emissive_buffer = RD::get_singleton()->storage_buffer_create(buf_size);
+				RD::get_singleton()->set_resource_name(p_state->emissive_buffer, "RT Emissive Buffer");
+			}
+			uint32_t rt_emissive_count = 0;
+			float emissive_score_sum = 0.0f;
+			if (emissive_enabled) {
+				if (emissive_scratch.size() < RT_EMISSIVE_MAX) {
+					emissive_scratch.resize(RT_EMISSIVE_MAX);
+				}
+				rt_emissive_count = gather_emissive(p_render_data, p_state, emissive_scratch.ptr(), RT_EMISSIVE_MAX, emissive_score_sum);
+				if (rt_emissive_count > 0) {
+					RD::get_singleton()->buffer_update(p_state->emissive_buffer, 0, rt_emissive_count * sizeof(RT_EmissiveInstance), emissive_scratch.ptr());
+				}
+			}
+
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_EMISSIVE_COUNT] = float(rt_emissive_count);
+			// One light sample per hit (D50): the share that goes to the emissive list follows the two
+			// lists' summed camera-weighted scores, clamped so neither strategy starves. Any share in
+			// (0, 1) is unbiased; the split only moves the noise between the two kinds of light.
+			float emissive_probability = 0.0f;
+			if (rt_emissive_count > 0) {
+				emissive_probability = (rt_light_count > 0) ? CLAMP(emissive_score_sum / MAX(emissive_score_sum + light_score_sum, 1.0e-20f), 0.1f, 0.9f) : 1.0f;
+			}
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_EMISSIVE_PROBABILITY] = emissive_probability;
+			if (rt_emissive_count != p_state->emissive_count_logged) {
+				// Once per change, so a run's log shows whether the list was ever non-empty and its share.
+				print_line(vformat("Path tracer: %d emissive instance(s) sampled as lights, share %.2f of the light samples.", rt_emissive_count, emissive_probability));
+				p_state->emissive_count_logged = rt_emissive_count;
+			}
 		}
 
 		if (!p_state->params_buffer.is_valid()) {
@@ -3243,6 +3426,19 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		// The same stand-in the raster binds when a frame carries no froxel volume; neither samples
 		// it, since both gate on the volume existing first.
 		u.append_id(fog_map.is_valid() ? fog_map : RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_3D_WHITE));
+		uniforms.push_back(u);
+	}
+
+	// Binding 42: the emissive mesh lights (D50).
+	{
+		RD::Uniform u;
+		u.binding = 42;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		if (p_state->emissive_buffer.is_valid()) {
+			u.append_id(p_state->emissive_buffer);
+		} else {
+			u.append_id(RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer());
+		}
 		uniforms.push_back(u);
 	}
 

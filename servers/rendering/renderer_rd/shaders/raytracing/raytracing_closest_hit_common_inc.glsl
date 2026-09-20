@@ -26,6 +26,7 @@
 HitData compute_hit_data() {
 	HitData h;
 	h.geometry_idx = gl_InstanceCustomIndexEXT;
+	h.primitive_id = gl_PrimitiveID;
 	GeometryData geom = geometries[h.geometry_idx];
 
 	// Custom hit groups may reference vertex color in their fragment code, so

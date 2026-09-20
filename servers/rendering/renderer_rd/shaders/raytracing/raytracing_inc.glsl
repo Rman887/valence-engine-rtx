@@ -26,12 +26,16 @@
 #define RT_PARAM_VFOG_INV_SPREAD 7 // rt_params[1].w - 1 / volumetric_fog_detail_spread
 #define RT_PARAM_VFOG_SKY_AFFECT 8 // rt_params[2].x - volumetric_fog_sky_affect
 #define RT_PARAM_HAS_PROCEDURAL_INSTANCES 9 // rt_params[2].y - TLAS contains procedural geometry
-// Indices 10-13 reserved for future use
+// Emissive mesh lights (D50): the count of instances in the emissive buffer, 0 when the
+// Environment turns the sampling off or no eligible instance was submitted.
+#define RT_PARAM_EMISSIVE_COUNT 10 // rt_params[2].z
+#define RT_PARAM_EMISSIVE_PROBABILITY 11 // rt_params[2].w - Share of light samples sent to the emissive list
+// Indices 12-13 reserved for future use
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation
 
 // ============================================================================
-// PATHTRACING PAYLOAD (48 bytes, fp16/unorm-packed)
+// PATHTRACING PAYLOAD (52 bytes, fp16/unorm-packed)
 // ============================================================================
 // Radiance (r) and throughput (T) interleaved as fp16 into 3 uints:
 //   [0]=rg, [1]=bR, [2]=GB  (packHalf2x16 pairs).
@@ -54,7 +58,13 @@ struct PathPayload {
 	// path entered through, which stands for the medium's top when a light's leg is charged.
 	uint packed_medium[3]; // 12 bytes - absorption.rg | absorption.b, inscatter.r | inscatter.gb
 	float medium_entry_height; //  4 bytes
+	// The density with which the last scatter chose the ray's direction (D50), so the next hit can
+	// weigh the emission it finds against the emissive light sampling that competes for it;
+	// RT_BSDF_PDF_DELTA for a lobe light sampling can never hit (a mirror, a refraction).
+	float bsdf_pdf; //  4 bytes
 };
+
+const float RT_BSDF_PDF_DELTA = -1.0;
 
 /// Unpacked fp32 working copy of the payload.
 struct PathState {
@@ -68,6 +78,7 @@ struct PathState {
 	vec3 medium_absorption;
 	vec3 medium_inscatter;
 	float medium_entry_height;
+	float bsdf_pdf;
 };
 
 PathState path_unpack(PathPayload p) {
@@ -88,6 +99,7 @@ PathState path_unpack(PathPayload p) {
 	s.medium_absorption = max(vec3(ab.x, ab.y, bi.x), vec3(0.0));
 	s.medium_inscatter = max(vec3(bi.y, gb.x, gb.y), vec3(0.0));
 	s.medium_entry_height = p.medium_entry_height;
+	s.bsdf_pdf = p.bsdf_pdf;
 	return s;
 }
 
@@ -109,6 +121,7 @@ void path_pack(inout PathPayload p, PathState s) {
 	p.packed_medium[1] = packHalf2x16(vec2(a.b, i.r));
 	p.packed_medium[2] = packHalf2x16(vec2(i.g, i.b));
 	p.medium_entry_height = s.medium_entry_height;
+	p.bsdf_pdf = s.bsdf_pdf;
 }
 
 /// A path state with no medium: the fields every fresh path (a sample's start, a shadow ray)

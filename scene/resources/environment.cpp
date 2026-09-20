@@ -659,6 +659,15 @@ RSE::PathtracingPrimarySurface Environment::get_pathtracing_primary_surface() co
 	return pathtracing_primary_surface;
 }
 
+void Environment::set_pathtracing_emissive_lights(bool p_enabled) {
+	pathtracing_emissive_lights = p_enabled;
+	RS::get_singleton()->environment_set_pathtracing_emissive_lights(environment, pathtracing_emissive_lights);
+}
+
+bool Environment::is_pathtracing_emissive_lights() const {
+	return pathtracing_emissive_lights;
+}
+
 void Environment::_update_pathtracing() {
 	RS::get_singleton()->environment_set_pathtracing(
 			environment,
@@ -1557,6 +1566,8 @@ void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pathtracing_denoiser"), &Environment::get_pathtracing_denoiser);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_primary_surface", "primary_surface"), &Environment::set_pathtracing_primary_surface);
 	ClassDB::bind_method(D_METHOD("get_pathtracing_primary_surface"), &Environment::get_pathtracing_primary_surface);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_emissive_lights", "enabled"), &Environment::set_pathtracing_emissive_lights);
+	ClassDB::bind_method(D_METHOD("is_pathtracing_emissive_lights"), &Environment::is_pathtracing_emissive_lights);
 	GLOBAL_DEF("rendering/pathtracing/use_simple_shadows", false);
 
 	ADD_GROUP("Pathtracing", "pathtracing_");
@@ -1566,6 +1577,7 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_max_bounces", PROPERTY_HINT_RANGE, "1,8,1"), "set_pathtracing_max_bounces", "get_pathtracing_max_bounces");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_denoiser", PROPERTY_HINT_ENUM, "None,DLSS Ray Reconstruction"), "set_pathtracing_denoiser", "get_pathtracing_denoiser");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_primary_surface", PROPERTY_HINT_ENUM, "G-Buffer,Traced"), "set_pathtracing_primary_surface", "get_pathtracing_primary_surface");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_emissive_lights"), "set_pathtracing_emissive_lights", "is_pathtracing_emissive_lights");
 
 	// Camera medium
 

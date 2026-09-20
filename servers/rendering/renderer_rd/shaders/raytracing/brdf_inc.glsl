@@ -1096,6 +1096,42 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 #endif
 }
 
+// The probability with which the scatter in shade_and_bounce picks the specular lobe over the
+// diffuse one: the luminance split, 1 when the diffuse lobe is dark and 0 when the specular one is
+// (no random number is drawn in either case). One function so the density below matches the choice.
+float brdfSpecularProbability(float3 specularF0, float3 diffuseReflectance) {
+	float specularLum = luminance(specularF0);
+	float diffuseLum = luminance(diffuseReflectance);
+	if (diffuseLum < 0.0001f) {
+		return 1.0f;
+	}
+	if (specularLum < 0.0001f) {
+		return 0.0f;
+	}
+	return clamp(specularLum / (specularLum + diffuseLum), 0.01f, 0.99f);
+}
+
+// The density (per solid angle) with which the scatter in shade_and_bounce produces L from V: the
+// lobe probability above times the cosine density of the diffuse lobe and the reflection density
+// of the specular sampler (specularPdf). A zero-roughness specular lobe is a delta and adds no
+// density here; the scatter reports RT_BSDF_PDF_DELTA for it instead. Emissive light sampling
+// weighs its samples against this (D50), so it must describe the sampler exactly.
+float brdf_pdf(float3 N, float3 L, float3 V, MaterialProperties material) {
+	const BrdfData data = prepareBRDFData(N, L, V, material);
+	if (data.Vbackfacing || data.Lbackfacing) {
+		return 0.0f;
+	}
+	float specularProbability = brdfSpecularProbability(data.specularF0, data.diffuseReflectance);
+	float pdf = 0.0f;
+	if (specularProbability < 1.0f) {
+		pdf += (1.0f - specularProbability) * diffusePdf(data.NdotL);
+	}
+	if (specularProbability > 0.0f && data.alpha > 0.0f) {
+		pdf += specularProbability * specularPdf(data.alpha, data.alphaSquared, data.NdotH, data.NdotV, data.LdotH);
+	}
+	return pdf;
+}
+
 // This is an entry point for evaluation of all other BRDFs based on selected configuration (for indirect light)
 bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNormal, float3 V, MaterialProperties material, const int brdfType, OUT_PARAMETER(float3) rayDirection, OUT_PARAMETER(float3) sampleWeight, float4 debug) {
 	// Ignore incident ray coming from "below" the hemisphere

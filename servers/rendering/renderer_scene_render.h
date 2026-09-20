@@ -256,6 +256,7 @@ public:
 	// Pathtracing
 	void environment_set_pathtracing(RID p_env, bool p_enable, int p_debug_mode, int p_samples_per_pixel, int p_max_bounces, RSE::PathtracingDenoiser p_denoiser);
 	void environment_set_pathtracing_primary_surface(RID p_env, RSE::PathtracingPrimarySurface p_primary_surface);
+	void environment_set_camera_medium(RID p_env, bool p_enable, const Color &p_absorption, const Color &p_scattering, float p_height);
 	bool environment_get_pathtracing_enabled(RID p_env) const;
 	int environment_get_pathtracing_debug_mode(RID p_env) const;
 	int environment_get_pathtracing_samples_per_pixel(RID p_env) const;

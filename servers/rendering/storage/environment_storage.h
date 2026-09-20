@@ -180,6 +180,12 @@ private:
 		RSE::PathtracingDenoiser pathtracing_denoiser = RSE::PT_DENOISER_NONE;
 		RSE::PathtracingPrimarySurface pathtracing_primary_surface = RSE::PT_PRIMARY_SURFACE_GBUFFER;
 
+		// Camera medium (the path tracer, D49)
+		bool camera_medium_enabled = false;
+		Color camera_medium_absorption = Color(0.30, 0.08, 0.04);
+		Color camera_medium_scattering = Color(0.1, 0.4, 0.45);
+		float camera_medium_height = 0.0;
+
 		// Adjustments
 		bool adjustments_enabled = false;
 		float adjustments_brightness = 1.0f;
@@ -341,6 +347,13 @@ public:
 	int environment_get_pathtracing_max_bounces(RID p_env) const;
 	RSE::PathtracingDenoiser environment_get_pathtracing_denoiser(RID p_env) const;
 	RSE::PathtracingPrimarySurface environment_get_pathtracing_primary_surface(RID p_env) const;
+
+	// Camera medium
+	void environment_set_camera_medium(RID p_env, bool p_enable, const Color &p_absorption, const Color &p_scattering, float p_height);
+	bool environment_get_camera_medium_enabled(RID p_env) const;
+	Color environment_get_camera_medium_absorption(RID p_env) const;
+	Color environment_get_camera_medium_scattering(RID p_env) const;
+	float environment_get_camera_medium_height(RID p_env) const;
 
 	// Adjustment
 	void environment_set_adjustment(RID p_env, bool p_enable, float p_brightness, float p_contrast, float p_saturation, bool p_use_1d_color_correction, RID p_color_correction);

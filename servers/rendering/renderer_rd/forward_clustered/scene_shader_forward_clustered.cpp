@@ -582,8 +582,8 @@ void SceneShaderForwardClustered::ShaderData::_create_pipeline(PipelineKey p_pip
 				blend_state = RD::PipelineColorBlendState::create_disabled(5);
 				break;
 			case PIPELINE_VERSION_GBUFFER_PASS:
-				// Five G-buffer targets and the motion vector, all opaque.
-				blend_state = RD::PipelineColorBlendState::create_disabled(6);
+				// The G-buffer targets and the motion vector, all opaque.
+				blend_state = RD::PipelineColorBlendState::create_disabled(RenderForwardClustered::RenderBufferDataForwardClustered::GBUFFER_TARGETS + 1);
 				break;
 			case PIPELINE_VERSION_DEPTH_PASS:
 			case PIPELINE_VERSION_DEPTH_PASS_DP:
@@ -889,6 +889,8 @@ void SceneShaderForwardClustered::init(const String p_defines) {
 		actions.renames["BACKLIGHT"] = "backlight";
 		actions.renames["TRANSMISSION"] = "transmission";
 		actions.renames["IOR"] = "ior";
+		actions.renames["ABSORPTION"] = "absorption";
+		actions.renames["SCATTERING"] = "scattering";
 		actions.renames["AO"] = "ao";
 		actions.renames["AO_LIGHT_AFFECT"] = "ao_light_affect";
 		actions.renames["EMISSION"] = "emission";

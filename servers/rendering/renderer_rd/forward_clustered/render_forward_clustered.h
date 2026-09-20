@@ -180,8 +180,8 @@ public:
 		static uint32_t get_normal_roughness_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
 		static RD::DataFormat get_voxelgi_format();
 		static uint32_t get_voxelgi_usage_bits(bool p_resolve, bool p_msaa, bool p_storage);
-		// The path tracer's G-buffer primary surface (RenderForwardClusteredPT): five single-sample targets.
-		static constexpr int GBUFFER_TARGETS = 5;
+		// The path tracer's G-buffer primary surface (RenderForwardClusteredPT): seven single-sample targets.
+		static constexpr int GBUFFER_TARGETS = 7;
 		static RD::DataFormat get_gbuffer_format();
 		static uint32_t get_gbuffer_usage_bits();
 	};

@@ -493,10 +493,11 @@ public:
 	bool rt_has_depth_texture(RenderSceneBuffersRD *p_render_buffers) const;
 	RID rt_get_depth_texture(RenderSceneBuffersRD *p_render_buffers) const;
 
-	// The G-buffer primary surface: five RGBA16F targets the scene shader's G-buffer variant writes
-	// (albedo + specular, normal + roughness, geometry normal + metallic, emission + IOR, transmission + flags),
-	// rasterized with the render buffers' velocity and depth, read by the raygen.
-	static constexpr int RT_GBUFFER_TARGETS = 5; // Pinned to RenderBufferDataForwardClustered::GBUFFER_TARGETS in the source.
+	// The G-buffer primary surface: seven RGBA16F targets the scene shader's G-buffer variant writes
+	// (albedo + specular, normal + roughness, geometry normal + metallic, emission + IOR, transmission + flags,
+	// the medium's absorption and scattering), rasterized with the render buffers' velocity and depth,
+	// read by the raygen.
+	static constexpr int RT_GBUFFER_TARGETS = 7; // Pinned to RenderBufferDataForwardClustered::GBUFFER_TARGETS in the source.
 	static StringName rt_gbuffer_texture_name(int p_target);
 	void rt_ensure_gbuffer_textures(RenderSceneBuffersRD *p_render_buffers);
 	void rt_free_gbuffer_textures(RenderSceneBuffersRD *p_render_buffers);

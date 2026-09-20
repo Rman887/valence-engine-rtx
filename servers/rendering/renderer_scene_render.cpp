@@ -717,6 +717,10 @@ void RendererSceneRender::environment_set_pathtracing_primary_surface(RID p_env,
 	environment_storage.environment_set_pathtracing_primary_surface(p_env, p_primary_surface);
 }
 
+void RendererSceneRender::environment_set_camera_medium(RID p_env, bool p_enable, const Color &p_absorption, const Color &p_scattering, float p_height) {
+	environment_storage.environment_set_camera_medium(p_env, p_enable, p_absorption, p_scattering, p_height);
+}
+
 bool RendererSceneRender::environment_get_pathtracing_enabled(RID p_env) const {
 	return environment_storage.environment_get_pathtracing_enabled(p_env);
 }

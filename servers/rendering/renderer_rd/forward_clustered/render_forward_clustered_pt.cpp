@@ -356,7 +356,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		_process_compositor_effects(RSE::COMPOSITOR_EFFECT_CALLBACK_TYPE_PRE_OPAQUE, p_render_data);
 	}
 
-	// The G-buffer pass: the opaque list into the five G-buffer targets, the velocity buffer and
+	// The G-buffer pass: the opaque list into the seven G-buffer targets, the velocity buffer and
 	// the depth buffer, with the lights, decals and cluster of the frame bound (decals land in
 	// the G-buffer). The raygen then starts every path from that surface.
 	if (use_gbuffer && rb_data.is_valid() && raytracing && raytracing->get_shader()) {

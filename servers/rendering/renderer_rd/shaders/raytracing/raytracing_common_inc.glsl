@@ -42,6 +42,11 @@ layout(set = 0, binding = 6, std140) uniform RaytracingParams {
 	mat4 curr_vp_unjittered;
 	// World-space anchor the trace is relative to (camera-relative tracing).
 	vec4 rt_origin;
+	// The medium the camera is inside of (Environment.camera_medium_*, D49): the per-metre
+	// extinction with 1 in w while enabled, and the single-scatter colour with the medium's top
+	// (trace space) in w.
+	vec4 camera_medium_absorption;
+	vec4 camera_medium_scatter;
 };
 
 float get_rt_param(uint idx) {

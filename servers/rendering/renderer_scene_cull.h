@@ -1388,6 +1388,7 @@ public:
 	// Pathtracing
 	PASS6(environment_set_pathtracing, RID, bool, int, int, int, RSE::PathtracingDenoiser)
 	PASS2(environment_set_pathtracing_primary_surface, RID, RSE::PathtracingPrimarySurface)
+	PASS5(environment_set_camera_medium, RID, bool, const Color &, const Color &, float)
 
 	PASS1RC(bool, environment_get_pathtracing_enabled, RID)
 	PASS1RC(int, environment_get_pathtracing_debug_mode, RID)

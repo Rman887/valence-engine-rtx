@@ -1345,6 +1345,17 @@
 				Sets the camera ID to be used as environment background.
 			</description>
 		</method>
+		<method name="environment_set_camera_medium">
+			<return type="void" />
+			<param index="0" name="env" type="RID" />
+			<param index="1" name="enable" type="bool" />
+			<param index="2" name="absorption" type="Color" />
+			<param index="3" name="scattering" type="Color" />
+			<param index="4" name="height" type="float" />
+			<description>
+				Sets the medium the path tracer's camera is inside of for the specified environment RID. See [member Environment.camera_medium_enabled].
+			</description>
+		</method>
 		<method name="environment_set_canvas_max_layer">
 			<return type="void" />
 			<param index="0" name="env" type="RID" />

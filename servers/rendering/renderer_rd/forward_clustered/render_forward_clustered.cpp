@@ -4794,7 +4794,7 @@ static RD::FramebufferFormatID _get_depth_framebuffer_format_for_pipeline(bool p
 	return RD::get_singleton()->framebuffer_format_create_multipass(Vector<RD::AttachmentFormat>(attachments), passes);
 }
 
-// The path tracer's G-buffer pass (RenderForwardClusteredPT): the five targets, the velocity
+// The path tracer's G-buffer pass (RenderForwardClusteredPT): the seven targets, the velocity
 // buffer and the depth buffer, single sample, one view; must match RenderRaytracing::rt_get_gbuffer_framebuffer.
 static RD::FramebufferFormatID _get_gbuffer_framebuffer_format_for_pipeline(bool p_can_be_storage) {
 	RD::AttachmentFormat attachment;

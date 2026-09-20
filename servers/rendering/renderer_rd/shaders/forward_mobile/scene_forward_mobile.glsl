@@ -1149,6 +1149,8 @@ void main() {
 	vec3 backlight_highp = vec3(0.0);
 	vec3 transmission = vec3(0.0); // Path tracer only; accepted and ignored here.
 	float ior = 1.5;
+	vec3 absorption = vec3(0.0);
+	vec3 scattering = vec3(0.0);
 	vec4 transmittance_color_highp = vec4(0.0);
 	float transmittance_depth_highp = 0.0;
 	float transmittance_boost_highp = 0.0;

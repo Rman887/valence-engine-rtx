@@ -950,6 +950,41 @@ RSE::PathtracingPrimarySurface RendererEnvironmentStorage::environment_get_patht
 	return env->pathtracing_primary_surface;
 }
 
+// Camera medium
+
+void RendererEnvironmentStorage::environment_set_camera_medium(RID p_env, bool p_enable, const Color &p_absorption, const Color &p_scattering, float p_height) {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL(env);
+	env->camera_medium_enabled = p_enable;
+	env->camera_medium_absorption = p_absorption;
+	env->camera_medium_scattering = p_scattering;
+	env->camera_medium_height = p_height;
+}
+
+bool RendererEnvironmentStorage::environment_get_camera_medium_enabled(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, false);
+	return env->camera_medium_enabled;
+}
+
+Color RendererEnvironmentStorage::environment_get_camera_medium_absorption(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, Color());
+	return env->camera_medium_absorption;
+}
+
+Color RendererEnvironmentStorage::environment_get_camera_medium_scattering(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, Color());
+	return env->camera_medium_scattering;
+}
+
+float RendererEnvironmentStorage::environment_get_camera_medium_height(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, 0.0f);
+	return env->camera_medium_height;
+}
+
 // Adjustments
 
 void RendererEnvironmentStorage::environment_set_adjustment(RID p_env, bool p_enable, float p_brightness, float p_contrast, float p_saturation, bool p_use_1d_color_correction, RID p_color_correction) {

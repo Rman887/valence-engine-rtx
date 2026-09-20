@@ -82,6 +82,22 @@
 		<member name="background_mode" type="int" setter="set_background" getter="get_background" enum="Environment.BGMode" default="0">
 			The background mode.
 		</member>
+		<member name="camera_medium_absorption" type="Color" setter="set_camera_medium_absorption" getter="get_camera_medium_absorption" default="Color(0.3, 0.08, 0.04, 1)">
+			The per-metre extinction of the medium the camera is inside of, per channel (the water's Beer-Lambert coefficients). Every path the tracer starts is charged with it over its segments until the path refracts out through a surface's back face.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] and [member camera_medium_enabled] are [code]true[/code].
+		</member>
+		<member name="camera_medium_enabled" type="bool" setter="set_camera_medium_enabled" getter="is_camera_medium_enabled" default="false">
+			If [code]true[/code], the path tracer starts every path inside a medium: the camera segment and every later one is charged with [member camera_medium_absorption] and adds [member camera_medium_scattering] until the path leaves through a refracting surface, and neither the Environment's fog nor the volumetric fog applies to the camera segment. Set by a water system while its camera is submerged. The same medium is what a surface's [code]ABSORPTION[/code] and [code]SCATTERING[/code] fragment built-ins describe from the other side.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code]; the rasterizer ignores it.
+		</member>
+		<member name="camera_medium_height" type="float" setter="set_camera_medium_height" getter="get_camera_medium_height" default="0.0">
+			The world-space height of the medium's top, the horizontal plane through which a light's leg to a lit surface inside the medium is charged.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] and [member camera_medium_enabled] are [code]true[/code].
+		</member>
+		<member name="camera_medium_scattering" type="Color" setter="set_camera_medium_scattering" getter="get_camera_medium_scattering" default="Color(0.1, 0.4, 0.45, 1)">
+			The single-scatter colour of the medium the camera is inside of, [code]0[/code] to [code]1[/code] per channel: the fraction of the light a white surface facing up would reflect that a segment in the medium adds in place of what it absorbed.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] and [member camera_medium_enabled] are [code]true[/code].
+		</member>
 		<member name="fog_aerial_perspective" type="float" setter="set_fog_aerial_perspective" getter="get_fog_aerial_perspective" default="0.0">
 			If set above [code]0.0[/code] (exclusive), blends between the fog's color and the color of the background [Sky], as read from the radiance cubemap. This has a small performance cost when set above [code]0.0[/code]. Must have [member background_mode] set to [constant BG_SKY].
 			This is useful to simulate [url=https://en.wikipedia.org/wiki/Aerial_perspective]aerial perspective[/url] in large scenes with low density fog. However, it is not very useful for high-density fog, as the sky will shine through. When set to [code]1.0[/code], the fog color comes completely from the [Sky]. If set to [code]0.0[/code], aerial perspective is disabled.

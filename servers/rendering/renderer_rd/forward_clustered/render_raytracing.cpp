@@ -209,8 +209,14 @@ StringName RenderRaytracing::rt_gbuffer_texture_name(int p_target) {
 			return SNAME("geo_normal_metallic");
 		case 3:
 			return SNAME("emission_ior");
-		default:
+		case 4:
 			return SNAME("transmission_flags");
+		case 5:
+			return SNAME("absorption");
+		case 6:
+			return SNAME("scattering");
+		default:
+			ERR_FAIL_V_MSG(StringName(), vformat("No G-buffer target %d.", p_target));
 	}
 }
 
@@ -240,7 +246,7 @@ RID RenderRaytracing::rt_get_gbuffer_framebuffer(RenderSceneBuffersRD *p_render_
 	ERR_FAIL_NULL_V(p_render_buffers, RID());
 	ERR_FAIL_COND_V(!rt_has_gbuffer_textures(p_render_buffers), RID());
 
-	// The five targets, then the velocity buffer the variant writes at location 5, on the
+	// The seven targets, then the velocity buffer the variant writes at location 7, on the
 	// single-sample depth buffer the raygen and DLSS read.
 	p_render_buffers->ensure_velocity();
 	RID velocity = p_render_buffers->get_velocity_buffer(false);
@@ -251,6 +257,8 @@ RID RenderRaytracing::rt_get_gbuffer_framebuffer(RenderSceneBuffersRD *p_render_
 			p_render_buffers->get_texture(RB_SCOPE_RT_GBUFFER, rt_gbuffer_texture_name(2)),
 			p_render_buffers->get_texture(RB_SCOPE_RT_GBUFFER, rt_gbuffer_texture_name(3)),
 			p_render_buffers->get_texture(RB_SCOPE_RT_GBUFFER, rt_gbuffer_texture_name(4)),
+			p_render_buffers->get_texture(RB_SCOPE_RT_GBUFFER, rt_gbuffer_texture_name(5)),
+			p_render_buffers->get_texture(RB_SCOPE_RT_GBUFFER, rt_gbuffer_texture_name(6)),
 			velocity, depth);
 }
 
@@ -2958,8 +2966,10 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			float prev_vp_unjittered[16];
 			float curr_vp_unjittered[16];
 			float rt_origin[4];
+			float camera_medium_absorption[4];
+			float camera_medium_scatter[4];
 		} rt_ubo = {};
-		static_assert(sizeof(rt_ubo) == 52 * sizeof(float));
+		static_assert(sizeof(rt_ubo) == 60 * sizeof(float));
 
 		if (p_render_data && p_render_data->environment.is_valid()) {
 			RendererEnvironmentStorage *env_storage = RendererEnvironmentStorage::get_singleton();
@@ -2968,6 +2978,25 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_SAMPLE_COUNT] = (float)env_storage->environment_get_pathtracing_samples_per_pixel(env);
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_MAX_BOUNCES] = (float)env_storage->environment_get_pathtracing_max_bounces(env);
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_DENOISER] = (float)(int)env_storage->environment_get_pathtracing_denoiser(env);
+
+			// The medium the camera is inside of (Environment.camera_medium_*, D49): the raygen seeds
+			// every path with it and composes no fog over the camera segment. Its top is handed over
+			// in trace space, relative to this frame's anchor, in double before the cast.
+			if (env_storage->environment_get_camera_medium_enabled(env)) {
+				// The absorption is a coefficient and goes up raw; the scattering is a colour and follows
+				// the Environment's convention (sRGB authored, linear uploaded), as the shader's
+				// source_color scatter_color does through the material packer.
+				Color absorption = env_storage->environment_get_camera_medium_absorption(env);
+				Color scattering = env_storage->environment_get_camera_medium_scattering(env).srgb_to_linear();
+				rt_ubo.camera_medium_absorption[0] = MAX(absorption.r, 0.0f);
+				rt_ubo.camera_medium_absorption[1] = MAX(absorption.g, 0.0f);
+				rt_ubo.camera_medium_absorption[2] = MAX(absorption.b, 0.0f);
+				rt_ubo.camera_medium_absorption[3] = 1.0f;
+				rt_ubo.camera_medium_scatter[0] = CLAMP(scattering.r, 0.0f, 1.0f);
+				rt_ubo.camera_medium_scatter[1] = CLAMP(scattering.g, 0.0f, 1.0f);
+				rt_ubo.camera_medium_scatter[2] = CLAMP(scattering.b, 0.0f, 1.0f);
+				rt_ubo.camera_medium_scatter[3] = (float)((real_t)env_storage->environment_get_camera_medium_height(env) - p_state->rt_origin.y);
+			}
 		}
 		// The frame decides (the Environment's choice, unless MSAA forced the traced primary ray).
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_PRIMARY_SURFACE] = p_primary_from_gbuffer ? (float)RSE::PT_PRIMARY_SURFACE_GBUFFER : (float)RSE::PT_PRIMARY_SURFACE_TRACED;
@@ -3179,15 +3208,16 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		uniforms.push_back(u);
 	}
 
-	// Bindings 33-38: the G-buffer primary surface and the depth it was rasterized with, read by
-	// the raygen when the frame shades from the G-buffer. The raygen declares them in every
-	// variant, so a traced frame binds black stand-ins.
+	// Bindings 33-38 and 40-41: the G-buffer primary surface and the depth it was rasterized with,
+	// read by the raygen when the frame shades from the G-buffer (the medium's two targets sit
+	// past the froxel at 39, D49). The raygen declares them in every variant, so a traced frame
+	// binds black stand-ins.
 	{
 		bool has_gbuffer = p_primary_from_gbuffer && rt_has_gbuffer_textures(rb);
 		RID black = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_BLACK);
 		for (int i = 0; i < RT_GBUFFER_TARGETS; i++) {
 			RD::Uniform u;
-			u.binding = 33 + i;
+			u.binding = i < 5 ? 33 + i : 40 + (i - 5);
 			u.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 			u.append_id(has_gbuffer ? rb->get_texture(RB_SCOPE_RT_GBUFFER, rt_gbuffer_texture_name(i)) : black);
 			uniforms.push_back(u);

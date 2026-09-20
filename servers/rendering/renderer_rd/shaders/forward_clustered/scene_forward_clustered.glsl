@@ -1074,8 +1074,10 @@ layout(location = 1) out vec4 gbuffer_normal_roughness;
 layout(location = 2) out vec4 gbuffer_geo_normal_metallic;
 layout(location = 3) out vec4 gbuffer_emission_ior;
 layout(location = 4) out vec4 gbuffer_transmission_flags;
+layout(location = 5) out vec4 gbuffer_absorption;
+layout(location = 6) out vec4 gbuffer_scattering;
 #ifdef MOTION_VECTORS
-layout(location = 5) out vec2 motion_vector;
+layout(location = 7) out vec2 motion_vector;
 #endif
 
 #elif defined(MODE_SEPARATE_SPECULAR)
@@ -1213,6 +1215,8 @@ void fragment_shader(in SceneData scene_data) {
 	vec3 backlight = vec3(0.0);
 	vec3 transmission = vec3(0.0); // Path tracer only (the hit shaders refract); accepted and ignored here.
 	float ior = 1.5;
+	vec3 absorption = vec3(0.0); // Path tracer only (the medium behind a refracting surface); accepted and ignored here.
+	vec3 scattering = vec3(0.0);
 	vec4 transmittance_color = vec4(0.0, 0.0, 0.0, 1.0);
 	float transmittance_depth = 0.0;
 	float transmittance_boost = 0.0;
@@ -3056,6 +3060,8 @@ void fragment_shader(in SceneData scene_data) {
 		gbuffer_geo_normal_metallic = vec4(normalize(view_to_world * gbuffer_geo_normal), metallic);
 		gbuffer_emission_ior = vec4(emission * scene_data.emissive_exposure_normalization, ior);
 		gbuffer_transmission_flags = vec4(clamp(transmission, vec3(0.0), vec3(1.0)), gl_FrontFacing ? 1.0 : 0.0);
+		gbuffer_absorption = vec4(max(absorption, vec3(0.0)), 0.0);
+		gbuffer_scattering = vec4(clamp(scattering, vec3(0.0), vec3(1.0)), 0.0);
 	}
 
 #else // MODE_RENDER_GBUFFER

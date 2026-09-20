@@ -669,6 +669,53 @@ void Environment::_update_pathtracing() {
 			pathtracing_denoiser);
 }
 
+// Camera medium
+
+void Environment::set_camera_medium_enabled(bool p_enabled) {
+	camera_medium_enabled = p_enabled;
+	_update_camera_medium();
+}
+
+bool Environment::is_camera_medium_enabled() const {
+	return camera_medium_enabled;
+}
+
+void Environment::set_camera_medium_absorption(const Color &p_absorption) {
+	camera_medium_absorption = p_absorption;
+	_update_camera_medium();
+}
+
+Color Environment::get_camera_medium_absorption() const {
+	return camera_medium_absorption;
+}
+
+void Environment::set_camera_medium_scattering(const Color &p_scattering) {
+	camera_medium_scattering = p_scattering;
+	_update_camera_medium();
+}
+
+Color Environment::get_camera_medium_scattering() const {
+	return camera_medium_scattering;
+}
+
+void Environment::set_camera_medium_height(float p_height) {
+	camera_medium_height = p_height;
+	_update_camera_medium();
+}
+
+float Environment::get_camera_medium_height() const {
+	return camera_medium_height;
+}
+
+void Environment::_update_camera_medium() {
+	RS::get_singleton()->environment_set_camera_medium(
+			environment,
+			camera_medium_enabled,
+			camera_medium_absorption,
+			camera_medium_scattering,
+			camera_medium_height);
+}
+
 // Glow
 
 void Environment::set_glow_enabled(bool p_enabled) {
@@ -1520,6 +1567,23 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_denoiser", PROPERTY_HINT_ENUM, "None,DLSS Ray Reconstruction"), "set_pathtracing_denoiser", "get_pathtracing_denoiser");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_primary_surface", PROPERTY_HINT_ENUM, "G-Buffer,Traced"), "set_pathtracing_primary_surface", "get_pathtracing_primary_surface");
 
+	// Camera medium
+
+	ClassDB::bind_method(D_METHOD("set_camera_medium_enabled", "enabled"), &Environment::set_camera_medium_enabled);
+	ClassDB::bind_method(D_METHOD("is_camera_medium_enabled"), &Environment::is_camera_medium_enabled);
+	ClassDB::bind_method(D_METHOD("set_camera_medium_absorption", "absorption"), &Environment::set_camera_medium_absorption);
+	ClassDB::bind_method(D_METHOD("get_camera_medium_absorption"), &Environment::get_camera_medium_absorption);
+	ClassDB::bind_method(D_METHOD("set_camera_medium_scattering", "scattering"), &Environment::set_camera_medium_scattering);
+	ClassDB::bind_method(D_METHOD("get_camera_medium_scattering"), &Environment::get_camera_medium_scattering);
+	ClassDB::bind_method(D_METHOD("set_camera_medium_height", "height"), &Environment::set_camera_medium_height);
+	ClassDB::bind_method(D_METHOD("get_camera_medium_height"), &Environment::get_camera_medium_height);
+
+	ADD_GROUP("Camera Medium", "camera_medium_");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "camera_medium_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_camera_medium_enabled", "is_camera_medium_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "camera_medium_absorption", PROPERTY_HINT_COLOR_NO_ALPHA), "set_camera_medium_absorption", "get_camera_medium_absorption");
+	ADD_PROPERTY(PropertyInfo(Variant::COLOR, "camera_medium_scattering", PROPERTY_HINT_COLOR_NO_ALPHA), "set_camera_medium_scattering", "get_camera_medium_scattering");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "camera_medium_height", PROPERTY_HINT_RANGE, "-1024,1024,0.01,or_less,or_greater,suffix:m"), "set_camera_medium_height", "get_camera_medium_height");
+
 	// Glow
 
 	ClassDB::bind_method(D_METHOD("set_glow_enabled", "enabled"), &Environment::set_glow_enabled);
@@ -1769,6 +1833,7 @@ Environment::Environment() {
 	_update_ssil();
 	_update_sdfgi();
 	_update_pathtracing();
+	_update_camera_medium();
 	_update_glow();
 	_update_fog();
 	_update_adjustment();

@@ -232,6 +232,7 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 	shadow_ps.hit_t = 0.0;
 	shadow_ps.offset_normal = vec3(0.0, 0.0, 1.0);
 	shadow_ps.next_ray_dir = vec3(0.0, 0.0, 1.0);
+	path_clear_medium(shadow_ps);
 	path_pack(payload, shadow_ps);
 
 	traceRayEXT(tlas,
@@ -255,6 +256,8 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 
 // Evaluate direct lighting using NEE with stochastic light selection.
 // Uses mini-batch reservoir sampling for importance-weighted light selection.
+// r_light_dir and r_light_dist name the sampled light's direction and distance (unbounded for a
+// directional light) so a medium can charge the light's own leg (D49).
 vec3 lights_evaluate_direct_lighting(
 		vec3 hit_pos,
 		vec3 N,
@@ -262,7 +265,11 @@ vec3 lights_evaluate_direct_lighting(
 		MaterialProperties material,
 		inout uint rng_state,
 		bool is_indirect_bounce,
-		uint light_count) {
+		uint light_count,
+		out vec3 r_light_dir,
+		out float r_light_dist) {
+	r_light_dir = vec3(0.0, 1.0, 0.0);
+	r_light_dist = 0.0;
 	if (light_count == 0u) {
 		return vec3(0.0);
 	}
@@ -334,6 +341,9 @@ vec3 lights_evaluate_direct_lighting(
 			shadow_dist = max(0.0, t_center - dt);
 		}
 
+		r_light_dir = L;
+		r_light_dist = shadow_dist;
+
 		// Spot cone early-out.
 		float spot_atten = 1.0;
 		if (light.type == RT_LIGHT_TYPE_SPOT) {
@@ -372,6 +382,8 @@ vec3 lights_evaluate_direct_lighting(
 		LightSample ls = lights_prepare_sample(hit_pos, light);
 		float light_pdf;
 		vec3 L = lights_sample_cone(ls, u, light_pdf);
+		r_light_dir = L;
+		r_light_dist = 1e30;
 
 		float NdotL = dot(N, L);
 		if (NdotL <= 0.0) {

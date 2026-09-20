@@ -694,6 +694,7 @@ public:
 	// Pathtracing
 	virtual void environment_set_pathtracing(RID p_env, bool p_enable, int p_debug_mode, int p_samples_per_pixel, int p_max_bounces, RSE::PathtracingDenoiser p_denoiser) = 0;
 	virtual void environment_set_pathtracing_primary_surface(RID p_env, RSE::PathtracingPrimarySurface p_primary_surface) = 0;
+	virtual void environment_set_camera_medium(RID p_env, bool p_enable, const Color &p_absorption, const Color &p_scattering, float p_height) = 0;
 
 	virtual void environment_set_fog(RID p_env, bool p_enable, const Color &p_light_color, float p_light_energy, float p_sun_scatter, float p_density, float p_height, float p_height_density, float p_aerial_perspective, float p_sky_affect, RSE::EnvironmentFogMode p_mode = RSE::EnvironmentFogMode::ENV_FOG_MODE_EXPONENTIAL) = 0;
 	virtual void environment_set_fog_depth(RID p_env, float p_curve, float p_begin, float p_end) = 0;

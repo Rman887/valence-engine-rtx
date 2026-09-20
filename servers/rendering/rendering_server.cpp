@@ -3099,6 +3099,7 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("environment_set_sdfgi", "env", "enable", "cascades", "min_cell_size", "y_scale", "use_occlusion", "bounce_feedback", "read_sky", "energy", "normal_bias", "probe_bias"), &RenderingServer::environment_set_sdfgi);
 	ClassDB::bind_method(D_METHOD("environment_set_pathtracing", "env", "enable", "debug_mode", "samples_per_pixel", "max_bounces", "denoiser"), &RenderingServer::environment_set_pathtracing);
 	ClassDB::bind_method(D_METHOD("environment_set_pathtracing_primary_surface", "env", "primary_surface"), &RenderingServer::environment_set_pathtracing_primary_surface);
+	ClassDB::bind_method(D_METHOD("environment_set_camera_medium", "env", "enable", "absorption", "scattering", "height"), &RenderingServer::environment_set_camera_medium);
 	ClassDB::bind_method(D_METHOD("environment_set_volumetric_fog", "env", "enable", "density", "albedo", "emission", "emission_energy", "anisotropy", "length", "detail_spread", "gi_inject", "temporal_reprojection", "temporal_reprojection_amount", "ambient_inject", "sky_affect"), &RenderingServer::environment_set_volumetric_fog);
 
 	ClassDB::bind_method(D_METHOD("environment_glow_set_use_bicubic_upscale", "enable"), &RenderingServer::environment_glow_set_use_bicubic_upscale);

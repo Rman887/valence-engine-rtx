@@ -199,6 +199,13 @@ private:
 	RSE::PathtracingPrimarySurface pathtracing_primary_surface = RSE::PT_PRIMARY_SURFACE_GBUFFER;
 	void _update_pathtracing();
 
+	// Camera medium
+	bool camera_medium_enabled = false;
+	Color camera_medium_absorption = Color(0.30, 0.08, 0.04);
+	Color camera_medium_scattering = Color(0.1, 0.4, 0.45);
+	float camera_medium_height = 0.0;
+	void _update_camera_medium();
+
 	// Glow
 	bool glow_enabled = false;
 	Vector<float> glow_levels;
@@ -399,6 +406,16 @@ public:
 	RSE::PathtracingDenoiser get_pathtracing_denoiser() const;
 	void set_pathtracing_primary_surface(RSE::PathtracingPrimarySurface p_primary_surface);
 	RSE::PathtracingPrimarySurface get_pathtracing_primary_surface() const;
+
+	// Camera medium
+	void set_camera_medium_enabled(bool p_enabled);
+	bool is_camera_medium_enabled() const;
+	void set_camera_medium_absorption(const Color &p_absorption);
+	Color get_camera_medium_absorption() const;
+	void set_camera_medium_scattering(const Color &p_scattering);
+	Color get_camera_medium_scattering() const;
+	void set_camera_medium_height(float p_height);
+	float get_camera_medium_height() const;
 
 	// Glow
 	void set_glow_enabled(bool p_enabled);

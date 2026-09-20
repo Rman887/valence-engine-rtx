@@ -292,6 +292,35 @@ void debug_visualize(
 #endif // RT_DEBUG_ENABLED
 
 // ============================================================================
+// MEDIA (D49)
+// ============================================================================
+
+/// The radiance a white Lambertian surface with normal p_normal would reflect, unshadowed, from
+/// the scene's directional lights and the sky: the hit shaders' diffuse convention
+/// (emission x NdotL / pi) and the prefiltered radiance at the roughest level. A medium's
+/// in-scatter is its SCATTERING times this at the interface the path entered through, so
+/// SCATTERING = 1 adds what white paper facing the light would reflect.
+vec3 medium_irradiance(vec3 p_normal) {
+	vec3 e = vec3(0.0);
+	for (uint i = 0u; i < scene_data_block.data.directional_light_count; i++) {
+		vec3 light_dir = -normalize(rt_lights[i].position);
+		e += rt_lights[i].emission * (max(dot(p_normal, light_dir), 0.0) * ONE_OVER_PI);
+	}
+	vec3 sky_dir = scene_data_block.data.radiance_inverse_xform * p_normal;
+	vec2 border = vec2(scene_data_block.data.radiance_border_size, 1.0 - scene_data_block.data.radiance_border_size * 2.0);
+	e += radiance_octmap_sample(vec3_to_oct_with_border(sky_dir, border), 1.0) * scene_data_block.data.IBL_exposure_normalization;
+	return e;
+}
+
+/// The segment inside a medium: Beer-Lambert over its length with the payload's extinction, and
+/// the in-scatter the medium adds in place of what it took (the closed form the segment fog uses).
+void apply_segment_medium(float segment_length, inout PathState ps) {
+	vec3 transmittance = exp(-ps.medium_absorption * segment_length);
+	ps.radiance += ps.throughput * ps.medium_inscatter * (vec3(1.0) - transmittance);
+	ps.throughput *= transmittance;
+}
+
+// ============================================================================
 // SHADE AND BOUNCE
 // ============================================================================
 
@@ -315,8 +344,13 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	uint diffuse_bounces = get_diffuse_bounces(ps.packed_bounces_flags);
 
 	// Media on this segment (D37): the camera segment is composed in the raygen over the whole
-	// path; every later segment is charged here, over its own length.
-	if (total_bounces > 0u) {
+	// path; every later segment is charged here, over its own length. Inside a medium (D49) the
+	// segment takes the payload's medium instead of the Environment's fog, the camera segment too
+	// (the raygen seeds the medium the camera is in and composes no fog over it).
+	bool in_medium = is_in_medium(ps.packed_bounces_flags);
+	if (in_medium) {
+		apply_segment_medium(hit_t, ps);
+	} else if (total_bounces > 0u) {
 		apply_segment_fog(ray_dir, hit_t, ps.radiance, ps.throughput);
 	}
 
@@ -414,8 +448,18 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	if (rt_light_count > 0u) {
 		vec3 hit_pos_offset = offset_ray_origin(h.hit_pos, h.geometry_normal);
 		bool is_indirect = (diffuse_bounces > 0u);
+		vec3 light_dir;
+		float light_dist;
 		vec3 direct_light = lights_evaluate_direct_lighting(
-				hit_pos_offset, N, V, brdf_mat, ps.rng_state, is_indirect, rt_light_count);
+				hit_pos_offset, N, V, brdf_mat, ps.rng_state, is_indirect, rt_light_count, light_dir, light_dist);
+		if (in_medium) {
+			// The light's own leg through the medium (D49): to the light, or up to the medium's
+			// top, the horizontal plane through the point the path entered at, whichever is
+			// nearer. The shadow ray is a visibility test that does not resolve the interface, so
+			// the leg is this estimate (a named limit); a light under the plane takes its distance.
+			float leg = min(light_dist, max(ps.medium_entry_height - h.hit_pos.y, 0.0) / max(light_dir.y, 0.1));
+			direct_light *= exp(-ps.medium_absorption * leg);
+		}
 		ps.radiance += ps.throughput * direct_light;
 	}
 
@@ -438,6 +482,18 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			}
 			ps.throughput *= m.transmission / transmit_max;
 			ps.packed_bounces_flags = inc_total_bounce(ps.packed_bounces_flags);
+			// The medium behind the interface (D49): the surface's ABSORPTION and SCATTERING,
+			// which a front face sets and a back face writes as zero to clear (no nesting: the
+			// last interface crossed decides). A reflection or a scatter leaves the state as it was.
+			bool enters_medium = any(greaterThan(m.absorption, vec3(0.0)));
+			ps.packed_bounces_flags = set_in_medium(ps.packed_bounces_flags, enters_medium);
+			if (enters_medium) {
+				ps.medium_absorption = m.absorption;
+				ps.medium_inscatter = m.scattering * medium_irradiance(N);
+				ps.medium_entry_height = h.hit_pos.y;
+			} else {
+				path_clear_medium(ps);
+			}
 			ps.hit_t = hit_t;
 			ps.offset_normal = -h.geometry_normal;
 			ps.next_ray_dir = refracted;

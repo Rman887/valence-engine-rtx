@@ -31,7 +31,7 @@
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation
 
 // ============================================================================
-// PATHTRACING PAYLOAD (32 bytes, fp16/unorm-packed)
+// PATHTRACING PAYLOAD (48 bytes, fp16/unorm-packed)
 // ============================================================================
 // Radiance (r) and throughput (T) interleaved as fp16 into 3 uints:
 //   [0]=rg, [1]=bR, [2]=GB  (packHalf2x16 pairs).
@@ -49,6 +49,11 @@ struct PathPayload {
 	float hit_t; //  4 bytes - ray distance, used by raygen to rebuild origin
 	uint oct_offset_nrm; //  4 bytes - packUnorm2x16(vec3_to_oct(offset normal))
 	uint oct_next_dir; //  4 bytes - packUnorm2x16(vec3_to_oct(next direction))
+	// The medium the path is inside of (D49): the per-metre extinction and the in-scattered
+	// radiance a segment adds, as fp16 pairs, and the height (trace space) of the interface the
+	// path entered through, which stands for the medium's top when a light's leg is charged.
+	uint packed_medium[3]; // 12 bytes - absorption.rg | absorption.b, inscatter.r | inscatter.gb
+	float medium_entry_height; //  4 bytes
 };
 
 /// Unpacked fp32 working copy of the payload.
@@ -60,6 +65,9 @@ struct PathState {
 	float hit_t;
 	vec3 offset_normal;
 	vec3 next_ray_dir;
+	vec3 medium_absorption;
+	vec3 medium_inscatter;
+	float medium_entry_height;
 };
 
 PathState path_unpack(PathPayload p) {
@@ -74,6 +82,12 @@ PathState path_unpack(PathPayload p) {
 	s.hit_t = p.hit_t;
 	s.offset_normal = oct_to_vec3(unpackUnorm2x16(p.oct_offset_nrm) * 2.0 - 1.0);
 	s.next_ray_dir = oct_to_vec3(unpackUnorm2x16(p.oct_next_dir) * 2.0 - 1.0);
+	vec2 ab = unpackHalf2x16(p.packed_medium[0]);
+	vec2 bi = unpackHalf2x16(p.packed_medium[1]);
+	vec2 gb = unpackHalf2x16(p.packed_medium[2]);
+	s.medium_absorption = max(vec3(ab.x, ab.y, bi.x), vec3(0.0));
+	s.medium_inscatter = max(vec3(bi.y, gb.x, gb.y), vec3(0.0));
+	s.medium_entry_height = p.medium_entry_height;
 	return s;
 }
 
@@ -89,6 +103,20 @@ void path_pack(inout PathPayload p, PathState s) {
 	p.hit_t = s.hit_t;
 	p.oct_offset_nrm = packUnorm2x16(vec3_to_oct(s.offset_normal));
 	p.oct_next_dir = packUnorm2x16(vec3_to_oct(s.next_ray_dir));
+	vec3 a = clamp(s.medium_absorption, vec3(0.0), vec3(FP16_MAX));
+	vec3 i = clamp(s.medium_inscatter, vec3(0.0), vec3(FP16_MAX));
+	p.packed_medium[0] = packHalf2x16(vec2(a.r, a.g));
+	p.packed_medium[1] = packHalf2x16(vec2(a.b, i.r));
+	p.packed_medium[2] = packHalf2x16(vec2(i.g, i.b));
+	p.medium_entry_height = s.medium_entry_height;
+}
+
+/// A path state with no medium: the fields every fresh path (a sample's start, a shadow ray)
+/// carries before a refracted bounce sets them.
+void path_clear_medium(inout PathState s) {
+	s.medium_absorption = vec3(0.0);
+	s.medium_inscatter = vec3(0.0);
+	s.medium_entry_height = 0.0;
 }
 
 // Bounce count helpers (bits 0-7: total, bits 8-15: diffuse)
@@ -133,6 +161,15 @@ const uint PRIMARY_MISS_FLAG = (1u << 27);
 // A bounded procedural primary probe. A miss clears this flag without touching
 // the path or its images, so the raygen can shade the raster surface instead.
 const uint PRIMARY_PROBE_FLAG = (1u << 28);
+// The path is inside a medium (bit 29, D49): the next segment is charged with the payload's
+// absorption and in-scatter instead of the Environment's fog, and a miss takes the full column.
+const uint IN_MEDIUM_FLAG = (1u << 29);
+uint set_in_medium(uint packed, bool inside) {
+	return inside ? (packed | IN_MEDIUM_FLAG) : (packed & ~IN_MEDIUM_FLAG);
+}
+bool is_in_medium(uint packed) {
+	return (packed & IN_MEDIUM_FLAG) != 0u;
+}
 uint set_path_terminated(uint packed) {
 	return packed | PATH_TERMINATED_FLAG;
 }

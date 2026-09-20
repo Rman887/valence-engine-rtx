@@ -93,6 +93,9 @@ layout(set = 0, binding = 38) uniform texture2D gbuffer_depth;
 // The frame's froxel volumetric fog (Environment.volumetric_fog_*), built in the path-traced
 // frame and shadowed against the TLAS; composed over the camera segment in apply_camera_media.
 layout(set = 0, binding = 39) uniform texture3D volumetric_fog_texture;
+// The medium behind the visible surface (D49), the G-buffer's sixth and seventh targets.
+layout(set = 0, binding = 40) uniform texture2D gbuffer_absorption;
+layout(set = 0, binding = 41) uniform texture2D gbuffer_scattering;
 
 void trace_path_ray(vec3 ray_origin, vec3 ray_dir, uint mask, float max_distance) {
 #ifdef USE_SER
@@ -152,6 +155,8 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	vec4 geo_normal_metallic = texelFetch(sampler2D(gbuffer_geo_normal_metallic, SAMPLER_NEAREST_CLAMP), pixel, 0);
 	vec4 emission_ior = texelFetch(sampler2D(gbuffer_emission_ior, SAMPLER_NEAREST_CLAMP), pixel, 0);
 	vec4 transmission_flags = texelFetch(sampler2D(gbuffer_transmission_flags, SAMPLER_NEAREST_CLAMP), pixel, 0);
+	vec4 absorption = texelFetch(sampler2D(gbuffer_absorption, SAMPLER_NEAREST_CLAMP), pixel, 0);
+	vec4 scattering = texelFetch(sampler2D(gbuffer_scattering, SAMPLER_NEAREST_CLAMP), pixel, 0);
 
 	HitData h;
 	h.hit_pos = ray_origin + ray_dir * hit_t;
@@ -173,6 +178,8 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	m.normal = normalize(normal_roughness.xyz);
 	m.transmission = clamp(transmission_flags.rgb, vec3(0.0), vec3(1.0));
 	m.ior = max(emission_ior.a, 1.0);
+	m.absorption = max(absorption.rgb, vec3(0.0));
+	m.scattering = clamp(scattering.rgb, vec3(0.0), vec3(1.0));
 
 #ifdef RT_DEBUG_ENABLED
 	int vis_mode = int(get_rt_param(RT_PARAM_VIS_MODE));
@@ -194,6 +201,11 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 /// froxel's far slice scaled by volumetric_fog_sky_affect, as the sky pass does. Every later
 /// segment is charged in shade_and_bounce.
 vec3 apply_camera_media(vec3 radiance, vec2 uv, vec3 ray_origin, vec3 ray_dir, float hit_t, bool primary_miss) {
+	if (camera_medium_absorption.w > 0.5) {
+		// The camera is inside a medium (D49): the camera segment was charged with it in
+		// shade_and_bounce, and neither the analytic fog nor the froxel (both air) applies.
+		return radiance;
+	}
 	vec4 fog = vec4(0.0, 0.0, 0.0, 1.0); // Premultiplied in-scatter, transmittance.
 	float depth_z = scene_data_block.data.z_far;
 	if (!primary_miss) {
@@ -259,6 +271,21 @@ void main() {
 	// for the traced reference (RT_PARAM_PRIMARY_SURFACE, 0 = G-buffer).
 	const bool primary_from_gbuffer = get_rt_param(RT_PARAM_PRIMARY_SURFACE) < 0.5;
 
+	// The camera's medium (D49), the same for every sample: its in-scatter at a horizontal
+	// interface, charged over the light's leg from the medium's top down to the camera (the
+	// first directional light's elevation, the leg formula NEE uses), so the water darkens
+	// with the camera's depth.
+	const bool camera_in_medium = camera_medium_absorption.w > 0.5;
+	vec3 camera_medium_inscatter = vec3(0.0);
+	if (camera_in_medium) {
+		float sun_y = 1.0;
+		if (scene_data_block.data.directional_light_count > 0u) {
+			sun_y = max(-normalize(rt_lights[0].position).y, 0.1);
+		}
+		float leg = max(camera_medium_scatter.w - origin.y, 0.0) / sun_y;
+		camera_medium_inscatter = camera_medium_scatter.xyz * medium_irradiance(vec3(0.0, 1.0, 0.0)) * exp(-camera_medium_absorption.xyz * leg);
+	}
+
 	// TODO: when we have a spp > 0 the first raycast is always identical,
 	// we should move it out of the loop
 
@@ -269,6 +296,15 @@ void main() {
 		ps.packed_bounces_flags = (sample_idx == 0u) ? set_sample_zero(0u) : 0u;
 		ps.rng_state = init_rng(pixel, frame_index, sample_idx);
 		ps.hit_t = 0.0;
+		path_clear_medium(ps);
+		if (camera_in_medium) {
+			// The camera is inside a medium (D49): the path starts in it and leaves it through the
+			// first back face it refracts out of.
+			ps.packed_bounces_flags = set_in_medium(ps.packed_bounces_flags, true);
+			ps.medium_absorption = camera_medium_absorption.xyz;
+			ps.medium_inscatter = camera_medium_inscatter;
+			ps.medium_entry_height = camera_medium_scatter.w;
+		}
 
 		vec3 ray_origin = origin.xyz;
 		vec3 ray_dir = direction.xyz;
@@ -445,6 +481,14 @@ void main() {
 		sky_color = mix(sky_color, fog_color, scene_data_block.data.fog_sky_affect);
 	}
 
+	if (is_in_medium(ps.packed_bounces_flags)) {
+		// A miss inside a medium (D49): the segment is charged over the trace's own reach (the
+		// 10000 m tmax), so a channel the medium does not extinguish stays continuous with a far
+		// hit and every other one takes the full column; the guides below carry the result.
+		vec3 t = exp(-ps.medium_absorption * 10000.0);
+		sky_color = mix(ps.medium_inscatter, sky_color, t);
+	}
+
 #ifdef DLSS_RR_ENABLED
 	{
 		uint total_bounces = get_total_bounces(ps.packed_bounces_flags);
@@ -609,6 +653,8 @@ void main() {
 	m.normal = normalize(mat3(inv_view_matrix) * normal); // view space -> world space
 	m.transmission = clamp(transmission, vec3(0.0), vec3(1.0));
 	m.ior = max(ior, 1.0);
+	m.absorption = max(absorption, vec3(0.0));
+	m.scattering = clamp(scattering, vec3(0.0), vec3(1.0));
 
 	// Apply normal map if it was written.
 	if (normal_map != vec3(0.5, 0.5, 1.0)) {
@@ -674,6 +720,8 @@ void main() {
 	m.normal = final_normal;
 	m.transmission = vec3(0.0);
 	m.ior = 1.5;
+	m.absorption = vec3(0.0);
+	m.scattering = vec3(0.0);
 
 #ifdef RT_DEBUG_ENABLED
 	{

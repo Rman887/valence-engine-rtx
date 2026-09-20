@@ -11,6 +11,8 @@ struct MaterialResult {
 	vec3 normal; // Final shading normal (world space, after normal mapping).
 	vec3 transmission; // Fraction of the unreflected light that continues through the surface, per channel; 0 = opaque.
 	float ior; // Refractive index of the medium behind the surface, for the refracted direction and the interface's Fresnel.
+	vec3 absorption; // Per-metre extinction of the medium behind a front face, per channel; 0 = no medium (D49).
+	vec3 scattering; // The medium's single-scatter colour, 0..1: what a segment in it adds of the sun and sky (D49).
 };
 
 /// Sensible default for a mid-grey diffuse surface.
@@ -25,5 +27,7 @@ MaterialResult default_material_result(vec3 geometry_normal) {
 	r.normal = geometry_normal;
 	r.transmission = vec3(0.0);
 	r.ior = 1.5;
+	r.absorption = vec3(0.0);
+	r.scattering = vec3(0.0);
 	return r;
 }

@@ -1389,6 +1389,7 @@ public:
 	PASS6(environment_set_pathtracing, RID, bool, int, int, int, RSE::PathtracingDenoiser)
 	PASS2(environment_set_pathtracing_primary_surface, RID, RSE::PathtracingPrimarySurface)
 	PASS2(environment_set_pathtracing_emissive_lights, RID, bool)
+	PASS2(environment_set_pathtracing_emissive_candidates, RID, int)
 	PASS5(environment_set_camera_medium, RID, bool, const Color &, const Color &, float)
 
 	PASS1RC(bool, environment_get_pathtracing_enabled, RID)
@@ -1398,6 +1399,7 @@ public:
 	PASS1RC(RSE::PathtracingDenoiser, environment_get_pathtracing_denoiser, RID)
 	PASS1RC(RSE::PathtracingPrimarySurface, environment_get_pathtracing_primary_surface, RID)
 	PASS1RC(bool, environment_get_pathtracing_emissive_lights, RID)
+	PASS1RC(int, environment_get_pathtracing_emissive_candidates, RID)
 
 	// Adjustment
 	PASS7(environment_set_adjustment, RID, bool, float, float, float, bool, RID)

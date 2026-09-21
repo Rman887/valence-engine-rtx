@@ -1421,6 +1421,14 @@
 			<description>
 			</description>
 		</method>
+		<method name="environment_set_pathtracing_emissive_candidates">
+			<return type="void" />
+			<param index="0" name="env" type="RID" />
+			<param index="1" name="candidates" type="int" />
+			<description>
+				Sets how many emissive surfaces the path tracer resamples before each light sample toward one for the specified environment RID. See [member Environment.pathtracing_emissive_candidates].
+			</description>
+		</method>
 		<method name="environment_set_pathtracing_emissive_lights">
 			<return type="void" />
 			<param index="0" name="env" type="RID" />

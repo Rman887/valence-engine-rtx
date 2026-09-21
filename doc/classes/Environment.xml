@@ -224,6 +224,10 @@
 			The denoiser used to reduce noise in the path-traced image. [constant RenderingServer.PT_DENOISER_DLSS_RAY_RECONSTRUCTION] uses NVIDIA DLSS Ray Reconstruction for high-quality temporal denoising and requires an NVIDIA RTX GPU. Use [constant RenderingServer.PT_DENOISER_NONE] to disable denoising.
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
 		</member>
+		<member name="pathtracing_emissive_candidates" type="int" setter="set_pathtracing_emissive_candidates" getter="get_pathtracing_emissive_candidates" default="8">
+			How many emissive surfaces the path tracer considers before each shadow ray toward one when [member pathtracing_emissive_lights] is [code]true[/code]: the candidates are drawn by emitted power and the one kept is chosen by how much of that power reaches the point being shaded, so nearby emitters are sampled more often than distant ones of the same power. [code]1[/code] keeps the power-only choice; higher values reduce noise at hundreds of emitters for a small per-hit cost.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
+		</member>
 		<member name="pathtracing_emissive_lights" type="bool" setter="set_pathtracing_emissive_lights" getter="is_pathtracing_emissive_lights" default="true">
 			If [code]true[/code], the path tracer samples emissive surfaces as lights: a surface whose material emits a constant, untextured colour ([member BaseMaterial3D.emission] with [member BaseMaterial3D.emission_energy_multiplier] and no emission texture) lights its surroundings through the same shadowed light sampling the light nodes use, weighed against the bounce that may land on it so nothing is counted twice. If [code]false[/code], emission only reaches the image where a path happens to hit the surface, as before. Textured emission, the [constant BaseMaterial3D.EMISSION_OP_MULTIPLY] operator, materials with alpha and custom shaders that write [code]EMISSION[/code] are not sampled either way.
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].

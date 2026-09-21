@@ -198,6 +198,7 @@ private:
 	RSE::PathtracingDenoiser pathtracing_denoiser = RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION;
 	RSE::PathtracingPrimarySurface pathtracing_primary_surface = RSE::PT_PRIMARY_SURFACE_GBUFFER;
 	bool pathtracing_emissive_lights = true;
+	int pathtracing_emissive_candidates = 8;
 	void _update_pathtracing();
 
 	// Camera medium
@@ -409,6 +410,8 @@ public:
 	RSE::PathtracingPrimarySurface get_pathtracing_primary_surface() const;
 	void set_pathtracing_emissive_lights(bool p_enabled);
 	bool is_pathtracing_emissive_lights() const;
+	void set_pathtracing_emissive_candidates(int p_candidates);
+	int get_pathtracing_emissive_candidates() const;
 
 	// Camera medium
 	void set_camera_medium_enabled(bool p_enabled);

@@ -151,7 +151,7 @@ enum {
 };
 
 // An emissive mesh light (D50): a TLAS instance whose material emits a constant radiance, listed
-// for the trace's next-event estimation. Must match GLSL RTEmissiveInstance (std430, 80 bytes).
+// for the trace's next-event estimation. Must match GLSL RTEmissiveInstance (std430, 96 bytes).
 struct alignas(16) RT_EmissiveInstance {
 	float xform[12]; // Object-to-world, trace space (mat3x4, transposed 3x4).
 	float radiance[3]; // Linear emission before the exposure normalisation.
@@ -160,8 +160,10 @@ struct alignas(16) RT_EmissiveInstance {
 	uint32_t primitive_count;
 	uint32_t flags;
 	float pdf; // This entry's selection probability.
+	float center[3]; // The instance's bounding sphere in trace space (D51): the resampler's proximity proxy.
+	float radius;
 };
-static_assert(sizeof(RT_EmissiveInstance) == 80, "RT_EmissiveInstance must be 80 bytes for std430");
+static_assert(sizeof(RT_EmissiveInstance) == 96, "RT_EmissiveInstance must be 96 bytes for std430");
 
 enum {
 	RT_EMISSIVE_MAX = 1024,
@@ -425,6 +427,8 @@ class RenderRaytracing {
 		uint32_t index;
 		float weight;
 		float score;
+		Vector3 center; // The box's centre and half diagonal in trace space, carried to the entry (D51).
+		float radius;
 	};
 	LocalVector<EmissiveCandidate> emissive_candidates; ///< The emissive gather's ranking (D50).
 	LocalVector<RT_EmissiveInstance> emissive_scratch;

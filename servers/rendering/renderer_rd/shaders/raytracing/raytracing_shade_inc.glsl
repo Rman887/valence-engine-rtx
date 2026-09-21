@@ -472,7 +472,8 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		LightSampleNEE light_sample;
 		bool have_sample;
 		if (sample_emissive) {
-			have_sample = emissive_sample_direct(hit_pos_offset, N, V, brdf_mat, ps.rng_state, strategy_probability, rt_emissive_count, light_sample);
+			uint candidates = uint(get_rt_param(RT_PARAM_EMISSIVE_CANDIDATES));
+			have_sample = emissive_sample_direct(hit_pos_offset, N, V, brdf_mat, ps.rng_state, strategy_probability, rt_emissive_count, candidates, light_sample);
 		} else {
 			have_sample = lights_sample_direct(hit_pos_offset, N, brdf_mat, ps.rng_state, is_indirect, rt_light_count, light_sample);
 		}

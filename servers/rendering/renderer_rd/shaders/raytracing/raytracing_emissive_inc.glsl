@@ -6,10 +6,16 @@
 // The CPU (RenderRaytracing::gather_emissive) lists the eligible TLAS instances once per frame,
 // sorted by instance index, each with its selection probability from a power CDF over the whole
 // list (luminance times an area proxy: no position enters it, so a hit can recover the density
-// its instance was sampled with). Selection is one binary search of the CDF, a triangle is
-// chosen uniformly within the instance and a point uniformly on the triangle; positions are read
-// straight from the vertex buffer the BLAS was built over, through its device address, which
-// works in every stage, and the instance's current object-to-world rides in the list.
+// its instance was sampled with). Selection resamples the CDF (D51): a few candidates drawn by
+// the CDF, one kept in proportion to how much of its power reaches the receiver, judged from the
+// instance's bounding sphere, so the density the sample really has is local while the density
+// the MIS weight is written in stays the global one, which both strategies can evaluate; the
+// weights of the two strategies still sum to one at every point, and each strategy's estimate of
+// its own weighted share is unbiased, so the sum is. With one candidate the selection is the CDF
+// itself. Within the kept instance a triangle is chosen uniformly and a point uniformly on the
+// triangle; positions are read straight from the vertex buffer the BLAS was built over, through
+// its device address, which works in every stage, and the instance's current object-to-world
+// rides in the list.
 //
 // Requires: raytracing_inc.glsl, brdf_inc.glsl (brdf_pdf), raytracing_hit_inc.glsl
 // (geometries[], get_triangle_indices_ex), raytracing_lights_inc.glsl (lights_trace_shadow_ray),
@@ -24,7 +30,7 @@
 // its lit face is the one from which the corners wind clockwise.
 #define RT_EMISSIVE_FLAG_FLIP_FACING 2u
 
-// Must match C++ RT_EmissiveInstance (std430, 80 bytes).
+// Must match C++ RT_EmissiveInstance (std430, 96 bytes).
 struct RTEmissiveInstance {
 	float xform[12]; // Object-to-world, trace space (mat3x4, transposed 3x4).
 	float radiance_r; // Linear emission before the exposure normalisation.
@@ -35,6 +41,10 @@ struct RTEmissiveInstance {
 	uint primitive_count;
 	uint flags;
 	float pdf; // This entry's selection probability.
+	float center_x; // The instance's bounding sphere in trace space (D51).
+	float center_y;
+	float center_z;
+	float radius;
 };
 
 layout(set = 0, binding = RT_EMISSIVE_BUFFER_BINDING, std430) readonly buffer EmissiveBuffer {
@@ -91,11 +101,47 @@ float emissive_mis_weight(float p_this, float p_other) {
 	return a / max(a + b, 1e-20);
 }
 
-/// Next-event estimation toward the emissive list: one instance by the CDF, one triangle, one
-/// point, and the power-heuristic weight against the BSDF density of the same direction. Fills
-/// the sample the caller traces the shadow ray for and evaluates the BRDF with (the same code the
-/// analytic lights share); its weight is the MIS weight over the light's density. Returns false
-/// when the sample carries nothing. Three random numbers are drawn whatever the outcome, so the
+/// One entry of the inclusive CDF by binary search: the first whose cdf reaches u.
+uint emissive_search_cdf(float u, uint count) {
+	uint lo = 0u;
+	uint hi = count - 1u;
+	while (lo < hi) {
+		uint mid = (lo + hi) >> 1u;
+		if (rt_emissive[mid].cdf < u) {
+			lo = mid + 1u;
+		} else {
+			hi = mid;
+		}
+	}
+	return lo;
+}
+
+/// How much of an entry's power can reach a receiver at hit_pos facing N, judged from the entry's
+/// bounding sphere: the cosine at the receiver, raised by the sphere's angular size so no part of
+/// an emitter above the horizon reads zero, over the distance squared, both floored by the radius
+/// for a receiver inside the sphere. A sphere wholly below the receiver's plane is demoted to a
+/// thousandth of its radius rather than excluded: the sphere is the rest pose's box, and a skinned
+/// or blend-shaped emitter can pose triangles outside it, so a target of zero there would lose
+/// their light. Any positive function of the entry is a valid resampling target; this one is the
+/// unshadowed irradiance up to the emitter's own facing.
+float emissive_proximity(RTEmissiveInstance e, vec3 hit_pos, vec3 N) {
+	vec3 to_c = vec3(e.center_x, e.center_y, e.center_z) - hit_pos;
+	float d_sq = dot(to_c, to_c);
+	float above = max(dot(N, to_c) + e.radius, 1e-3 * e.radius);
+	if (above <= 0.0 || e.pdf <= 0.0) {
+		return 0.0;
+	}
+	float r_sq = e.radius * e.radius;
+	float denominator = max(sqrt(d_sq), e.radius) * max(d_sq, r_sq);
+	return denominator > 0.0 ? above / denominator : 0.0;
+}
+
+/// Next-event estimation toward the emissive list: candidates by the CDF resampled by their
+/// proximity (D51), one triangle, one point, and the power-heuristic weight against the BSDF
+/// density of the same direction. Fills the sample the caller traces the shadow ray for and
+/// evaluates the BRDF with (the same code the analytic lights share); its weight is the MIS
+/// weight over the density the sample was really produced with. Returns false when the sample
+/// carries nothing. candidates + 3 random numbers are drawn whatever the outcome, so the
 /// sequence is stable per call.
 bool emissive_sample_direct(
 		vec3 hit_pos,
@@ -105,6 +151,7 @@ bool emissive_sample_direct(
 		inout uint rng_state,
 		float strategy_probability,
 		uint count,
+		uint candidates,
 		out LightSampleNEE r_sample) {
 	r_sample.direction = vec3(0.0, 1.0, 0.0);
 	r_sample.shadow_distance = 0.0;
@@ -113,22 +160,48 @@ bool emissive_sample_direct(
 	r_sample.weight = 0.0;
 	r_sample.specular_multiplier = 1.0;
 
-	float u_sel = rand(rng_state);
-	vec2 u_tri = rand2(rng_state);
-
-	// Binary search of the inclusive CDF.
-	uint lo = 0u;
-	uint hi = count - 1u;
-	while (lo < hi) {
-		uint mid = (lo + hi) >> 1u;
-		if (rt_emissive[mid].cdf < u_sel) {
-			lo = mid + 1u;
-		} else {
-			hi = mid;
+	candidates = clamp(candidates, 1u, 16u);
+	// Weighted reservoir over the candidates on one random number, rescaled after every
+	// decision so it stays uniform; the candidates are stratified over the CDF. Each candidate
+	// is drawn with probability pdf and targeted at pdf times its proximity, so its resampling
+	// weight is the proximity alone.
+	// rand() can round to 1.0, which would refuse the first candidate below.
+	float u_res = min(rand(rng_state), 0.99999994);
+	uint selected = 0u;
+	float w_sum = 0.0;
+	float w_selected = 0.0;
+	for (uint i = 0u; i < candidates; i++) {
+		float u_sel = (float(i) + rand(rng_state)) / float(candidates);
+		uint idx = emissive_search_cdf(u_sel, count);
+		RTEmissiveInstance c = rt_emissive[idx];
+		float w = emissive_proximity(c, hit_pos, N);
+		if (w <= 0.0) {
+			continue;
 		}
+		w_sum += w;
+		float accept = w / w_sum;
+		if (u_res < accept) {
+			selected = idx;
+			w_selected = w;
+			u_res = u_res / accept;
+		} else {
+			u_res = (u_res - accept) / (1.0 - accept);
+		}
+		// Rounding must not carry the number to 1.0: the first kept candidate accepts at 1.0, and
+		// a number at 1.0 would refuse it and divide by zero.
+		u_res = min(u_res, 0.99999994);
 	}
-	RTEmissiveInstance e = rt_emissive[lo];
-	if (e.pdf <= 0.0 || e.primitive_count == 0u) {
+	vec2 u_tri = rand2(rng_state);
+	if (w_selected <= 0.0) {
+		return false;
+	}
+	// The resampling's contribution weight is w_sum / (candidates * pdf * w_selected), so the
+	// instance was really selected with candidates * w_selected / w_sum times its pdf; with one
+	// candidate that factor is 1 and the selection is the CDF's.
+	float resample_factor = float(candidates) * w_selected / w_sum;
+
+	RTEmissiveInstance e = rt_emissive[selected];
+	if (e.primitive_count == 0u) {
 		return false;
 	}
 
@@ -176,17 +249,23 @@ bool emissive_sample_direct(
 		return false;
 	}
 
+	// The global density, in which the MIS weight is written: what a chance hit recovers.
 	float pdf_light = emissive_solid_angle_pdf(e, area, dist, cos_l);
 	if (pdf_light <= 0.0) {
 		return false;
 	}
+	// The density this sample was really produced with: the resampled instance choice in place
+	// of the entry's global probability.
+	float pdf_sample = pdf_light * resample_factor;
 
 	float pdf_bsdf = brdf_pdf(N, L, V, material);
-	// The density this strategy really has is the list's times the share of samples sent to it.
+	// The weight is a function of the point alone, shared with the chance-hit side, so the two
+	// strategies' weights sum to one there whatever density either really sampled with; the
+	// share of samples sent to this strategy enters it as it enters the other side.
 	float w = emissive_mis_weight(strategy_probability * pdf_light, pdf_bsdf);
 
 	r_sample.radiance = vec3(e.radiance_r, e.radiance_g, e.radiance_b) * scene_data_block.data.emissive_exposure_normalization;
-	r_sample.weight = w / pdf_light;
+	r_sample.weight = w / pdf_sample;
 	return true;
 }
 

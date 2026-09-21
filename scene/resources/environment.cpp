@@ -668,6 +668,15 @@ bool Environment::is_pathtracing_emissive_lights() const {
 	return pathtracing_emissive_lights;
 }
 
+void Environment::set_pathtracing_emissive_candidates(int p_candidates) {
+	pathtracing_emissive_candidates = CLAMP(p_candidates, 1, 16);
+	RS::get_singleton()->environment_set_pathtracing_emissive_candidates(environment, pathtracing_emissive_candidates);
+}
+
+int Environment::get_pathtracing_emissive_candidates() const {
+	return pathtracing_emissive_candidates;
+}
+
 void Environment::_update_pathtracing() {
 	RS::get_singleton()->environment_set_pathtracing(
 			environment,
@@ -1568,6 +1577,8 @@ void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pathtracing_primary_surface"), &Environment::get_pathtracing_primary_surface);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_emissive_lights", "enabled"), &Environment::set_pathtracing_emissive_lights);
 	ClassDB::bind_method(D_METHOD("is_pathtracing_emissive_lights"), &Environment::is_pathtracing_emissive_lights);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_emissive_candidates", "candidates"), &Environment::set_pathtracing_emissive_candidates);
+	ClassDB::bind_method(D_METHOD("get_pathtracing_emissive_candidates"), &Environment::get_pathtracing_emissive_candidates);
 	GLOBAL_DEF("rendering/pathtracing/use_simple_shadows", false);
 
 	ADD_GROUP("Pathtracing", "pathtracing_");
@@ -1578,6 +1589,7 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_denoiser", PROPERTY_HINT_ENUM, "None,DLSS Ray Reconstruction"), "set_pathtracing_denoiser", "get_pathtracing_denoiser");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_primary_surface", PROPERTY_HINT_ENUM, "G-Buffer,Traced"), "set_pathtracing_primary_surface", "get_pathtracing_primary_surface");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_emissive_lights"), "set_pathtracing_emissive_lights", "is_pathtracing_emissive_lights");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_emissive_candidates", PROPERTY_HINT_RANGE, "1,16,1"), "set_pathtracing_emissive_candidates", "get_pathtracing_emissive_candidates");
 
 	// Camera medium
 

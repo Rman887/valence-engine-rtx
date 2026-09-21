@@ -2897,11 +2897,14 @@ uint32_t RenderRaytracing::gather_emissive(const RenderDataRD *p_render_data, co
 		if (!(weight > 0.0f)) {
 			continue;
 		}
-		float dist_sq = (float)(box.get_center() - cam_pos).length_squared();
+		Vector3 center = box.get_center();
+		float dist_sq = (float)(center - cam_pos).length_squared();
 		EmissiveCandidate c;
 		c.index = i;
 		c.weight = weight;
 		c.score = weight * exposure / (dist_sq + area_proxy);
+		c.center = center;
+		c.radius = (float)(sz.length() * 0.5);
 		candidates.push_back(c);
 	}
 
@@ -2959,6 +2962,10 @@ uint32_t RenderRaytracing::gather_emissive(const RenderDataRD *p_render_data, co
 			e.flags ^= RT_EMISSIVE_FLAG_FLIP_FACING;
 		}
 		e.pdf = (float)(c.weight / total);
+		e.center[0] = (float)c.center.x;
+		e.center[1] = (float)c.center.y;
+		e.center[2] = (float)c.center.z;
+		e.radius = c.radius;
 	}
 	return count;
 }
@@ -3214,8 +3221,10 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		// --- Emissive mesh lights (D50) ---
 		{
 			bool emissive_enabled = true;
+			int emissive_candidate_count = 8;
 			if (p_render_data && p_render_data->environment.is_valid()) {
 				emissive_enabled = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_emissive_lights(p_render_data->environment);
+				emissive_candidate_count = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_emissive_candidates(p_render_data->environment);
 			}
 			uint32_t buf_size = RT_EMISSIVE_MAX * sizeof(RT_EmissiveInstance);
 			if (!p_state->emissive_buffer.is_valid()) {
@@ -3243,6 +3252,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 				emissive_probability = (rt_light_count > 0) ? CLAMP(emissive_score_sum / MAX(emissive_score_sum + light_score_sum, 1.0e-20f), 0.1f, 0.9f) : 1.0f;
 			}
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_EMISSIVE_PROBABILITY] = emissive_probability;
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_EMISSIVE_CANDIDATES] = float(CLAMP(emissive_candidate_count, 1, 16));
 			if (rt_emissive_count != p_state->emissive_count_logged) {
 				// Once per change, so a run's log shows whether the list was ever non-empty and its share.
 				print_line(vformat("Path tracer: %d emissive instance(s) sampled as lights, share %.2f of the light samples.", rt_emissive_count, emissive_probability));

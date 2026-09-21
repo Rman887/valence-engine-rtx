@@ -920,6 +920,12 @@ void RendererEnvironmentStorage::environment_set_pathtracing_emissive_lights(RID
 	env->pathtracing_emissive_lights = p_enable;
 }
 
+void RendererEnvironmentStorage::environment_set_pathtracing_emissive_candidates(RID p_env, int p_candidates) {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL(env);
+	env->pathtracing_emissive_candidates = CLAMP(p_candidates, 1, 16);
+}
+
 bool RendererEnvironmentStorage::environment_get_pathtracing_enabled(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, false);
@@ -960,6 +966,12 @@ bool RendererEnvironmentStorage::environment_get_pathtracing_emissive_lights(RID
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, true);
 	return env->pathtracing_emissive_lights;
+}
+
+int RendererEnvironmentStorage::environment_get_pathtracing_emissive_candidates(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, 8);
+	return env->pathtracing_emissive_candidates;
 }
 
 // Camera medium

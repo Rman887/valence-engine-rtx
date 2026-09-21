@@ -895,6 +895,7 @@ public:
 	FUNC6(environment_set_pathtracing, RID, bool, int, int, int, RSE::PathtracingDenoiser)
 	FUNC2(environment_set_pathtracing_primary_surface, RID, RSE::PathtracingPrimarySurface)
 	FUNC2(environment_set_pathtracing_emissive_lights, RID, bool)
+	FUNC2(environment_set_pathtracing_emissive_candidates, RID, int)
 	FUNC5(environment_set_camera_medium, RID, bool, const Color &, const Color &, float)
 
 	FUNC3R(Ref<Image>, environment_bake_panorama, RID, bool, const Size2i &)

@@ -107,7 +107,8 @@ public:
 	static constexpr int RT_PARAM_HAS_PROCEDURAL_INSTANCES = 9;
 	static constexpr int RT_PARAM_EMISSIVE_COUNT = 10; // Emissive mesh lights in the emissive buffer (D50).
 	static constexpr int RT_PARAM_EMISSIVE_PROBABILITY = 11; // The share of light samples that go to the emissive list (D50).
-	// Indices 12-13 reserved for future use.
+	static constexpr int RT_PARAM_EMISSIVE_CANDIDATES = 12; // Candidates resampled per emissive light sample (D51).
+	// Index 13 reserved for future use.
 	static constexpr int RT_PARAM_LIGHT_COUNT = 14;
 	static constexpr int RT_PARAM_FRAME_INDEX = 15;
 

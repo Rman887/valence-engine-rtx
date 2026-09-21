@@ -180,6 +180,7 @@ private:
 		RSE::PathtracingDenoiser pathtracing_denoiser = RSE::PT_DENOISER_NONE;
 		RSE::PathtracingPrimarySurface pathtracing_primary_surface = RSE::PT_PRIMARY_SURFACE_GBUFFER;
 		bool pathtracing_emissive_lights = true;
+		int pathtracing_emissive_candidates = 8;
 
 		// Camera medium (the path tracer, D49)
 		bool camera_medium_enabled = false;
@@ -343,6 +344,7 @@ public:
 	void environment_set_pathtracing(RID p_env, bool p_enable, int p_debug_mode, int p_samples_per_pixel, int p_max_bounces, RSE::PathtracingDenoiser p_denoiser);
 	void environment_set_pathtracing_primary_surface(RID p_env, RSE::PathtracingPrimarySurface p_primary_surface);
 	void environment_set_pathtracing_emissive_lights(RID p_env, bool p_enable);
+	void environment_set_pathtracing_emissive_candidates(RID p_env, int p_candidates);
 	bool environment_get_pathtracing_enabled(RID p_env) const;
 	int environment_get_pathtracing_debug_mode(RID p_env) const;
 	int environment_get_pathtracing_samples_per_pixel(RID p_env) const;
@@ -350,6 +352,7 @@ public:
 	RSE::PathtracingDenoiser environment_get_pathtracing_denoiser(RID p_env) const;
 	RSE::PathtracingPrimarySurface environment_get_pathtracing_primary_surface(RID p_env) const;
 	bool environment_get_pathtracing_emissive_lights(RID p_env) const;
+	int environment_get_pathtracing_emissive_candidates(RID p_env) const;
 
 	// Camera medium
 	void environment_set_camera_medium(RID p_env, bool p_enable, const Color &p_absorption, const Color &p_scattering, float p_height);

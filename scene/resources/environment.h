@@ -200,7 +200,10 @@ private:
 	bool pathtracing_emissive_lights = true;
 	int pathtracing_emissive_candidates = 8;
 	RSE::PathtracingSampler pathtracing_sampler = RSE::PT_SAMPLER_HASH;
+	float pathtracing_clamp_direct = 0.0f;
+	float pathtracing_clamp_indirect = 0.0f;
 	void _update_pathtracing();
+	void _update_pathtracing_clamp();
 
 	// Camera medium
 	bool camera_medium_enabled = false;
@@ -415,6 +418,10 @@ public:
 	int get_pathtracing_emissive_candidates() const;
 	void set_pathtracing_sampler(RSE::PathtracingSampler p_sampler);
 	RSE::PathtracingSampler get_pathtracing_sampler() const;
+	void set_pathtracing_clamp_direct(float p_clamp);
+	float get_pathtracing_clamp_direct() const;
+	void set_pathtracing_clamp_indirect(float p_clamp);
+	float get_pathtracing_clamp_indirect() const;
 
 	// Camera medium
 	void set_camera_medium_enabled(bool p_enabled);

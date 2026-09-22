@@ -484,12 +484,20 @@ void main() {
 		sky_color = mix(sky_color, fog_color, scene_data_block.data.fog_sky_affect);
 	}
 
+	// The sky a scattered path finds is indirect light under the clamp (D53); the sky the camera
+	// sees, through any delta interfaces, is the image. The medium's in-scatter below is charged
+	// analytically and stays outside the clamp, as it does on a hit.
+	vec3 sky_add = ps.throughput * sky_color;
+	if (is_scattered(ps.packed_bounces_flags)) {
+		sky_add = rt_clamp_contribution(sky_add, get_rt_param(RT_PARAM_CLAMP_INDIRECT));
+	}
 	if (is_in_medium(ps.packed_bounces_flags)) {
 		// A miss inside a medium (D49): the segment is charged over the trace's own reach (the
 		// 10000 m tmax), so a channel the medium does not extinguish stays continuous with a far
 		// hit and every other one takes the full column; the guides below carry the result.
 		vec3 t = exp(-ps.medium_absorption * 10000.0);
 		sky_color = mix(ps.medium_inscatter, sky_color, t);
+		sky_add = mix(ps.throughput * ps.medium_inscatter, sky_add, t);
 	}
 
 #ifdef DLSS_RR_ENABLED
@@ -511,13 +519,13 @@ void main() {
 		if (VIS_MODE == 20) {
 			ps.radiance = vec3(1.0);
 		} else if (VIS_MODE == 0) {
-			ps.radiance += ps.throughput * sky_color;
+			ps.radiance += sky_add;
 		} else {
 			ps.radiance = sky_color;
 		}
 	}
 #else
-	ps.radiance += ps.throughput * sky_color;
+	ps.radiance += sky_add;
 #endif // RT_DEBUG_ENABLED
 
 	path_pack(payload, ps);

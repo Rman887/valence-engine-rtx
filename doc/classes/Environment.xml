@@ -216,6 +216,14 @@
 			The strength that is used when blurring across the screen to generate the glow effect. This affects the distance and intensity of the blur. When using the Mobile rendering method, this should be increased to compensate for the lower dynamic range.
 			[b]Note:[/b] [member glow_strength] has no effect when using the Compatibility rendering method, due to this rendering method using a simpler glow implementation optimized for low-end devices.
 		</member>
+		<member name="pathtracing_clamp_direct" type="float" setter="set_pathtracing_clamp_direct" getter="get_pathtracing_clamp_direct" default="0.0">
+			The most luminance one sampled light may add to a pixel at the surface the camera sees, through a window or the water as well. A sample above it is scaled down to it with its colour kept, which removes the bright single-pixel spikes (fireflies) a rarely chosen light leaves behind at the price of some energy where the light is strong. [code]0.0[/code] leaves direct light unclamped. Emitters and the sky seen directly are never clamped.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
+		</member>
+		<member name="pathtracing_clamp_indirect" type="float" setter="set_pathtracing_clamp_indirect" getter="get_pathtracing_clamp_indirect" default="0.0">
+			The most luminance a path may add to a pixel once it has scattered off a rough or diffuse surface, whether from a sampled light, an emitter or the sky found after the scatter; a mirror reflection or a refraction is not a scatter. Fireflies are mostly indirect, so this is the clamp to set first; it darkens strong indirect light a little. [code]0.0[/code] leaves indirect light unclamped.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].
+		</member>
 		<member name="pathtracing_debug_mode" type="int" setter="set_pathtracing_debug_mode" getter="get_pathtracing_debug_mode" enum="Environment.PathtracingDebugMode" default="0">
 			Selects a debug visualization channel to display instead of the final path-traced image. Useful for inspecting individual G-buffer inputs and intermediate shading data. Set to [constant RT_DEBUG_DISABLED] to show the normal rendered result.
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].

@@ -729,6 +729,10 @@ void RendererSceneRender::environment_set_pathtracing_sampler(RID p_env, RSE::Pa
 	environment_storage.environment_set_pathtracing_sampler(p_env, p_sampler);
 }
 
+void RendererSceneRender::environment_set_pathtracing_clamp(RID p_env, float p_direct, float p_indirect) {
+	environment_storage.environment_set_pathtracing_clamp(p_env, p_direct, p_indirect);
+}
+
 void RendererSceneRender::environment_set_camera_medium(RID p_env, bool p_enable, const Color &p_absorption, const Color &p_scattering, float p_height) {
 	environment_storage.environment_set_camera_medium(p_env, p_enable, p_absorption, p_scattering, p_height);
 }
@@ -767,6 +771,14 @@ int RendererSceneRender::environment_get_pathtracing_emissive_candidates(RID p_e
 
 RSE::PathtracingSampler RendererSceneRender::environment_get_pathtracing_sampler(RID p_env) const {
 	return environment_storage.environment_get_pathtracing_sampler(p_env);
+}
+
+float RendererSceneRender::environment_get_pathtracing_clamp_direct(RID p_env) const {
+	return environment_storage.environment_get_pathtracing_clamp_direct(p_env);
+}
+
+float RendererSceneRender::environment_get_pathtracing_clamp_indirect(RID p_env) const {
+	return environment_storage.environment_get_pathtracing_clamp_indirect(p_env);
 }
 
 void RendererSceneRender::environment_set_adjustment(RID p_env, bool p_enable, float p_brightness, float p_contrast, float p_saturation, bool p_use_1d_color_correction, RID p_color_correction) {

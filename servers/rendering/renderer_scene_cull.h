@@ -1391,6 +1391,7 @@ public:
 	PASS2(environment_set_pathtracing_emissive_lights, RID, bool)
 	PASS2(environment_set_pathtracing_emissive_candidates, RID, int)
 	PASS2(environment_set_pathtracing_sampler, RID, RSE::PathtracingSampler)
+	PASS3(environment_set_pathtracing_clamp, RID, float, float)
 	PASS5(environment_set_camera_medium, RID, bool, const Color &, const Color &, float)
 
 	PASS1RC(bool, environment_get_pathtracing_enabled, RID)
@@ -1402,6 +1403,8 @@ public:
 	PASS1RC(bool, environment_get_pathtracing_emissive_lights, RID)
 	PASS1RC(int, environment_get_pathtracing_emissive_candidates, RID)
 	PASS1RC(RSE::PathtracingSampler, environment_get_pathtracing_sampler, RID)
+	PASS1RC(float, environment_get_pathtracing_clamp_direct, RID)
+	PASS1RC(float, environment_get_pathtracing_clamp_indirect, RID)
 
 	// Adjustment
 	PASS7(environment_set_adjustment, RID, bool, float, float, float, bool, RID)

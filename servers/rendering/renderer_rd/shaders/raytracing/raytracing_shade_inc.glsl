@@ -364,7 +364,13 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		float pdf_light = get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY) * emissive_hit_pdf(h.geometry_idx, h.primitive_id, ray_dir, hit_t, h.is_front_face, rt_emissive_count);
 		emissive_weight = emissive_mis_weight(ps.bsdf_pdf, pdf_light);
 	}
-	ps.radiance += ps.throughput * m.emissive * emissive_weight;
+	vec3 emitted = ps.throughput * m.emissive * emissive_weight;
+	if (is_scattered(ps.packed_bounces_flags)) {
+		// An emitter found after a scatter is indirect light; the one the camera sees, through
+		// any delta interfaces, is the image (D53).
+		emitted = rt_clamp_contribution(emitted, get_rt_param(RT_PARAM_CLAMP_INDIRECT));
+	}
+	ps.radiance += emitted;
 
 	// Bounce limit check.
 	if (total_bounces >= RT_GET_MAX_BOUNCES() || diffuse_bounces >= MAX_DIFFUSE_BOUNCES) {
@@ -499,7 +505,8 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 				float leg = min(light_sample.leg_distance, max(ps.medium_entry_height - h.hit_pos.y, 0.0) / max(light_sample.direction.y, 0.1));
 				direct_light *= exp(-ps.medium_absorption * leg);
 			}
-			ps.radiance += ps.throughput * direct_light;
+			// The clamp (D53): direct at the surface the camera sees, indirect after a scatter.
+			ps.radiance += rt_clamp_contribution(ps.throughput * direct_light, get_rt_param(is_scattered(ps.packed_bounces_flags) ? RT_PARAM_CLAMP_INDIRECT : RT_PARAM_CLAMP_DIRECT));
 		}
 	}
 
@@ -590,6 +597,10 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		ps.packed_bounces_flags = inc_diffuse_bounce(ps.packed_bounces_flags);
 	} else {
 		ps.packed_bounces_flags = inc_total_bounce(ps.packed_bounces_flags);
+	}
+	// Past a non-delta lobe the path carries sampling variance (D53); a mirror does not.
+	if (!(brdfType == SPECULAR_TYPE && brdf_mat.roughness * brdf_mat.roughness <= 0.0)) {
+		ps.packed_bounces_flags = set_scattered(ps.packed_bounces_flags);
 	}
 
 	// The density of the direction just chosen, for the next hit's emission weight (D50): a

@@ -13,7 +13,7 @@
 // ============================================================================
 // RT_PARAMS INDICES - Must match RT_PARAM_* in scene_shader_raytracing.h
 // ============================================================================
-// rt_params is a vec4[4] uniform buffer (16 floats total)
+// rt_params is a vec4[5] uniform buffer (20 floats total)
 // Access: rt_params[idx >> 2][idx & 3] or get_rt_param(idx)
 #define RT_PARAM_VIS_MODE 0 // rt_params[0].x - Debug visualization mode (0 = disabled)
 #define RT_PARAM_SAMPLE_COUNT 1 // rt_params[0].y - Samples per pixel
@@ -31,9 +31,10 @@
 #define RT_PARAM_EMISSIVE_COUNT 10 // rt_params[2].z
 #define RT_PARAM_EMISSIVE_PROBABILITY 11 // rt_params[2].w - Share of light samples sent to the emissive list
 #define RT_PARAM_EMISSIVE_CANDIDATES 12 // rt_params[3].x - Candidates resampled per emissive light sample (D51), 1 to 16
-// Index 13 reserved for future use
+#define RT_PARAM_CLAMP_DIRECT 13 // rt_params[3].y - Luminance clamp on a direct light sample, 0 for none (D53)
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation
+#define RT_PARAM_CLAMP_INDIRECT 16 // rt_params[4].x - Luminance clamp on an indirect contribution, 0 for none (D53)
 
 // ============================================================================
 // PATHTRACING PAYLOAD (52 bytes, fp16/unorm-packed)
@@ -183,6 +184,16 @@ uint set_in_medium(uint packed, bool inside) {
 }
 bool is_in_medium(uint packed) {
 	return (packed & IN_MEDIUM_FLAG) != 0u;
+}
+// The path has scattered off a non-delta lobe (bit 30, D53): what it finds from here on is
+// indirect light under the clamp. A refraction or a mirror reflection carries the camera's view
+// on deterministically, so a surface seen through water or glass still counts as direct.
+const uint SCATTERED_FLAG = (1u << 30);
+uint set_scattered(uint packed) {
+	return packed | SCATTERED_FLAG;
+}
+bool is_scattered(uint packed) {
+	return (packed & SCATTERED_FLAG) != 0u;
 }
 uint set_path_terminated(uint packed) {
 	return packed | PATH_TERMINATED_FLAG;

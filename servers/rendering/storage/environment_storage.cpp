@@ -932,6 +932,13 @@ void RendererEnvironmentStorage::environment_set_pathtracing_sampler(RID p_env, 
 	env->pathtracing_sampler = p_sampler;
 }
 
+void RendererEnvironmentStorage::environment_set_pathtracing_clamp(RID p_env, float p_direct, float p_indirect) {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL(env);
+	env->pathtracing_clamp_direct = MAX(p_direct, 0.0f);
+	env->pathtracing_clamp_indirect = MAX(p_indirect, 0.0f);
+}
+
 bool RendererEnvironmentStorage::environment_get_pathtracing_enabled(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, false);
@@ -984,6 +991,18 @@ RSE::PathtracingSampler RendererEnvironmentStorage::environment_get_pathtracing_
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, RSE::PT_SAMPLER_HASH);
 	return env->pathtracing_sampler;
+}
+
+float RendererEnvironmentStorage::environment_get_pathtracing_clamp_direct(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, 0.0f);
+	return env->pathtracing_clamp_direct;
+}
+
+float RendererEnvironmentStorage::environment_get_pathtracing_clamp_indirect(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, 0.0f);
+	return env->pathtracing_clamp_indirect;
 }
 
 // Camera medium

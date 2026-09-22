@@ -93,7 +93,7 @@ public:
 	// 2: shadow ray from closest_hit (NEE)
 	constexpr static uint32_t RT_MAX_RECURSION_DEPTH = 2;
 
-	// Pathtracing parameter indices for the float[16] params buffer.
+	// Pathtracing parameter indices for the float[20] params buffer.
 	// Must match RT_PARAM_* defines in raytracing_inc.glsl.
 	static constexpr int RT_PARAM_VIS_MODE = 0;
 	static constexpr int RT_PARAM_SAMPLE_COUNT = 1;
@@ -109,9 +109,11 @@ public:
 	static constexpr int RT_PARAM_EMISSIVE_COUNT = 10; // Emissive mesh lights in the emissive buffer (D50).
 	static constexpr int RT_PARAM_EMISSIVE_PROBABILITY = 11; // The share of light samples that go to the emissive list (D50).
 	static constexpr int RT_PARAM_EMISSIVE_CANDIDATES = 12; // Candidates resampled per emissive light sample (D51).
-	// Index 13 reserved for future use.
+	static constexpr int RT_PARAM_CLAMP_DIRECT = 13; // Luminance clamp on a direct light sample, 0 for none (D53).
 	static constexpr int RT_PARAM_LIGHT_COUNT = 14;
 	static constexpr int RT_PARAM_FRAME_INDEX = 15;
+	static constexpr int RT_PARAM_CLAMP_INDIRECT = 16; // Luminance clamp on an indirect contribution, 0 for none (D53).
+	static constexpr int RT_PARAM_COUNT = 20;
 
 	static inline uint32_t rt_flags_pack(uint32_t p_flags, uint32_t p_sample_count, uint32_t p_max_bounces) {
 		uint32_t result = p_flags;

@@ -38,7 +38,7 @@ layout(set = 0, binding = 14, std430) readonly buffer GlobalShaderUniformData {
 global_shader_uniforms;
 
 layout(set = 0, binding = 6, std140) uniform RaytracingParams {
-	vec4 rt_params[4];
+	vec4 rt_params[5];
 	mat4 prev_vp_unjittered;
 	mat4 curr_vp_unjittered;
 	// World-space anchor the trace is relative to (camera-relative tracing).
@@ -52,6 +52,23 @@ layout(set = 0, binding = 6, std140) uniform RaytracingParams {
 
 float get_rt_param(uint idx) {
 	return rt_params[idx >> 2u][idx & 3u];
+}
+
+/// One path contribution under a luminance clamp (D53): above the limit it is scaled down to the
+/// limit with its colour kept, and a limit of 0 is no clamp. A contribution that is not finite is
+/// dropped either way: path_pack's saturation is undefined for a NaN, and one such pixel poisons
+/// the denoiser's history.
+vec3 rt_clamp_contribution(vec3 c, float limit) {
+	if (any(isnan(c)) || any(isinf(c))) {
+		return vec3(0.0);
+	}
+	if (limit > 0.0) {
+		float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+		if (l > limit) {
+			c *= limit / l;
+		}
+	}
+	return c;
 }
 
 /// The sampler the pipeline was specialised for (D52): a constant, so the other one costs nothing.

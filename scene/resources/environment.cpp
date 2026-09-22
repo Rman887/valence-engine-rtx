@@ -677,6 +677,28 @@ int Environment::get_pathtracing_emissive_candidates() const {
 	return pathtracing_emissive_candidates;
 }
 
+void Environment::set_pathtracing_clamp_direct(float p_clamp) {
+	pathtracing_clamp_direct = MAX(p_clamp, 0.0f);
+	_update_pathtracing_clamp();
+}
+
+float Environment::get_pathtracing_clamp_direct() const {
+	return pathtracing_clamp_direct;
+}
+
+void Environment::set_pathtracing_clamp_indirect(float p_clamp) {
+	pathtracing_clamp_indirect = MAX(p_clamp, 0.0f);
+	_update_pathtracing_clamp();
+}
+
+float Environment::get_pathtracing_clamp_indirect() const {
+	return pathtracing_clamp_indirect;
+}
+
+void Environment::_update_pathtracing_clamp() {
+	RS::get_singleton()->environment_set_pathtracing_clamp(environment, pathtracing_clamp_direct, pathtracing_clamp_indirect);
+}
+
 void Environment::set_pathtracing_sampler(RSE::PathtracingSampler p_sampler) {
 	pathtracing_sampler = p_sampler;
 	RS::get_singleton()->environment_set_pathtracing_sampler(environment, pathtracing_sampler);
@@ -1590,6 +1612,10 @@ void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pathtracing_emissive_candidates"), &Environment::get_pathtracing_emissive_candidates);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_sampler", "sampler"), &Environment::set_pathtracing_sampler);
 	ClassDB::bind_method(D_METHOD("get_pathtracing_sampler"), &Environment::get_pathtracing_sampler);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_clamp_direct", "clamp"), &Environment::set_pathtracing_clamp_direct);
+	ClassDB::bind_method(D_METHOD("get_pathtracing_clamp_direct"), &Environment::get_pathtracing_clamp_direct);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_clamp_indirect", "clamp"), &Environment::set_pathtracing_clamp_indirect);
+	ClassDB::bind_method(D_METHOD("get_pathtracing_clamp_indirect"), &Environment::get_pathtracing_clamp_indirect);
 	GLOBAL_DEF("rendering/pathtracing/use_simple_shadows", false);
 
 	ADD_GROUP("Pathtracing", "pathtracing_");
@@ -1602,6 +1628,8 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_emissive_lights"), "set_pathtracing_emissive_lights", "is_pathtracing_emissive_lights");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_emissive_candidates", PROPERTY_HINT_RANGE, "1,16,1"), "set_pathtracing_emissive_candidates", "get_pathtracing_emissive_candidates");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_sampler", PROPERTY_HINT_ENUM, "Hash,Sobol"), "set_pathtracing_sampler", "get_pathtracing_sampler");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "pathtracing_clamp_direct", PROPERTY_HINT_RANGE, "0,100,0.1,or_greater"), "set_pathtracing_clamp_direct", "get_pathtracing_clamp_direct");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "pathtracing_clamp_indirect", PROPERTY_HINT_RANGE, "0,100,0.1,or_greater"), "set_pathtracing_clamp_indirect", "get_pathtracing_clamp_indirect");
 
 	// Camera medium
 

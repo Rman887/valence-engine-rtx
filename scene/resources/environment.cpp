@@ -677,6 +677,15 @@ int Environment::get_pathtracing_emissive_candidates() const {
 	return pathtracing_emissive_candidates;
 }
 
+void Environment::set_pathtracing_sampler(RSE::PathtracingSampler p_sampler) {
+	pathtracing_sampler = p_sampler;
+	RS::get_singleton()->environment_set_pathtracing_sampler(environment, pathtracing_sampler);
+}
+
+RSE::PathtracingSampler Environment::get_pathtracing_sampler() const {
+	return pathtracing_sampler;
+}
+
 void Environment::_update_pathtracing() {
 	RS::get_singleton()->environment_set_pathtracing(
 			environment,
@@ -1579,6 +1588,8 @@ void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_pathtracing_emissive_lights"), &Environment::is_pathtracing_emissive_lights);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_emissive_candidates", "candidates"), &Environment::set_pathtracing_emissive_candidates);
 	ClassDB::bind_method(D_METHOD("get_pathtracing_emissive_candidates"), &Environment::get_pathtracing_emissive_candidates);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_sampler", "sampler"), &Environment::set_pathtracing_sampler);
+	ClassDB::bind_method(D_METHOD("get_pathtracing_sampler"), &Environment::get_pathtracing_sampler);
 	GLOBAL_DEF("rendering/pathtracing/use_simple_shadows", false);
 
 	ADD_GROUP("Pathtracing", "pathtracing_");
@@ -1590,6 +1601,7 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_primary_surface", PROPERTY_HINT_ENUM, "G-Buffer,Traced"), "set_pathtracing_primary_surface", "get_pathtracing_primary_surface");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_emissive_lights"), "set_pathtracing_emissive_lights", "is_pathtracing_emissive_lights");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_emissive_candidates", PROPERTY_HINT_RANGE, "1,16,1"), "set_pathtracing_emissive_candidates", "get_pathtracing_emissive_candidates");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_sampler", PROPERTY_HINT_ENUM, "Hash,Sobol"), "set_pathtracing_sampler", "get_pathtracing_sampler");
 
 	// Camera medium
 

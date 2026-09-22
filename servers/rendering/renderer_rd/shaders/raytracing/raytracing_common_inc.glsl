@@ -7,6 +7,7 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 
 #define RT_FLAG_DLSS_RR_ENABLED (1u << 1)
 #define RT_FLAG_FOG_ENABLED (1u << 2)
+#define RT_FLAG_SOBOL_SAMPLER (1u << 5)
 
 #define RT_SAMPLE_COUNT_SHIFT 21u
 #define RT_SAMPLE_COUNT_MASK 0xFFu
@@ -51,6 +52,16 @@ layout(set = 0, binding = 6, std140) uniform RaytracingParams {
 
 float get_rt_param(uint idx) {
 	return rt_params[idx >> 2u][idx & 3u];
+}
+
+/// The sampler the pipeline was specialised for (D52): a constant, so the other one costs nothing.
+bool rng_is_sobol() {
+	return (RT_FLAGS & RT_FLAG_SOBOL_SAMPLER) != 0u;
+}
+
+/// The launch pixel's hash, the Sobol sampler's per-pixel key (raytracing_inc.glsl, D52).
+uint rt_pixel_seed() {
+	return pcg_hash(gl_LaunchIDEXT.x + (gl_LaunchIDEXT.y << 16u));
 }
 
 /// Project a world-space point to UV through an unjittered VP.

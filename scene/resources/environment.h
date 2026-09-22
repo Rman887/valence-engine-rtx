@@ -199,6 +199,7 @@ private:
 	RSE::PathtracingPrimarySurface pathtracing_primary_surface = RSE::PT_PRIMARY_SURFACE_GBUFFER;
 	bool pathtracing_emissive_lights = true;
 	int pathtracing_emissive_candidates = 8;
+	RSE::PathtracingSampler pathtracing_sampler = RSE::PT_SAMPLER_HASH;
 	void _update_pathtracing();
 
 	// Camera medium
@@ -412,6 +413,8 @@ public:
 	bool is_pathtracing_emissive_lights() const;
 	void set_pathtracing_emissive_candidates(int p_candidates);
 	int get_pathtracing_emissive_candidates() const;
+	void set_pathtracing_sampler(RSE::PathtracingSampler p_sampler);
+	RSE::PathtracingSampler get_pathtracing_sampler() const;
 
 	// Camera medium
 	void set_camera_medium_enabled(bool p_enabled);

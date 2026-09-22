@@ -767,6 +767,11 @@ enum PathtracingPrimarySurface {
 	PT_PRIMARY_SURFACE_TRACED = 1,
 };
 
+enum PathtracingSampler {
+	PT_SAMPLER_HASH = 0,
+	PT_SAMPLER_SOBOL = 1,
+};
+
 enum SubSurfaceScatteringQuality {
 	SUB_SURFACE_SCATTERING_QUALITY_DISABLED,
 	SUB_SURFACE_SCATTERING_QUALITY_LOW,

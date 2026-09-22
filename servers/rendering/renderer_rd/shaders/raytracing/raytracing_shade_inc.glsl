@@ -453,6 +453,14 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// =================================================================
 	path_pack(payload, ps);
 
+	// This bounce's block of Sobol dimensions (D52): the light sampling below draws a variable
+	// count, so the scatter's draws are pinned again after it. The analytic path draws the
+	// strategy, a pick and an acceptance per reservoir slot and the cone pair, which must stay
+	// below the scatter's offset or the scatter would redraw the light's numbers.
+#if 2 * RT_LIGHT_RESERVOIR_SIZE + 4 > 40
+#error RT_SOBOL_DIM_SCATTER must exceed the analytic light path's draw count
+#endif
+	rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE);
 	uint rt_light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
 	if (rt_light_count > 0u || rt_emissive_count > 0u) {
 		vec3 hit_pos_offset = offset_ray_origin(h.hit_pos, h.geometry_normal);
@@ -498,6 +506,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// =================================================================
 	// Transmission: refract through the surface with probability transmit_p
 	// =================================================================
+	rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER);
 	if (transmit_p > 0.0) {
 		if (rand(ps.rng_state) < transmit_p) {
 			vec3 refracted = refract(-V, N, refract_eta);

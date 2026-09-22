@@ -1445,6 +1445,14 @@
 				Selects how the path tracer finds the visible surface for the specified environment RID. See [member Environment.pathtracing_primary_surface].
 			</description>
 		</method>
+		<method name="environment_set_pathtracing_sampler">
+			<return type="void" />
+			<param index="0" name="env" type="RID" />
+			<param index="1" name="sampler" type="int" enum="RenderingServer.PathtracingSampler" />
+			<description>
+				Sets the random sampler the path tracer draws from for the specified environment RID. See [member Environment.pathtracing_sampler].
+			</description>
+		</method>
 		<method name="environment_set_sdfgi">
 			<return type="void" />
 			<param index="0" name="env" type="RID" />
@@ -6041,6 +6049,12 @@
 		</constant>
 		<constant name="PT_PRIMARY_SURFACE_TRACED" value="1" enum="PathtracingPrimarySurface">
 			The visible surface comes from tracing the primary ray. A reference view for the G-buffer path.
+		</constant>
+		<constant name="PT_SAMPLER_HASH" value="0" enum="PathtracingSampler">
+			Independent hashed random numbers: white noise, the default.
+		</constant>
+		<constant name="PT_SAMPLER_SOBOL" value="1" enum="PathtracingSampler">
+			An Owen-scrambled Sobol sequence per pixel, stratified across samples and frames; more expensive per sample.
 		</constant>
 		<constant name="SUB_SURFACE_SCATTERING_QUALITY_DISABLED" value="0" enum="SubSurfaceScatteringQuality">
 			Disables subsurface scattering entirely, even on materials that have [member BaseMaterial3D.subsurf_scatter_enabled] set to [code]true[/code]. This has the lowest GPU requirements.

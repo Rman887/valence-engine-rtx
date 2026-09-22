@@ -696,6 +696,7 @@ public:
 	virtual void environment_set_pathtracing_primary_surface(RID p_env, RSE::PathtracingPrimarySurface p_primary_surface) = 0;
 	virtual void environment_set_pathtracing_emissive_lights(RID p_env, bool p_enable) = 0;
 	virtual void environment_set_pathtracing_emissive_candidates(RID p_env, int p_candidates) = 0;
+	virtual void environment_set_pathtracing_sampler(RID p_env, RSE::PathtracingSampler p_sampler) = 0;
 	virtual void environment_set_camera_medium(RID p_env, bool p_enable, const Color &p_absorption, const Color &p_scattering, float p_height) = 0;
 
 	virtual void environment_set_fog(RID p_env, bool p_enable, const Color &p_light_color, float p_light_energy, float p_sun_scatter, float p_density, float p_height, float p_height_density, float p_aerial_perspective, float p_sky_affect, RSE::EnvironmentFogMode p_mode = RSE::EnvironmentFogMode::ENV_FOG_MODE_EXPONENTIAL) = 0;
@@ -1164,6 +1165,7 @@ VARIANT_ENUM_CAST_EXT(RSE::EnvironmentSDFGIFramesToUpdateLight, RenderingServer:
 VARIANT_ENUM_CAST_EXT(RSE::EnvironmentSDFGIYScale, RenderingServer::EnvironmentSDFGIYScale);
 VARIANT_ENUM_CAST_EXT(RSE::PathtracingDenoiser, RenderingServer::PathtracingDenoiser);
 VARIANT_ENUM_CAST_EXT(RSE::PathtracingPrimarySurface, RenderingServer::PathtracingPrimarySurface);
+VARIANT_ENUM_CAST_EXT(RSE::PathtracingSampler, RenderingServer::PathtracingSampler);
 VARIANT_ENUM_CAST_EXT(RSE::SubSurfaceScatteringQuality, RenderingServer::SubSurfaceScatteringQuality);
 VARIANT_ENUM_CAST_EXT(RSE::DOFBlurQuality, RenderingServer::DOFBlurQuality);
 VARIANT_ENUM_CAST_EXT(RSE::DOFBokehShape, RenderingServer::DOFBokehShape);

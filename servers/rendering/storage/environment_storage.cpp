@@ -926,6 +926,12 @@ void RendererEnvironmentStorage::environment_set_pathtracing_emissive_candidates
 	env->pathtracing_emissive_candidates = CLAMP(p_candidates, 1, 16);
 }
 
+void RendererEnvironmentStorage::environment_set_pathtracing_sampler(RID p_env, RSE::PathtracingSampler p_sampler) {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL(env);
+	env->pathtracing_sampler = p_sampler;
+}
+
 bool RendererEnvironmentStorage::environment_get_pathtracing_enabled(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, false);
@@ -972,6 +978,12 @@ int RendererEnvironmentStorage::environment_get_pathtracing_emissive_candidates(
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, 8);
 	return env->pathtracing_emissive_candidates;
+}
+
+RSE::PathtracingSampler RendererEnvironmentStorage::environment_get_pathtracing_sampler(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, RSE::PT_SAMPLER_HASH);
+	return env->pathtracing_sampler;
 }
 
 // Camera medium

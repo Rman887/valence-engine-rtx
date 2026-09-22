@@ -691,6 +691,9 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_e
 		if (env_storage->environment_get_pathtracing_denoiser(p_environment) == RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION) {
 			flags |= RT_FLAG_DLSS_RR_ENABLED;
 		}
+		if (env_storage->environment_get_pathtracing_sampler(p_environment) == RSE::PT_SAMPLER_SOBOL) {
+			flags |= RT_FLAG_SOBOL_SAMPLER;
+		}
 	}
 
 	if (p_fog_enabled) {

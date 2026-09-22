@@ -79,6 +79,7 @@ public:
 		RT_FLAG_FOG_ENABLED = (1 << 2),
 		RT_FLAG_SER_ENABLED = (1 << 3),
 		RT_FLAG_RAY_QUERY_SHADOWS_ENABLED = (1 << 4),
+		RT_FLAG_SOBOL_SAMPLER = (1 << 5), // The Owen-scrambled Sobol sampler (D52); clear, the PCG hash.
 	};
 
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 21;

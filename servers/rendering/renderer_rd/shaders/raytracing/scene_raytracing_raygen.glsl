@@ -296,7 +296,7 @@ void main() {
 		ps.radiance = vec3(0.0);
 		ps.throughput = vec3(1.0);
 		ps.packed_bounces_flags = (sample_idx == 0u) ? set_sample_zero(0u) : 0u;
-		ps.rng_state = init_rng(pixel, frame_index, sample_idx);
+		ps.rng_state = init_rng(pixel, frame_index, sample_idx, samples_per_pixel);
 		ps.hit_t = 0.0;
 		ps.bsdf_pdf = 0.0;
 		path_clear_medium(ps);

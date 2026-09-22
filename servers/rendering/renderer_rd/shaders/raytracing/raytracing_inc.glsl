@@ -50,7 +50,7 @@
 struct PathPayload {
 	uint packed_rt[3]; // 12 bytes - radiance+throughput interleaved as fp16
 	uint packed_bounces_flags; //  4 bytes - [flags:8][unused:8][diffuse:8][total:8]
-	uint rng_state; //  4 bytes - RNG state for PCG
+	uint rng_state; //  4 bytes - the sampler's state (D52): the PCG chain, or the Sobol index and dimension
 	float hit_t; //  4 bytes - ray distance, used by raygen to rebuild origin
 	uint oct_offset_nrm; //  4 bytes - packUnorm2x16(vec3_to_oct(offset normal))
 	uint oct_next_dir; //  4 bytes - packUnorm2x16(vec3_to_oct(next direction))
@@ -208,8 +208,33 @@ const uint FLAG_PROCEDURAL = 2u;
 const uint FLAG_DEFORMED = 4u;
 
 // ============================================================================
-// RANDOM NUMBER GENERATION - PCG (Permuted Congruential Generator)
+// RANDOM NUMBER GENERATION
 // ============================================================================
+// Two samplers behind the payload's one uint of state, chosen by the Environment through the
+// pipeline's RT_FLAG_SOBOL_SAMPLER (D52), so the one not chosen compiles away. Hash: NVIDIA's
+// PCG chain, re-seeded per sample from the pixel, the frame and the sample index and re-hashed by every draw, so every number is independent white
+// noise. Sobol: an Owen-scrambled (0,2)-sequence (Burley 2020, "Practical Hash-based Owen
+// Scrambling"): each pixel walks its own shuffle of the sequence, one index per sample and per
+// frame; every draw takes the next dimension (a rand2 the stratified pair of one dimension);
+// and each dimension re-shuffles the index with a hash of the pixel and the dimension, so the
+// draws of one path stay decorrelated and any number of dimensions is available. The state
+// packs the sample's index in its pixel's sequence (the frame count times the sample count plus
+// the sample, 20 bits, wrapping) above the dimension counter (12 bits).
+
+#define RT_SOBOL_DIM_BITS 12u
+#define RT_SOBOL_DIM_MASK 0xFFFu
+#define RT_SOBOL_INDEX_MASK 0xFFFFFu
+// Each bounce owns a block of dimensions (worst case 37 draws: the strategy, up to 16 light
+// picks and 16 acceptances, the cone pair, the transmission and lobe choices, the direction pair),
+// so a draw keeps its dimension across frames whatever the blocks before it consumed; 8 bounces
+// use 512 of the 4096 available.
+#define RT_SOBOL_DIMS_PER_BOUNCE 64u
+#define RT_SOBOL_DIM_SCATTER 40u // The transmission, lobe and direction draws inside a bounce's block.
+
+// Both in raytracing_common_inc.glsl, which every stage includes after this file, after its
+// ray-tracing extensions are enabled and where the specialization constant is declared.
+bool rng_is_sobol();
+uint rt_pixel_seed();
 
 /// PCG random number generator - improved XSH-RR variant with better avalanche
 uint pcg_hash(uint seed) {
@@ -218,8 +243,65 @@ uint pcg_hash(uint seed) {
 	return (word >> 22u) ^ word;
 }
 
-/// Initialize RNG state with improved mixing to eliminate patterns
-uint init_rng(uvec2 pixel, uint frame, uint sample_idx) {
+/// A Laine-Karras style permutation in the form Vegdahl derived ("Building a better LK hash",
+/// 2021, the one Cycles ships): every bit of x is flipped by a hash of the bits below it, so on the
+/// reversed digits of a radical inverse it is a nested uniform (Owen) scramble keyed by seed. Every
+/// step is a bijection only while each `x ^= x * c` constant is even and the plain multiplier odd;
+/// an odd constant there zeroes a bit for every input.
+uint sobol_lk_permute(uint x, uint seed) {
+	x ^= x * 0x3d20adeau;
+	x += seed;
+	x *= (seed >> 16u) | 1u;
+	x ^= x * 0x05526c56u;
+	x ^= x * 0x53a22864u;
+	return x;
+}
+
+/// Owen-scrambles x, a fixed-point number in [0, 1) with its first digit at bit 31; on an index
+/// (first digit at bit 0) the same function shuffles the sequence while every aligned block of
+/// 2^k indices stays a block, which keeps the prefix stratification the frames rely on.
+uint sobol_owen_scramble(uint x, uint seed) {
+	return bitfieldReverse(sobol_lk_permute(bitfieldReverse(x), seed));
+}
+
+/// Sobol's second dimension at index i, fixed point: its direction numbers are the rows of
+/// Pascal's triangle modulo 2 (the first dimension is the bit reversal of i).
+uint sobol_dim1(uint i) {
+	uint r = 0u;
+	for (uint v = 1u << 31; i != 0u; i >>= 1) {
+		if ((i & 1u) != 0u) {
+			r ^= v;
+		}
+		v ^= v >> 1;
+	}
+	return r;
+}
+
+/// The seed of the next dimension's shuffle and scrambles for this pixel; advances the state.
+uint sobol_next_dimension(inout uint state, out uint index) {
+	uint dim = state & RT_SOBOL_DIM_MASK;
+	index = state >> RT_SOBOL_DIM_BITS;
+	state = (index << RT_SOBOL_DIM_BITS) | ((dim + 1u) & RT_SOBOL_DIM_MASK);
+	return pcg_hash(rt_pixel_seed() ^ pcg_hash(dim));
+}
+
+/// A fixed-point sample's 24 most significant digits as a float in [0, 1), 1.0 never returned.
+float sobol_to_float(uint x) {
+	return float(x >> 8) * (1.0 / 16777216.0);
+}
+
+/// Pins the next draw's dimension (the Sobol sampler only; nothing in hash mode).
+void rng_set_dimension(inout uint state, uint dim) {
+	if (rng_is_sobol()) {
+		state = (state & ~RT_SOBOL_DIM_MASK) | (dim & RT_SOBOL_DIM_MASK);
+	}
+}
+
+/// Initialize RNG state: the hash chain's seed, or the sample's index in its pixel's sequence.
+uint init_rng(uvec2 pixel, uint frame, uint sample_idx, uint samples_per_pixel) {
+	if (rng_is_sobol()) {
+		return ((frame * samples_per_pixel + sample_idx) & RT_SOBOL_INDEX_MASK) << RT_SOBOL_DIM_BITS;
+	}
 	// Use Wang hash for better mixing - eliminates linear patterns
 	uint seed = pixel.x + pixel.y * 65536u + frame * 1000000u + sample_idx * 100000000u;
 	return pcg_hash(seed);
@@ -227,12 +309,26 @@ uint init_rng(uvec2 pixel, uint frame, uint sample_idx) {
 
 /// Random float in [0, 1)
 float rand(inout uint state) {
+	if (rng_is_sobol()) {
+		uint index;
+		uint seed = sobol_next_dimension(state, index);
+		index = sobol_owen_scramble(index, seed);
+		return sobol_to_float(sobol_owen_scramble(bitfieldReverse(index), pcg_hash(seed ^ 0x68bc21ebu)));
+	}
 	state = pcg_hash(state);
 	return float(state) / 4294967296.0;
 }
 
-/// Random vec2 in [0, 1)
+/// Random vec2 in [0, 1): under the Sobol sampler a stratified pair of one dimension.
 vec2 rand2(inout uint state) {
+	if (rng_is_sobol()) {
+		uint index;
+		uint seed = sobol_next_dimension(state, index);
+		index = sobol_owen_scramble(index, seed);
+		uint x = sobol_owen_scramble(bitfieldReverse(index), pcg_hash(seed ^ 0x68bc21ebu));
+		uint y = sobol_owen_scramble(sobol_dim1(index), pcg_hash(seed ^ 0x02e5be93u));
+		return vec2(sobol_to_float(x), sobol_to_float(y));
+	}
 	return vec2(rand(state), rand(state));
 }
 

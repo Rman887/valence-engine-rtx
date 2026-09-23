@@ -184,6 +184,7 @@ private:
 		RSE::PathtracingSampler pathtracing_sampler = RSE::PT_SAMPLER_HASH;
 		float pathtracing_clamp_direct = 0.0f;
 		float pathtracing_clamp_indirect = 0.0f;
+		bool pathtracing_sky_light = false;
 
 		// Camera medium (the path tracer, D49)
 		bool camera_medium_enabled = false;
@@ -350,6 +351,7 @@ public:
 	void environment_set_pathtracing_emissive_candidates(RID p_env, int p_candidates);
 	void environment_set_pathtracing_sampler(RID p_env, RSE::PathtracingSampler p_sampler);
 	void environment_set_pathtracing_clamp(RID p_env, float p_direct, float p_indirect);
+	void environment_set_pathtracing_sky_light(RID p_env, bool p_enable);
 	bool environment_get_pathtracing_enabled(RID p_env) const;
 	int environment_get_pathtracing_debug_mode(RID p_env) const;
 	int environment_get_pathtracing_samples_per_pixel(RID p_env) const;
@@ -361,6 +363,7 @@ public:
 	RSE::PathtracingSampler environment_get_pathtracing_sampler(RID p_env) const;
 	float environment_get_pathtracing_clamp_direct(RID p_env) const;
 	float environment_get_pathtracing_clamp_indirect(RID p_env) const;
+	bool environment_get_pathtracing_sky_light(RID p_env) const;
 
 	// Camera medium
 	void environment_set_camera_medium(RID p_env, bool p_enable, const Color &p_absorption, const Color &p_scattering, float p_height);

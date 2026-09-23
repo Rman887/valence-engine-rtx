@@ -359,9 +359,12 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// after a scatter (D50): the camera ray and a delta lobe keep the whole weight, and so does
 	// a surface the emissive list does not carry, since light sampling never reaches it.
 	uint rt_emissive_count = uint(get_rt_param(RT_PARAM_EMISSIVE_COUNT));
+	// The sky's share of the light samples (D54), 0 without a sky light; the surface lights
+	// split the rest, so their densities carry the remainder on both sides of the weight.
+	float p_sky = sky_light_probability();
 	float emissive_weight = 1.0;
 	if (total_bounces > 0u && rt_emissive_count > 0u && ps.bsdf_pdf != RT_BSDF_PDF_DELTA && any(greaterThan(m.emissive, vec3(0.0)))) {
-		float pdf_light = get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY) * emissive_hit_pdf(h.geometry_idx, h.primitive_id, ray_dir, hit_t, h.is_front_face, rt_emissive_count);
+		float pdf_light = (1.0 - p_sky) * get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY) * emissive_hit_pdf(h.geometry_idx, h.primitive_id, ray_dir, hit_t, h.is_front_face, rt_emissive_count);
 		emissive_weight = emissive_mis_weight(ps.bsdf_pdf, pdf_light);
 	}
 	vec3 emitted = ps.throughput * m.emissive * emissive_weight;
@@ -460,32 +463,42 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	path_pack(payload, ps);
 
 	// This bounce's block of Sobol dimensions (D52): the light sampling below draws a variable
-	// count, so the scatter's draws are pinned again after it. The analytic path draws the
-	// strategy, a pick and an acceptance per reservoir slot and the cone pair, which must stay
-	// below the scatter's offset or the scatter would redraw the light's numbers.
-#if 2 * RT_LIGHT_RESERVOIR_SIZE + 4 > 40
+	// count, so the scatter's draws are pinned again after it. The analytic path draws the two
+	// strategy choices (the sky's, then the emissive list's), a pick and an acceptance per
+	// reservoir slot and the cone pair, which must stay below the scatter's offset or the
+	// scatter would redraw the light's numbers.
+#if 2 * RT_LIGHT_RESERVOIR_SIZE + 5 > 40
 #error RT_SOBOL_DIM_SCATTER must exceed the analytic light path's draw count
 #endif
 	rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE);
 	uint rt_light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
-	if (rt_light_count > 0u || rt_emissive_count > 0u) {
+	if (rt_light_count > 0u || rt_emissive_count > 0u || p_sky > 0.0) {
 		vec3 hit_pos_offset = offset_ray_origin(h.hit_pos, h.geometry_normal);
 		bool is_indirect = (diffuse_bounces > 0u);
 		// One light sample per hit (D50): the analytic lights or the emissive list, chosen by the
 		// per-frame share, the contribution divided by its share. Nothing is drawn for the choice
 		// when the emissive list is empty, so such a frame keeps its random sequence. Only the
 		// sample's generation diverges; the shadow ray and the BRDF below are shared, so a warp
-		// whose threads chose differently traces once.
-		bool sample_emissive = rt_emissive_count > 0u;
+		// whose threads chose differently traces once. The sky is the third strategy (D54), drawn
+		// first by its share; the surface lights split the rest as before, so a frame without a
+		// sky light keeps its random sequence.
+		bool sample_sky = p_sky > 0.0;
 		float strategy_probability = 1.0;
-		if (rt_light_count > 0u && rt_emissive_count > 0u) {
+		if (sample_sky && (rt_light_count > 0u || rt_emissive_count > 0u)) {
+			sample_sky = rand(ps.rng_state) < p_sky;
+			strategy_probability = sample_sky ? p_sky : (1.0 - p_sky);
+		}
+		bool sample_emissive = !sample_sky && rt_emissive_count > 0u;
+		if (!sample_sky && rt_light_count > 0u && rt_emissive_count > 0u) {
 			float p_emissive = get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY);
 			sample_emissive = rand(ps.rng_state) < p_emissive;
-			strategy_probability = sample_emissive ? p_emissive : (1.0 - p_emissive);
+			strategy_probability *= sample_emissive ? p_emissive : (1.0 - p_emissive);
 		}
 		LightSampleNEE light_sample;
 		bool have_sample;
-		if (sample_emissive) {
+		if (sample_sky) {
+			have_sample = sky_sample_direct(N, V, brdf_mat, ps.rng_state, strategy_probability, light_sample);
+		} else if (sample_emissive) {
 			uint candidates = uint(get_rt_param(RT_PARAM_EMISSIVE_CANDIDATES));
 			have_sample = emissive_sample_direct(hit_pos_offset, N, V, brdf_mat, ps.rng_state, strategy_probability, rt_emissive_count, candidates, light_sample);
 		} else {
@@ -606,9 +619,10 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// The density of the direction just chosen, for the next hit's emission weight (D50): a
 	// zero-roughness specular lobe is a delta light sampling cannot hit, so it keeps the whole
 	// weight; every other direction is weighed with the density brdf_pdf assigns it, which is
-	// the same function light sampling evaluates for its own directions.
-	if (rt_emissive_count == 0u || (brdfType == SPECULAR_TYPE && brdf_mat.roughness * brdf_mat.roughness <= 0.0)) {
-		// With no emitter listed no hit reads the density, so the feature off costs no ALU here.
+	// the same function light sampling evaluates for its own directions. The miss weighs the sky
+	// with it too when the sky is a light (D54).
+	if ((rt_emissive_count == 0u && !sky_light_enabled()) || (brdfType == SPECULAR_TYPE && brdf_mat.roughness * brdf_mat.roughness <= 0.0)) {
+		// With no emitter listed and no sky light nothing reads the density, so both off cost no ALU here.
 		ps.bsdf_pdf = RT_BSDF_PDF_DELTA;
 	} else {
 		float pdf = brdf_pdf(N, next_dir, V, brdf_mat);

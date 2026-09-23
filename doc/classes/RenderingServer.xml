@@ -1462,6 +1462,14 @@
 				Sets the random sampler the path tracer draws from for the specified environment RID. See [member Environment.pathtracing_sampler].
 			</description>
 		</method>
+		<method name="environment_set_pathtracing_sky_light">
+			<return type="void" />
+			<param index="0" name="env" type="RID" />
+			<param index="1" name="enable" type="bool" />
+			<description>
+				Sets whether the path tracer samples the sky as a light for the specified environment RID. See [member Environment.pathtracing_sky_light].
+			</description>
+		</method>
 		<method name="environment_set_sdfgi">
 			<return type="void" />
 			<param index="0" name="env" type="RID" />

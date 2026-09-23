@@ -323,6 +323,7 @@ public:
 	virtual void environment_set_pathtracing_emissive_candidates(RID p_env, int p_candidates) = 0;
 	virtual void environment_set_pathtracing_sampler(RID p_env, RSE::PathtracingSampler p_sampler) = 0;
 	virtual void environment_set_pathtracing_clamp(RID p_env, float p_direct, float p_indirect) = 0;
+	virtual void environment_set_pathtracing_sky_light(RID p_env, bool p_enable) = 0;
 	virtual void environment_set_camera_medium(RID p_env, bool p_enable, const Color &p_absorption, const Color &p_scattering, float p_height) = 0;
 
 	virtual bool environment_get_pathtracing_enabled(RID p_env) const = 0;
@@ -336,6 +337,7 @@ public:
 	virtual RSE::PathtracingSampler environment_get_pathtracing_sampler(RID p_env) const = 0;
 	virtual float environment_get_pathtracing_clamp_direct(RID p_env) const = 0;
 	virtual float environment_get_pathtracing_clamp_indirect(RID p_env) const = 0;
+	virtual bool environment_get_pathtracing_sky_light(RID p_env) const = 0;
 
 	virtual void environment_set_adjustment(RID p_env, bool p_enable, float p_brightness, float p_contrast, float p_saturation, bool p_use_1d_color_correction, RID p_color_correction) = 0;
 

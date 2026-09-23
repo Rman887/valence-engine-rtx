@@ -35,6 +35,7 @@
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation
 #define RT_PARAM_CLAMP_INDIRECT 16 // rt_params[4].x - Luminance clamp on an indirect contribution, 0 for none (D53)
+#define RT_PARAM_SKY_SURFACE_SCORE 17 // rt_params[4].y - The analytic and emissive lights' summed score the sky's share is judged against (D54)
 
 // ============================================================================
 // PATHTRACING PAYLOAD (52 bytes, fp16/unorm-packed)
@@ -235,7 +236,7 @@ const uint FLAG_DEFORMED = 4u;
 #define RT_SOBOL_DIM_BITS 12u
 #define RT_SOBOL_DIM_MASK 0xFFFu
 #define RT_SOBOL_INDEX_MASK 0xFFFFFu
-// Each bounce owns a block of dimensions (worst case 37 draws: the strategy, up to 16 light
+// Each bounce owns a block of dimensions (worst case 38 draws: the two strategy choices, up to 16 light
 // picks and 16 acceptances, the cone pair, the transmission and lobe choices, the direction pair),
 // so a draw keeps its dimension across frames whatever the blocks before it consumed; 8 bounces
 // use 512 of the 4096 available.

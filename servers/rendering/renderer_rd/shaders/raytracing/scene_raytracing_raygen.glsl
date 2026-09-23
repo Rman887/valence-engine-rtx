@@ -81,6 +81,7 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 #endif // USE_RADIANCE_OCTMAP_ARRAY
 
 // clang-format off
+#include "raytracing_sky_inc.glsl"
 #include "raytracing_material_eval_inc.glsl"
 #include "raytracing_shade_inc.glsl"
 // clang-format on
@@ -408,6 +409,8 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 
 #endif // USE_RADIANCE_OCTMAP_ARRAY
 
+#include "raytracing_sky_inc.glsl"
+
 void main() {
 	if ((payload.packed_bounces_flags & PRIMARY_PROBE_FLAG) != 0u) {
 		payload.packed_bounces_flags &= ~PRIMARY_PROBE_FLAG;
@@ -465,29 +468,18 @@ void main() {
 	mat3 world_to_sky = scene_data_block.data.radiance_inverse_xform * camera_basis;
 	vec3 sky_dir = world_to_sky * gl_WorldRayDirectionEXT;
 
-	vec2 border = vec2(scene_data_block.data.radiance_border_size,
-			1.0 - scene_data_block.data.radiance_border_size * 2.0);
-	vec2 sky_uv = vec3_to_oct_with_border(sky_dir, border);
-
-	vec3 sky_color = radiance_octmap_sample(sky_uv, 0.0);
-	sky_color *= scene_data_block.data.IBL_exposure_normalization;
-
-	if ((RT_FLAGS & RT_FLAG_FOG_ENABLED) != 0u) {
-		vec3 fog_color = scene_data_block.data.fog_light_color;
-
-		if (scene_data_block.data.fog_aerial_perspective > 0.0) {
-			vec3 sky_fog = radiance_octmap_sample(sky_uv, 1.0 / MAX_ROUGHNESS_LOD);
-			sky_fog *= scene_data_block.data.IBL_exposure_normalization;
-			fog_color = mix(fog_color, sky_fog, scene_data_block.data.fog_aerial_perspective);
-		}
-
-		sky_color = mix(sky_color, fog_color, scene_data_block.data.fog_sky_affect);
-	}
+	// The sky along the ray (D54): the one evaluation the sky light sample reads too.
+	vec3 sky_color = sky_radiance(sky_dir);
 
 	// The sky a scattered path finds is indirect light under the clamp (D53); the sky the camera
 	// sees, through any delta interfaces, is the image. The medium's in-scatter below is charged
 	// analytically and stays outside the clamp, as it does on a hit.
 	vec3 sky_add = ps.throughput * sky_color;
+	// The sky a bounce found on its own is weighed against the sky light sample that competes
+	// for it (D54): the camera ray and a delta lobe keep the whole weight, as with an emitter.
+	if (sky_light_enabled() && get_total_bounces(ps.packed_bounces_flags) > 0u && ps.bsdf_pdf != RT_BSDF_PDF_DELTA) {
+		sky_add *= sky_mis_weight(ps.bsdf_pdf, sky_light_probability() * sky_pdf(sky_dir));
+	}
 	if (is_scattered(ps.packed_bounces_flags)) {
 		sky_add = rt_clamp_contribution(sky_add, get_rt_param(RT_PARAM_CLAMP_INDIRECT));
 	}
@@ -623,6 +615,7 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 #endif // USE_RADIANCE_OCTMAP_ARRAY
 
 // clang-format off
+#include "raytracing_sky_inc.glsl"
 #include "raytracing_material_eval_inc.glsl"
 #include "raytracing_closest_hit_common_inc.glsl"
 // clang-format on

@@ -202,6 +202,7 @@ private:
 	RSE::PathtracingSampler pathtracing_sampler = RSE::PT_SAMPLER_HASH;
 	float pathtracing_clamp_direct = 0.0f;
 	float pathtracing_clamp_indirect = 0.0f;
+	bool pathtracing_sky_light = false;
 	void _update_pathtracing();
 	void _update_pathtracing_clamp();
 
@@ -422,6 +423,8 @@ public:
 	float get_pathtracing_clamp_direct() const;
 	void set_pathtracing_clamp_indirect(float p_clamp);
 	float get_pathtracing_clamp_indirect() const;
+	void set_pathtracing_sky_light(bool p_enable);
+	bool is_pathtracing_sky_light() const;
 
 	// Camera medium
 	void set_camera_medium_enabled(bool p_enabled);

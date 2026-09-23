@@ -39,6 +39,7 @@
 #include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
+#include "servers/rendering/renderer_rd/uniform_set_cache_rd.h"
 #include "servers/rendering/rendering_server_globals.h"
 #include "servers/rendering/storage/environment_storage.h"
 
@@ -62,6 +63,14 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		mm_merge_shader.version_shader[i] = mm_merge_shader.shader.version_get_shader(mm_merge_shader.version, i);
 		mm_merge_shader.pipeline[i] = RD::get_singleton()->compute_pipeline_create(mm_merge_shader.version_shader[i]);
 	}
+
+	// The sky's sampling table (D54).
+	Vector<String> sky_light_modes;
+	sky_light_modes.push_back("\n");
+	sky_light_shader.shader.initialize(sky_light_modes);
+	sky_light_shader.version = sky_light_shader.shader.version_create();
+	sky_light_shader.version_shader = sky_light_shader.shader.version_get_shader(sky_light_shader.version, 0);
+	sky_light_shader.pipeline = RD::get_singleton()->compute_pipeline_create(sky_light_shader.version_shader);
 }
 
 RenderRaytracing::~RenderRaytracing() {
@@ -87,6 +96,7 @@ RenderRaytracing::~RenderRaytracing() {
 	}
 
 	mm_merge_shader.shader.version_free(mm_merge_shader.version);
+	sky_light_shader.shader.version_free(sky_light_shader.version);
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +153,9 @@ void RenderRaytracing::_free_viewport_state_internal(RTViewportState *p_state) {
 	}
 	if (p_state->params_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->params_buffer);
+	}
+	if (p_state->sky_light_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->sky_light_buffer);
 	}
 	if (p_state->scene_uniform_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->scene_uniform_buffer);
@@ -3255,6 +3268,9 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			}
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_EMISSIVE_PROBABILITY] = emissive_probability;
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_EMISSIVE_CANDIDATES] = float(CLAMP(emissive_candidate_count, 1, 16));
+			// The sky's share (D54) is judged in the shader against both lists' summed scores, since
+			// the sky's own total lives in the table the GPU builds.
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_SKY_SURFACE_SCORE] = light_score_sum + emissive_score_sum;
 			if (rt_emissive_count != p_state->emissive_count_logged) {
 				// Once per change, so a run's log shows whether the list was ever non-empty and its share.
 				print_line(vformat("Path tracer: %d emissive instance(s) sampled as lights, share %.2f of the light samples.", rt_emissive_count, emissive_probability));
@@ -3454,6 +3470,21 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		uniforms.push_back(u);
 	}
 
+	// Binding 43: the sky's sampling table (D54), filled by update_sky_light once the octmap is
+	// rendered; zero until then, which the shader reads as no sky light.
+	{
+		if (!p_state->sky_light_buffer.is_valid()) {
+			p_state->sky_light_buffer = RD::get_singleton()->storage_buffer_create(RT_SKY_LIGHT_BUFFER_SIZE);
+			RD::get_singleton()->set_resource_name(p_state->sky_light_buffer, "RT Sky Light Buffer");
+			RD::get_singleton()->buffer_clear(p_state->sky_light_buffer, 0, RT_SKY_LIGHT_BUFFER_SIZE);
+		}
+		RD::Uniform u;
+		u.binding = 43;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.append_id(p_state->sky_light_buffer);
+		uniforms.push_back(u);
+	}
+
 	RID shader_rd = shader ? shader->get_pipeline_shader_rd(p_rt_flags) : RID();
 
 	RID result;
@@ -3492,6 +3523,79 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 // ---------------------------------------------------------------------------
 // Trace-time buffer dependencies
 // ---------------------------------------------------------------------------
+
+// The sky's sampling table (D54): rebuilt when the Environment's sky or the count of its
+// renders into the octmap changes, in one workgroup over the octmap's sharpest layer; cleared
+// when the sky goes, so the shader's share reads 0 and nothing samples a table that is stale.
+void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags) {
+	ERR_FAIL_NULL(p_state);
+	if (!p_state->sky_light_buffer.is_valid() || (p_rt_flags & SceneShaderRaytracing::RT_FLAG_SKY_LIGHT) == 0) {
+		return;
+	}
+	RD *rd = RD::get_singleton();
+	RID sky_rid;
+	if (p_render_data && p_render_data->environment.is_valid()) {
+		sky_rid = owner->environment_get_sky(p_render_data->environment);
+	}
+	if (!sky_rid.is_valid()) {
+		if (p_state->sky_light_sky.is_valid()) {
+			rd->buffer_clear(p_state->sky_light_buffer, 0, RT_SKY_LIGHT_BUFFER_SIZE);
+			p_state->sky_light_sky = RID();
+			p_state->sky_light_version = 0;
+		}
+		return;
+	}
+	uint64_t version = owner->sky.sky_get_radiance_version(sky_rid);
+	if (sky_rid == p_state->sky_light_sky && version == p_state->sky_light_version) {
+		return;
+	}
+	RID radiance = owner->sky.sky_get_radiance_2d_texture_rd(sky_rid);
+	if (!radiance.is_valid() || version == 0) {
+		return; // Not rendered yet; the next frame's version says when.
+	}
+
+	RD::Uniform u_octmap;
+	u_octmap.binding = 0;
+	u_octmap.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+	u_octmap.append_id(radiance);
+	RD::Uniform u_sampler;
+	u_sampler.binding = 1;
+	u_sampler.uniform_type = RD::UNIFORM_TYPE_SAMPLER;
+	u_sampler.append_id(RendererRD::MaterialStorage::get_singleton()->sampler_rd_get_default(
+			RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED));
+	RD::Uniform u_table;
+	u_table.binding = 2;
+	u_table.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+	u_table.append_id(p_state->sky_light_buffer);
+	// Through the cache: a sky that re-renders every frame (a sun that moves) rebuilds every frame.
+	RID uniform_set = UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader, 0, u_octmap, u_sampler, u_table);
+
+	struct SkyLightPC {
+		float border_pad;
+		float border_scale;
+		float lod;
+		float floor_fraction;
+	} pc;
+	pc.border_pad = owner->sky.sky_get_uv_border_size(sky_rid);
+	pc.border_scale = 1.0f - 2.0f * pc.border_pad;
+	// In array mode the layer's mips are box averages: a cell of the table spans
+	// radiance_size * 2 / RT_SKY_LIGHT_N texels of the sharpest mip and the build taps it four
+	// times, so the mip whose texel is half a cell wide averages the cell (the sharpest when the
+	// octmap is no finer than the table). In 2D mode the mips are roughness levels, so the sharpest
+	// is read.
+	pc.lod = owner->is_using_radiance_octmap_array() ? MAX(0.0f, Math::log2((float)owner->sky.sky_get_radiance_size(sky_rid) / (float)RT_SKY_LIGHT_N)) : 0.0f;
+	pc.floor_fraction = 1.0e-3f;
+
+	RD::ComputeListID compute_list = rd->compute_list_begin();
+	rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline);
+	rd->compute_list_bind_uniform_set(compute_list, uniform_set, 0);
+	rd->compute_list_set_push_constant(compute_list, &pc, sizeof(SkyLightPC));
+	rd->compute_list_dispatch(compute_list, 1, 1, 1);
+	rd->compute_list_end();
+
+	p_state->sky_light_sky = sky_rid;
+	p_state->sky_light_version = version;
+}
 
 void RenderRaytracing::register_raytracing_buffer_dependencies(RD::RaytracingListID p_list) {
 	RD *rd = RD::get_singleton();

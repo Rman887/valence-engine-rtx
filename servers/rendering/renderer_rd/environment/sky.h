@@ -270,6 +270,7 @@ public:
 		int processing_layer = 0;
 		Sky *dirty_list = nullptr;
 		float baked_exposure = 1.0;
+		uint64_t radiance_version = 0; // Counts the renders into the octmap's sharpest layer (D54).
 
 		// State to track when radiance octmap needs updating.
 		SkyMaterialData *prev_material = nullptr;
@@ -319,6 +320,7 @@ public:
 	// Returns a TEXTURE_TYPE_2D view of the radiance octahedral map (layer 0 slice
 	// when the radiance is stored as a 2D array), for shaders that bind it as texture2D.
 	RID sky_get_radiance_2d_texture_rd(RID p_sky) const;
+	uint64_t sky_get_radiance_version(RID p_sky) const;
 	float sky_get_baked_exposure(RID p_sky) const;
 
 	RID allocate_sky_rid();

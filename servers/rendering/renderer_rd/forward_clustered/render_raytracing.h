@@ -38,6 +38,7 @@
 #include "core/templates/vector.h"
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/raytracing/sky_light_cdf.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
 
 #define RB_TEX_RAYTRACING SNAME("raytracing")
@@ -345,6 +346,11 @@ struct RTViewportState {
 	RID emissive_buffer; // The emissive mesh lights of the frame (D50), RT_EMISSIVE_MAX entries.
 	uint32_t emissive_count_logged = 0; // The last count printed for this viewport.
 	RID params_buffer;
+	// The sky's sampling table (D54), rebuilt by `RenderRaytracing::update_sky_light` when the
+	// sky or its rendered radiance changes; zero (no sky light) until then.
+	RID sky_light_buffer;
+	RID sky_light_sky;
+	uint64_t sky_light_version = 0;
 	RID scene_uniform_set;
 
 	// Camera-relative tracing: the anchor every position uploaded to the trace
@@ -383,6 +389,17 @@ class RenderRaytracing {
 		RID version_shader[MODE_MAX];
 		RID pipeline[MODE_MAX];
 	} mm_merge_shader;
+
+	// The sky's sampling table (D54): the compute shader that builds it from the radiance octmap.
+	struct SkyLightShader {
+		SkyLightCdfShaderRD shader;
+		RID version;
+		RID version_shader;
+		RID pipeline;
+	} sky_light_shader;
+	static constexpr uint32_t RT_SKY_LIGHT_N = 256; // Must match RT_SKY_N in raytracing_sky_inc.glsl.
+	static constexpr uint32_t RT_SKY_LIGHT_CELLS = RT_SKY_LIGHT_N * RT_SKY_LIGHT_N;
+	static constexpr uint32_t RT_SKY_LIGHT_BUFFER_SIZE = (4 + RT_SKY_LIGHT_N + 2 * RT_SKY_LIGHT_CELLS) * sizeof(float);
 
 	struct MMSurfaceHandles {
 		LocalVector<RID> per_surface; // Grown on demand; entry per touched surface index.
@@ -517,6 +534,7 @@ public:
 	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, const Vector3 &p_origin, float &r_score_sum);
 	uint32_t gather_emissive(const RenderDataRD *p_render_data, const RTViewportState *p_state, RT_EmissiveInstance *r_emissive_data, uint32_t p_max_emissive, float &r_score_sum);
 	RID update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_primary_from_gbuffer);
+	void update_sky_light(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags);
 
 	void copy_output_texture(const RenderDataRD *p_render_data);
 	void free_viewport_state(RenderSceneBuffersRD *p_render_buffers);

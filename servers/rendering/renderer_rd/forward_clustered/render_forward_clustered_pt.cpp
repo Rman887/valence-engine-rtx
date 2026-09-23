@@ -194,6 +194,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	// Captured from build_tlas/update_uniform_set so the trace-dispatch block
 	// below can bind without RenderRaytracing keeping hidden "current" state.
 	RID rt_uniform_set;
+	RTViewportState *rt_state = nullptr;
 	bool using_depth_reconstruct = false;
 
 	if (rb_data.is_valid() && raytracing && raytracing->get_shader()) {
@@ -216,7 +217,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 			raytracing->rt_free_gbuffer_textures(rb.ptr());
 		}
 
-		RTViewportState *rt_state = raytracing->build_tlas(p_render_data, rt_flags);
+		rt_state = raytracing->build_tlas(p_render_data, rt_flags);
 		if (rt_state) {
 			// The froxel volumetric fog (D37): the frame renders no shadow map, so the froxel's lights are
 			// shadowed by ray queries against the TLAS just built, and the raygen composes the result over
@@ -384,6 +385,11 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	// Execute raytracing (replaces the opaque + motion vector pass).
 	if (rb_data.is_valid() && raytracing && raytracing->get_shader()) {
 		RD::get_singleton()->draw_command_begin_label("Raytracing");
+		if (rt_state) {
+			// The sky's sampling table (D54) follows the octmap rendered above, and is cleared when
+			// the Environment has no sky, so it runs whether or not the sky block did.
+			raytracing->update_sky_light(rt_state, p_render_data, rt_flags);
+		}
 		RENDER_TIMESTAMP("TLAS Build");
 
 		// Ensure raytracing output textures exist.

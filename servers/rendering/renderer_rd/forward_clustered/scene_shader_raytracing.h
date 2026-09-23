@@ -80,6 +80,7 @@ public:
 		RT_FLAG_SER_ENABLED = (1 << 3),
 		RT_FLAG_RAY_QUERY_SHADOWS_ENABLED = (1 << 4),
 		RT_FLAG_SOBOL_SAMPLER = (1 << 5), // The Owen-scrambled Sobol sampler (D52); clear, the PCG hash.
+		RT_FLAG_SKY_LIGHT = (1 << 6), // The sky sampled as a light with next-event estimation (D54).
 	};
 
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 21;
@@ -113,6 +114,7 @@ public:
 	static constexpr int RT_PARAM_LIGHT_COUNT = 14;
 	static constexpr int RT_PARAM_FRAME_INDEX = 15;
 	static constexpr int RT_PARAM_CLAMP_INDIRECT = 16; // Luminance clamp on an indirect contribution, 0 for none (D53).
+	static constexpr int RT_PARAM_SKY_SURFACE_SCORE = 17; // The analytic and emissive lights' summed score the sky's share is judged against (D54).
 	static constexpr int RT_PARAM_COUNT = 20;
 
 	static inline uint32_t rt_flags_pack(uint32_t p_flags, uint32_t p_sample_count, uint32_t p_max_bounces) {

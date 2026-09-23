@@ -1356,6 +1356,7 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 		}
 		sky->baked_exposure = p_luminance_multiplier;
 		sky->reflection.dirty = false;
+		sky->radiance_version++;
 
 	} else {
 		if (sky_mode == RSE::SKY_MODE_INCREMENTAL && sky->processing_layer < max_processing_layer) {
@@ -1708,6 +1709,12 @@ RID SkyRD::sky_get_radiance_2d_texture_rd(RID p_sky) const {
 	// so consumers binding a texture2D get a matching texture type. Low-quality
 	// skies already use a plain 2D texture.
 	return sky->radiance_first_layer_slice.is_valid() ? sky->radiance_first_layer_slice : sky->radiance;
+}
+
+uint64_t SkyRD::sky_get_radiance_version(RID p_sky) const {
+	Sky *sky = get_sky(p_sky);
+	ERR_FAIL_NULL_V(sky, 0);
+	return sky->radiance_version;
 }
 
 float SkyRD::sky_get_uv_border_size(RID p_sky) {

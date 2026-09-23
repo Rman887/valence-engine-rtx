@@ -717,6 +717,15 @@ bool Environment::is_pathtracing_sky_light() const {
 	return pathtracing_sky_light;
 }
 
+void Environment::set_pathtracing_light_tree(bool p_enable) {
+	pathtracing_light_tree = p_enable;
+	RS::get_singleton()->environment_set_pathtracing_light_tree(environment, pathtracing_light_tree);
+}
+
+bool Environment::is_pathtracing_light_tree() const {
+	return pathtracing_light_tree;
+}
+
 void Environment::_update_pathtracing() {
 	RS::get_singleton()->environment_set_pathtracing(
 			environment,
@@ -1627,6 +1636,8 @@ void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pathtracing_clamp_indirect"), &Environment::get_pathtracing_clamp_indirect);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_sky_light", "enable"), &Environment::set_pathtracing_sky_light);
 	ClassDB::bind_method(D_METHOD("is_pathtracing_sky_light"), &Environment::is_pathtracing_sky_light);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_light_tree", "enable"), &Environment::set_pathtracing_light_tree);
+	ClassDB::bind_method(D_METHOD("is_pathtracing_light_tree"), &Environment::is_pathtracing_light_tree);
 	GLOBAL_DEF("rendering/pathtracing/use_simple_shadows", false);
 
 	ADD_GROUP("Pathtracing", "pathtracing_");
@@ -1642,6 +1653,7 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "pathtracing_clamp_direct", PROPERTY_HINT_RANGE, "0,100,0.1,or_greater"), "set_pathtracing_clamp_direct", "get_pathtracing_clamp_direct");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "pathtracing_clamp_indirect", PROPERTY_HINT_RANGE, "0,100,0.1,or_greater"), "set_pathtracing_clamp_indirect", "get_pathtracing_clamp_indirect");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_sky_light"), "set_pathtracing_sky_light", "is_pathtracing_sky_light");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_light_tree"), "set_pathtracing_light_tree", "is_pathtracing_light_tree");
 
 	// Camera medium
 

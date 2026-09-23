@@ -146,9 +146,10 @@ struct alignas(16) RT_LightData {
 static_assert(sizeof(RT_LightData) == 80, "RT_LightData must be 80 bytes for std430");
 
 enum {
-	RT_LIGHTS_MAX = 64,
+	RT_LIGHTS_MAX = 1024, // The light buffer's capacity; the light tree (D55) selects over all of it.
+	RT_LIGHTS_UNIFORM_MAX = 64, // The cap without the tree, where the pick is uniform over the list.
 	RT_LIGHTS_FRUSTUM_BUDGET = 48,
-	RT_LIGHTS_INDIRECT_BUDGET = RT_LIGHTS_MAX - RT_LIGHTS_FRUSTUM_BUDGET,
+	RT_LIGHTS_INDIRECT_BUDGET = RT_LIGHTS_UNIFORM_MAX - RT_LIGHTS_FRUSTUM_BUDGET,
 };
 
 // An emissive mesh light (D50): a TLAS instance whose material emits a constant radiance, listed
@@ -170,6 +171,32 @@ enum {
 	RT_EMISSIVE_MAX = 1024,
 	RT_EMISSIVE_FLAG_TWO_SIDED = 1u,
 	RT_EMISSIVE_FLAG_FLIP_FACING = 2u, // The instance flips the winding: its lit face winds clockwise as seen (Godot front faces).
+};
+
+// A node of the light tree (D55): a bounding sphere, an orientation cone, the summed power and the
+// largest range of the lights under it, and its place in the tree. Must match GLSL RTLightTreeNode
+// (std430, 48 bytes) in raytracing_light_tree_inc.glsl.
+struct alignas(16) RT_LightTreeNode {
+	float center[3]; // Trace space.
+	float radius;
+	float axis[3]; // The orientation cone's axis; unused when cos_theta_o is -1.
+	float cos_theta_o; // Cosine of the cone's half-angle, -1 for every direction.
+	float power; // Luminance at unit distance, summed over the leaves.
+	float max_range; // The largest light range under the node, 0 for unbounded.
+	uint32_t child; // An inner node: the right child (the left is the next node); a leaf: RT_LIGHT_TREE_LEAF_BIT | flags | index.
+	uint32_t parent; // RT_LIGHT_TREE_NO_NODE at the root.
+};
+static_assert(sizeof(RT_LightTreeNode) == 48, "RT_LightTreeNode must be 48 bytes for std430");
+
+enum : uint32_t {
+	RT_LIGHT_TREE_LEAF_BIT = 0x80000000u,
+	RT_LIGHT_TREE_EMISSIVE_BIT = 0x40000000u,
+	RT_LIGHT_TREE_NO_NODE = 0xFFFFFFFFu,
+	RT_LIGHT_TREE_LEAVES_MAX = RT_LIGHTS_MAX + RT_EMISSIVE_MAX,
+	RT_LIGHT_TREE_NODES_MAX = 2 * RT_LIGHT_TREE_LEAVES_MAX - 1, // Must match RT_LIGHT_TREE_NODES_MAX in raytracing_light_tree_inc.glsl.
+	RT_LIGHT_TREE_HEADER_SIZE = 4 * sizeof(uint32_t),
+	RT_LIGHT_TREE_LEAF_MAP_OFFSET = RT_LIGHT_TREE_HEADER_SIZE + RT_LIGHT_TREE_NODES_MAX * sizeof(RT_LightTreeNode),
+	RT_LIGHT_TREE_BUFFER_SIZE = RT_LIGHT_TREE_LEAF_MAP_OFFSET + RT_EMISSIVE_MAX * sizeof(uint32_t),
 };
 
 enum {
@@ -344,6 +371,7 @@ struct RTViewportState {
 
 	RID light_buffer;
 	RID emissive_buffer; // The emissive mesh lights of the frame (D50), RT_EMISSIVE_MAX entries.
+	RID light_tree_buffer; // The light tree (D55): a header, the nodes and each emissive entry's leaf; rebuilt per frame while the Environment asks for it.
 	uint32_t emissive_count_logged = 0; // The last count printed for this viewport.
 	RID params_buffer;
 	// The sky's sampling table (D54), rebuilt by `RenderRaytracing::update_sky_light` when the
@@ -422,6 +450,7 @@ class RenderRaytracing {
 	LocalVector<RID> merged_mm_active_this_frame;
 
 	RTDeformedCacheEntry *_access_deformed_slot(RID &r_handle);
+	uint32_t _build_light_tree_node(uint32_t p_begin, uint32_t p_end, uint32_t p_parent); // The light tree's recursive build (D55).
 	void _release_deformed_blas(RTDeformedCacheEntry &p_entry);
 	RTMergedMMEntry *_access_merged_mm_slot(RID &r_handle);
 
@@ -449,6 +478,22 @@ class RenderRaytracing {
 	};
 	LocalVector<EmissiveCandidate> emissive_candidates; ///< The emissive gather's ranking (D50).
 	LocalVector<RT_EmissiveInstance> emissive_scratch;
+	LocalVector<RT_LightData> light_scratch; ///< The frame's light list before upload.
+	// The light tree's build scratch (D55): a leaf per positional light and per emissive entry,
+	// the nodes in depth-first order and the leaf map, uploaded as one buffer.
+	struct LightTreeLeaf {
+		Vector3 center;
+		float radius;
+		Vector3 axis;
+		float cos_theta_o;
+		float power;
+		float max_range;
+		uint32_t encoded; // RT_LIGHT_TREE_LEAF_BIT | flags | index.
+	};
+	LocalVector<LightTreeLeaf> light_tree_leaves;
+	LocalVector<uint32_t> light_tree_order; ///< Leaf indices, partitioned in place by the build.
+	LocalVector<RT_LightTreeNode> light_tree_nodes;
+	LocalVector<uint32_t> light_tree_leaf_map;
 	// Camera and bounce rays select all geometry. Shadow rays select bit 1;
 	// the G-buffer primary probe selects only procedural geometry (bit 2).
 	// Keep these in sync with RT_MASK_* in raytracing_common_inc.glsl.
@@ -531,8 +576,9 @@ public:
 	void cleanup_caches();
 
 	RTViewportState *build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags);
-	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, const Vector3 &p_origin, float &r_score_sum);
+	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, const Vector3 &p_origin, float &r_score_sum, uint32_t &r_directional_count);
 	uint32_t gather_emissive(const RenderDataRD *p_render_data, const RTViewportState *p_state, RT_EmissiveInstance *r_emissive_data, uint32_t p_max_emissive, float &r_score_sum);
+	uint32_t build_light_tree(const RT_LightData *p_lights, uint32_t p_light_count, uint32_t p_directional_count, const RT_EmissiveInstance *p_emissive, uint32_t p_emissive_count, float p_exposure);
 	RID update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_primary_from_gbuffer);
 	void update_sky_light(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags);
 

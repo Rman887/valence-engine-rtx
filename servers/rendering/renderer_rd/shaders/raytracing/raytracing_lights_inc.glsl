@@ -159,6 +159,9 @@ float lights_get_specular_multiplier(float specular_amount, float roughness) {
 	}
 }
 
+// The miss stage reads the light buffer for the light tree's selection (D55) and traces nothing.
+#ifndef RT_STAGE_MISS
+
 // ============================================================================
 // Inline Alpha Test (shared by all ray query proceed loops)
 // ============================================================================
@@ -251,6 +254,8 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 #endif
 }
 
+#endif // !RT_STAGE_MISS
+
 // ============================================================================
 // Next Event Estimation (NEE) - Direct Light Sampling
 // ============================================================================
@@ -269,6 +274,8 @@ struct LightSampleNEE {
 	float weight;
 	float specular_multiplier;
 };
+
+bool lights_sample_light(RTLightData light, vec3 hit_pos, vec3 N, MaterialProperties material, vec2 u, bool is_indirect_bounce, out LightSampleNEE r_sample);
 
 // Sample one analytic light for NEE with stochastic light selection.
 // Uses mini-batch reservoir sampling for importance-weighted light selection.
@@ -328,8 +335,30 @@ bool lights_sample_direct(
 
 	RTLightData light = rt_lights[selected_idx];
 	vec2 u = rand2(rng_state);
-	float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
+	bool have_sample = lights_sample_light(light, hit_pos, N, material, u, is_indirect_bounce, r_sample);
 	r_sample.weight = 1.0 / max(light_select_pdf, 1e-10);
+	return have_sample;
+}
+
+// One analytic light's sample from its pair of random numbers: an omni or spot light's point or
+// cone with its attenuation, a directional light's cone; the weight is left at 1 for the caller's
+// selection density (the reservoir's estimate above, the light tree's exact probability, D55).
+// Returns false when the sample carries nothing (out of range, outside the spot cone, below the
+// horizon).
+bool lights_sample_light(
+		RTLightData light,
+		vec3 hit_pos,
+		vec3 N,
+		MaterialProperties material,
+		vec2 u,
+		bool is_indirect_bounce,
+		out LightSampleNEE r_sample) {
+	r_sample.direction = vec3(0.0, 1.0, 0.0);
+	r_sample.shadow_distance = 0.0;
+	r_sample.leg_distance = 0.0;
+	r_sample.radiance = vec3(0.0);
+	r_sample.weight = 1.0;
+	float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 	r_sample.specular_multiplier = lights_get_specular_multiplier(light.specular_amount, material.roughness);
 
 	// === POSITIONAL LIGHT PATH (omni + spot) ===

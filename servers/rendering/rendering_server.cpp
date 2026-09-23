@@ -3104,6 +3104,7 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("environment_set_pathtracing_sampler", "env", "sampler"), &RenderingServer::environment_set_pathtracing_sampler);
 	ClassDB::bind_method(D_METHOD("environment_set_pathtracing_clamp", "env", "direct", "indirect"), &RenderingServer::environment_set_pathtracing_clamp);
 	ClassDB::bind_method(D_METHOD("environment_set_pathtracing_sky_light", "env", "enable"), &RenderingServer::environment_set_pathtracing_sky_light);
+	ClassDB::bind_method(D_METHOD("environment_set_pathtracing_light_tree", "env", "enable"), &RenderingServer::environment_set_pathtracing_light_tree);
 	ClassDB::bind_method(D_METHOD("environment_set_camera_medium", "env", "enable", "absorption", "scattering", "height"), &RenderingServer::environment_set_camera_medium);
 	ClassDB::bind_method(D_METHOD("environment_set_volumetric_fog", "env", "enable", "density", "albedo", "emission", "emission_energy", "anisotropy", "length", "detail_spread", "gi_inject", "temporal_reprojection", "temporal_reprojection_amount", "ambient_inject", "sky_affect"), &RenderingServer::environment_set_volumetric_fog);
 

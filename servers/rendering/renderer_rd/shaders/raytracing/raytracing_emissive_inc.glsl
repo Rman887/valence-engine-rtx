@@ -15,7 +15,9 @@
 // itself. Within the kept instance a triangle is chosen uniformly and a point uniformly on the
 // triangle; positions are read straight from the vertex buffer the BLAS was built over, through
 // its device address, which works in every stage, and the instance's current object-to-world
-// rides in the list.
+// rides in the list. Under the light tree (D55) the instance is chosen by the tree's resampling
+// instead and sampled through emissive_sample_instance with the tree density as the density the
+// MIS weight is written in; the chance-hit side recovers it by emissive_hit_pdf_entry.
 //
 // Requires: raytracing_inc.glsl, brdf_inc.glsl (brdf_pdf), raytracing_hit_inc.glsl
 // (geometries[], get_triangle_indices_ex), raytracing_lights_inc.glsl (lights_trace_shadow_ray),
@@ -87,11 +89,15 @@ void emissive_fetch_triangle(RTEmissiveInstance e, uint primitive_id, out vec3 p
 /// The density, per solid angle at the receiver, with which light sampling produces a point at
 /// distance dist on a triangle of area, met at cos_l (the cosine at the triangle, against the
 /// direction). Zero for a degenerate triangle or a point seen edge-on.
-float emissive_solid_angle_pdf(RTEmissiveInstance e, float area, float dist, float cos_l) {
+float emissive_solid_angle_pdf_p(float p_instance, uint primitive_count, float area, float dist, float cos_l) {
 	if (area <= 0.0 || cos_l <= 0.0) {
 		return 0.0;
 	}
-	return e.pdf / float(max(e.primitive_count, 1u)) * (dist * dist) / (area * cos_l);
+	return p_instance / float(max(primitive_count, 1u)) * (dist * dist) / (area * cos_l);
+}
+
+float emissive_solid_angle_pdf(RTEmissiveInstance e, float area, float dist, float cos_l) {
+	return emissive_solid_angle_pdf_p(e.pdf, e.primitive_count, area, dist, cos_l);
 }
 
 /// The power-heuristic weight of the strategy with density p_this against the other's p_other.
@@ -135,6 +141,8 @@ float emissive_proximity(RTEmissiveInstance e, vec3 hit_pos, vec3 N) {
 	float denominator = max(sqrt(d_sq), e.radius) * max(d_sq, r_sq);
 	return denominator > 0.0 ? above / denominator : 0.0;
 }
+
+bool emissive_sample_instance(RTEmissiveInstance e, float p_instance, float resample_factor, vec3 hit_pos, vec3 N, vec3 V, MaterialProperties material, vec2 u_tri, float strategy_probability, out LightSampleNEE r_sample);
 
 /// Next-event estimation toward the emissive list: candidates by the CDF resampled by their
 /// proximity (D51), one triangle, one point, and the power-heuristic weight against the BSDF
@@ -201,6 +209,31 @@ bool emissive_sample_direct(
 	float resample_factor = float(candidates) * w_selected / w_sum;
 
 	RTEmissiveInstance e = rt_emissive[selected];
+	return emissive_sample_instance(e, e.pdf, resample_factor, hit_pos, N, V, material, u_tri, strategy_probability, r_sample);
+}
+
+/// One emissive instance's sample from its pair of random numbers: a uniform triangle, a uniform
+/// point on it, the power-heuristic weight against the BSDF density written in p_instance (the
+/// probability the instance is selected with, as the chance-hit side recovers it: the global CDF's
+/// under D51, the light tree's exact one under D55) over the density the sample was really
+/// produced with (p_instance times resample_factor). Returns false when the sample carries nothing.
+bool emissive_sample_instance(
+		RTEmissiveInstance e,
+		float p_instance,
+		float resample_factor,
+		vec3 hit_pos,
+		vec3 N,
+		vec3 V,
+		MaterialProperties material,
+		vec2 u_tri,
+		float strategy_probability,
+		out LightSampleNEE r_sample) {
+	r_sample.direction = vec3(0.0, 1.0, 0.0);
+	r_sample.shadow_distance = 0.0;
+	r_sample.leg_distance = 0.0;
+	r_sample.radiance = vec3(0.0);
+	r_sample.weight = 0.0;
+	r_sample.specular_multiplier = 1.0;
 	if (e.primitive_count == 0u) {
 		return false;
 	}
@@ -249,8 +282,8 @@ bool emissive_sample_direct(
 		return false;
 	}
 
-	// The global density, in which the MIS weight is written: what a chance hit recovers.
-	float pdf_light = emissive_solid_angle_pdf(e, area, dist, cos_l);
+	// The density the MIS weight is written in: what a chance hit recovers.
+	float pdf_light = emissive_solid_angle_pdf_p(p_instance, e.primitive_count, area, dist, cos_l);
 	if (pdf_light <= 0.0) {
 		return false;
 	}
@@ -273,7 +306,7 @@ bool emissive_sample_direct(
 /// path found by its own scatter: the instance's entry (a binary search of the list by instance
 /// index; zero when the instance is not listed, so its emission keeps the whole weight), its
 /// triangle's area and the cosine at the hit. Zero on the unlit side of a one-sided entry.
-float emissive_hit_pdf(uint instance_index, uint primitive_id, vec3 ray_dir, float hit_t, bool is_front_face, uint count) {
+uint emissive_find_entry(uint instance_index, uint count) {
 	uint lo = 0u;
 	uint hi = count;
 	while (lo < hi) {
@@ -285,9 +318,25 @@ float emissive_hit_pdf(uint instance_index, uint primitive_id, vec3 ray_dir, flo
 		}
 	}
 	if (lo >= count || rt_emissive[lo].instance_index != instance_index) {
+		return count;
+	}
+	return lo;
+}
+
+float emissive_hit_pdf_entry(uint entry, float p_instance, uint primitive_id, vec3 ray_dir, float hit_t, bool is_front_face);
+
+float emissive_hit_pdf(uint instance_index, uint primitive_id, vec3 ray_dir, float hit_t, bool is_front_face, uint count) {
+	uint entry = emissive_find_entry(instance_index, count);
+	if (entry >= count) {
 		return 0.0;
 	}
-	RTEmissiveInstance e = rt_emissive[lo];
+	return emissive_hit_pdf_entry(entry, rt_emissive[entry].pdf, primitive_id, ray_dir, hit_t, is_front_face);
+}
+
+/// The same density for a listed entry selected with probability p_instance (the light tree's,
+/// D55, evaluated at the previous vertex by the caller).
+float emissive_hit_pdf_entry(uint entry, float p_instance, uint primitive_id, vec3 ray_dir, float hit_t, bool is_front_face) {
+	RTEmissiveInstance e = rt_emissive[entry];
 	if (!is_front_face && (e.flags & RT_EMISSIVE_FLAG_TWO_SIDED) == 0u) {
 		return 0.0;
 	}
@@ -301,5 +350,5 @@ float emissive_hit_pdf(uint instance_index, uint primitive_id, vec3 ray_dir, flo
 	// The side was settled above; the cosine is the face's own, as light sampling computes it,
 	// not the interpolated normal the hit carries, so the two densities agree exactly.
 	float cos_l = abs(dot(n_scaled, ray_dir)) / twice_area;
-	return emissive_solid_angle_pdf(e, 0.5 * twice_area, hit_t, cos_l);
+	return emissive_solid_angle_pdf_p(p_instance, e.primitive_count, 0.5 * twice_area, hit_t, cos_l);
 }

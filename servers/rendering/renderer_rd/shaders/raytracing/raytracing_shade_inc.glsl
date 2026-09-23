@@ -6,7 +6,8 @@
 //
 // Required includes (before this file):
 //   raytracing_inc.glsl, brdf_inc.glsl, raytracing_hit_inc.glsl, raytracing_lights_inc.glsl,
-//   raytracing_emissive_inc.glsl, raytracing_material_eval_inc.glsl, radiance_octmap_sample()
+//   raytracing_emissive_inc.glsl, raytracing_sky_inc.glsl, raytracing_light_tree_inc.glsl,
+//   raytracing_material_eval_inc.glsl, radiance_octmap_sample()
 //
 // Required bindings (before this file):
 //   tlas, payload, scene_data_block, geometries[], materials[], bindless_textures[],
@@ -327,6 +328,16 @@ void apply_segment_medium(float segment_length, inout PathState ps) {
 
 /// Production shading: emissive + NEE direct lighting + BRDF importance sampling + next bounce.
 /// Also handles DLSS-RR G-buffer output on primary ray.
+/// The vertex the ray that reached h left from: the hit stage's own origin, or reconstructed
+/// from the hit for the raygen's G-buffer surface (whose camera ray never weighs an emitter).
+vec3 shade_previous_origin(HitData h, vec3 ray_dir, float hit_t) {
+#ifdef RT_STAGE_CLOSEST_HIT
+	return gl_WorldRayOriginEXT;
+#else
+	return h.hit_pos - ray_dir * hit_t;
+#endif
+}
+
 /// ray_dir and hit_t describe the ray that reached h.hit_pos: the hit stage's
 /// built-ins, or the raygen's own primary ray for a G-buffer surface.
 void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
@@ -361,10 +372,19 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	uint rt_emissive_count = uint(get_rt_param(RT_PARAM_EMISSIVE_COUNT));
 	// The sky's share of the light samples (D54), 0 without a sky light; the surface lights
 	// split the rest, so their densities carry the remainder on both sides of the weight.
-	float p_sky = sky_light_probability();
+	float p_sky = light_tree_enabled() ? 0.0 : sky_light_probability();
 	float emissive_weight = 1.0;
 	if (total_bounces > 0u && rt_emissive_count > 0u && ps.bsdf_pdf != RT_BSDF_PDF_DELTA && any(greaterThan(m.emissive, vec3(0.0)))) {
-		float pdf_light = (1.0 - p_sky) * get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY) * emissive_hit_pdf(h.geometry_idx, h.primitive_id, ray_dir, hit_t, h.is_front_face, rt_emissive_count);
+		float pdf_light;
+		if (light_tree_enabled()) {
+			// The light tree's exact probability of this entry at the previous vertex (D55): the ray's
+			// origin and the offset normal the payload carried from there.
+			uint entry = emissive_find_entry(h.geometry_idx, rt_emissive_count);
+			float p_instance = (entry < rt_emissive_count) ? light_tree_emissive_probability(entry, shade_previous_origin(h, ray_dir, hit_t), ps.offset_normal) : 0.0;
+			pdf_light = (entry < rt_emissive_count) ? emissive_hit_pdf_entry(entry, p_instance, h.primitive_id, ray_dir, hit_t, h.is_front_face) : 0.0;
+		} else {
+			pdf_light = (1.0 - p_sky) * get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY) * emissive_hit_pdf(h.geometry_idx, h.primitive_id, ray_dir, hit_t, h.is_front_face, rt_emissive_count);
+		}
 		emissive_weight = emissive_mis_weight(ps.bsdf_pdf, pdf_light);
 	}
 	vec3 emitted = ps.throughput * m.emissive * emissive_weight;
@@ -466,13 +486,18 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// count, so the scatter's draws are pinned again after it. The analytic path draws the two
 	// strategy choices (the sky's, then the emissive list's), a pick and an acceptance per
 	// reservoir slot and the cone pair, which must stay below the scatter's offset or the
-	// scatter would redraw the light's numbers.
-#if 2 * RT_LIGHT_RESERVOIR_SIZE + 5 > 40
-#error RT_SOBOL_DIM_SCATTER must exceed the analytic light path's draw count
+	// scatter would redraw the light's numbers; the light tree (D55) draws one for its reservoir,
+	// two per candidate (the top split, then the descent on one rescaled number) and the leaf's
+	// pair, plus the sky's.
+#if 2 * RT_LIGHT_RESERVOIR_SIZE + 5 > 40 || 2 * RT_LIGHT_TREE_MAX_CANDIDATES + 4 > 40
+#error RT_SOBOL_DIM_SCATTER must exceed the light sampling paths' draw counts
 #endif
 	rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE);
 	uint rt_light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
-	if (rt_light_count > 0u || rt_emissive_count > 0u || p_sky > 0.0) {
+	// Under the tree (D55) the sky's share is per hit, so a frame whose only light is the sky still
+	// takes its sample here (the miss weighs against it either way).
+	bool tree_sky = light_tree_enabled() && sky_light_enabled() && sky_total > 0.0;
+	if (rt_light_count > 0u || rt_emissive_count > 0u || p_sky > 0.0 || tree_sky) {
 		vec3 hit_pos_offset = offset_ray_origin(h.hit_pos, h.geometry_normal);
 		bool is_indirect = (diffuse_bounces > 0u);
 		// One light sample per hit (D50): the analytic lights or the emissive list, chosen by the
@@ -489,14 +514,21 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			strategy_probability = sample_sky ? p_sky : (1.0 - p_sky);
 		}
 		bool sample_emissive = !sample_sky && rt_emissive_count > 0u;
-		if (!sample_sky && rt_light_count > 0u && rt_emissive_count > 0u) {
+		if (!light_tree_enabled() && !sample_sky && rt_light_count > 0u && rt_emissive_count > 0u) {
 			float p_emissive = get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY);
 			sample_emissive = rand(ps.rng_state) < p_emissive;
 			strategy_probability *= sample_emissive ? p_emissive : (1.0 - p_emissive);
 		}
 		LightSampleNEE light_sample;
 		bool have_sample;
-		if (sample_sky) {
+		if (light_tree_enabled()) {
+			// The light tree (D55) chooses among every strategy by its importance here, judged on the
+			// geometry normal as the payload carries it on, so the next vertex recovers the same
+			// probability; the shading normal still decides what the sample delivers.
+			vec3 N_select = oct_to_vec3(unpackUnorm2x16(packUnorm2x16(vec3_to_oct(h.geometry_normal))) * 2.0 - 1.0);
+			uint tree_candidates = uint(get_rt_param(RT_PARAM_EMISSIVE_CANDIDATES));
+			have_sample = light_tree_sample_direct(hit_pos_offset, N_select, N, V, brdf_mat, ps.rng_state, is_indirect, tree_candidates, light_sample, strategy_probability);
+		} else if (sample_sky) {
 			have_sample = sky_sample_direct(N, V, brdf_mat, ps.rng_state, strategy_probability, light_sample);
 		} else if (sample_emissive) {
 			uint candidates = uint(get_rt_param(RT_PARAM_EMISSIVE_CANDIDATES));

@@ -899,6 +899,7 @@ public:
 	FUNC2(environment_set_pathtracing_sampler, RID, RSE::PathtracingSampler)
 	FUNC3(environment_set_pathtracing_clamp, RID, float, float)
 	FUNC2(environment_set_pathtracing_sky_light, RID, bool)
+	FUNC2(environment_set_pathtracing_light_tree, RID, bool)
 	FUNC5(environment_set_camera_medium, RID, bool, const Color &, const Color &, float)
 
 	FUNC3R(Ref<Image>, environment_bake_panorama, RID, bool, const Size2i &)

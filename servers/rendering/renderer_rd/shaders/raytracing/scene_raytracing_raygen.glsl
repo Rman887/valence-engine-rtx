@@ -82,6 +82,7 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 
 // clang-format off
 #include "raytracing_sky_inc.glsl"
+#include "raytracing_light_tree_inc.glsl"
 #include "raytracing_material_eval_inc.glsl"
 #include "raytracing_shade_inc.glsl"
 // clang-format on
@@ -409,7 +410,11 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 
 #endif // USE_RADIANCE_OCTMAP_ARRAY
 
+// clang-format off
 #include "raytracing_sky_inc.glsl"
+#include "raytracing_lights_inc.glsl"
+#include "raytracing_light_tree_inc.glsl"
+// clang-format on
 
 void main() {
 	if ((payload.packed_bounces_flags & PRIMARY_PROBE_FLAG) != 0u) {
@@ -478,7 +483,10 @@ void main() {
 	// The sky a bounce found on its own is weighed against the sky light sample that competes
 	// for it (D54): the camera ray and a delta lobe keep the whole weight, as with an emitter.
 	if (sky_light_enabled() && get_total_bounces(ps.packed_bounces_flags) > 0u && ps.bsdf_pdf != RT_BSDF_PDF_DELTA) {
-		sky_add *= sky_mis_weight(ps.bsdf_pdf, sky_light_probability() * sky_pdf(sky_dir));
+		// Under the light tree (D55) the sky's share was decided at the previous vertex: the ray's
+		// origin and the offset normal the payload carried from there.
+		float p_sky = light_tree_enabled() ? light_tree_sky_probability(gl_WorldRayOriginEXT, ps.offset_normal) : sky_light_probability();
+		sky_add *= sky_mis_weight(ps.bsdf_pdf, p_sky * sky_pdf(sky_dir));
 	}
 	if (is_scattered(ps.packed_bounces_flags)) {
 		sky_add = rt_clamp_contribution(sky_add, get_rt_param(RT_PARAM_CLAMP_INDIRECT));
@@ -616,6 +624,7 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 
 // clang-format off
 #include "raytracing_sky_inc.glsl"
+#include "raytracing_light_tree_inc.glsl"
 #include "raytracing_material_eval_inc.glsl"
 #include "raytracing_closest_hit_common_inc.glsl"
 // clang-format on

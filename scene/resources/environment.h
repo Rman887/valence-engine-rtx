@@ -203,6 +203,7 @@ private:
 	float pathtracing_clamp_direct = 0.0f;
 	float pathtracing_clamp_indirect = 0.0f;
 	bool pathtracing_sky_light = false;
+	bool pathtracing_light_tree = false;
 	void _update_pathtracing();
 	void _update_pathtracing_clamp();
 
@@ -425,6 +426,8 @@ public:
 	float get_pathtracing_clamp_indirect() const;
 	void set_pathtracing_sky_light(bool p_enable);
 	bool is_pathtracing_sky_light() const;
+	void set_pathtracing_light_tree(bool p_enable);
+	bool is_pathtracing_light_tree() const;
 
 	// Camera medium
 	void set_camera_medium_enabled(bool p_enabled);

@@ -945,6 +945,12 @@ void RendererEnvironmentStorage::environment_set_pathtracing_sky_light(RID p_env
 	env->pathtracing_sky_light = p_enable;
 }
 
+void RendererEnvironmentStorage::environment_set_pathtracing_light_tree(RID p_env, bool p_enable) {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL(env);
+	env->pathtracing_light_tree = p_enable;
+}
+
 bool RendererEnvironmentStorage::environment_get_pathtracing_enabled(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, false);
@@ -1015,6 +1021,12 @@ bool RendererEnvironmentStorage::environment_get_pathtracing_sky_light(RID p_env
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, false);
 	return env->pathtracing_sky_light;
+}
+
+bool RendererEnvironmentStorage::environment_get_pathtracing_light_tree(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, false);
+	return env->pathtracing_light_tree;
 }
 
 // Camera medium

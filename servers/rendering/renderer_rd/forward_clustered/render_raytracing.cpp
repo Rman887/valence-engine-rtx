@@ -148,6 +148,9 @@ void RenderRaytracing::_free_viewport_state_internal(RTViewportState *p_state) {
 	if (p_state->emissive_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->emissive_buffer);
 	}
+	if (p_state->light_tree_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(p_state->light_tree_buffer);
+	}
 	if (p_state->light_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->light_buffer);
 	}
@@ -2667,8 +2670,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 // Light gathering
 // ---------------------------------------------------------------------------
 
-uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, const Vector3 &p_origin, float &r_score_sum) {
+uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, const Vector3 &p_origin, float &r_score_sum, uint32_t &r_directional_count) {
 	r_score_sum = 0.0f;
+	r_directional_count = 0;
 	uint32_t rt_light_count = 0;
 
 	if (!p_render_data || !p_render_data->lights) {
@@ -2791,6 +2795,8 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		ld.spot_direction[2] = 0.0f;
 		rt_light_count++;
 	}
+
+	r_directional_count = rt_light_count;
 
 	// Positional lights from the AABB-culled RT list (superset of frustum).
 	if (p_render_data->rt_lights) {
@@ -2981,6 +2987,219 @@ uint32_t RenderRaytracing::gather_emissive(const RenderDataRD *p_render_data, co
 		e.radius = c.radius;
 	}
 	return count;
+}
+
+// ---------------------------------------------------------------------------
+// The light tree (D55)
+// ---------------------------------------------------------------------------
+
+static float _rt_luminance(const float *p_rgb) {
+	return 0.2126f * p_rgb[0] + 0.7152f * p_rgb[1] + 0.0722f * p_rgb[2];
+}
+
+/// The smallest sphere holding two spheres.
+static void _rt_sphere_union(const Vector3 &p_c1, float p_r1, const Vector3 &p_c2, float p_r2, Vector3 &r_center, float &r_radius) {
+	Vector3 d = p_c2 - p_c1;
+	float dist = d.length();
+	if (dist + p_r2 <= p_r1) {
+		r_center = p_c1;
+		r_radius = p_r1;
+		return;
+	}
+	if (dist + p_r1 <= p_r2) {
+		r_center = p_c2;
+		r_radius = p_r2;
+		return;
+	}
+	float r = 0.5f * (dist + p_r1 + p_r2);
+	r_center = p_c1 + d * ((r - p_r1) / dist);
+	r_radius = r;
+}
+
+/// The smallest cone holding two orientation cones (Conty Estevez and Kulla 2018, without the
+/// emission falloff angle, which the shader bounds at a right angle). A cosine of -1 is every
+/// direction and absorbs anything.
+static void _rt_cone_union(const Vector3 &p_a1, float p_cos1, const Vector3 &p_a2, float p_cos2, Vector3 &r_axis, float &r_cos) {
+	if (p_cos1 <= -1.0f || p_cos2 <= -1.0f) {
+		r_axis = p_a1;
+		r_cos = -1.0f;
+		return;
+	}
+	Vector3 a1 = p_a1;
+	Vector3 a2 = p_a2;
+	float t1 = Math::acos(CLAMP(p_cos1, -1.0f, 1.0f));
+	float t2 = Math::acos(CLAMP(p_cos2, -1.0f, 1.0f));
+	if (t2 > t1) {
+		SWAP(a1, a2);
+		SWAP(t1, t2);
+	}
+	float td = Math::acos(CLAMP(a1.dot(a2), -1.0f, 1.0f));
+	if (MIN(td + t2, (float)Math::PI) <= t1) {
+		r_axis = a1;
+		r_cos = Math::cos(t1);
+		return;
+	}
+	float to = 0.5f * (t1 + td + t2);
+	if (to >= (float)Math::PI) {
+		r_axis = a1;
+		r_cos = -1.0f;
+		return;
+	}
+	float tr = to - t1;
+	Vector3 rot_axis = a1.cross(a2);
+	if (rot_axis.length_squared() > 1.0e-12f) {
+		a1 = Basis(rot_axis.normalized(), tr).xform(a1).normalized();
+	}
+	r_axis = a1;
+	r_cos = Math::cos(to);
+}
+
+/// Lists the frame's leaves, one per positional light and per emissive entry (the directional
+/// lights and the sky are the tree's top-level companions in the shader), and builds a binary
+/// tree over them balanced by count, split at the median of the leaf centres along the longest
+/// axis, in depth-first order so a node's left child follows it. Each node carries the union of
+/// its children's spheres and cones, their summed power and their largest range. The nodes and
+/// each emissive entry's leaf land in the scratch vectors for the upload. Returns the node count,
+/// 0 when there is no leaf.
+uint32_t RenderRaytracing::build_light_tree(const RT_LightData *p_lights, uint32_t p_light_count, uint32_t p_directional_count, const RT_EmissiveInstance *p_emissive, uint32_t p_emissive_count, float p_exposure) {
+	light_tree_leaves.clear();
+	light_tree_nodes.clear();
+	if (light_tree_leaf_map.size() < RT_EMISSIVE_MAX) {
+		light_tree_leaf_map.resize(RT_EMISSIVE_MAX);
+	}
+	for (uint32_t n = 0; n < p_emissive_count; n++) {
+		light_tree_leaf_map[n] = RT_LIGHT_TREE_NO_NODE;
+	}
+
+	for (uint32_t i = p_directional_count; i < p_light_count; i++) {
+		const RT_LightData &l = p_lights[i];
+		// A negative light subtracts; its importance is its magnitude.
+		float power = Math::abs(_rt_luminance(l.emission));
+		if (!(power > 0.0f)) {
+			continue;
+		}
+		LightTreeLeaf leaf;
+		leaf.center = Vector3(l.position[0], l.position[1], l.position[2]);
+		leaf.radius = MAX(l.radius, 0.0f);
+		if (l.type == RT_LIGHT_TYPE_SPOT) {
+			leaf.axis = Vector3(l.spot_direction[0], l.spot_direction[1], l.spot_direction[2]);
+			leaf.cos_theta_o = l.cos_spot_angle;
+		} else {
+			leaf.axis = Vector3(0, 0, 1);
+			leaf.cos_theta_o = -1.0f;
+		}
+		leaf.power = power;
+		leaf.max_range = l.max_range_squared > 0.0f ? Math::sqrt(l.max_range_squared) : 0.0f;
+		leaf.encoded = RT_LIGHT_TREE_LEAF_BIT | i;
+		light_tree_leaves.push_back(leaf);
+	}
+	// The emissive gather's ranking is in the entries' order; its weight is the luminance times
+	// the area proxy, which under the exposure is the entry's power at unit distance.
+	ERR_FAIL_COND_V(p_emissive_count > 0 && emissive_candidates.size() != p_emissive_count, 0);
+	for (uint32_t n = 0; n < p_emissive_count; n++) {
+		const RT_EmissiveInstance &e = p_emissive[n];
+		float power = emissive_candidates[n].weight * p_exposure;
+		if (!(power > 0.0f)) {
+			continue;
+		}
+		LightTreeLeaf leaf;
+		leaf.center = Vector3(e.center[0], e.center[1], e.center[2]);
+		leaf.radius = MAX(e.radius, 0.0f);
+		leaf.axis = Vector3(0, 0, 1);
+		leaf.cos_theta_o = -1.0f;
+		leaf.power = power;
+		leaf.max_range = 0.0f;
+		leaf.encoded = RT_LIGHT_TREE_LEAF_BIT | RT_LIGHT_TREE_EMISSIVE_BIT | n;
+		light_tree_leaves.push_back(leaf);
+	}
+
+	uint32_t leaf_count = light_tree_leaves.size();
+	if (leaf_count == 0) {
+		return 0;
+	}
+	light_tree_order.resize(leaf_count);
+	for (uint32_t i = 0; i < leaf_count; i++) {
+		light_tree_order[i] = i;
+	}
+	light_tree_nodes.reserve(2 * leaf_count - 1);
+	_build_light_tree_node(0, leaf_count, RT_LIGHT_TREE_NO_NODE);
+
+	for (uint32_t i = 0; i < light_tree_nodes.size(); i++) {
+		uint32_t child = light_tree_nodes[i].child;
+		if ((child & RT_LIGHT_TREE_LEAF_BIT) && (child & RT_LIGHT_TREE_EMISSIVE_BIT)) {
+			light_tree_leaf_map[child & ~(RT_LIGHT_TREE_LEAF_BIT | RT_LIGHT_TREE_EMISSIVE_BIT)] = i;
+		}
+	}
+	return light_tree_nodes.size();
+}
+
+uint32_t RenderRaytracing::_build_light_tree_node(uint32_t p_begin, uint32_t p_end, uint32_t p_parent) {
+	uint32_t node_index = light_tree_nodes.size();
+	light_tree_nodes.push_back(RT_LightTreeNode());
+	if (p_end - p_begin == 1) {
+		const LightTreeLeaf &leaf = light_tree_leaves[light_tree_order[p_begin]];
+		RT_LightTreeNode &n = light_tree_nodes[node_index];
+		n.center[0] = leaf.center.x;
+		n.center[1] = leaf.center.y;
+		n.center[2] = leaf.center.z;
+		n.radius = leaf.radius;
+		n.axis[0] = leaf.axis.x;
+		n.axis[1] = leaf.axis.y;
+		n.axis[2] = leaf.axis.z;
+		n.cos_theta_o = leaf.cos_theta_o;
+		n.power = leaf.power;
+		n.max_range = leaf.max_range;
+		n.child = leaf.encoded;
+		n.parent = p_parent;
+		return node_index;
+	}
+
+	// The median along the longest axis of the leaf centres.
+	AABB bounds(light_tree_leaves[light_tree_order[p_begin]].center, Vector3());
+	for (uint32_t i = p_begin + 1; i < p_end; i++) {
+		bounds.expand_to(light_tree_leaves[light_tree_order[i]].center);
+	}
+	int axis = bounds.get_longest_axis_index();
+	struct AxisComparator {
+		const LightTreeLeaf *leaves = nullptr;
+		int axis = 0;
+		bool operator()(uint32_t a, uint32_t b) const {
+			return leaves[a].center[axis] < leaves[b].center[axis];
+		}
+	};
+	SortArray<uint32_t, AxisComparator> sorter;
+	sorter.compare.leaves = light_tree_leaves.ptr();
+	sorter.compare.axis = axis;
+	sorter.sort(light_tree_order.ptr() + p_begin, p_end - p_begin);
+	uint32_t mid = (p_begin + p_end) / 2;
+
+	uint32_t left = _build_light_tree_node(p_begin, mid, node_index);
+	uint32_t right = _build_light_tree_node(mid, p_end, node_index);
+	DEV_ASSERT(left == node_index + 1);
+
+	// The vector may have moved: take the references after the children are built.
+	const RT_LightTreeNode &l = light_tree_nodes[left];
+	const RT_LightTreeNode &r = light_tree_nodes[right];
+	Vector3 center;
+	float radius;
+	_rt_sphere_union(Vector3(l.center[0], l.center[1], l.center[2]), l.radius, Vector3(r.center[0], r.center[1], r.center[2]), r.radius, center, radius);
+	Vector3 cone_axis;
+	float cone_cos;
+	_rt_cone_union(Vector3(l.axis[0], l.axis[1], l.axis[2]), l.cos_theta_o, Vector3(r.axis[0], r.axis[1], r.axis[2]), r.cos_theta_o, cone_axis, cone_cos);
+	RT_LightTreeNode &n = light_tree_nodes[node_index];
+	n.center[0] = center.x;
+	n.center[1] = center.y;
+	n.center[2] = center.z;
+	n.radius = radius;
+	n.axis[0] = cone_axis.x;
+	n.axis[1] = cone_axis.y;
+	n.axis[2] = cone_axis.z;
+	n.cos_theta_o = cone_cos;
+	n.power = l.power + r.power;
+	n.max_range = (l.max_range > 0.0f && r.max_range > 0.0f) ? MAX(l.max_range, r.max_range) : 0.0f;
+	n.child = right;
+	n.parent = p_parent;
+	return node_index;
 }
 
 // ---------------------------------------------------------------------------
@@ -3215,22 +3434,30 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		}
 
 		// --- Light gathering ---
-		uint32_t rt_light_count = 0;
-		RT_LightData rt_light_data[RT_LIGHTS_MAX] = {};
+		// The light tree (D55) selects over the whole buffer; the uniform pick keeps its cap.
+		const bool light_tree = (p_rt_flags & SceneShaderRaytracing::RT_FLAG_LIGHT_TREE) != 0;
+		const uint32_t light_cap = light_tree ? RT_LIGHTS_MAX : RT_LIGHTS_UNIFORM_MAX;
+		if (light_scratch.size() < RT_LIGHTS_MAX) {
+			light_scratch.resize(RT_LIGHTS_MAX);
+		}
+		RT_LightData *rt_light_data = light_scratch.ptr();
+		memset(rt_light_data, 0, light_cap * sizeof(RT_LightData));
 
 		float light_score_sum = 0.0f;
-		rt_light_count = gather_lights(p_render_data, rt_light_data, RT_LIGHTS_MAX, p_state->rt_origin, light_score_sum);
+		uint32_t rt_directional_count = 0;
+		uint32_t rt_light_count = gather_lights(p_render_data, rt_light_data, light_cap, p_state->rt_origin, light_score_sum, rt_directional_count);
 
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_LIGHT_COUNT] = float(rt_light_count);
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_DIRECTIONAL_COUNT] = float(rt_directional_count);
 
-		// Upload light buffer.
+		// Upload light buffer: the cap's entries, as the uniform pick always had (zeroed past the count).
 		{
 			uint32_t buf_size = RT_LIGHTS_MAX * sizeof(RT_LightData);
 			if (!p_state->light_buffer.is_valid()) {
 				p_state->light_buffer = RD::get_singleton()->storage_buffer_create(buf_size);
 				RD::get_singleton()->set_resource_name(p_state->light_buffer, "RT Light Buffer");
 			}
-			RD::get_singleton()->buffer_update(p_state->light_buffer, 0, buf_size, rt_light_data);
+			RD::get_singleton()->buffer_update(p_state->light_buffer, 0, light_cap * sizeof(RT_LightData), rt_light_data);
 		}
 
 		// --- Emissive mesh lights (D50) ---
@@ -3275,6 +3502,29 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 				// Once per change, so a run's log shows whether the list was ever non-empty and its share.
 				print_line(vformat("Path tracer: %d emissive instance(s) sampled as lights, share %.2f of the light samples.", rt_emissive_count, emissive_probability));
 				p_state->emissive_count_logged = rt_emissive_count;
+			}
+
+			// --- The light tree (D55) ---
+			// Rebuilt every frame the Environment asks for it (the lights move with the anchor); a
+			// cleared buffer reads as no tree, which the shader treats as no positional light.
+			{
+				if (!p_state->light_tree_buffer.is_valid()) {
+					p_state->light_tree_buffer = RD::get_singleton()->storage_buffer_create(RT_LIGHT_TREE_BUFFER_SIZE);
+					RD::get_singleton()->set_resource_name(p_state->light_tree_buffer, "RT Light Tree Buffer");
+					RD::get_singleton()->buffer_clear(p_state->light_tree_buffer, 0, RT_LIGHT_TREE_BUFFER_SIZE);
+				}
+				if (light_tree) {
+					float exposure = (p_render_data && p_render_data->camera_attributes.is_valid()) ? RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes) : 1.0f;
+					uint32_t node_count = build_light_tree(rt_light_data, rt_light_count, rt_directional_count, emissive_scratch.ptr(), rt_emissive_count, exposure);
+					uint32_t header[4] = { node_count, 0, 0, 0 };
+					RD::get_singleton()->buffer_update(p_state->light_tree_buffer, 0, sizeof(header), header);
+					if (node_count > 0) {
+						RD::get_singleton()->buffer_update(p_state->light_tree_buffer, RT_LIGHT_TREE_HEADER_SIZE, node_count * sizeof(RT_LightTreeNode), light_tree_nodes.ptr());
+					}
+					if (rt_emissive_count > 0) {
+						RD::get_singleton()->buffer_update(p_state->light_tree_buffer, RT_LIGHT_TREE_LEAF_MAP_OFFSET, rt_emissive_count * sizeof(uint32_t), light_tree_leaf_map.ptr());
+					}
+				}
 			}
 		}
 
@@ -3482,6 +3732,15 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		u.binding = 43;
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 		u.append_id(p_state->sky_light_buffer);
+		uniforms.push_back(u);
+	}
+
+	// Binding 44: the light tree (D55), rebuilt above while the Environment asks for it.
+	{
+		RD::Uniform u;
+		u.binding = 44;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.append_id(p_state->light_tree_buffer);
 		uniforms.push_back(u);
 	}
 

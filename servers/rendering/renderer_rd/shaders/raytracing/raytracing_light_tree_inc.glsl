@@ -81,22 +81,29 @@ bool light_tree_enabled() {
 /// power over the distance squared (floored by the sphere, so a receiver inside it reads the
 /// power), the cosine at the receiver and the cosine at the light each bounded over the sphere's
 /// angular extent. Zero beyond the node's range and outside its cone by more than a right angle,
-/// where the lights are zero too; the receiver bound is floored.
+/// where the lights are zero too; the receiver bound is floored. Every angle is kept as its
+/// cosine and sine (the sum and difference identities), so a node costs one reciprocal square
+/// root and at most four square roots (two of them for a spot's cone), no arc function: the cut
+/// is scored on every hit.
 float light_tree_node_importance(RTLightTreeNode n, vec3 x, vec3 N) {
 	vec3 to_c = n.center - x;
 	float d2 = dot(to_c, to_c);
-	float d = sqrt(d2);
-	if (n.max_range > 0.0 && d - n.radius > n.max_range) {
-		return 0.0;
+	float r2 = n.radius * n.radius;
+	if (n.max_range > 0.0) {
+		float reach = n.max_range + n.radius;
+		if (d2 > reach * reach) {
+			return 0.0;
+		}
 	}
-	float inv_d2 = 1.0 / max(max(d2, n.radius * n.radius), 1e-8);
-	if (d <= n.radius) {
+	float inv_d2 = 1.0 / max(max(d2, r2), 1e-8);
+	if (d2 <= r2) {
 		// Inside the bound no angle is bounded.
 		return n.power * inv_d2;
 	}
-	float sin_u = n.radius / d;
+	float inv_d = inversesqrt(d2);
+	float sin_u = min(n.radius * inv_d, 1.0);
 	float cos_u = sqrt(max(1.0 - sin_u * sin_u, 0.0));
-	vec3 dir = to_c / d;
+	vec3 dir = to_c * inv_d;
 
 	// cos(max(theta_i - theta_u, 0)) at the receiver, floored.
 	float cos_i = clamp(dot(N, dir), -1.0, 1.0);
@@ -106,16 +113,23 @@ float light_tree_node_importance(RTLightTreeNode n, vec3 x, vec3 N) {
 	}
 	cos_bi = max(cos_bi, RT_LIGHT_TREE_RECEIVER_FLOOR);
 
-	// cos(max(theta - theta_o - theta_u, 0)) at the light, zero past a right angle beyond the cone.
+	// cos(max(theta - theta_o - theta_u, 0)) at the light, zero past a right angle beyond the cone:
+	// with phi = theta_o + theta_u, the bound applies when phi < pi and theta > phi (cos theta below
+	// cos phi), and is then cos(theta - phi), zero or under when that angle reaches a right angle.
 	float cos_bl = 1.0;
 	if (n.cos_theta_o > -1.0) {
-		float theta = acos(clamp(dot(n.axis, -dir), -1.0, 1.0));
-		float a = theta - acos(clamp(n.cos_theta_o, -1.0, 1.0)) - asin(clamp(sin_u, 0.0, 1.0));
-		if (a > 0.0) {
-			if (a >= 0.5 * PI) {
+		float cos_t = clamp(dot(n.axis, -dir), -1.0, 1.0);
+		float sin_t = sqrt(max(1.0 - cos_t * cos_t, 0.0));
+		float cos_o = clamp(n.cos_theta_o, -1.0, 1.0);
+		float sin_o = sqrt(max(1.0 - cos_o * cos_o, 0.0));
+		float cos_phi = cos_o * cos_u - sin_o * sin_u;
+		float sin_phi = sin_o * cos_u + cos_o * sin_u;
+		bool phi_under_pi = sin_phi > 0.0 || cos_phi > 0.0;
+		if (phi_under_pi && cos_t < cos_phi) {
+			cos_bl = cos_t * cos_phi + sin_t * sin_phi;
+			if (cos_bl <= 0.0) {
 				return 0.0;
 			}
-			cos_bl = cos(a);
 		}
 	}
 	return n.power * cos_bi * cos_bl * inv_d2;
@@ -151,9 +165,11 @@ struct LightTreeTop {
 
 /// Scores the top once for a hit: the cut's nodes are read independently and their importances
 /// summed in slot order. Nothing is stored per slot (a per-hit array would live in local memory
-/// and cost the trace its occupancy): a pick or a density evaluation runs the same sum again and
-/// takes its slot's interval from it, the same two floats in the same order on every side.
-LightTreeTop light_tree_top(vec3 x, vec3 N) {
+/// and cost the trace its occupancy): a pick runs the same sum again and takes its slot's
+/// interval from it, the same two floats in the same order on every side. A density evaluation
+/// knows its slot before the sum, so it takes the interval out of this pass (r_interval, the
+/// interval of `slot`, 0 when the slot is not in the cut).
+LightTreeTop light_tree_top_slot(vec3 x, vec3 N, uint slot, out float r_interval) {
 	LightTreeTop t;
 	t.directional_count = uint(get_rt_param(RT_PARAM_DIRECTIONAL_COUNT));
 	t.sky = light_tree_sky_importance();
@@ -163,12 +179,23 @@ LightTreeTop light_tree_top(vec3 x, vec3 N) {
 	}
 	t.cut_count = min(tree_cut_count, uint(RT_LIGHT_TREE_CUT_MAX));
 	float running = 0.0;
+	r_interval = 0.0;
 	for (uint s = 0u; s < t.cut_count; s++) {
+		float below = running;
 		running += light_tree_node_importance(tree_cut[s], x, N);
+		if (s == slot) {
+			r_interval = running - below;
+		}
 	}
 	t.root = running;
 	t.total = t.sky + t.directional + t.root;
 	return t;
+}
+
+/// The top alone, for the sampler and the miss: light_tree_top_slot with no slot.
+LightTreeTop light_tree_top(vec3 x, vec3 N) {
+	float unused;
+	return light_tree_top_slot(x, N, RT_LIGHT_TREE_NO_NODE, unused);
 }
 
 /// The probability a pick from the top t assigns a leaf of cut slot `slot` (its interval of the
@@ -209,19 +236,11 @@ float light_tree_emissive_probability(uint p_entry, vec3 x, vec3 N) {
 	if (slot == RT_LIGHT_TREE_NO_NODE || slot >= tree_cut_count || slot >= uint(RT_LIGHT_TREE_CUT_MAX)) {
 		return 0.0;
 	}
-	LightTreeTop t = light_tree_top(x, N);
+	// The slot's interval of the same running sum the sampler takes, out of the one pass that sums it.
+	float interval;
+	LightTreeTop t = light_tree_top_slot(x, N, slot, interval);
 	if (light_tree_sky_only(t) || !(t.total > 0.0)) {
 		return 0.0;
-	}
-	// The slot's interval of the same running sum light_tree_top and the sampler take.
-	float running = 0.0;
-	float interval = 0.0;
-	for (uint s = 0u; s < t.cut_count; s++) {
-		float below = running;
-		running += light_tree_node_importance(tree_cut[s], x, N);
-		if (s == slot) {
-			interval = running - below;
-		}
 	}
 	if (!(interval > 0.0)) {
 		return 0.0;
@@ -344,8 +363,17 @@ float light_tree_analytic_target(RTLightData light, vec3 hit_pos, vec3 N) {
 	if (light.type == RT_LIGHT_TYPE_SPOT) {
 		float scos = dot(-L, light.spot_direction);
 		// The sampler tests the cone on a direction drawn within the light's angular size, so the
-		// zero here is one angular size wider than the cone; inside it the falloff is floored.
-		float cos_outer = cos(min(acos(clamp(light.cos_spot_angle, -1.0, 1.0)) + asin(clamp(light.radius / max(dist, light.radius), 0.0, 1.0)), PI));
+		// zero here is one angular size wider than the cone; inside it the falloff is floored. The
+		// widened cone's cosine by the sum identity, -1 once the two angles reach a half turn.
+		float cos_s = clamp(light.cos_spot_angle, -1.0, 1.0);
+		float sin_s = sqrt(max(1.0 - cos_s * cos_s, 0.0));
+		float sin_u = clamp(light.radius / max(dist, light.radius), 0.0, 1.0);
+		float cos_u = sqrt(max(1.0 - sin_u * sin_u, 0.0));
+		float cos_outer = cos_s * cos_u - sin_s * sin_u;
+		float sin_outer = sin_s * cos_u + cos_s * sin_u;
+		if (sin_outer <= 0.0 && cos_outer <= 0.0) {
+			cos_outer = -1.0;
+		}
 		if (scos <= cos_outer) {
 			return 0.0;
 		}

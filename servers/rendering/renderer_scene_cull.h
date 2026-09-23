@@ -1394,6 +1394,7 @@ public:
 	PASS3(environment_set_pathtracing_clamp, RID, float, float)
 	PASS2(environment_set_pathtracing_sky_light, RID, bool)
 	PASS2(environment_set_pathtracing_light_tree, RID, bool)
+	PASS2(environment_set_pathtracing_light_tree_cut, RID, int)
 	PASS5(environment_set_camera_medium, RID, bool, const Color &, const Color &, float)
 
 	PASS1RC(bool, environment_get_pathtracing_enabled, RID)
@@ -1409,6 +1410,7 @@ public:
 	PASS1RC(float, environment_get_pathtracing_clamp_indirect, RID)
 	PASS1RC(bool, environment_get_pathtracing_sky_light, RID)
 	PASS1RC(bool, environment_get_pathtracing_light_tree, RID)
+	PASS1RC(int, environment_get_pathtracing_light_tree_cut, RID)
 
 	// Adjustment
 	PASS7(environment_set_adjustment, RID, bool, float, float, float, bool, RID)

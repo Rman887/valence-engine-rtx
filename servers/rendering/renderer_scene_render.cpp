@@ -741,6 +741,10 @@ void RendererSceneRender::environment_set_pathtracing_light_tree(RID p_env, bool
 	environment_storage.environment_set_pathtracing_light_tree(p_env, p_enable);
 }
 
+void RendererSceneRender::environment_set_pathtracing_light_tree_cut(RID p_env, int p_nodes) {
+	environment_storage.environment_set_pathtracing_light_tree_cut(p_env, p_nodes);
+}
+
 void RendererSceneRender::environment_set_camera_medium(RID p_env, bool p_enable, const Color &p_absorption, const Color &p_scattering, float p_height) {
 	environment_storage.environment_set_camera_medium(p_env, p_enable, p_absorption, p_scattering, p_height);
 }
@@ -795,6 +799,10 @@ bool RendererSceneRender::environment_get_pathtracing_sky_light(RID p_env) const
 
 bool RendererSceneRender::environment_get_pathtracing_light_tree(RID p_env) const {
 	return environment_storage.environment_get_pathtracing_light_tree(p_env);
+}
+
+int RendererSceneRender::environment_get_pathtracing_light_tree_cut(RID p_env) const {
+	return environment_storage.environment_get_pathtracing_light_tree_cut(p_env);
 }
 
 void RendererSceneRender::environment_set_adjustment(RID p_env, bool p_enable, float p_brightness, float p_contrast, float p_saturation, bool p_use_1d_color_correction, RID p_color_correction) {

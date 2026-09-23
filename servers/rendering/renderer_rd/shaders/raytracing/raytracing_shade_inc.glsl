@@ -487,7 +487,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// strategy choices (the sky's, then the emissive list's), a pick and an acceptance per
 	// reservoir slot and the cone pair, which must stay below the scatter's offset or the
 	// scatter would redraw the light's numbers; the light tree (D55) draws one for its reservoir,
-	// two per candidate (the top split, then the descent on one rescaled number) and the leaf's
+	// at most two per candidate (the top split, then its place in the cut, D56) and the leaf's
 	// pair, plus the sky's.
 #if 2 * RT_LIGHT_RESERVOIR_SIZE + 5 > 40 || 2 * RT_LIGHT_TREE_MAX_CANDIDATES + 4 > 40
 #error RT_SOBOL_DIM_SCATTER must exceed the light sampling paths' draw counts

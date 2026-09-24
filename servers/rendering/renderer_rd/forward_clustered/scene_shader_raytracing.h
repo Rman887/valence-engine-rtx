@@ -82,6 +82,7 @@ public:
 		RT_FLAG_SOBOL_SAMPLER = (1 << 5), // The Owen-scrambled Sobol sampler (D52); clear, the PCG hash.
 		RT_FLAG_SKY_LIGHT = (1 << 6), // The sky sampled as a light with next-event estimation (D54).
 		RT_FLAG_LIGHT_TREE = (1 << 7), // Light selection over the light tree (D55); clear, the per-frame shares and candidate picks.
+		RT_FLAG_LIGHT_TREE_POWER_PICK = (1 << 8), // The pick under a cut node by the lights' power (D60); clear, uniform. Set only with RT_FLAG_LIGHT_TREE.
 	};
 
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 21;

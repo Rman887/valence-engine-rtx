@@ -10,6 +10,7 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 #define RT_FLAG_SOBOL_SAMPLER (1u << 5)
 #define RT_FLAG_SKY_LIGHT (1u << 6)
 #define RT_FLAG_LIGHT_TREE (1u << 7)
+#define RT_FLAG_LIGHT_TREE_POWER_PICK (1u << 8)
 
 #define RT_SAMPLE_COUNT_SHIFT 21u
 #define RT_SAMPLE_COUNT_MASK 0xFFu

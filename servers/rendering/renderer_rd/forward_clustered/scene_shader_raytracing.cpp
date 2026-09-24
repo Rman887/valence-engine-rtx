@@ -699,6 +699,9 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_e
 		}
 		if (env_storage->environment_get_pathtracing_light_tree(p_environment)) {
 			flags |= RT_FLAG_LIGHT_TREE;
+			if (env_storage->environment_get_pathtracing_light_tree_power_pick(p_environment)) {
+				flags |= RT_FLAG_LIGHT_TREE_POWER_PICK;
+			}
 		}
 	}
 

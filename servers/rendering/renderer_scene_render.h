@@ -264,6 +264,7 @@ public:
 	void environment_set_pathtracing_light_tree(RID p_env, bool p_enable);
 	void environment_set_pathtracing_light_tree_cut(RID p_env, int p_nodes);
 	void environment_set_pathtracing_light_tree_cut_indirect(RID p_env, int p_nodes);
+	void environment_set_pathtracing_light_tree_power_pick(RID p_env, bool p_enable);
 	void environment_set_camera_medium(RID p_env, bool p_enable, const Color &p_absorption, const Color &p_scattering, float p_height);
 	bool environment_get_pathtracing_enabled(RID p_env) const;
 	int environment_get_pathtracing_debug_mode(RID p_env) const;
@@ -280,6 +281,7 @@ public:
 	bool environment_get_pathtracing_light_tree(RID p_env) const;
 	int environment_get_pathtracing_light_tree_cut(RID p_env) const;
 	int environment_get_pathtracing_light_tree_cut_indirect(RID p_env) const;
+	bool environment_get_pathtracing_light_tree_power_pick(RID p_env) const;
 
 	// Adjustment
 	void environment_set_adjustment(RID p_env, bool p_enable, float p_brightness, float p_contrast, float p_saturation, bool p_use_1d_color_correction, RID p_color_correction);

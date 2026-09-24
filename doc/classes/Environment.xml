@@ -256,6 +256,10 @@
 			How many nodes of the light tree the path tracer scores at a surface reached after the path's first diffuse bounce, in place of [member pathtracing_light_tree_cut]: a second, coarser cut of the same tree, so the light samples that carry the least (the indirect bounces, which are most of a path's surfaces) cost the least to select. Never wider than [member pathtracing_light_tree_cut]; at the same value (the default) every surface scores the same cut.
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] and [member pathtracing_light_tree] are [code]true[/code].
 		</member>
+		<member name="pathtracing_light_tree_power_pick" type="bool" setter="set_pathtracing_light_tree_power_pick" getter="is_pathtracing_light_tree_power_pick" default="false">
+			If [code]true[/code], a candidate that lands on a node of the light tree's cut with several lights under it picks one of them in proportion to their power (mixed with a small uniform share, so no light under the node is ever skipped); if [code]false[/code], it picks one of them uniformly. The power-weighted pick tells a bright light from a dim one under the same node before the contribution resampling does, which matters where lights of unequal power share a node ([member pathtracing_light_tree_cut] narrower than the light count, or an omni light and its emissive bulb). Either pick is unbiased.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] and [member pathtracing_light_tree] are [code]true[/code].
+		</member>
 		<member name="pathtracing_max_bounces" type="int" setter="set_pathtracing_max_bounces" getter="get_pathtracing_max_bounces" default="3">
 			Maximum number of times a ray is allowed to bounce off surfaces before it is terminated. Higher values produce more accurate indirect lighting and inter-reflections at the cost of GPU performance. A value of [code]0[/code] produces direct illumination only.
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].

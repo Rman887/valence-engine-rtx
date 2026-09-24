@@ -8,13 +8,17 @@
 // a cut of it: the nodes of its shallowest full levels, as many as Environment.pathtracing_light_tree_cut
 // allows, with the leaves under each cut node contiguous in a leaf list. A hit scores the cut once
 // (D56; the reads are independent, unlike a descent's) and every candidate is a pick over the cut
-// by those scores, then a uniform pick among the leaves under it, so the probability of a leaf is
-// its cut node's share over its leaf count, exact, and a chance hit on an emitter recovers the same
-// probability from its entry's cut slot, so the MIS weights on both sides are written in the same
-// density (D51 wrote them in the global one). The cut is the proposal: a few candidates are drawn
-// through it and one is kept by its unshadowed contribution over its proposal probability (D51's
+// by those scores, then a pick among the leaves under it: by their power (D60,
+// Environment.pathtracing_light_tree_power_pick, a search of the cut node's cumulative shares, so a
+// torch is drawn over its dim bulb and a bright lantern over a faint one before the resampling
+// sees them) or uniformly with the switch off, so the probability of a leaf is its cut node's share
+// times its share of the node (of the power, or one over the leaf count), exact, and a chance hit
+// on an emitter recovers the same probability from its entry's cut slot and leaf position, so the
+// MIS weights on both sides are written in the same density (D51 wrote them in the global one).
+// The cut is the proposal: a few candidates are drawn through it and one is kept by its unshadowed
+// contribution over its proposal probability (D51's
 // resampling), which corrects the bounds where they are loose (a receiver inside a cluster's sphere,
-// a cluster in range by its bound alone) and the uniform pick below the cut, and spends no sample on
+// a cluster in range by its bound alone) and the pick below the cut, and spends no sample on
 // a light that delivers nothing; a cut node that is itself an omni or emissive leaf is targeted
 // from the cut copy and reads no light (D59), a spot leaf keeps the target that skips it outside
 // its cone. Past the path's first diffuse bounce a vertex scores a second, coarser cut of the same
@@ -77,10 +81,26 @@ layout(set = 0, binding = RT_LIGHT_TREE_BINDING, std430) readonly buffer LightTr
 	uint tree_emissive_cut[RT_LIGHT_TREE_EMISSIVE_MAX]; // The cut slots over each emissive entry's leaf (the primary cut's in the low 16 bits, the indirect's in the high, 0xFFFF for none), RT_LIGHT_TREE_NO_NODE when it has no leaf.
 	RTLightTreeNode tree_cut[2 * RT_LIGHT_TREE_CUT_MAX]; // The cut's nodes, copied so a slot is one read; the indirect cut's (D59) follow at RT_LIGHT_TREE_CUT_MAX, one array so a slot is one indexed read.
 	uint tree_leaf_list[RT_LIGHT_TREE_LEAVES_MAX]; // The leaf nodes in the build's order: a node's leaves are contiguous.
+	uint tree_emissive_leaf[RT_LIGHT_TREE_EMISSIVE_MAX]; // Each emissive entry's position in tree_leaf_list (D60), RT_LIGHT_TREE_NO_NODE without a leaf.
+	float tree_leaf_cdf[2 * RT_LIGHT_TREE_LEAVES_MAX]; // Each leaf-list position's cumulative power share inside its cut node, the node's last leaf 1 (D60); the indirect cut's follow at RT_LIGHT_TREE_LEAVES_MAX, one array indexed by a base.
 };
 
 bool light_tree_enabled() {
 	return (RT_FLAGS & RT_FLAG_LIGHT_TREE) != 0u;
+}
+
+/// The pick under a cut node by the lights' power (D60); clear, uniform.
+bool light_tree_power_pick() {
+	return (RT_FLAGS & RT_FLAG_LIGHT_TREE_POWER_PICK) != 0u;
+}
+
+/// A leaf's share of its cut node's power: the difference of its cumulative share and its left
+/// neighbour's inside the node's range [first, ...), in the cut the base names (D60). The sampler
+/// and the chance-hit side read the same two floats.
+float light_tree_leaf_share(uint first, uint at, bool indirect) {
+	uint base = indirect ? RT_LIGHT_TREE_LEAVES_MAX : 0u;
+	float below = at > first ? tree_leaf_cdf[base + at - 1u] : 0.0;
+	return tree_leaf_cdf[base + at] - below;
 }
 
 /// The cut a vertex scores (D59): the primary cut, or the coarser indirect cut past the path's first
@@ -234,6 +254,13 @@ float light_tree_leaf_probability(LightTreeTop t, float interval, uint slot) {
 	return light_tree_leaf_probability_count(t, interval, light_tree_cut_node(slot, t.indirect).leaf_range & 0xFFFFu);
 }
 
+/// The probability under the power-weighted pick (D60): the node's interval over the total times
+/// the leaf's share of the node's power (light_tree_leaf_share). A cut node that is a leaf takes
+/// the count form on both sides.
+float light_tree_leaf_probability_share(LightTreeTop t, float interval, float share) {
+	return interval / t.total * share;
+}
+
 /// With no surface light listed at all the sky is the only strategy, as D54 has it, whatever its
 /// concentration; with lights listed but nothing reaching x, nothing is drawn.
 bool light_tree_sky_only(LightTreeTop t) {
@@ -254,7 +281,8 @@ float light_tree_sky_probability(vec3 x, vec3 N, bool indirect) {
 }
 
 /// The probability with which a pick from (x, N) reaches an emissive entry's leaf: its cut node's
-/// share of the total over the leaves under that node, the expression light_tree_draw_leaf evaluates.
+/// share of the total times the leaf's share of the node (by power, D60, or one over the leaf
+/// count), the expression light_tree_draw_leaf evaluates.
 /// Zero when the entry has no leaf or its cut node reads nothing there. `indirect` is the cut the
 /// previous vertex scored, as the payload carries it (D59).
 float light_tree_emissive_probability(uint p_entry, vec3 x, vec3 N, bool indirect) {
@@ -273,6 +301,18 @@ float light_tree_emissive_probability(uint p_entry, vec3 x, vec3 N, bool indirec
 	}
 	if (!(interval > 0.0)) {
 		return 0.0;
+	}
+	if (light_tree_power_pick()) {
+		RTLightTreeNode n = light_tree_cut_node(slot, indirect);
+		uint count = n.leaf_range & 0xFFFFu;
+		uint at = tree_emissive_leaf[p_entry];
+		uint first = n.leaf_range >> 16u;
+		if (count > 1u) {
+			if (at < first || at >= first + count) {
+				return 0.0;
+			}
+			return light_tree_leaf_probability_share(t, interval, light_tree_leaf_share(first, at, indirect));
+		}
 	}
 	return light_tree_leaf_probability(t, interval, slot);
 }
@@ -329,8 +369,9 @@ bool light_tree_draw_top(float u_top, LightTreeTop t, vec3 N, out LightTreeCandi
 }
 
 /// The leaf a candidate lands on under the cut node `n`, whose interval [below, below + interval)
-/// of the running sum holds its target: a uniform pick among the node's leaves on the target
-/// rescaled inside the interval. A cut node that is itself a leaf is the candidate, taken from the
+/// of the running sum holds its target: on the target rescaled inside the interval, a binary search
+/// of the node's cumulative power shares (D60; about log2 of the node's leaf count serially
+/// dependent float reads, none of a light) or a uniform pick among the node's leaves. A cut node that is itself a leaf is the candidate, taken from the
 /// cut copy with no read of the node list (D59). False when the leaf is not one.
 bool light_tree_draw_leaf(float target, float below, float interval, RTLightTreeNode n, LightTreeTop t, out LightTreeCandidate r_c) {
 	r_c.kind = RT_LIGHT_TREE_KIND_LEAF;
@@ -341,10 +382,30 @@ bool light_tree_draw_leaf(float target, float below, float interval, RTLightTree
 	uint count = max(n.leaf_range & 0xFFFFu, 1u);
 	uint encoded = n.child;
 	float power = n.power;
+	float p = light_tree_leaf_probability_count(t, interval, count);
 	if ((encoded & RT_LIGHT_TREE_LEAF_BIT) == 0u) {
 		uint first = n.leaf_range >> 16u;
 		float u_leaf = clamp((target - below) / interval, 0.0, 0.99999994);
-		uint at = min(first + uint(u_leaf * float(count)), min(first + count - 1u, RT_LIGHT_TREE_LEAVES_MAX - 1u));
+		uint last = min(first + count - 1u, RT_LIGHT_TREE_LEAVES_MAX - 1u);
+		uint at;
+		if (light_tree_power_pick()) {
+			// The first leaf whose cumulative share exceeds the number: a leaf is reached with its share.
+			uint base = t.indirect ? RT_LIGHT_TREE_LEAVES_MAX : 0u;
+			uint lo = first;
+			uint hi = last;
+			while (lo < hi) {
+				uint mid = (lo + hi) >> 1u;
+				if (u_leaf < tree_leaf_cdf[base + mid]) {
+					hi = mid;
+				} else {
+					lo = mid + 1u;
+				}
+			}
+			at = lo;
+			p = light_tree_leaf_probability_share(t, interval, light_tree_leaf_share(first, at, t.indirect));
+		} else {
+			at = min(first + uint(u_leaf * float(count)), last);
+		}
 		uint leaf = tree_leaf_list[at];
 		if (leaf >= tree_node_count) {
 			return false;
@@ -358,7 +419,7 @@ bool light_tree_draw_leaf(float target, float below, float interval, RTLightTree
 	r_c.index = encoded & RT_LIGHT_TREE_INDEX_MASK;
 	r_c.encoded = encoded;
 	r_c.power = power;
-	r_c.p = light_tree_leaf_probability_count(t, interval, count);
+	r_c.p = p;
 	return r_c.p > 0.0;
 }
 
@@ -483,9 +544,9 @@ float light_tree_target(LightTreeCandidate c, LightTreeTop t, vec3 hit_pos, vec3
 /// reservoir sampling on a single rescaled number (D51's form; the cut's candidates are offered in
 /// slot order, which changes nothing in the distribution), then the kept candidate's own sample (an analytic light's cone or point, an emissive
 /// triangle, a sky direction). The resampling corrects the proposal where its bounds are loose (a
-/// receiver inside a cluster's sphere, a cluster in range by its bound alone) and where the pick
-/// under a cut node is uniform, so no sample is spent on a light that delivers nothing when any
-/// candidate does. r_probability is what the caller divides the contribution by: the resampled
+/// receiver inside a cluster's sphere, a cluster in range by its bound alone) and below the pick
+/// under a cut node (by power, D60, or uniform), so no sample is spent on a light that delivers
+/// nothing when any candidate does. r_probability is what the caller divides the contribution by: the resampled
 /// probability for an analytic light or the sky (their weights written as before, the sky's MIS
 /// weight in the proposal's density the miss evaluates too), 1 for an emissive leaf, whose weight
 /// already carries the proposal's density in its MIS weight and the resampled density under it.

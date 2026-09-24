@@ -15,12 +15,14 @@
 // through it and one is kept by its unshadowed contribution over its proposal probability (D51's
 // resampling), which corrects the bounds where they are loose (a receiver inside a cluster's sphere,
 // a cluster in range by its bound alone) and the uniform pick below the cut, and spends no sample on
-// a light that delivers nothing. Past the path's first diffuse bounce a vertex scores a second,
-// coarser cut of the same tree (D59, Environment.pathtracing_light_tree_cut_indirect): its light
-// sample carries the least of the path's, so its proposal costs the least, and the payload carries
-// which cut the sample was drawn from so the next vertex's densities read the same one. The off
-// path (the per-frame shares, the uniform analytic pick, the resampled emissive candidates over the
-// global CDF) compiles when the flag is clear.
+// a light that delivers nothing; a cut node that is itself an omni or emissive leaf is targeted
+// from the cut copy and reads no light (D59), a spot leaf keeps the target that skips it outside
+// its cone. Past the path's first diffuse bounce a vertex scores a second, coarser cut of the same
+// tree (D59, Environment.pathtracing_light_tree_cut_indirect): its light sample carries the least
+// of the path's, so its proposal costs the least, and the payload carries which cut the sample was
+// drawn from so the next vertex's densities read the same one. The off path (the per-frame shares,
+// the uniform analytic pick, the resampled emissive candidates over the global CDF) compiles when
+// the flag is clear.
 //
 // The normal the selection reads is the geometry normal as the payload carries it to the next
 // vertex (the octahedral unorm16 of oct_offset_nrm), so the chance-hit side evaluates the same
@@ -58,7 +60,7 @@
 struct RTLightTreeNode {
 	vec3 center; // Bounding sphere, trace space.
 	float radius;
-	vec3 axis; // Orientation cone: the spot directions under the node; unused when cos_theta_o is -1.
+	vec3 axis; // Orientation cone: the spot directions under the node; unused when cos_theta_o is -1, except that an omni leaf's x is its attenuation exponent (D59).
 	float cos_theta_o; // Cosine of the cone's half-angle, -1 for every direction (omni and emissive).
 	float power; // The luminance the node's lights deliver at unit distance, summed.
 	float max_range; // The largest range under the node, 0 for unbounded.
@@ -221,12 +223,15 @@ LightTreeTop light_tree_top(vec3 x, vec3 N, bool indirect) {
 	return light_tree_top_slot(x, N, RT_LIGHT_TREE_NO_NODE, indirect, unused);
 }
 
-/// The probability a pick from the top t assigns a leaf of cut slot `slot` (its interval of the
-/// sum over the total, over the leaves under it), written so light_tree_draw_leaf and the
-/// chance-hit side agree bit for bit.
+/// The probability a pick from the top t assigns one leaf of a cut node with `count` leaves (the
+/// node's interval of the sum over the total, over its leaves), written so light_tree_draw_leaf
+/// (which holds the node) and the chance-hit side (which holds the slot) evaluate one expression.
+float light_tree_leaf_probability_count(LightTreeTop t, float interval, uint count) {
+	return interval / (t.total * float(max(count, 1u)));
+}
+
 float light_tree_leaf_probability(LightTreeTop t, float interval, uint slot) {
-	uint count = max(light_tree_cut_node(slot, t.indirect).leaf_range & 0xFFFFu, 1u);
-	return interval / (t.total * float(count));
+	return light_tree_leaf_probability_count(t, interval, light_tree_cut_node(slot, t.indirect).leaf_range & 0xFFFFu);
 }
 
 /// With no surface light listed at all the sky is the only strategy, as D54 has it, whatever its
@@ -283,7 +288,8 @@ float light_tree_emissive_probability(uint p_entry, vec3 x, vec3 N, bool indirec
 struct LightTreeCandidate {
 	uint kind;
 	uint index; // The light or the emissive entry.
-	uint node; // The leaf node (a leaf candidate).
+	uint encoded; // A leaf candidate's leaf word: RT_LIGHT_TREE_LEAF_BIT | (RT_LIGHT_TREE_EMISSIVE_BIT) | index.
+	float power; // A leaf candidate's power at unit distance (the emissive target's scale).
 	float p; // The proposal's probability of this candidate.
 };
 
@@ -294,7 +300,8 @@ struct LightTreeCandidate {
 bool light_tree_draw_top(float u_top, LightTreeTop t, vec3 N, out LightTreeCandidate r_c) {
 	r_c.kind = RT_LIGHT_TREE_KIND_LEAF;
 	r_c.index = 0u;
-	r_c.node = 0u;
+	r_c.encoded = 0u;
+	r_c.power = 0.0;
 	r_c.p = 0.0;
 	float pick = u_top * t.total;
 	if (pick < t.sky) {
@@ -321,30 +328,37 @@ bool light_tree_draw_top(float u_top, LightTreeTop t, vec3 N, out LightTreeCandi
 	return false;
 }
 
-/// The leaf a candidate lands on under cut slot `slot`, whose interval [below, below + interval)
-/// of the running sum holds its target: a uniform pick among the slot's leaves on the target
-/// rescaled inside the interval. False when the leaf is not one.
-bool light_tree_draw_leaf(float target, float below, float interval, uint slot, LightTreeTop t, out LightTreeCandidate r_c) {
+/// The leaf a candidate lands on under the cut node `n`, whose interval [below, below + interval)
+/// of the running sum holds its target: a uniform pick among the node's leaves on the target
+/// rescaled inside the interval. A cut node that is itself a leaf is the candidate, taken from the
+/// cut copy with no read of the node list (D59). False when the leaf is not one.
+bool light_tree_draw_leaf(float target, float below, float interval, RTLightTreeNode n, LightTreeTop t, out LightTreeCandidate r_c) {
 	r_c.kind = RT_LIGHT_TREE_KIND_LEAF;
 	r_c.index = 0u;
-	r_c.node = 0u;
+	r_c.encoded = 0u;
+	r_c.power = 0.0;
 	r_c.p = 0.0;
-	uint leaf_range = light_tree_cut_node(slot, t.indirect).leaf_range;
-	uint first = leaf_range >> 16u;
-	uint count = max(leaf_range & 0xFFFFu, 1u);
-	float u_leaf = clamp((target - below) / interval, 0.0, 0.99999994);
-	uint at = min(first + uint(u_leaf * float(count)), min(first + count - 1u, RT_LIGHT_TREE_LEAVES_MAX - 1u));
-	uint leaf = tree_leaf_list[at];
-	if (leaf >= tree_node_count) {
-		return false;
-	}
-	uint encoded = tree_nodes[leaf].child;
+	uint count = max(n.leaf_range & 0xFFFFu, 1u);
+	uint encoded = n.child;
+	float power = n.power;
 	if ((encoded & RT_LIGHT_TREE_LEAF_BIT) == 0u) {
-		return false;
+		uint first = n.leaf_range >> 16u;
+		float u_leaf = clamp((target - below) / interval, 0.0, 0.99999994);
+		uint at = min(first + uint(u_leaf * float(count)), min(first + count - 1u, RT_LIGHT_TREE_LEAVES_MAX - 1u));
+		uint leaf = tree_leaf_list[at];
+		if (leaf >= tree_node_count) {
+			return false;
+		}
+		encoded = tree_nodes[leaf].child;
+		power = tree_nodes[leaf].power;
+		if ((encoded & RT_LIGHT_TREE_LEAF_BIT) == 0u) {
+			return false;
+		}
 	}
 	r_c.index = encoded & RT_LIGHT_TREE_INDEX_MASK;
-	r_c.node = leaf;
-	r_c.p = light_tree_leaf_probability(t, interval, slot);
+	r_c.encoded = encoded;
+	r_c.power = power;
+	r_c.p = light_tree_leaf_probability_count(t, interval, count);
 	return r_c.p > 0.0;
 }
 
@@ -415,6 +429,37 @@ float light_tree_analytic_target(RTLightData light, vec3 hit_pos, vec3 N) {
 	return lum * atten * above;
 }
 
+/// The target of a candidate that is its own cut slot, an omni or emissive leaf (D59): the light's
+/// contribution estimate from the cut copy alone, so the candidate reads no light. An emitter's is
+/// D51's proximity from the same sphere (the receiver's cosine raised by the angular size, floored
+/// just above zero, over the distance floored by the sphere). An omni light's is the analytic target
+/// itself: its luminance under Godot's attenuation (the light's own decay exponent, carried in the
+/// leaf's axis.x, inside the quartic window to its range) times the cosine raised by the angular
+/// size and floored. An inverse-square stand-in for that curve cost the matrix 2.4 dB: the studio's
+/// lights decay linearly. A spot leaf keeps the full target: its cone's zero is not in the node.
+float light_tree_leaf_target(RTLightTreeNode n, vec3 hit_pos, vec3 N) {
+	vec3 to_c = n.center - hit_pos;
+	float d2 = dot(to_c, to_c);
+	float r2 = n.radius * n.radius;
+	float d = sqrt(d2);
+	if ((n.child & RT_LIGHT_TREE_EMISSIVE_BIT) != 0u) {
+		float above = max(dot(N, to_c) + n.radius, 1e-3 * n.radius);
+		float denominator = max(d, n.radius) * max(d2, r2);
+		return (above > 0.0 && denominator > 0.0) ? n.power * above / denominator : 0.0;
+	}
+	float dist = max(d, 1e-4);
+	float above = max(dot(N, to_c) / dist + n.radius / max(dist, n.radius), RT_LIGHT_TREE_RECEIVER_FLOOR);
+	float atten = min(pow(dist, -n.axis.x), 1.0);
+	if (n.max_range > 0.0) {
+		float nd = dist / n.max_range;
+		nd *= nd;
+		nd *= nd;
+		nd = max(1.0 - nd, 0.0);
+		atten *= nd * nd;
+	}
+	return n.power * atten * above;
+}
+
 /// The resampling target of a candidate: its unshadowed contribution estimate at the hit, in one
 /// unit for every kind (an irradiance), against which the proposal's probability is corrected.
 /// Any positive function is unbiased; the sky's is its own importance, so the proposal stands.
@@ -425,19 +470,18 @@ float light_tree_target(LightTreeCandidate c, LightTreeTop t, vec3 hit_pos, vec3
 	if (c.kind == RT_LIGHT_TREE_KIND_DIRECTIONAL) {
 		return light_tree_analytic_target(rt_lights[c.index], hit_pos, N);
 	}
-	uint encoded = tree_nodes[c.node].child;
-	if ((encoded & RT_LIGHT_TREE_EMISSIVE_BIT) != 0u) {
+	if ((c.encoded & RT_LIGHT_TREE_EMISSIVE_BIT) != 0u) {
 		// The entry's power at unit distance is the leaf's; the proximity is D51's target.
-		return tree_nodes[c.node].power * emissive_proximity(rt_emissive[c.index], hit_pos, N);
+		return c.power * emissive_proximity(rt_emissive[c.index], hit_pos, N);
 	}
 	return light_tree_analytic_target(rt_lights[c.index], hit_pos, N);
 }
 
 /// One light sample by the tree: `candidates` draws through the proposal (the top-level split
 /// and the pick over the cut, a random number each), each weighed by its target over its proposal
-/// probability, one kept by weighted reservoir sampling on a single rescaled number (D51's
-/// form; the cut's candidates are offered in slot order, which changes nothing in the
-/// distribution), then the kept candidate's own sample (an analytic light's cone or point, an emissive
+/// probability (an omni or emissive leaf slot targeted from its cut copy, D59), one kept by weighted
+/// reservoir sampling on a single rescaled number (D51's form; the cut's candidates are offered in
+/// slot order, which changes nothing in the distribution), then the kept candidate's own sample (an analytic light's cone or point, an emissive
 /// triangle, a sky direction). The resampling corrects the proposal where its bounds are loose (a
 /// receiver inside a cluster's sphere, a cluster in range by its bound alone) and where the pick
 /// under a cut node is uniform, so no sample is spent on a light that delivers nothing when any
@@ -480,7 +524,8 @@ bool light_tree_sample_direct(
 	LightTreeCandidate selected;
 	selected.kind = RT_LIGHT_TREE_KIND_LEAF;
 	selected.index = 0u;
-	selected.node = 0u;
+	selected.encoded = 0u;
+	selected.power = 0.0;
 	selected.p = 0.0;
 	float w_sum = 0.0;
 	float w_selected = 0.0;
@@ -513,7 +558,8 @@ bool light_tree_sample_direct(
 	}
 	for (uint s = 0u; s < t.cut_count && target >= 0.0; s++) {
 		float below = running;
-		running += light_tree_node_importance(light_tree_cut_node(s, t.indirect), hit_pos, N_select);
+		RTLightTreeNode n = light_tree_cut_node(s, t.indirect);
+		running += light_tree_node_importance(n, hit_pos, N_select);
 		float interval = running - below;
 		if (!(interval > 0.0)) {
 			continue;
@@ -524,8 +570,14 @@ bool light_tree_sample_direct(
 		// slot's fallthrough never fires.
 		while (target >= 0.0 && (target < running || last)) {
 			LightTreeCandidate c;
-			if (light_tree_draw_leaf(target, below, interval, s, t, c)) {
-				light_tree_reservoir_offer(c, light_tree_target(c, t, hit_pos, N) / c.p, w_sum, u_res, selected, w_selected);
+			if (light_tree_draw_leaf(target, below, interval, n, t, c)) {
+				// A slot that is an omni or emissive leaf is targeted from the cut copy (D59), so the
+				// candidate reads no light (its bound alone as the target, the sky's rule, lost 1.2 dB
+				// on the matrix: the correction is what the target buys). A spot leaf and a light under
+				// an inner node keep the light's own contribution estimate.
+				bool leaf_slot = (n.child & RT_LIGHT_TREE_LEAF_BIT) != 0u && n.cos_theta_o <= -1.0;
+				float w = (leaf_slot ? light_tree_leaf_target(n, hit_pos, N) : light_tree_target(c, t, hit_pos, N)) / c.p;
+				light_tree_reservoir_offer(c, w, w_sum, u_res, selected, w_selected);
 			}
 			if (tree_pending > 0u) {
 				order *= pow(rand(rng_state), 1.0 / float(tree_pending));
@@ -552,7 +604,7 @@ bool light_tree_sample_direct(
 		r_probability = selected.p * resample_factor;
 		return lights_sample_light(rt_lights[selected.index], hit_pos, N, material, u2, is_indirect_bounce, r_sample);
 	}
-	if ((tree_nodes[selected.node].child & RT_LIGHT_TREE_EMISSIVE_BIT) != 0u) {
+	if ((selected.encoded & RT_LIGHT_TREE_EMISSIVE_BIT) != 0u) {
 		r_probability = 1.0;
 		return emissive_sample_instance(rt_emissive[selected.index], selected.p, resample_factor, hit_pos, N, V, material, u2, 1.0, r_sample);
 	}

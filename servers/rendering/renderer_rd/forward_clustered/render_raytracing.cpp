@@ -3087,11 +3087,14 @@ uint32_t RenderRaytracing::build_light_tree(const RT_LightData *p_lights, uint32
 		LightTreeLeaf leaf;
 		leaf.center = Vector3(l.position[0], l.position[1], l.position[2]);
 		leaf.radius = MAX(l.radius, 0.0f);
-		if (l.type == RT_LIGHT_TYPE_SPOT) {
+		// Keyed on the cone the shader keys on: a spot opened to a half turn has cos -1 and is an omni here.
+		if (l.type == RT_LIGHT_TYPE_SPOT && l.cos_spot_angle > -1.0f) {
 			leaf.axis = Vector3(l.spot_direction[0], l.spot_direction[1], l.spot_direction[2]);
 			leaf.cos_theta_o = l.cos_spot_angle;
 		} else {
-			leaf.axis = Vector3(0, 0, 1);
+			// A leaf whose cone is every direction never has its axis read as one; its x carries the
+			// light's attenuation exponent so the shader can target a leaf slot from the cut copy (D59).
+			leaf.axis = Vector3(l.attenuation, 0, 0);
 			leaf.cos_theta_o = -1.0f;
 		}
 		leaf.power = power;

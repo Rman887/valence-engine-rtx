@@ -179,7 +179,7 @@ enum {
 struct alignas(16) RT_LightTreeNode {
 	float center[3]; // Trace space.
 	float radius;
-	float axis[3]; // The orientation cone's axis; unused when cos_theta_o is -1.
+	float axis[3]; // The orientation cone's axis; unused when cos_theta_o is -1, except that an omni leaf's x is its attenuation exponent (D59).
 	float cos_theta_o; // Cosine of the cone's half-angle, -1 for every direction.
 	float power; // Luminance at unit distance, summed over the leaves.
 	float max_range; // The largest light range under the node, 0 for unbounded.

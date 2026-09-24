@@ -188,6 +188,18 @@ struct alignas(16) RT_LightTreeNode {
 };
 static_assert(sizeof(RT_LightTreeNode) == 48, "RT_LightTreeNode must be 48 bytes for std430");
 
+// One leaf-list position's entry in its cut node's alias table (D60, D61): a pick lands on the
+// position by the leaf count, keeps it when the rescaled remainder is under the threshold and takes
+// the alias otherwise, each with its share of the node, so one read gives the leaf and its
+// probability. Must match the uvec4 of tree_leaf_alias in raytracing_light_tree_inc.glsl.
+struct alignas(16) RT_LightTreeAlias {
+	float threshold; // The position keeps a pick whose remainder is below this; 1 for a position with no alias.
+	uint32_t alias; // The leaf-list position the pick goes to otherwise (absolute, inside the same cut node).
+	float share; // The position's own share of its cut node, the power share with the uniform floor.
+	float alias_share; // The alias's share, the same float as the alias position's own.
+};
+static_assert(sizeof(RT_LightTreeAlias) == 16, "RT_LightTreeAlias must be 16 bytes for std430");
+
 enum : uint32_t {
 	RT_LIGHT_TREE_LEAF_BIT = 0x80000000u,
 	RT_LIGHT_TREE_EMISSIVE_BIT = 0x40000000u,
@@ -201,10 +213,11 @@ enum : uint32_t {
 	RT_LIGHT_TREE_CUT_INDIRECT_OFFSET = RT_LIGHT_TREE_CUT_OFFSET + RT_LIGHT_TREE_CUT_MAX * sizeof(RT_LightTreeNode), // The indirect bounces' coarser cut (D59), copied.
 	RT_LIGHT_TREE_LEAF_LIST_OFFSET = RT_LIGHT_TREE_CUT_INDIRECT_OFFSET + RT_LIGHT_TREE_CUT_MAX * sizeof(RT_LightTreeNode), // The leaf nodes in the build's order.
 	RT_LIGHT_TREE_EMISSIVE_LEAF_OFFSET = RT_LIGHT_TREE_LEAF_LIST_OFFSET + RT_LIGHT_TREE_LEAVES_MAX * sizeof(uint32_t), // Each emissive entry's position in the leaf list (D60).
-	RT_LIGHT_TREE_LEAF_CDF_OFFSET = RT_LIGHT_TREE_EMISSIVE_LEAF_OFFSET + RT_EMISSIVE_MAX * sizeof(uint32_t), // Each leaf's cumulative power share inside its cut node, the primary cut's then the indirect's (D60).
-	RT_LIGHT_TREE_BUFFER_SIZE = RT_LIGHT_TREE_LEAF_CDF_OFFSET + 2 * RT_LIGHT_TREE_LEAVES_MAX * sizeof(float),
+	RT_LIGHT_TREE_LEAF_ALIAS_OFFSET = RT_LIGHT_TREE_EMISSIVE_LEAF_OFFSET + RT_EMISSIVE_MAX * sizeof(uint32_t), // Each leaf's alias-table entry inside its cut node, the primary cut's then the indirect's (D60, D61).
+	RT_LIGHT_TREE_BUFFER_SIZE = RT_LIGHT_TREE_LEAF_ALIAS_OFFSET + 2 * RT_LIGHT_TREE_LEAVES_MAX * sizeof(RT_LightTreeAlias),
 };
 static_assert(RT_LIGHT_TREE_CUT_OFFSET % 16 == 0, "the light tree's cut must start on a 16-byte boundary for std430");
+static_assert(RT_LIGHT_TREE_LEAF_ALIAS_OFFSET % 16 == 0, "the light tree's alias table must start on a 16-byte boundary for std430");
 
 enum {
 	RT_OFFSET_NONE = 0xFFFFFFFFu,
@@ -378,7 +391,7 @@ struct RTViewportState {
 
 	RID light_buffer;
 	RID emissive_buffer; // The emissive mesh lights of the frame (D50), RT_EMISSIVE_MAX entries.
-	RID light_tree_buffer; // The light tree (D55): a header, the nodes, each emissive entry's cut slot, the cut's nodes and the leaf list (D56), each emissive entry's leaf position and the leaves' cumulative power shares per cut (D60); rebuilt per frame while the Environment asks for it.
+	RID light_tree_buffer; // The light tree (D55): a header, the nodes, each emissive entry's cut slot, the cut's nodes and the leaf list (D56), each emissive entry's leaf position and the leaves' alias tables per cut (D60, D61); rebuilt per frame while the Environment asks for it.
 	uint32_t emissive_count_logged = 0; // The last count printed for this viewport.
 	RID params_buffer;
 	// The sky's sampling table (D54), rebuilt by `RenderRaytracing::update_sky_light` when the
@@ -458,7 +471,7 @@ class RenderRaytracing {
 
 	RTDeformedCacheEntry *_access_deformed_slot(RID &r_handle);
 	uint32_t _build_light_tree_node(uint32_t p_begin, uint32_t p_end); // The light tree's recursive build (D55).
-	void _build_light_tree_cut(uint32_t p_cut_size, LocalVector<RT_LightTreeNode> &r_cut, uint32_t p_slot_shift, uint32_t p_cdf_base); // A cut the shader scores per hit (D56), the primary or the indirect one (D59), with its leaves' cumulative power shares (D60).
+	void _build_light_tree_cut(uint32_t p_cut_size, LocalVector<RT_LightTreeNode> &r_cut, uint32_t p_slot_shift, uint32_t p_alias_base, bool p_power_pick); // A cut the shader scores per hit (D56), the primary or the indirect one (D59), with its leaves' alias tables (D60, D61).
 	void _release_deformed_blas(RTDeformedCacheEntry &p_entry);
 	RTMergedMMEntry *_access_merged_mm_slot(RID &r_handle);
 
@@ -508,7 +521,10 @@ class RenderRaytracing {
 	LocalVector<uint32_t> light_tree_cut_queue; ///< The cut's breadth-first work queue.
 	LocalVector<uint32_t> light_tree_emissive_cut; ///< Each emissive entry's cut slots (the primary's low, the indirect's high, 0xFFFF for none), RT_LIGHT_TREE_NO_NODE without a leaf.
 	LocalVector<uint32_t> light_tree_emissive_leaf; ///< Each emissive entry's position in the leaf list (D60), RT_LIGHT_TREE_NO_NODE without a leaf.
-	LocalVector<float> light_tree_leaf_cdf; ///< Each leaf-list position's cumulative power share inside its cut node (D60): the primary cut's, then the indirect's at RT_LIGHT_TREE_LEAVES_MAX.
+	LocalVector<RT_LightTreeAlias> light_tree_leaf_alias; ///< Each leaf-list position's alias-table entry inside its cut node (D60, D61): the primary cut's, then the indirect's at RT_LIGHT_TREE_LEAVES_MAX.
+	LocalVector<double> light_tree_alias_scaled; ///< The alias build's scratch: each leaf's share times its node's count, indexed by leaf-list position.
+	LocalVector<uint32_t> light_tree_alias_small; ///< The alias build's scratch: positions whose scaled share is below 1.
+	LocalVector<uint32_t> light_tree_alias_large; ///< The alias build's scratch: positions whose scaled share is 1 or more.
 	// Camera and bounce rays select all geometry. Shadow rays select bit 1;
 	// the G-buffer primary probe selects only procedural geometry (bit 2).
 	// Keep these in sync with RT_MASK_* in raytracing_common_inc.glsl.
@@ -593,7 +609,7 @@ public:
 	RTViewportState *build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags);
 	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, const Vector3 &p_origin, float &r_score_sum, uint32_t &r_directional_count);
 	uint32_t gather_emissive(const RenderDataRD *p_render_data, const RTViewportState *p_state, RT_EmissiveInstance *r_emissive_data, uint32_t p_max_emissive, float &r_score_sum);
-	uint32_t build_light_tree(const RT_LightData *p_lights, uint32_t p_light_count, uint32_t p_directional_count, const RT_EmissiveInstance *p_emissive, uint32_t p_emissive_count, float p_exposure, uint32_t p_cut_size, uint32_t p_cut_indirect_size);
+	uint32_t build_light_tree(const RT_LightData *p_lights, uint32_t p_light_count, uint32_t p_directional_count, const RT_EmissiveInstance *p_emissive, uint32_t p_emissive_count, float p_exposure, uint32_t p_cut_size, uint32_t p_cut_indirect_size, bool p_power_pick);
 	RID update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_primary_from_gbuffer);
 	void update_sky_light(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags);
 

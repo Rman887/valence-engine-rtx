@@ -9,7 +9,7 @@
 // allows, with the leaves under each cut node contiguous in a leaf list. A hit scores the cut once
 // (D56; the reads are independent, unlike a descent's) and every candidate is a pick over the cut
 // by those scores, then a pick among the leaves under it: by their power (D60,
-// Environment.pathtracing_light_tree_power_pick, a search of the cut node's cumulative shares, so a
+// Environment.pathtracing_light_tree_power_pick, one read of the cut node's alias table (D61), so a
 // torch is drawn over its dim bulb and a bright lantern over a faint one before the resampling
 // sees them) or uniformly with the switch off, so the probability of a leaf is its cut node's share
 // times its share of the node (of the power, or one over the leaf count), exact, and a chance hit
@@ -82,7 +82,7 @@ layout(set = 0, binding = RT_LIGHT_TREE_BINDING, std430) readonly buffer LightTr
 	RTLightTreeNode tree_cut[2 * RT_LIGHT_TREE_CUT_MAX]; // The cut's nodes, copied so a slot is one read; the indirect cut's (D59) follow at RT_LIGHT_TREE_CUT_MAX, one array so a slot is one indexed read.
 	uint tree_leaf_list[RT_LIGHT_TREE_LEAVES_MAX]; // The leaf nodes in the build's order: a node's leaves are contiguous.
 	uint tree_emissive_leaf[RT_LIGHT_TREE_EMISSIVE_MAX]; // Each emissive entry's position in tree_leaf_list (D60), RT_LIGHT_TREE_NO_NODE without a leaf.
-	float tree_leaf_cdf[2 * RT_LIGHT_TREE_LEAVES_MAX]; // Each leaf-list position's cumulative power share inside its cut node, the node's last leaf 1 (D60); the indirect cut's follow at RT_LIGHT_TREE_LEAVES_MAX, one array indexed by a base.
+	uvec4 tree_leaf_alias[2 * RT_LIGHT_TREE_LEAVES_MAX]; // Each leaf-list position's entry in its cut node's alias table (D60, D61): the threshold, the alias's position, the position's own share and the alias's, the floats as bits; the indirect cut's follow at RT_LIGHT_TREE_LEAVES_MAX, one array indexed by a base.
 };
 
 bool light_tree_enabled() {
@@ -94,13 +94,12 @@ bool light_tree_power_pick() {
 	return (RT_FLAGS & RT_FLAG_LIGHT_TREE_POWER_PICK) != 0u;
 }
 
-/// A leaf's share of its cut node's power: the difference of its cumulative share and its left
-/// neighbour's inside the node's range [first, ...), in the cut the base names (D60). The sampler
-/// and the chance-hit side read the same two floats.
-float light_tree_leaf_share(uint first, uint at, bool indirect) {
+/// A leaf's share of its cut node's power, from its alias-table entry in the cut `indirect` names
+/// (D60, D61). The sampler reads the same float, as the entry's own share or as the alias share of
+/// the entry that sent it there, which the CPU copies from this one.
+float light_tree_leaf_share(uint at, bool indirect) {
 	uint base = indirect ? RT_LIGHT_TREE_LEAVES_MAX : 0u;
-	float below = at > first ? tree_leaf_cdf[base + at - 1u] : 0.0;
-	return tree_leaf_cdf[base + at] - below;
+	return uintBitsToFloat(tree_leaf_alias[base + at].z);
 }
 
 /// The cut a vertex scores (D59): the primary cut, or the coarser indirect cut past the path's first
@@ -311,7 +310,7 @@ float light_tree_emissive_probability(uint p_entry, vec3 x, vec3 N, bool indirec
 			if (at < first || at >= first + count) {
 				return 0.0;
 			}
-			return light_tree_leaf_probability_share(t, interval, light_tree_leaf_share(first, at, indirect));
+			return light_tree_leaf_probability_share(t, interval, light_tree_leaf_share(at, indirect));
 		}
 	}
 	return light_tree_leaf_probability(t, interval, slot);
@@ -369,9 +368,10 @@ bool light_tree_draw_top(float u_top, LightTreeTop t, vec3 N, out LightTreeCandi
 }
 
 /// The leaf a candidate lands on under the cut node `n`, whose interval [below, below + interval)
-/// of the running sum holds its target: on the target rescaled inside the interval, a binary search
-/// of the node's cumulative power shares (D60; about log2 of the node's leaf count serially
-/// dependent float reads, none of a light) or a uniform pick among the node's leaves. A cut node that is itself a leaf is the candidate, taken from the
+/// of the running sum holds its target: on the target rescaled inside the interval, a uniform pick
+/// among the node's leaves, which with the power pick (D60) is the position of an alias table whose
+/// entry keeps it or sends it to its alias by the rest of the number (D61, one read where D60
+/// searched cumulative shares). A cut node that is itself a leaf is the candidate, taken from the
 /// cut copy with no read of the node list (D59). False when the leaf is not one.
 bool light_tree_draw_leaf(float target, float below, float interval, RTLightTreeNode n, LightTreeTop t, out LightTreeCandidate r_c) {
 	r_c.kind = RT_LIGHT_TREE_KIND_LEAF;
@@ -387,24 +387,15 @@ bool light_tree_draw_leaf(float target, float below, float interval, RTLightTree
 		uint first = n.leaf_range >> 16u;
 		float u_leaf = clamp((target - below) / interval, 0.0, 0.99999994);
 		uint last = min(first + count - 1u, RT_LIGHT_TREE_LEAVES_MAX - 1u);
-		uint at;
+		float u_count = u_leaf * float(count);
+		uint at = min(first + uint(u_count), last);
 		if (light_tree_power_pick()) {
-			// The first leaf whose cumulative share exceeds the number: a leaf is reached with its share.
-			uint base = t.indirect ? RT_LIGHT_TREE_LEAVES_MAX : 0u;
-			uint lo = first;
-			uint hi = last;
-			while (lo < hi) {
-				uint mid = (lo + hi) >> 1u;
-				if (u_leaf < tree_leaf_cdf[base + mid]) {
-					hi = mid;
-				} else {
-					lo = mid + 1u;
-				}
-			}
-			at = lo;
-			p = light_tree_leaf_probability_share(t, interval, light_tree_leaf_share(first, at, t.indirect));
-		} else {
-			at = min(first + uint(u_leaf * float(count)), last);
+			// The position keeps the pick below its threshold and sends it to its alias above: a leaf
+			// is reached with its share, which the entry carries for both outcomes.
+			uvec4 e = tree_leaf_alias[(t.indirect ? RT_LIGHT_TREE_LEAVES_MAX : 0u) + at];
+			bool keep = clamp(u_count - float(at - first), 0.0, 0.99999994) < uintBitsToFloat(e.x);
+			at = keep ? at : min(e.y, RT_LIGHT_TREE_LEAVES_MAX - 1u);
+			p = light_tree_leaf_probability_share(t, interval, uintBitsToFloat(keep ? e.z : e.w));
 		}
 		uint leaf = tree_leaf_list[at];
 		if (leaf >= tree_node_count) {

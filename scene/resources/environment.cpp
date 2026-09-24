@@ -735,6 +735,15 @@ int Environment::get_pathtracing_light_tree_cut() const {
 	return pathtracing_light_tree_cut;
 }
 
+void Environment::set_pathtracing_light_tree_cut_indirect(int p_nodes) {
+	pathtracing_light_tree_cut_indirect = CLAMP(p_nodes, 1, 64);
+	RS::get_singleton()->environment_set_pathtracing_light_tree_cut_indirect(environment, pathtracing_light_tree_cut_indirect);
+}
+
+int Environment::get_pathtracing_light_tree_cut_indirect() const {
+	return pathtracing_light_tree_cut_indirect;
+}
+
 void Environment::_update_pathtracing() {
 	RS::get_singleton()->environment_set_pathtracing(
 			environment,
@@ -1649,6 +1658,8 @@ void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_pathtracing_light_tree"), &Environment::is_pathtracing_light_tree);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_light_tree_cut", "nodes"), &Environment::set_pathtracing_light_tree_cut);
 	ClassDB::bind_method(D_METHOD("get_pathtracing_light_tree_cut"), &Environment::get_pathtracing_light_tree_cut);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_light_tree_cut_indirect", "nodes"), &Environment::set_pathtracing_light_tree_cut_indirect);
+	ClassDB::bind_method(D_METHOD("get_pathtracing_light_tree_cut_indirect"), &Environment::get_pathtracing_light_tree_cut_indirect);
 	GLOBAL_DEF("rendering/pathtracing/use_simple_shadows", false);
 
 	ADD_GROUP("Pathtracing", "pathtracing_");
@@ -1666,6 +1677,7 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_sky_light"), "set_pathtracing_sky_light", "is_pathtracing_sky_light");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_light_tree"), "set_pathtracing_light_tree", "is_pathtracing_light_tree");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_light_tree_cut", PROPERTY_HINT_RANGE, "1,64,1"), "set_pathtracing_light_tree_cut", "get_pathtracing_light_tree_cut");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_light_tree_cut_indirect", PROPERTY_HINT_RANGE, "1,64,1"), "set_pathtracing_light_tree_cut_indirect", "get_pathtracing_light_tree_cut_indirect");
 
 	// Camera medium
 

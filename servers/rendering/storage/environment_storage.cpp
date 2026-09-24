@@ -957,6 +957,12 @@ void RendererEnvironmentStorage::environment_set_pathtracing_light_tree_cut(RID 
 	env->pathtracing_light_tree_cut = CLAMP(p_nodes, 1, 64);
 }
 
+void RendererEnvironmentStorage::environment_set_pathtracing_light_tree_cut_indirect(RID p_env, int p_nodes) {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL(env);
+	env->pathtracing_light_tree_cut_indirect = CLAMP(p_nodes, 1, 64);
+}
+
 bool RendererEnvironmentStorage::environment_get_pathtracing_enabled(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, false);
@@ -1039,6 +1045,12 @@ int RendererEnvironmentStorage::environment_get_pathtracing_light_tree_cut(RID p
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, 32);
 	return env->pathtracing_light_tree_cut;
+}
+
+int RendererEnvironmentStorage::environment_get_pathtracing_light_tree_cut_indirect(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, 32);
+	return env->pathtracing_light_tree_cut_indirect;
 }
 
 // Camera medium

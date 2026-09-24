@@ -197,6 +197,16 @@ uint set_scattered(uint packed) {
 bool is_scattered(uint packed) {
 	return (packed & SCATTERED_FLAG) != 0u;
 }
+// The previous vertex selected its light sample over the light tree's indirect cut (bit 31, D59),
+// so the density a chance hit or a miss recovers for its MIS weight reads that cut. Set at the
+// first vertex past a diffuse bounce and kept: the diffuse count only grows.
+const uint LIGHT_TREE_INDIRECT_FLAG = (1u << 31);
+uint set_light_tree_indirect(uint packed) {
+	return packed | LIGHT_TREE_INDIRECT_FLAG;
+}
+bool is_light_tree_indirect(uint packed) {
+	return (packed & LIGHT_TREE_INDIRECT_FLAG) != 0u;
+}
 uint set_path_terminated(uint packed) {
 	return packed | PATH_TERMINATED_FLAG;
 }

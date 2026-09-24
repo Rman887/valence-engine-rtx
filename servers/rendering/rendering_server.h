@@ -701,6 +701,7 @@ public:
 	virtual void environment_set_pathtracing_sky_light(RID p_env, bool p_enable) = 0;
 	virtual void environment_set_pathtracing_light_tree(RID p_env, bool p_enable) = 0;
 	virtual void environment_set_pathtracing_light_tree_cut(RID p_env, int p_nodes) = 0;
+	virtual void environment_set_pathtracing_light_tree_cut_indirect(RID p_env, int p_nodes) = 0;
 	virtual void environment_set_camera_medium(RID p_env, bool p_enable, const Color &p_absorption, const Color &p_scattering, float p_height) = 0;
 
 	virtual void environment_set_fog(RID p_env, bool p_enable, const Color &p_light_color, float p_light_energy, float p_sun_scatter, float p_density, float p_height, float p_height_density, float p_aerial_perspective, float p_sky_affect, RSE::EnvironmentFogMode p_mode = RSE::EnvironmentFogMode::ENV_FOG_MODE_EXPONENTIAL) = 0;

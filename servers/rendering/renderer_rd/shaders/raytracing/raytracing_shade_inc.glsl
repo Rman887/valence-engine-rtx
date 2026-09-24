@@ -380,7 +380,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			// The light tree's exact probability of this entry at the previous vertex (D55): the ray's
 			// origin and the offset normal the payload carried from there.
 			uint entry = emissive_find_entry(h.geometry_idx, rt_emissive_count);
-			float p_instance = (entry < rt_emissive_count) ? light_tree_emissive_probability(entry, shade_previous_origin(h, ray_dir, hit_t), ps.offset_normal) : 0.0;
+			float p_instance = (entry < rt_emissive_count) ? light_tree_emissive_probability(entry, shade_previous_origin(h, ray_dir, hit_t), ps.offset_normal, is_light_tree_indirect(ps.packed_bounces_flags)) : 0.0;
 			pdf_light = (entry < rt_emissive_count) ? emissive_hit_pdf_entry(entry, p_instance, h.primitive_id, ray_dir, hit_t, h.is_front_face) : 0.0;
 		} else {
 			pdf_light = (1.0 - p_sky) * get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY) * emissive_hit_pdf(h.geometry_idx, h.primitive_id, ray_dir, hit_t, h.is_front_face, rt_emissive_count);
@@ -527,6 +527,11 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			// probability; the shading normal still decides what the sample delivers.
 			vec3 N_select = oct_to_vec3(unpackUnorm2x16(packUnorm2x16(vec3_to_oct(h.geometry_normal))) * 2.0 - 1.0);
 			uint tree_candidates = uint(get_rt_param(RT_PARAM_EMISSIVE_CANDIDATES));
+			// Past the first diffuse bounce the sample is drawn over the coarser indirect cut (D59);
+			// the payload tells the next vertex, whose chance-hit and miss densities read the same cut.
+			if (is_indirect) {
+				ps.packed_bounces_flags = set_light_tree_indirect(ps.packed_bounces_flags);
+			}
 			have_sample = light_tree_sample_direct(hit_pos_offset, N_select, N, V, brdf_mat, ps.rng_state, is_indirect, tree_candidates, light_sample, strategy_probability);
 		} else if (sample_sky) {
 			have_sample = sky_sample_direct(N, V, brdf_mat, ps.rng_state, strategy_probability, light_sample);

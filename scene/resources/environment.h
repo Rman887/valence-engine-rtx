@@ -205,6 +205,7 @@ private:
 	bool pathtracing_sky_light = false;
 	bool pathtracing_light_tree = false;
 	int pathtracing_light_tree_cut = 32;
+	int pathtracing_light_tree_cut_indirect = 32;
 	void _update_pathtracing();
 	void _update_pathtracing_clamp();
 
@@ -431,6 +432,8 @@ public:
 	bool is_pathtracing_light_tree() const;
 	void set_pathtracing_light_tree_cut(int p_nodes);
 	int get_pathtracing_light_tree_cut() const;
+	void set_pathtracing_light_tree_cut_indirect(int p_nodes);
+	int get_pathtracing_light_tree_cut_indirect() const;
 
 	// Camera medium
 	void set_camera_medium_enabled(bool p_enabled);

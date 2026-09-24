@@ -252,6 +252,10 @@
 			How many nodes of the light tree the path tracer scores at every surface when [member pathtracing_light_tree] is [code]true[/code]: the tree's shallowest nodes, this many, are weighed once per surface and each candidate picks one of them by its weight and a light under it uniformly, so the work per surface is this many node scores plus one read per candidate rather than a walk of the whole tree per candidate. With no more lights than this every light is scored on its own; with more, the lights under one node share its score and [member pathtracing_emissive_candidates] tells them apart by their contribution. Higher values pick better among many lights for a cost that grows with the count.
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] and [member pathtracing_light_tree] are [code]true[/code].
 		</member>
+		<member name="pathtracing_light_tree_cut_indirect" type="int" setter="set_pathtracing_light_tree_cut_indirect" getter="get_pathtracing_light_tree_cut_indirect" default="32">
+			How many nodes of the light tree the path tracer scores at a surface reached after the path's first diffuse bounce, in place of [member pathtracing_light_tree_cut]: a second, coarser cut of the same tree, so the light samples that carry the least (the indirect bounces, which are most of a path's surfaces) cost the least to select. Never wider than [member pathtracing_light_tree_cut]; at the same value (the default) every surface scores the same cut.
+			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] and [member pathtracing_light_tree] are [code]true[/code].
+		</member>
 		<member name="pathtracing_max_bounces" type="int" setter="set_pathtracing_max_bounces" getter="get_pathtracing_max_bounces" default="3">
 			Maximum number of times a ray is allowed to bounce off surfaces before it is terminated. Higher values produce more accurate indirect lighting and inter-reflections at the cost of GPU performance. A value of [code]0[/code] produces direct illumination only.
 			[b]Note:[/b] Only has an effect when [member pathtracing_enabled] is [code]true[/code].

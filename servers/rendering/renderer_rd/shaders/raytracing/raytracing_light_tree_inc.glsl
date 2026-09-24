@@ -15,8 +15,12 @@
 // through it and one is kept by its unshadowed contribution over its proposal probability (D51's
 // resampling), which corrects the bounds where they are loose (a receiver inside a cluster's sphere,
 // a cluster in range by its bound alone) and the uniform pick below the cut, and spends no sample on
-// a light that delivers nothing. The off path (the per-frame shares, the uniform analytic pick, the
-// resampled emissive candidates over the global CDF) compiles when the flag is clear.
+// a light that delivers nothing. Past the path's first diffuse bounce a vertex scores a second,
+// coarser cut of the same tree (D59, Environment.pathtracing_light_tree_cut_indirect): its light
+// sample carries the least of the path's, so its proposal costs the least, and the payload carries
+// which cut the sample was drawn from so the next vertex's densities read the same one. The off
+// path (the per-frame shares, the uniform analytic pick, the resampled emissive candidates over the
+// global CDF) compiles when the flag is clear.
 //
 // The normal the selection reads is the geometry normal as the payload carries it to the next
 // vertex (the octahedral unorm16 of oct_offset_nrm), so the chance-hit side evaluates the same
@@ -66,15 +70,32 @@ layout(set = 0, binding = RT_LIGHT_TREE_BINDING, std430) readonly buffer LightTr
 	uint tree_node_count; // 0 when the tree has no leaf (no positional light and no emitter).
 	uint tree_cut_count; // The cut's nodes, at most RT_LIGHT_TREE_CUT_MAX; 0 with no leaf.
 	uint tree_leaf_count;
-	uint tree_pad;
+	uint tree_cut_indirect_count; // The indirect cut's nodes (D59), at most RT_LIGHT_TREE_CUT_MAX; 0 with no leaf.
 	RTLightTreeNode tree_nodes[RT_LIGHT_TREE_NODES_MAX];
-	uint tree_emissive_cut[RT_LIGHT_TREE_EMISSIVE_MAX]; // The cut slot over each emissive entry's leaf, RT_LIGHT_TREE_NO_NODE when it has none.
-	RTLightTreeNode tree_cut[RT_LIGHT_TREE_CUT_MAX]; // The cut's nodes, copied so a slot is one read.
+	uint tree_emissive_cut[RT_LIGHT_TREE_EMISSIVE_MAX]; // The cut slots over each emissive entry's leaf (the primary cut's in the low 16 bits, the indirect's in the high, 0xFFFF for none), RT_LIGHT_TREE_NO_NODE when it has no leaf.
+	RTLightTreeNode tree_cut[2 * RT_LIGHT_TREE_CUT_MAX]; // The cut's nodes, copied so a slot is one read; the indirect cut's (D59) follow at RT_LIGHT_TREE_CUT_MAX, one array so a slot is one indexed read.
 	uint tree_leaf_list[RT_LIGHT_TREE_LEAVES_MAX]; // The leaf nodes in the build's order: a node's leaves are contiguous.
 };
 
 bool light_tree_enabled() {
 	return (RT_FLAGS & RT_FLAG_LIGHT_TREE) != 0u;
+}
+
+/// The cut a vertex scores (D59): the primary cut, or the coarser indirect cut past the path's first
+/// diffuse bounce. Every reader of a slot takes the cut from the LightTreeTop it scored, so the
+/// sampler and the densities never mix the two.
+uint light_tree_cut_count(bool indirect) {
+	return min(indirect ? tree_cut_indirect_count : tree_cut_count, uint(RT_LIGHT_TREE_CUT_MAX));
+}
+
+RTLightTreeNode light_tree_cut_node(uint slot, bool indirect) {
+	return tree_cut[(indirect ? uint(RT_LIGHT_TREE_CUT_MAX) : 0u) + slot];
+}
+
+/// An emissive entry's slot in one cut, RT_LIGHT_TREE_NO_NODE without one.
+uint light_tree_emissive_slot(uint entry, bool indirect) {
+	uint slot = (tree_emissive_cut[entry] >> (indirect ? 16u : 0u)) & 0xFFFFu;
+	return slot == 0xFFFFu ? RT_LIGHT_TREE_NO_NODE : slot;
 }
 
 /// How much the lights under a node could deliver at x facing N, from the node's bounds: its
@@ -161,6 +182,7 @@ struct LightTreeTop {
 	float total;
 	uint directional_count;
 	uint cut_count;
+	bool indirect; // Which cut was scored (D59).
 };
 
 /// Scores the top once for a hit: the cut's nodes are read independently and their importances
@@ -168,21 +190,22 @@ struct LightTreeTop {
 /// and cost the trace its occupancy): a pick runs the same sum again and takes its slot's
 /// interval from it, the same two floats in the same order on every side. A density evaluation
 /// knows its slot before the sum, so it takes the interval out of this pass (r_interval, the
-/// interval of `slot`, 0 when the slot is not in the cut).
-LightTreeTop light_tree_top_slot(vec3 x, vec3 N, uint slot, out float r_interval) {
+/// interval of `slot`, 0 when the slot is not in the cut). `indirect` picks the cut (D59).
+LightTreeTop light_tree_top_slot(vec3 x, vec3 N, uint slot, bool indirect, out float r_interval) {
 	LightTreeTop t;
+	t.indirect = indirect;
 	t.directional_count = uint(get_rt_param(RT_PARAM_DIRECTIONAL_COUNT));
 	t.sky = light_tree_sky_importance();
 	t.directional = 0.0;
 	for (uint k = 0u; k < t.directional_count; k++) {
 		t.directional += light_tree_directional_importance(rt_lights[k], N);
 	}
-	t.cut_count = min(tree_cut_count, uint(RT_LIGHT_TREE_CUT_MAX));
+	t.cut_count = light_tree_cut_count(indirect);
 	float running = 0.0;
 	r_interval = 0.0;
 	for (uint s = 0u; s < t.cut_count; s++) {
 		float below = running;
-		running += light_tree_node_importance(tree_cut[s], x, N);
+		running += light_tree_node_importance(light_tree_cut_node(s, indirect), x, N);
 		if (s == slot) {
 			r_interval = running - below;
 		}
@@ -193,16 +216,16 @@ LightTreeTop light_tree_top_slot(vec3 x, vec3 N, uint slot, out float r_interval
 }
 
 /// The top alone, for the sampler and the miss: light_tree_top_slot with no slot.
-LightTreeTop light_tree_top(vec3 x, vec3 N) {
+LightTreeTop light_tree_top(vec3 x, vec3 N, bool indirect) {
 	float unused;
-	return light_tree_top_slot(x, N, RT_LIGHT_TREE_NO_NODE, unused);
+	return light_tree_top_slot(x, N, RT_LIGHT_TREE_NO_NODE, indirect, unused);
 }
 
 /// The probability a pick from the top t assigns a leaf of cut slot `slot` (its interval of the
 /// sum over the total, over the leaves under it), written so light_tree_draw_leaf and the
 /// chance-hit side agree bit for bit.
 float light_tree_leaf_probability(LightTreeTop t, float interval, uint slot) {
-	uint count = max(tree_cut[slot].leaf_range & 0xFFFFu, 1u);
+	uint count = max(light_tree_cut_node(slot, t.indirect).leaf_range & 0xFFFFu, 1u);
 	return interval / (t.total * float(count));
 }
 
@@ -212,10 +235,10 @@ bool light_tree_sky_only(LightTreeTop t) {
 	return sky_light_enabled() && sky_total > 0.0 && get_rt_param(RT_PARAM_LIGHT_COUNT) == 0.0 && get_rt_param(RT_PARAM_EMISSIVE_COUNT) == 0.0;
 }
 
-/// The probability with which the sky was chosen at the previous vertex (x, N): what the miss
-/// weighs the sky it found against.
-float light_tree_sky_probability(vec3 x, vec3 N) {
-	LightTreeTop t = light_tree_top(x, N);
+/// The probability with which the sky was chosen at the previous vertex (x, N, over the cut the
+/// payload says it scored): what the miss weighs the sky it found against.
+float light_tree_sky_probability(vec3 x, vec3 N, bool indirect) {
+	LightTreeTop t = light_tree_top(x, N, indirect);
 	if (light_tree_sky_only(t)) {
 		return 1.0;
 	}
@@ -227,18 +250,19 @@ float light_tree_sky_probability(vec3 x, vec3 N) {
 
 /// The probability with which a pick from (x, N) reaches an emissive entry's leaf: its cut node's
 /// share of the total over the leaves under that node, the expression light_tree_draw_leaf evaluates.
-/// Zero when the entry has no leaf or its cut node reads nothing there.
-float light_tree_emissive_probability(uint p_entry, vec3 x, vec3 N) {
+/// Zero when the entry has no leaf or its cut node reads nothing there. `indirect` is the cut the
+/// previous vertex scored, as the payload carries it (D59).
+float light_tree_emissive_probability(uint p_entry, vec3 x, vec3 N, bool indirect) {
 	if (p_entry >= RT_LIGHT_TREE_EMISSIVE_MAX) {
 		return 0.0;
 	}
-	uint slot = tree_emissive_cut[p_entry];
-	if (slot == RT_LIGHT_TREE_NO_NODE || slot >= tree_cut_count || slot >= uint(RT_LIGHT_TREE_CUT_MAX)) {
+	uint slot = light_tree_emissive_slot(p_entry, indirect);
+	if (slot == RT_LIGHT_TREE_NO_NODE || slot >= light_tree_cut_count(indirect)) {
 		return 0.0;
 	}
 	// The slot's interval of the same running sum the sampler takes, out of the one pass that sums it.
 	float interval;
-	LightTreeTop t = light_tree_top_slot(x, N, slot, interval);
+	LightTreeTop t = light_tree_top_slot(x, N, slot, indirect, interval);
 	if (light_tree_sky_only(t) || !(t.total > 0.0)) {
 		return 0.0;
 	}
@@ -305,7 +329,7 @@ bool light_tree_draw_leaf(float target, float below, float interval, uint slot, 
 	r_c.index = 0u;
 	r_c.node = 0u;
 	r_c.p = 0.0;
-	uint leaf_range = tree_cut[slot].leaf_range;
+	uint leaf_range = light_tree_cut_node(slot, t.indirect).leaf_range;
 	uint first = leaf_range >> 16u;
 	uint count = max(leaf_range & 0xFFFFu, 1u);
 	float u_leaf = clamp((target - below) / interval, 0.0, 0.99999994);
@@ -423,6 +447,8 @@ float light_tree_target(LightTreeCandidate c, LightTreeTop t, vec3 hit_pos, vec3
 /// already carries the proposal's density in its MIS weight and the resampled density under it.
 /// Returns false when nothing was drawn or the sample carries nothing. Draws: one for the
 /// reservoir, at most two per candidate (the top split, and the cut's place) and the leaf's pair.
+/// Past the first diffuse bounce (is_indirect_bounce) the proposal is the indirect cut (D59); the
+/// caller marks the payload so the next vertex's densities read it too.
 bool light_tree_sample_direct(
 		vec3 hit_pos,
 		vec3 N_select,
@@ -442,7 +468,7 @@ bool light_tree_sample_direct(
 	r_sample.specular_multiplier = 1.0;
 	r_probability = 1.0;
 
-	LightTreeTop t = light_tree_top(hit_pos, N_select);
+	LightTreeTop t = light_tree_top(hit_pos, N_select, is_indirect_bounce);
 	if (light_tree_sky_only(t)) {
 		return sky_sample_direct(N, V, material, rng_state, 1.0, r_sample);
 	}
@@ -487,7 +513,7 @@ bool light_tree_sample_direct(
 	}
 	for (uint s = 0u; s < t.cut_count && target >= 0.0; s++) {
 		float below = running;
-		running += light_tree_node_importance(tree_cut[s], hit_pos, N_select);
+		running += light_tree_node_importance(light_tree_cut_node(s, t.indirect), hit_pos, N_select);
 		float interval = running - below;
 		if (!(interval > 0.0)) {
 			continue;

@@ -1462,6 +1462,14 @@
 				Sets how many nodes of the light tree the path tracer scores at every surface for the specified environment RID. See [member Environment.pathtracing_light_tree_cut].
 			</description>
 		</method>
+		<method name="environment_set_pathtracing_light_tree_cut_indirect">
+			<return type="void" />
+			<param index="0" name="env" type="RID" />
+			<param index="1" name="nodes" type="int" />
+			<description>
+				Sets how many nodes of the light tree the path tracer scores at a surface reached after the path's first diffuse bounce for the specified environment RID. See [member Environment.pathtracing_light_tree_cut_indirect].
+			</description>
+		</method>
 		<method name="environment_set_pathtracing_primary_surface">
 			<return type="void" />
 			<param index="0" name="env" type="RID" />

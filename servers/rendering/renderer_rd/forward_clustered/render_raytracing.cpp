@@ -3059,14 +3059,17 @@ static void _rt_cone_union(const Vector3 &p_a1, float p_cos1, const Vector3 &p_a
 /// tree over them balanced by count, split at the median of the leaf centres along the longest
 /// axis, in depth-first order so a node's left child follows it and a node's leaves are contiguous
 /// in the order. Each node carries the union of its children's spheres and cones, their summed
-/// power, their largest range and its leaves' range. Then the cut (D56): the tree's shallowest
+/// power, their largest range and its leaves' range. Then the cuts: the tree's shallowest
 /// nodes, at most p_cut_size of them, which the shader scores once per hit and picks a leaf under
-/// uniformly. The nodes, the cut, the leaf list and each emissive entry's cut slot land in the
-/// scratch vectors for the upload. Returns the node count, 0 when there is no leaf.
-uint32_t RenderRaytracing::build_light_tree(const RT_LightData *p_lights, uint32_t p_light_count, uint32_t p_directional_count, const RT_EmissiveInstance *p_emissive, uint32_t p_emissive_count, float p_exposure, uint32_t p_cut_size) {
+/// uniformly (D56), and a second, coarser cut of at most p_cut_indirect_size for the surfaces past
+/// the path's first diffuse bounce (D59). The nodes, the cuts, the leaf list and each emissive
+/// entry's cut slots land in the scratch vectors for the upload. Returns the node count, 0 when
+/// there is no leaf.
+uint32_t RenderRaytracing::build_light_tree(const RT_LightData *p_lights, uint32_t p_light_count, uint32_t p_directional_count, const RT_EmissiveInstance *p_emissive, uint32_t p_emissive_count, float p_exposure, uint32_t p_cut_size, uint32_t p_cut_indirect_size) {
 	light_tree_leaves.clear();
 	light_tree_nodes.clear();
 	light_tree_cut.clear();
+	light_tree_cut_indirect.clear();
 	if (light_tree_emissive_cut.size() < RT_EMISSIVE_MAX) {
 		light_tree_emissive_cut.resize(RT_EMISSIVE_MAX);
 	}
@@ -3127,16 +3130,21 @@ uint32_t RenderRaytracing::build_light_tree(const RT_LightData *p_lights, uint32
 	}
 	light_tree_nodes.reserve(2 * leaf_count - 1);
 	_build_light_tree_node(0, leaf_count);
-	_build_light_tree_cut(p_cut_size);
+	_build_light_tree_cut(p_cut_size, light_tree_cut, 0);
+	// The indirect cut is never wider than the primary: equal sizes (the default) score one cut everywhere.
+	_build_light_tree_cut(MIN(p_cut_indirect_size, p_cut_size), light_tree_cut_indirect, 16);
 	return light_tree_nodes.size();
 }
 
-/// The cut: the root, then breadth first the shallowest node in it replaced by its two children
+/// A cut: the root, then breadth first the shallowest node in it replaced by its two children
 /// while the size allows, so the cut is the tree's shallowest full level plus part of the next and
 /// a tree with no more leaves than the size is cut at its leaves, where the score is each light's
-/// own. Each cut node is copied for the upload and the emissive entries under it map to its slot.
-void RenderRaytracing::_build_light_tree_cut(uint32_t p_cut_size) {
+/// own. Each cut node is copied into r_cut for the upload and the emissive entries under it map to
+/// its slot in the 16 bits of their entry at p_slot_shift (the primary cut's slot in the low half,
+/// the indirect cut's in the high half, D59).
+void RenderRaytracing::_build_light_tree_cut(uint32_t p_cut_size, LocalVector<RT_LightTreeNode> &r_cut, uint32_t p_slot_shift) {
 	p_cut_size = CLAMP(p_cut_size, 1u, (uint32_t)RT_LIGHT_TREE_CUT_MAX);
+	r_cut.clear();
 	light_tree_cut_queue.clear();
 	light_tree_cut_queue.push_back(0);
 	uint32_t head = 0;
@@ -3144,25 +3152,26 @@ void RenderRaytracing::_build_light_tree_cut(uint32_t p_cut_size) {
 		uint32_t node = light_tree_cut_queue[head];
 		const RT_LightTreeNode &n = light_tree_nodes[node];
 		// Splitting turns one pending node into two: allowed while the cut plus the queue's rest fits.
-		uint32_t size_now = light_tree_cut.size() + (light_tree_cut_queue.size() - head);
+		uint32_t size_now = r_cut.size() + (light_tree_cut_queue.size() - head);
 		if ((n.child & RT_LIGHT_TREE_LEAF_BIT) == 0 && size_now + 1 <= p_cut_size) {
 			light_tree_cut_queue.push_back(node + 1);
 			light_tree_cut_queue.push_back(n.child);
 		} else {
-			uint32_t slot = light_tree_cut.size();
-			light_tree_cut.push_back(n);
+			uint32_t slot = r_cut.size();
+			r_cut.push_back(n);
 			uint32_t first = n.leaf_range >> 16;
 			uint32_t count = n.leaf_range & 0xFFFFu;
 			for (uint32_t i = first; i < first + count; i++) {
 				uint32_t encoded = light_tree_nodes[light_tree_leaf_list[i]].child;
 				if (encoded & RT_LIGHT_TREE_EMISSIVE_BIT) {
-					light_tree_emissive_cut[encoded & ~(RT_LIGHT_TREE_LEAF_BIT | RT_LIGHT_TREE_EMISSIVE_BIT)] = slot;
+					uint32_t entry = encoded & ~(RT_LIGHT_TREE_LEAF_BIT | RT_LIGHT_TREE_EMISSIVE_BIT);
+					light_tree_emissive_cut[entry] = (light_tree_emissive_cut[entry] & ~(0xFFFFu << p_slot_shift)) | (slot << p_slot_shift);
 				}
 			}
 		}
 		head++;
 	}
-	DEV_ASSERT(light_tree_cut.size() <= p_cut_size);
+	DEV_ASSERT(r_cut.size() <= p_cut_size);
 }
 
 uint32_t RenderRaytracing::_build_light_tree_node(uint32_t p_begin, uint32_t p_end) {
@@ -3499,10 +3508,12 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			bool emissive_enabled = true;
 			int emissive_candidate_count = 8;
 			int light_tree_cut_size = 32;
+			int light_tree_cut_indirect_size = 32;
 			if (p_render_data && p_render_data->environment.is_valid()) {
 				emissive_enabled = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_emissive_lights(p_render_data->environment);
 				emissive_candidate_count = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_emissive_candidates(p_render_data->environment);
 				light_tree_cut_size = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_light_tree_cut(p_render_data->environment);
+				light_tree_cut_indirect_size = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_light_tree_cut_indirect(p_render_data->environment);
 			}
 			uint32_t buf_size = RT_EMISSIVE_MAX * sizeof(RT_EmissiveInstance);
 			if (!p_state->emissive_buffer.is_valid()) {
@@ -3551,14 +3562,16 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 				}
 				if (light_tree) {
 					float exposure = (p_render_data && p_render_data->camera_attributes.is_valid()) ? RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes) : 1.0f;
-					uint32_t node_count = build_light_tree(rt_light_data, rt_light_count, rt_directional_count, emissive_scratch.ptr(), rt_emissive_count, exposure, (uint32_t)MAX(light_tree_cut_size, 1));
+					uint32_t node_count = build_light_tree(rt_light_data, rt_light_count, rt_directional_count, emissive_scratch.ptr(), rt_emissive_count, exposure, (uint32_t)MAX(light_tree_cut_size, 1), (uint32_t)MAX(light_tree_cut_indirect_size, 1));
 					uint32_t cut_count = node_count > 0 ? light_tree_cut.size() : 0;
+					uint32_t cut_indirect_count = node_count > 0 ? light_tree_cut_indirect.size() : 0;
 					uint32_t leaf_count = node_count > 0 ? light_tree_leaf_list.size() : 0;
-					uint32_t header[4] = { node_count, cut_count, leaf_count, 0 };
+					uint32_t header[4] = { node_count, cut_count, leaf_count, cut_indirect_count };
 					RD::get_singleton()->buffer_update(p_state->light_tree_buffer, 0, sizeof(header), header);
 					if (node_count > 0) {
 						RD::get_singleton()->buffer_update(p_state->light_tree_buffer, RT_LIGHT_TREE_HEADER_SIZE, node_count * sizeof(RT_LightTreeNode), light_tree_nodes.ptr());
 						RD::get_singleton()->buffer_update(p_state->light_tree_buffer, RT_LIGHT_TREE_CUT_OFFSET, cut_count * sizeof(RT_LightTreeNode), light_tree_cut.ptr());
+						RD::get_singleton()->buffer_update(p_state->light_tree_buffer, RT_LIGHT_TREE_CUT_INDIRECT_OFFSET, cut_indirect_count * sizeof(RT_LightTreeNode), light_tree_cut_indirect.ptr());
 						RD::get_singleton()->buffer_update(p_state->light_tree_buffer, RT_LIGHT_TREE_LEAF_LIST_OFFSET, leaf_count * sizeof(uint32_t), light_tree_leaf_list.ptr());
 					}
 					if (rt_emissive_count > 0) {

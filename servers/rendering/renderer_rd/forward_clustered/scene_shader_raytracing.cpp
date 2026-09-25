@@ -670,6 +670,40 @@ bool SceneShaderRaytracing::is_hg_ready_in_bundle(uint32_t p_slot_index, uint32_
 	return b.live_ready_mask[p_slot_index];
 }
 
+// A slot that is not live in the bundle yet but will be: it has not failed, and a rebuild of
+// the bundle is owed (dirty), queued or running. A failed slot stays out of the TLAS for good,
+// and one whose bundle rebuild failed stays out until a new slot dirties the bundle again;
+// neither is counted as compiling.
+bool SceneShaderRaytracing::is_hg_compiling_in_bundle(uint32_t p_slot_index, uint32_t p_rt_flags) const {
+	if (p_slot_index == 0 || p_slot_index >= hit_group_slots.size() || hit_group_slots[p_slot_index].state == HGState::Failed) {
+		return false;
+	}
+	if (is_hg_ready_in_bundle(p_slot_index, p_rt_flags)) {
+		return false;
+	}
+	HashMap<uint32_t, PipelineBundle>::ConstIterator it = pipeline_bundles.find(p_rt_flags);
+	if (it == pipeline_bundles.end()) {
+		return false;
+	}
+	const PipelineBundle &b = it->value;
+	if (p_slot_index < b.per_hg_states.size() && b.per_hg_states[p_slot_index] == HGState::Failed) {
+		return false;
+	}
+	if (b.dirty && b.initial_pipeline_built) {
+		return true;
+	}
+	MutexLock lock(compile_lane.mutex);
+	if (compile_lane.current && compile_lane.current->rt_flags == p_rt_flags) {
+		return true;
+	}
+	for (const PipelineBuildTask *task : compile_lane.queue) {
+		if (task->rt_flags == p_rt_flags) {
+			return true;
+		}
+	}
+	return false;
+}
+
 uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_enabled) {
 	uint32_t flags = RT_FLAG_NONE;
 	uint32_t sample_count = 1;

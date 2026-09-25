@@ -657,7 +657,10 @@
 		<constant name="RENDER_INFO_RT_TRIANGLES_REFIT" value="7" enum="RenderInfo">
 			Total triangles processed by BLAS refits this frame (ray tracing only).
 		</constant>
-		<constant name="RENDER_INFO_MAX" value="8" enum="RenderInfo">
+		<constant name="RENDER_INFO_RT_INSTANCES_COMPILING" value="8" enum="RenderInfo">
+			Instances left out of this frame's TLAS because their custom hit group is still compiling, which takes several frames under [member ProjectSettings.rendering/pathtracing/async_shader_compilation]. A hit group that failed to compile is not counted, so zero means every instance that can be traced is in the frame. A MultiMesh counts each of its instances and a procedural instance counts once, so the count is not in the unit of [constant RENDER_INFO_RT_TLAS_INSTANCES] (ray tracing only, editor builds only).
+		</constant>
+		<constant name="RENDER_INFO_MAX" value="9" enum="RenderInfo">
 			Represents the size of the [enum RenderInfo] enum.
 		</constant>
 		<constant name="RENDER_INFO_TYPE_VISIBLE" value="0" enum="RenderInfoType">

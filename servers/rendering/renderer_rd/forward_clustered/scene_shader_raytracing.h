@@ -455,6 +455,7 @@ public:
 	uint32_t get_hit_group_slot_count() const { return hit_group_slots.size(); }
 
 	bool is_hg_ready_in_bundle(uint32_t p_slot_index, uint32_t p_rt_flags) const;
+	bool is_hg_compiling_in_bundle(uint32_t p_slot_index, uint32_t p_rt_flags) const;
 	void drain_completed_compiles();
 	void finalize_custom_shaders();
 

@@ -969,6 +969,12 @@ void RendererEnvironmentStorage::environment_set_pathtracing_light_tree_power_pi
 	env->pathtracing_light_tree_power_pick = p_enable;
 }
 
+void RendererEnvironmentStorage::environment_set_pathtracing_sky_light_variance_share(RID p_env, bool p_enable) {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL(env);
+	env->pathtracing_sky_light_variance_share = p_enable;
+}
+
 bool RendererEnvironmentStorage::environment_get_pathtracing_enabled(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, false);
@@ -1063,6 +1069,12 @@ bool RendererEnvironmentStorage::environment_get_pathtracing_light_tree_power_pi
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, false);
 	return env->pathtracing_light_tree_power_pick;
+}
+
+bool RendererEnvironmentStorage::environment_get_pathtracing_sky_light_variance_share(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, false);
+	return env->pathtracing_sky_light_variance_share;
 }
 
 // Camera medium

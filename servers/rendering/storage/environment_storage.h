@@ -189,6 +189,7 @@ private:
 		int pathtracing_light_tree_cut = 32;
 		int pathtracing_light_tree_cut_indirect = 32;
 		bool pathtracing_light_tree_power_pick = false;
+		bool pathtracing_sky_light_variance_share = false;
 
 		// Camera medium (the path tracer, D49)
 		bool camera_medium_enabled = false;
@@ -360,6 +361,7 @@ public:
 	void environment_set_pathtracing_light_tree_cut(RID p_env, int p_nodes);
 	void environment_set_pathtracing_light_tree_cut_indirect(RID p_env, int p_nodes);
 	void environment_set_pathtracing_light_tree_power_pick(RID p_env, bool p_enable);
+	void environment_set_pathtracing_sky_light_variance_share(RID p_env, bool p_enable);
 	bool environment_get_pathtracing_enabled(RID p_env) const;
 	int environment_get_pathtracing_debug_mode(RID p_env) const;
 	int environment_get_pathtracing_samples_per_pixel(RID p_env) const;
@@ -376,6 +378,7 @@ public:
 	int environment_get_pathtracing_light_tree_cut(RID p_env) const;
 	int environment_get_pathtracing_light_tree_cut_indirect(RID p_env) const;
 	bool environment_get_pathtracing_light_tree_power_pick(RID p_env) const;
+	bool environment_get_pathtracing_sky_light_variance_share(RID p_env) const;
 
 	// Camera medium
 	void environment_set_camera_medium(RID p_env, bool p_enable, const Color &p_absorption, const Color &p_scattering, float p_height);

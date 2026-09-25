@@ -696,6 +696,9 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_e
 		}
 		if (env_storage->environment_get_pathtracing_sky_light(p_environment)) {
 			flags |= RT_FLAG_SKY_LIGHT;
+			if (env_storage->environment_get_pathtracing_sky_light_variance_share(p_environment)) {
+				flags |= RT_FLAG_SKY_LIGHT_VARIANCE_SHARE;
+			}
 		}
 		if (env_storage->environment_get_pathtracing_light_tree(p_environment)) {
 			flags |= RT_FLAG_LIGHT_TREE;

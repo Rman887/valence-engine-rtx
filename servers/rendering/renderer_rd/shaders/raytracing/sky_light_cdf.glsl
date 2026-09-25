@@ -20,6 +20,17 @@
 // SKY_CONCENTRATION_RATIO times the sky's mean radiance): a smooth sky is estimated well by the
 // BSDF's own directions, and a light sample spent on it is one taken from a light whose sample
 // had no variance, so the share the sky gets follows its concentrated light, not its total.
+// For the share by variance (D62) the table also reports, at each of eight candidate shares, the
+// variance of the sky's irradiance on a surface facing the sky's up when a share c of the light
+// samples draws from this table and the surface's cosine lobe draws the bounce, the two combined
+// by the balance heuristic: the second moment of the combined estimator, the integral of
+// f^2 / (p_bsdf + c p_sky), less the squares of the two strategies' weighted means, and the sky
+// strategy's weighted mean itself, which the share's covariance with the other lights needs
+// (raytracing_sky_inc.glsl). A smooth sky reads nearly zero at c = 0 (the cosine lobe alone
+// estimates it well) and rises with c; a sky that carries a small bright source reads high at
+// c = 0 and falls as c grows. The balance heuristic, the upward Lambertian receiver and the
+// sky without the fog's mix are a proxy for the trace's power heuristic over any surface: they
+// choose the share, and any share is unbiased.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -29,6 +40,11 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #define SKY_CELLS (SKY_N * SKY_N)
 #define SKY_CONCENTRATION_RATIO 4.0
 #define SKY_FULL_SPHERE (4.0 * 3.14159265358979)
+#define SKY_PI 3.14159265358979
+#define SKY_SHARE_COUNT 8u
+
+// Written to the table's sky_share, which the trace reads, so the list lives here alone.
+const float SKY_SHARES[SKY_SHARE_COUNT] = float[](0.0, 1.0 / 32.0, 1.0 / 16.0, 0.125, 0.25, 0.5, 0.75, 0.9);
 
 // The radiance octmap's sharpest layer as a 2D texture with its mip chain.
 layout(set = 0, binding = 0) uniform texture2D radiance_octmap;
@@ -39,6 +55,9 @@ layout(set = 0, binding = 2, std430) restrict buffer SkyLightBuffer {
 	float sky_total; // The sum over cells of luminance times solid angle; 0 for a black sky.
 	float sky_concentrated; // The part of sky_total in cells brighter than the ratio times the mean.
 	float sky_pad[2];
+	float sky_share[SKY_SHARE_COUNT]; // The candidate shares, SKY_SHARES (D62).
+	float sky_variance[SKY_SHARE_COUNT]; // The sky term's variance at each share, before the exposure.
+	float sky_light_mean[SKY_SHARE_COUNT]; // The sky strategy's MIS-weighted mean at each share, before the exposure.
 	float sky_marginal[SKY_N]; // Inclusive CDF over the rows; the last entry reads 1.0.
 	float sky_conditional[SKY_CELLS]; // Inclusive CDF over each row's cells, each row to 1.0.
 	float sky_pdf_uv[SKY_CELLS]; // The density per unit octahedral area inside the cell.
@@ -54,6 +73,9 @@ params;
 
 shared float row_sum[SKY_N];
 shared float row_concentrated[SKY_N];
+shared float row_moment[SKY_N];
+shared float row_mean_bsdf[SKY_N];
+shared float row_mean_sky[SKY_N];
 
 float sky_luminance(vec3 p_color) {
 	return dot(p_color, vec3(0.2126, 0.7152, 0.0722));
@@ -109,12 +131,41 @@ void main() {
 	float grand = total + floor_w * float(SKY_CELLS);
 	float row_total = sum + floor_w * float(SKY_N);
 	float acc = 0.0;
+	// Per share: the second moment and the two strategies' weighted means over this row's cells.
+	float moment[SKY_SHARE_COUNT];
+	float mean_bsdf[SKY_SHARE_COUNT];
+	float mean_sky[SKY_SHARE_COUNT];
+	for (uint k = 0u; k < SKY_SHARE_COUNT; k++) {
+		moment[k] = 0.0;
+		mean_bsdf[k] = 0.0;
+		mean_sky[k] = 0.0;
+	}
 	for (uint col = 0u; col < SKY_N; col++) {
 		uint cell = row_base + col;
+		float lum = sky_conditional[cell]; // The parked luminance, read before it is overwritten.
 		float w = sky_pdf_uv[cell] + floor_w;
 		acc += w;
 		sky_conditional[cell] = (col == SKY_N - 1u) ? 1.0 : acc / row_total;
 		sky_pdf_uv[cell] = w / grand * float(SKY_CELLS);
+
+		// The cell at its centre as seen from a surface facing +Y: the irradiance integrand, the
+		// cosine lobe's density and the table's, each over solid angle.
+		vec2 uv_centre = (vec2(col, row) + 0.5) / float(SKY_N);
+		vec3 dir_centre = oct_to_vec3(uv_centre * 2.0 - 1.0);
+		if (dir_centre.y > 0.0) {
+			float l1 = abs(dir_centre.x) + abs(dir_centre.y) + abs(dir_centre.z);
+			float solid_angle = 4.0 * l1 * l1 * l1 / float(SKY_CELLS);
+			float f = lum * dir_centre.y;
+			float p_bsdf = dir_centre.y / SKY_PI;
+			float p_sky = w / grand / solid_angle;
+			for (uint k = 0u; k < SKY_SHARE_COUNT; k++) {
+				float q = SKY_SHARES[k] * p_sky;
+				float f_over = solid_angle * f / (p_bsdf + q);
+				moment[k] += f_over * f;
+				mean_bsdf[k] += f_over * p_bsdf;
+				mean_sky[k] += f_over * q;
+			}
+		}
 	}
 	float marginal = 0.0;
 	for (uint r = 0u; r <= row; r++) {
@@ -128,5 +179,27 @@ void main() {
 		}
 		sky_total = total;
 		sky_concentrated = concentrated_total;
+	}
+
+	// The variance at each share, the rows reduced through shared memory one share at a time.
+	for (uint k = 0u; k < SKY_SHARE_COUNT; k++) {
+		barrier(); // The previous share's reduction has read the rows.
+		row_moment[row] = moment[k];
+		row_mean_bsdf[row] = mean_bsdf[k];
+		row_mean_sky[row] = mean_sky[k];
+		barrier();
+		if (row == 0u) {
+			float m = 0.0;
+			float b = 0.0;
+			float s = 0.0;
+			for (uint r = 0u; r < SKY_N; r++) {
+				m += row_moment[r];
+				b += row_mean_bsdf[r];
+				s += row_mean_sky[r];
+			}
+			sky_share[k] = SKY_SHARES[k];
+			sky_variance[k] = max(m - b * b - s * s, 0.0);
+			sky_light_mean[k] = s;
+		}
 	}
 }

@@ -3108,6 +3108,7 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("environment_set_pathtracing_light_tree_cut", "env", "nodes"), &RenderingServer::environment_set_pathtracing_light_tree_cut);
 	ClassDB::bind_method(D_METHOD("environment_set_pathtracing_light_tree_cut_indirect", "env", "nodes"), &RenderingServer::environment_set_pathtracing_light_tree_cut_indirect);
 	ClassDB::bind_method(D_METHOD("environment_set_pathtracing_light_tree_power_pick", "env", "enable"), &RenderingServer::environment_set_pathtracing_light_tree_power_pick);
+	ClassDB::bind_method(D_METHOD("environment_set_pathtracing_sky_light_variance_share", "env", "enable"), &RenderingServer::environment_set_pathtracing_sky_light_variance_share);
 	ClassDB::bind_method(D_METHOD("environment_set_camera_medium", "env", "enable", "absorption", "scattering", "height"), &RenderingServer::environment_set_camera_medium);
 	ClassDB::bind_method(D_METHOD("environment_set_volumetric_fog", "env", "enable", "density", "albedo", "emission", "emission_energy", "anisotropy", "length", "detail_spread", "gi_inject", "temporal_reprojection", "temporal_reprojection_amount", "ambient_inject", "sky_affect"), &RenderingServer::environment_set_volumetric_fog);
 

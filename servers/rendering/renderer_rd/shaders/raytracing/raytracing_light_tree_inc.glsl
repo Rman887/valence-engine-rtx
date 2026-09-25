@@ -37,7 +37,8 @@
 //
 // Requires: raytracing_inc.glsl, raytracing_common_inc.glsl (RT_FLAGS, get_rt_param),
 // raytracing_lights_inc.glsl (RTLightData, rt_lights), raytracing_sky_inc.glsl
-// (sky_light_enabled, sky_total, sky_concentrated, and in the hit stages sky_sample_direct);
+// (sky_light_enabled, sky_total, sky_concentrated, sky_variance_share_enabled, sky_variance_share,
+// and in the hit stages sky_sample_direct);
 // in the hit stages raytracing_emissive_inc.glsl (rt_emissive, emissive_sample_instance) too.
 
 #ifndef RT_LIGHT_TREE_BINDING
@@ -186,10 +187,20 @@ float light_tree_directional_importance(RTLightData light, vec3 N) {
 }
 
 /// The sky's importance: its concentrated light as a horizontal-surface irradiance, D54's share
-/// judged per hit; 0 without the sky light or a black sky.
-float light_tree_sky_importance() {
+/// judged per hit; 0 without the sky light or a black sky. With the share by variance (D62) it
+/// is the importance that gives the sky sky_variance_share's share against the directional
+/// lights and the cut summed at this hit (p_surface): s / (s + p_surface) = share.
+float light_tree_sky_importance(float p_surface) {
 	if (!sky_light_enabled() || !(sky_total > 0.0)) {
 		return 0.0;
+	}
+	if (sky_variance_share_enabled()) {
+		float share = sky_variance_share(p_surface);
+		if (!(share > 0.0)) {
+			return 0.0;
+		}
+		// The shares stop at 0.9; with nothing else in reach any positive importance is the whole.
+		return (p_surface > 0.0) ? p_surface * share / (1.0 - share) : 1.0;
 	}
 	return max(0.25 * sky_concentrated * scene_data_block.data.IBL_exposure_normalization, 0.0);
 }
@@ -216,7 +227,6 @@ LightTreeTop light_tree_top_slot(vec3 x, vec3 N, uint slot, bool indirect, out f
 	LightTreeTop t;
 	t.indirect = indirect;
 	t.directional_count = uint(get_rt_param(RT_PARAM_DIRECTIONAL_COUNT));
-	t.sky = light_tree_sky_importance();
 	t.directional = 0.0;
 	for (uint k = 0u; k < t.directional_count; k++) {
 		t.directional += light_tree_directional_importance(rt_lights[k], N);
@@ -232,6 +242,8 @@ LightTreeTop light_tree_top_slot(vec3 x, vec3 N, uint slot, bool indirect, out f
 		}
 	}
 	t.root = running;
+	// The sky last: its share by variance (D62) is judged against the rest of the top.
+	t.sky = light_tree_sky_importance(t.directional + t.root);
 	t.total = t.sky + t.directional + t.root;
 	return t;
 }

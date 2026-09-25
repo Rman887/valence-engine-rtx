@@ -20,12 +20,16 @@
 
 #define RT_SKY_N 256u
 #define RT_SKY_CELLS (RT_SKY_N * RT_SKY_N)
+#define RT_SKY_SHARE_COUNT 8u // Must match SKY_SHARE_COUNT in sky_light_cdf.glsl and RT_SKY_LIGHT_SHARES.
 
 // Must match SkyLightBuffer in sky_light_cdf.glsl (std430, RT_SKY_LIGHT_BUFFER_SIZE bytes).
 layout(set = 0, binding = RT_SKY_LIGHT_BINDING, std430) readonly buffer SkyLightBuffer {
 	float sky_total; // The sum over cells of luminance times solid angle; 0 for a black sky or none built.
 	float sky_concentrated; // The part of sky_total in cells brighter than four times the sky's mean.
 	float sky_pad[2];
+	float sky_share[RT_SKY_SHARE_COUNT]; // The candidate shares (D62), ascending from 0; the table writes them.
+	float sky_variance[RT_SKY_SHARE_COUNT]; // The sky term's variance at each share, before the exposure.
+	float sky_light_mean[RT_SKY_SHARE_COUNT]; // The sky strategy's MIS-weighted mean at each share, before the exposure.
 	float sky_marginal[RT_SKY_N]; // Inclusive CDF over the rows.
 	float sky_conditional[RT_SKY_CELLS]; // Inclusive CDF over each row's cells.
 	float sky_pdf_uv[RT_SKY_CELLS]; // The density per unit octahedral area inside the cell.
@@ -33,6 +37,39 @@ layout(set = 0, binding = RT_SKY_LIGHT_BINDING, std430) readonly buffer SkyLight
 
 bool sky_light_enabled() {
 	return (RT_FLAGS & RT_FLAG_SKY_LIGHT) != 0u;
+}
+
+bool sky_variance_share_enabled() {
+	return (RT_FLAGS & RT_FLAG_SKY_LIGHT_VARIANCE_SHARE) != 0u;
+}
+
+/// The sky's share by the variance it removes (D62): of the table's candidate shares, the one
+/// that minimizes the variance of the hit's light sample and the bounce's sky together. With
+/// the surface lights' summed score S taken as their sample's mean (a directional sun, a lamp
+/// in range: little variance of their own), a share c raises their second moment from S^2 to
+/// S^2 / (1 - c); the sky's term at c is the table's variance V(c), judged for a surface facing
+/// the sky's up with a cosine lobe; and since the one sample is either a light or the sky, the
+/// two branches covary by -2 S mu(c), mu the sky strategy's weighted mean:
+/// S^2 c / (1 - c) + V(c) - 2 S mu(c), each sky term under the exposure. A smooth sky beside a
+/// bright sun keeps a share near 0, a sky with its own small bright source a large one. The
+/// share steps between candidates as S moves, so a vertex on a step can read neighbouring
+/// shares on its two sides where the tree recomputes S (the 1e-7 of D55's origin), a density
+/// mismatch on a set of that measure.
+float sky_variance_share(float p_surface) {
+	float exposure = scene_data_block.data.IBL_exposure_normalization;
+	float e2 = exposure * exposure;
+	float s2 = p_surface * p_surface;
+	float best_share = 0.0;
+	float best = e2 * sky_variance[0]; // The share 0 draws nothing from the sky: no covariance.
+	for (uint k = 1u; k < RT_SKY_SHARE_COUNT; k++) {
+		float c = sky_share[k];
+		float j = s2 * c / (1.0 - c) + e2 * sky_variance[k] - 2.0 * p_surface * exposure * sky_light_mean[k];
+		if (j < best) {
+			best = j;
+			best_share = c;
+		}
+	}
+	return best_share;
 }
 
 /// World direction to the octmap's frame, as the miss maps its ray.
@@ -73,7 +110,8 @@ vec3 sky_radiance(vec3 p_sky_dir) {
 /// quarter of the total) against the analytic and emissive lights' summed score, with no floor,
 /// so a clear sky under a directional sun draws nothing and an HDRI that carries its own sun
 /// draws often; 0 with the feature off or a black sky, 1 when the sky is the only light. Any
-/// share in [0, 1] is unbiased (at 0 the miss keeps its whole weight).
+/// share in [0, 1] is unbiased (at 0 the miss keeps its whole weight). With the share by
+/// variance (D62) the same summed score is the S sky_variance_share judges against.
 float sky_light_probability() {
 	if (!sky_light_enabled()) {
 		return 0.0;
@@ -84,12 +122,15 @@ float sky_light_probability() {
 	if (get_rt_param(RT_PARAM_LIGHT_COUNT) == 0.0 && get_rt_param(RT_PARAM_EMISSIVE_COUNT) == 0.0) {
 		return 1.0;
 	}
+	// A listed light of no or negative score still takes its share: the gate is the counts.
+	float surface_score = max(get_rt_param(RT_PARAM_SKY_SURFACE_SCORE), 0.0);
+	if (sky_variance_share_enabled()) {
+		return sky_variance_share(surface_score);
+	}
 	float sky_score = 0.25 * sky_concentrated * scene_data_block.data.IBL_exposure_normalization;
 	if (!(sky_score > 0.0)) {
 		return 0.0;
 	}
-	// A listed light of no or negative score still takes its share: the gate is the counts.
-	float surface_score = max(get_rt_param(RT_PARAM_SKY_SURFACE_SCORE), 0.0);
 	return min(sky_score / (sky_score + surface_score), 0.9);
 }
 

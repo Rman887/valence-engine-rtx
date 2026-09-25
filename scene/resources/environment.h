@@ -207,6 +207,7 @@ private:
 	int pathtracing_light_tree_cut = 32;
 	int pathtracing_light_tree_cut_indirect = 32;
 	bool pathtracing_light_tree_power_pick = false;
+	bool pathtracing_sky_light_variance_share = false;
 	void _update_pathtracing();
 	void _update_pathtracing_clamp();
 
@@ -437,6 +438,8 @@ public:
 	int get_pathtracing_light_tree_cut_indirect() const;
 	void set_pathtracing_light_tree_power_pick(bool p_enable);
 	bool is_pathtracing_light_tree_power_pick() const;
+	void set_pathtracing_sky_light_variance_share(bool p_enable);
+	bool is_pathtracing_sky_light_variance_share() const;
 
 	// Camera medium
 	void set_camera_medium_enabled(bool p_enabled);

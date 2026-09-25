@@ -447,7 +447,10 @@ class RenderRaytracing {
 	} sky_light_shader;
 	static constexpr uint32_t RT_SKY_LIGHT_N = 256; // Must match RT_SKY_N in raytracing_sky_inc.glsl.
 	static constexpr uint32_t RT_SKY_LIGHT_CELLS = RT_SKY_LIGHT_N * RT_SKY_LIGHT_N;
-	static constexpr uint32_t RT_SKY_LIGHT_BUFFER_SIZE = (4 + RT_SKY_LIGHT_N + 2 * RT_SKY_LIGHT_CELLS) * sizeof(float);
+	// The candidate shares the table judges the sky's variance at (D62); must match SKY_SHARE_COUNT in
+	// sky_light_cdf.glsl and RT_SKY_SHARE_COUNT in raytracing_sky_inc.glsl.
+	static constexpr uint32_t RT_SKY_LIGHT_SHARES = 8;
+	static constexpr uint32_t RT_SKY_LIGHT_BUFFER_SIZE = (4 + 3 * RT_SKY_LIGHT_SHARES + RT_SKY_LIGHT_N + 2 * RT_SKY_LIGHT_CELLS) * sizeof(float);
 
 	struct MMSurfaceHandles {
 		LocalVector<RID> per_surface; // Grown on demand; entry per touched surface index.

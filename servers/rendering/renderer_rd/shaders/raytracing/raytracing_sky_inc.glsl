@@ -77,15 +77,18 @@ mat3 sky_world_to_sky() {
 /// the 81 normals held a double well, and the share jumped from about 0.3 to 0 as S crossed 0.1
 /// to 0.4 of the receiver's sky irradiance (`docs/performance.md`, D67). The hull's value at any c
 /// is the least of the chords between two candidates that span c, so J's minimum over the hull is
-/// the least, over the 28 chords, of J's minimum on the chord: with a the chord's slope,
-/// J'(c) = S^2 / (1 - c)^2 + a on it, zero at 1 - S / sqrt(-a), clamped to the chord's span; a
-/// chord that rises has its minimum at its left end, a candidate, and the candidate 0 is the base.
-/// The chords' minima are compared, not their hull membership, so the minimum found is exact.
+/// either at a candidate, whose own J is compared first, or inside one of the 28 chords: with a the
+/// chord's slope, J'(c) = S^2 / (1 - c)^2 + a on it, zero at 1 - S / sqrt(-a), and the chord is
+/// valued only where that point lies inside it (D68; at an end it is a candidate's value). The
+/// chords' minima are compared, not their hull membership, so the minimum found is exact.
 /// Where the two sides of the weight read S or the normal a rounding apart (the tree recomputes S,
 /// the 1e-7 of D55's origin; the stages transform the normal) the densities differ by that
 /// rounding times the share's sensitivity, large only where J is flat (S under a hundredth of
 /// the sky's irradiance): with one minimum there is no tie for them to fall on opposite sides of.
-/// Its cost is 28 chords against 7 intervals where the share is not 0, and 7 slopes where it is.
+/// Where the share is not 0 the search is 7 candidate values, 28 chord slopes with two compares
+/// each and a square root and a few operations on the chords whose stationary point is inside
+/// them, and one inverse square root at the end for the share: no division (D68; the cost as
+/// measured is in `docs/performance.md`); 7 slopes where the share is 0.
 /// p_normal must be the normal the other side of the weight reads: the geometry normal as the
 /// payload carries it on.
 float sky_variance_share(float p_surface, vec3 p_normal) {
@@ -118,32 +121,59 @@ float sky_variance_share(float p_surface, vec3 p_normal) {
 #undef SKY_MOMENTS
 	// Most hits take the share 0 (a sun over a smooth sky, D62). J over the hull has its minimum at
 	// 0 exactly when its right derivative there, S^2 plus the least slope from candidate 0, is not
-	// negative, and being convex it then beats every chord: those hits skip the 28 chords.
+	// negative, and being convex it then beats every chord: those hits skip the search.
 	float a0 = min(min(min((g1 - g0) * (1.0 / RT_SKY_SHARES[1]), (g2 - g0) * (1.0 / RT_SKY_SHARES[2])), min((g3 - g0) * (1.0 / RT_SKY_SHARES[3]), (g4 - g0) * (1.0 / RT_SKY_SHARES[4]))),
 			min(min((g5 - g0) * (1.0 / RT_SKY_SHARES[5]), (g6 - g0) * (1.0 / RT_SKY_SHARES[6])), (g7 - g0) * (1.0 / RT_SKY_SHARES[7])));
 	if (a0 >= -s2) {
 		return 0.0;
 	}
+	// The minimum of J over the hull lies at a hull vertex, which is a candidate, or inside a hull
+	// edge, which is one of the 28 chords. A candidate's own J is g_k + S^2 c_k / (1 - c_k), the odds
+	// a constant of the candidate; a candidate above the hull rates no better than the hull under
+	// it, so all eight are compared and the least is the base. Candidate 0 is g0.
 	float best = g0;
 	float best_share = 0.0;
-	// J's minimum on the chord from candidate i to candidate j, kept if it is the least so far. A
-	// chord that rises (a >= 0) has its minimum at its left end, a candidate, which is the base, or
-	// the right end of a chord falling into it, judged there, or a candidate above the base with no
-	// chord falling into it, which the base beats: only falling chords are evaluated. The chord's
-	// value is taken from its right end: V(0) is the largest moment by far (3e4 against 4e2 on the
-	// HDRI), and a chord from candidate 0 anchored there would carry V(0)'s float spacing to every
-	// interior minimum, enough for a rounding to snap the share to a neighbouring candidate.
-#define SKY_CHORD(i, j, gi, gj)                                                                     \
-	{                                                                                               \
-		float a = (gj - gi) * (1.0 / (RT_SKY_SHARES[j] - RT_SKY_SHARES[i]));                        \
-		if (a < 0.0) {                                                                              \
-			float c = clamp(1.0 - p_surface * inversesqrt(-a), RT_SKY_SHARES[i], RT_SKY_SHARES[j]); \
-			float jc = s2 * c / (1.0 - c) + gj + a * (c - RT_SKY_SHARES[j]);                        \
-			if (jc < best) {                                                                        \
-				best = jc;                                                                          \
-				best_share = c;                                                                     \
-			}                                                                                       \
-		}                                                                                           \
+#define SKY_ODDS(k) (RT_SKY_SHARES[k] / (1.0 - RT_SKY_SHARES[k]))
+#define SKY_CANDIDATE(k, gk)               \
+	{                                      \
+		float jk = gk + s2 * SKY_ODDS(k);  \
+		if (jk < best) {                   \
+			best = jk;                     \
+			best_share = RT_SKY_SHARES[k]; \
+		}                                  \
+	}
+	SKY_CANDIDATE(1, g1)
+	SKY_CANDIDATE(2, g2)
+	SKY_CANDIDATE(3, g3)
+	SKY_CANDIDATE(4, g4)
+	SKY_CANDIDATE(5, g5)
+	SKY_CANDIDATE(6, g6)
+	SKY_CANDIDATE(7, g7)
+#undef SKY_CANDIDATE
+	// On the chord from candidate i to j with slope a, J'(c) = S^2 / (1 - c)^2 + a is zero at
+	// c = 1 - S / sqrt(-a), which lies strictly inside the chord exactly when -a lies between
+	// S^2 times 1 / (1 - c_i)^2 and S^2 times 1 / (1 - c_j)^2, constants of the chord; at either
+	// end the minimum is a candidate's, compared above, so only the interior case is valued. There
+	// J is J(c_j) - (1 - c_j) (S / (1 - c_j) - sqrt(-a))^2: the candidate's own value less a square,
+	// which is g_j + a (1 - c_j) - S^2 + 2 S sqrt(-a) written so that no term exceeds J itself (the
+	// expanded form cancels terms of S^2 / (1 - c)^2 on the short chords and drifts five times as
+	// far in float). Valued from the chord's right end: V(0) is the largest moment by far (3e4
+	// against 4e2 on the HDRI), and a chord from candidate 0 anchored there would carry V(0)'s
+	// float spacing to every interior minimum, enough for a rounding to snap the share to a
+	// neighbouring candidate. The winning slope is kept and the share taken from it once at the end.
+	float best_a = 0.0;
+#define SKY_INV_SQ(k) (1.0 / ((1.0 - RT_SKY_SHARES[k]) * (1.0 - RT_SKY_SHARES[k])))
+#define SKY_CHORD(i, j, gi, gj)                                                  \
+	{                                                                            \
+		float a = (gj - gi) * (1.0 / (RT_SKY_SHARES[j] - RT_SKY_SHARES[i]));     \
+		if (-a > s2 * SKY_INV_SQ(i) && -a < s2 * SKY_INV_SQ(j)) {                \
+			float d = p_surface * (1.0 / (1.0 - RT_SKY_SHARES[j])) - sqrt(-a);   \
+			float jc = gj + s2 * SKY_ODDS(j) - (1.0 - RT_SKY_SHARES[j]) * d * d; \
+			if (jc < best) {                                                     \
+				best = jc;                                                       \
+				best_a = a;                                                      \
+			}                                                                    \
+		}                                                                        \
 	}
 	SKY_CHORD(0, 1, g0, g1)
 	SKY_CHORD(0, 2, g0, g2)
@@ -174,7 +204,13 @@ float sky_variance_share(float p_surface, vec3 p_normal) {
 	SKY_CHORD(5, 7, g5, g7)
 	SKY_CHORD(6, 7, g6, g7)
 #undef SKY_CHORD
-	return best_share;
+#undef SKY_ODDS
+#undef SKY_INV_SQ
+	// An interior minimum's share, 1 - S / sqrt(-a), computed once; a chord's a is negative
+	// wherever it won. The gate holds the point inside the chord in exact arithmetic; an inverse
+	// square root a rounding high can put it an ulp past 0 or 0.9, and the readers of the share
+	// (`light_tree_sky_importance`, the emissive density's 1 - share) hold to that range.
+	return (best_a < 0.0) ? clamp(1.0 - p_surface * inversesqrt(-best_a), 0.0, RT_SKY_SHARES[7]) : best_share;
 }
 
 /// The sky's radiance along a direction in the octmap's frame, as the miss reports it: the

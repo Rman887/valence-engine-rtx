@@ -403,6 +403,14 @@ struct RTViewportState {
 	RID sky_light_buffer;
 	RID sky_light_sky;
 	uint64_t sky_light_version = 0;
+	// The share by variance's moments (D65): built for the table they follow, then combined with the
+	// frame's weights of the delivered radiance, which are kept to tell when they change. The weights
+	// come from what sky_radiance reads in this frame's scene data copy (the exposure, the fog's sky
+	// affect and aerial perspective, the fog light's luminance), taken where the copy is made.
+	bool sky_light_moments_built = false;
+	bool sky_light_mix_valid = false;
+	float sky_light_mix[3] = {};
+	float sky_light_scene[4] = {};
 	RID scene_uniform_set;
 
 	// Camera-relative tracing: the anchor every position uploaded to the trace
@@ -442,13 +450,17 @@ class RenderRaytracing {
 		RID pipeline[MODE_MAX];
 	} mm_merge_shader;
 
-	// The sky's sampling table (D54): the compute shader that builds it from the radiance octmap, in
-	// the form the trace reads the octmap in (the roughness layers as an array, or one texture whose
-	// mips are the roughness levels), since the fog's level is read as the trace reads it (D64).
+	// The sky's sampling table (D54): the compute shader that builds it from the radiance octmap, then
+	// the share by variance's moments per receiver normal (D65), in the form the trace reads the
+	// octmap in (the roughness layers as an array, or one texture whose mips are the roughness
+	// levels), since the fog's level is read as the trace reads it (D64), and their combination with
+	// the frame's weights.
 	struct SkyLightShader {
 		enum Mode {
-			MODE_OCTMAP_2D = 0,
-			MODE_OCTMAP_ARRAY = 1,
+			MODE_TABLE = 0,
+			MODE_MOMENTS_OCTMAP_2D = 1,
+			MODE_MOMENTS_OCTMAP_ARRAY = 2,
+			MODE_COMBINE = 3,
 			MODE_MAX,
 		};
 		SkyLightCdfShaderRD shader;
@@ -464,7 +476,15 @@ class RenderRaytracing {
 	// The integrals the table holds per share (D64); must match SKY_BASIS in sky_light_cdf.glsl and
 	// RT_SKY_BASIS in raytracing_sky_inc.glsl.
 	static constexpr uint32_t RT_SKY_LIGHT_BASIS = 12;
-	static constexpr uint32_t RT_SKY_LIGHT_BUFFER_SIZE = (4 + RT_SKY_LIGHT_SHARES * (1 + RT_SKY_LIGHT_BASIS) + RT_SKY_LIGHT_N + 2 * RT_SKY_LIGHT_CELLS) * sizeof(float);
+	// The cells a side of the receiver normals' grid over the octahedral square, a normal at every
+	// vertex (D65); must match SKY_NORMAL_CELLS in sky_light_cdf.glsl and RT_SKY_NORMAL_CELLS in
+	// raytracing_sky_inc.glsl.
+	static constexpr uint32_t RT_SKY_LIGHT_NORMAL_CELLS = 8;
+	static constexpr uint32_t RT_SKY_LIGHT_NORMALS = (RT_SKY_LIGHT_NORMAL_CELLS + 1) * (RT_SKY_LIGHT_NORMAL_CELLS + 1);
+	// The header, the shares, per normal and share the combined variance and mean and the basis, the
+	// marginal, and per cell the conditional and the density.
+	static constexpr uint32_t RT_SKY_LIGHT_BUFFER_SIZE = (4 + RT_SKY_LIGHT_SHARES + RT_SKY_LIGHT_NORMALS * RT_SKY_LIGHT_SHARES * (2 + RT_SKY_LIGHT_BASIS) + RT_SKY_LIGHT_N + 2 * RT_SKY_LIGHT_CELLS) * sizeof(float);
+	static_assert((4 + RT_SKY_LIGHT_SHARES) % 2 == 0, "The per-normal vec2 array must start 8-byte aligned in std430, or the shaders pad where the size does not.");
 
 	struct MMSurfaceHandles {
 		LocalVector<RID> per_surface; // Grown on demand; entry per touched surface index.

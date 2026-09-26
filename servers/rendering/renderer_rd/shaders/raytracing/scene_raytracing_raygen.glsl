@@ -483,9 +483,10 @@ void main() {
 	// The sky a bounce found on its own is weighed against the sky light sample that competes
 	// for it (D54): the camera ray and a delta lobe keep the whole weight, as with an emitter.
 	if (sky_light_enabled() && get_total_bounces(ps.packed_bounces_flags) > 0u && ps.bsdf_pdf != RT_BSDF_PDF_DELTA) {
-		// Under the light tree (D55) the sky's share was decided at the previous vertex: the ray's
-		// origin and the offset normal the payload carried from there.
-		float p_sky = light_tree_enabled() ? light_tree_sky_probability(gl_WorldRayOriginEXT, ps.offset_normal, is_light_tree_indirect(ps.packed_bounces_flags)) : sky_light_probability();
+		// The sky's share was decided at the previous vertex: under the light tree (D55) from the
+		// ray's origin and the offset normal the payload carried from there, without it from that
+		// normal alone (D65).
+		float p_sky = light_tree_enabled() ? light_tree_sky_probability(gl_WorldRayOriginEXT, ps.offset_normal, is_light_tree_indirect(ps.packed_bounces_flags)) : sky_light_probability(ps.offset_normal);
 		sky_add *= sky_mis_weight(ps.bsdf_pdf, p_sky * sky_pdf(sky_dir));
 	}
 	if (is_scattered(ps.packed_bounces_flags)) {

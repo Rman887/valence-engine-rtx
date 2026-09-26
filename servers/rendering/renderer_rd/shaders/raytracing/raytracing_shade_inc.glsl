@@ -370,9 +370,6 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// after a scatter (D50): the camera ray and a delta lobe keep the whole weight, and so does
 	// a surface the emissive list does not carry, since light sampling never reaches it.
 	uint rt_emissive_count = uint(get_rt_param(RT_PARAM_EMISSIVE_COUNT));
-	// The sky's share of the light samples (D54), 0 without a sky light; the surface lights
-	// split the rest, so their densities carry the remainder on both sides of the weight.
-	float p_sky = light_tree_enabled() ? 0.0 : sky_light_probability();
 	float emissive_weight = 1.0;
 	if (total_bounces > 0u && rt_emissive_count > 0u && ps.bsdf_pdf != RT_BSDF_PDF_DELTA && any(greaterThan(m.emissive, vec3(0.0)))) {
 		float pdf_light;
@@ -383,7 +380,11 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			float p_instance = (entry < rt_emissive_count) ? light_tree_emissive_probability(entry, shade_previous_origin(h, ray_dir, hit_t), ps.offset_normal, is_light_tree_indirect(ps.packed_bounces_flags)) : 0.0;
 			pdf_light = (entry < rt_emissive_count) ? emissive_hit_pdf_entry(entry, p_instance, h.primitive_id, ray_dir, hit_t, h.is_front_face) : 0.0;
 		} else {
-			pdf_light = (1.0 - p_sky) * get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY) * emissive_hit_pdf(h.geometry_idx, h.primitive_id, ray_dir, hit_t, h.is_front_face, rt_emissive_count);
+			// The sky's share of the light samples (D54), 0 without a sky light; the surface lights
+			// split the rest, so their densities carry the remainder on both sides of the weight. It is
+			// the previous vertex's share, for its receiver as the payload carried it (D65).
+			float p_sky_previous = sky_light_probability(ps.offset_normal);
+			pdf_light = (1.0 - p_sky_previous) * get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY) * emissive_hit_pdf(h.geometry_idx, h.primitive_id, ray_dir, hit_t, h.is_front_face, rt_emissive_count);
 		}
 		emissive_weight = emissive_mis_weight(ps.bsdf_pdf, pdf_light);
 	}
@@ -494,6 +495,13 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 #endif
 	rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE);
 	uint rt_light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
+	// The selection's receiver: the geometry normal as the payload carries it to the next vertex,
+	// so the chance-hit and miss densities there read the same function of the same normal (the
+	// light tree's since D55, the sky's share by variance since D65).
+	vec3 N_select = oct_to_vec3(unpackUnorm2x16(packUnorm2x16(vec3_to_oct(h.geometry_normal))) * 2.0 - 1.0);
+	// The sky's share of the light samples (D54), 0 without a sky light; the surface lights
+	// split the rest, so their densities carry the remainder on both sides of the weight.
+	float p_sky = light_tree_enabled() ? 0.0 : sky_light_probability(N_select);
 	// Under the tree (D55) the sky's share is per hit, so a frame whose only light is the sky still
 	// takes its sample here (the miss weighs against it either way).
 	bool tree_sky = light_tree_enabled() && sky_light_enabled() && sky_total > 0.0;
@@ -522,10 +530,9 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		LightSampleNEE light_sample;
 		bool have_sample;
 		if (light_tree_enabled()) {
-			// The light tree (D55) chooses among every strategy by its importance here, judged on the
-			// geometry normal as the payload carries it on, so the next vertex recovers the same
-			// probability; the shading normal still decides what the sample delivers.
-			vec3 N_select = oct_to_vec3(unpackUnorm2x16(packUnorm2x16(vec3_to_oct(h.geometry_normal))) * 2.0 - 1.0);
+			// The light tree (D55) chooses among every strategy by its importance here, judged on
+			// N_select, so the next vertex recovers the same probability; the shading normal still
+			// decides what the sample delivers.
 			uint tree_candidates = uint(get_rt_param(RT_PARAM_EMISSIVE_CANDIDATES));
 			// Past the first diffuse bounce the sample is drawn over the coarser indirect cut (D59);
 			// the payload tells the next vertex, whose chance-hit and miss densities read the same cut.

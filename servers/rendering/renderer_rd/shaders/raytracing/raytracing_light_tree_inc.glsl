@@ -222,13 +222,14 @@ float light_tree_directional_importance(RTLightData light, vec3 N) {
 /// The sky's importance: its concentrated light as a horizontal-surface irradiance, D54's share
 /// judged per hit; 0 without the sky light or a black sky. With the share by variance (D62) it
 /// is the importance that gives the sky sky_variance_share's share against the directional
-/// lights and the cut summed at this hit (p_surface): s / (s + p_surface) = share.
-float light_tree_sky_importance(float p_surface) {
+/// lights and the cut summed at this hit (p_surface), for a receiver facing N (D65):
+/// s / (s + p_surface) = share.
+float light_tree_sky_importance(float p_surface, vec3 N) {
 	if (!sky_light_enabled() || !(sky_total > 0.0)) {
 		return 0.0;
 	}
 	if (sky_variance_share_enabled()) {
-		float share = sky_variance_share(p_surface);
+		float share = sky_variance_share(p_surface, N);
 		if (!(share > 0.0)) {
 			return 0.0;
 		}
@@ -276,7 +277,7 @@ LightTreeTop light_tree_top_slot(vec3 x, vec3 N, uint slot, bool indirect, out f
 	}
 	t.root = running;
 	// The sky last: its share by variance (D62) is judged against the rest of the top.
-	t.sky = light_tree_sky_importance(t.directional + t.root);
+	t.sky = light_tree_sky_importance(t.directional + t.root, N);
 	t.total = t.sky + t.directional + t.root;
 	return t;
 }

@@ -22,6 +22,8 @@
 #define RT_SKY_CELLS (RT_SKY_N * RT_SKY_N)
 #define RT_SKY_SHARE_COUNT 8u // Must match SKY_SHARE_COUNT in sky_light_cdf.glsl and RT_SKY_LIGHT_SHARES.
 #define RT_SKY_BASIS 12u // Must match SKY_BASIS in sky_light_cdf.glsl and RT_SKY_LIGHT_BASIS.
+#define RT_SKY_NORMAL_CELLS 8u // Must match SKY_NORMAL_CELLS in sky_light_cdf.glsl and RT_SKY_LIGHT_NORMAL_CELLS.
+#define RT_SKY_NORMALS ((RT_SKY_NORMAL_CELLS + 1u) * (RT_SKY_NORMAL_CELLS + 1u))
 
 // Must match SkyLightBuffer in sky_light_cdf.glsl (std430, RT_SKY_LIGHT_BUFFER_SIZE bytes).
 layout(set = 0, binding = RT_SKY_LIGHT_BINDING, std430) readonly buffer SkyLightBuffer {
@@ -29,7 +31,8 @@ layout(set = 0, binding = RT_SKY_LIGHT_BINDING, std430) readonly buffer SkyLight
 	float sky_concentrated; // The part of sky_total in cells brighter than four times the sky's mean.
 	float sky_pad[2];
 	float sky_share[RT_SKY_SHARE_COUNT]; // The candidate shares (D62), ascending from 0; the table writes them.
-	float sky_basis[RT_SKY_SHARE_COUNT * RT_SKY_BASIS]; // Per share, the integrals sky_share_moments combines (D64).
+	vec2 sky_share_moments[RT_SKY_NORMALS * RT_SKY_SHARE_COUNT]; // Per receiver normal and share, the sky term's variance and its sky strategy's mean this frame (D65).
+	float sky_basis[RT_SKY_NORMALS * RT_SKY_SHARE_COUNT * RT_SKY_BASIS]; // What the table's combine stage folds into sky_share_moments (D64); the trace reads none of it.
 	float sky_marginal[RT_SKY_N]; // Inclusive CDF over the rows.
 	float sky_conditional[RT_SKY_CELLS]; // Inclusive CDF over each row's cells.
 	float sky_pdf_uv[RT_SKY_CELLS]; // The density per unit octahedral area inside the cell.
@@ -43,32 +46,9 @@ bool sky_variance_share_enabled() {
 	return (RT_FLAGS & RT_FLAG_SKY_LIGHT_VARIANCE_SHARE) != 0u;
 }
 
-/// The weights of the radiance the trace delivers along a direction (D64): sky_radiance mixes the
-/// octmap's sharpest level L under the exposure toward the fog by its sky affect, and the fog's
-/// colour is the Environment's fog light mixed with the exposed level L_f by the aerial
-/// perspective, so the delivered luminance is alpha L + beta L_f + gamma, returned as (alpha,
-/// beta, gamma); without the fog it is the exposure times L.
-vec3 sky_share_mix() {
-	float exposure = scene_data_block.data.IBL_exposure_normalization;
-	if ((RT_FLAGS & RT_FLAG_FOG_ENABLED) == 0u) {
-		return vec3(exposure, 0.0, 0.0);
-	}
-	float affect = scene_data_block.data.fog_sky_affect;
-	float aerial = (scene_data_block.data.fog_aerial_perspective > 0.0) ? scene_data_block.data.fog_aerial_perspective : 0.0;
-	float fog = dot(scene_data_block.data.fog_light_color, vec3(0.2126, 0.7152, 0.0722));
-	return vec3(exposure * (1.0 - affect), exposure * affect * aerial, affect * (1.0 - aerial) * fog);
-}
-
-/// The sky term's variance and its sky strategy's weighted mean at candidate share k, for the
-/// radiance sky_share_mix weighs: the table's integrals of each product of L, L_f and 1 combined
-/// into the second moment, and of each level into the two strategies' means (sky_light_cdf.glsl).
-void sky_share_moments(uint k, vec3 p_mix, out float r_variance, out float r_mean) {
-	uint b = k * RT_SKY_BASIS;
-	float moment = p_mix.x * p_mix.x * sky_basis[b] + p_mix.y * p_mix.y * sky_basis[b + 1u] + p_mix.z * p_mix.z * sky_basis[b + 2u] +
-			2.0 * (p_mix.x * p_mix.y * sky_basis[b + 3u] + p_mix.x * p_mix.z * sky_basis[b + 4u] + p_mix.y * p_mix.z * sky_basis[b + 5u]);
-	float mean_bsdf = dot(p_mix, vec3(sky_basis[b + 6u], sky_basis[b + 7u], sky_basis[b + 8u]));
-	r_mean = dot(p_mix, vec3(sky_basis[b + 9u], sky_basis[b + 10u], sky_basis[b + 11u]));
-	r_variance = max(moment - mean_bsdf * mean_bsdf - r_mean * r_mean, 0.0);
+/// World direction to the octmap's frame, as the miss maps its ray.
+mat3 sky_world_to_sky() {
+	return scene_data_block.data.radiance_inverse_xform * mat3(scene_data_block.data.inv_view_matrix);
 }
 
 /// The sky's share by the variance it removes (D62): of the table's candidate shares, the one
@@ -76,36 +56,43 @@ void sky_share_moments(uint k, vec3 p_mix, out float r_variance, out float r_mea
 /// the surface lights' summed score S taken as their sample's mean (a directional sun, a lamp
 /// in range: little variance of their own, 2 to 4 % measured where 24 lanterns reach, D64), a
 /// share c raises their second moment from S^2 to S^2 / (1 - c); the sky's term at c is the
-/// table's variance V(c), judged for a surface facing the sky's up with a cosine lobe and the
-/// radiance the trace delivers; and since the one sample is either a light or the sky, the two
-/// branches covary by -2 S mu(c), mu the sky strategy's weighted mean:
-/// S^2 c / (1 - c) + V(c) - 2 S mu(c). A smooth sky beside a bright sun keeps a share near 0, a
-/// sky with its own small bright source a large one. The share steps between candidates as S
-/// moves, so a vertex on a step can read neighbouring shares on its two sides where the tree
-/// recomputes S (the 1e-7 of D55's origin), a density mismatch on a set of that measure.
-float sky_variance_share(float p_surface) {
-	vec3 weights = sky_share_mix();
+/// table's variance V(c), judged for a Lambertian receiver facing p_normal with the radiance the
+/// trace delivers (D64); and since the one sample is either a light or the sky, the two branches
+/// covary by -2 S mu(c), mu the sky strategy's weighted mean: S^2 c / (1 - c) + V(c) - 2 S mu(c).
+/// A smooth sky beside a bright sun keeps a share near 0, a sky with its own small bright source a
+/// large one. The receiver is the vertex's own (D65): the table holds V and mu at the vertices of a
+/// grid of normals over the octahedral square in the sky's frame, and they are read bilinearly
+/// between the four around p_normal, so both vary continuously with it. The share steps between
+/// candidates as S and the normal move, so a vertex on a step can read neighbouring shares on its
+/// two sides where the tree recomputes S (the 1e-7 of D55's origin), or where the two sides' stages
+/// round the normal's transform differently, a density mismatch on a set of that measure. p_normal
+/// must be the normal the other side of the weight reads: the geometry normal as the payload
+/// carries it on.
+float sky_variance_share(float p_surface, vec3 p_normal) {
+	// The grid's vertices are RT_SKY_NORMAL_CELLS cells a side over the octahedral square, so the
+	// four around any normal lie inside it and the weights need no wrap.
+	vec2 g = vec3_to_oct(sky_world_to_sky() * p_normal) * float(RT_SKY_NORMAL_CELLS);
+	uvec2 lo = min(uvec2(g), uvec2(RT_SKY_NORMAL_CELLS - 1u));
+	vec2 f = clamp(g - vec2(lo), 0.0, 1.0);
+	uint v00 = (lo.y * (RT_SKY_NORMAL_CELLS + 1u) + lo.x) * RT_SKY_SHARE_COUNT;
+	uint v10 = v00 + RT_SKY_SHARE_COUNT;
+	uint v01 = v00 + (RT_SKY_NORMAL_CELLS + 1u) * RT_SKY_SHARE_COUNT;
+	uint v11 = v01 + RT_SKY_SHARE_COUNT;
+	vec4 w = vec4((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
 	float s2 = p_surface * p_surface;
-	float variance;
-	float mean;
-	sky_share_moments(0u, weights, variance, mean);
+	// The share 0 draws nothing from the sky: no covariance, V(0) alone.
+	float best = w.x * sky_share_moments[v00].x + w.y * sky_share_moments[v10].x + w.z * sky_share_moments[v01].x + w.w * sky_share_moments[v11].x;
 	float best_share = 0.0;
-	float best = variance; // The share 0 draws nothing from the sky: no covariance.
 	for (uint k = 1u; k < RT_SKY_SHARE_COUNT; k++) {
 		float c = sky_share[k];
-		sky_share_moments(k, weights, variance, mean);
-		float j = s2 * c / (1.0 - c) + variance - 2.0 * p_surface * mean;
+		vec2 moments = w.x * sky_share_moments[v00 + k] + w.y * sky_share_moments[v10 + k] + w.z * sky_share_moments[v01 + k] + w.w * sky_share_moments[v11 + k];
+		float j = s2 * c / (1.0 - c) + moments.x - 2.0 * p_surface * moments.y;
 		if (j < best) {
 			best = j;
 			best_share = c;
 		}
 	}
 	return best_share;
-}
-
-/// World direction to the octmap's frame, as the miss maps its ray.
-mat3 sky_world_to_sky() {
-	return scene_data_block.data.radiance_inverse_xform * mat3(scene_data_block.data.inv_view_matrix);
 }
 
 /// The sky's radiance along a direction in the octmap's frame, as the miss reports it: the
@@ -142,8 +129,10 @@ vec3 sky_radiance(vec3 p_sky_dir) {
 /// so a clear sky under a directional sun draws nothing and an HDRI that carries its own sun
 /// draws often; 0 with the feature off or a black sky, 1 when the sky is the only light. Any
 /// share in [0, 1] is unbiased (at 0 the miss keeps its whole weight). With the share by
-/// variance (D62) the same summed score is the S sky_variance_share judges against.
-float sky_light_probability() {
+/// variance (D62) the same summed score is the S sky_variance_share judges against, for the
+/// receiver p_normal (D65), so the share is the vertex's: its geometry normal as the payload
+/// carries it on, which the miss and the emitter found after it read back.
+float sky_light_probability(vec3 p_normal) {
 	if (!sky_light_enabled()) {
 		return 0.0;
 	}
@@ -156,7 +145,7 @@ float sky_light_probability() {
 	// A listed light of no or negative score still takes its share: the gate is the counts.
 	float surface_score = max(get_rt_param(RT_PARAM_SKY_SURFACE_SCORE), 0.0);
 	if (sky_variance_share_enabled()) {
-		return sky_variance_share(surface_score);
+		return sky_variance_share(surface_score, p_normal);
 	}
 	float sky_score = 0.25 * sky_concentrated * scene_data_block.data.IBL_exposure_normalization;
 	if (!(sky_score > 0.0)) {

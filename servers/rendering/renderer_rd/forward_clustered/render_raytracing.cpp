@@ -64,10 +64,13 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		mm_merge_shader.pipeline[i] = RD::get_singleton()->compute_pipeline_create(mm_merge_shader.version_shader[i]);
 	}
 
-	// The sky's sampling table (D54), in both forms of the radiance octmap (D64).
+	// The sky's sampling table (D54), its moments per receiver normal in both forms of the radiance
+	// octmap (D64, D65), and their combination with the frame's weights.
 	Vector<String> sky_light_modes;
-	sky_light_modes.push_back("\n");
-	sky_light_modes.push_back("\n#define USE_RADIANCE_OCTMAP_ARRAY\n");
+	sky_light_modes.push_back("\n#define MODE_TABLE\n");
+	sky_light_modes.push_back("\n#define MODE_MOMENTS\n");
+	sky_light_modes.push_back("\n#define MODE_MOMENTS\n#define USE_RADIANCE_OCTMAP_ARRAY\n");
+	sky_light_modes.push_back("\n#define MODE_COMBINE\n");
 	sky_light_shader.shader.initialize(sky_light_modes);
 	sky_light_shader.version = sky_light_shader.shader.version_create();
 	for (int i = 0; i < SkyLightShader::MODE_MAX; i++) {
@@ -3402,6 +3405,13 @@ void RenderRaytracing::_update_scene_uniform_buffer(RTViewportState *p_state, co
 		memcpy(ubos[i]->inv_view_matrix, &block, sizeof(CameraBlock));
 	}
 	RD::get_singleton()->buffer_update(p_state->scene_uniform_buffer, 0, size, &ubo_data);
+
+	// What sky_radiance reads from this copy, for the sky share's weights (D65): a later pass of the
+	// frame can refill the raster UBO (a sky's first render moves its baked exposure).
+	p_state->sky_light_scene[0] = ubo_data.ubo.IBL_exposure_normalization;
+	p_state->sky_light_scene[1] = ubo_data.ubo.fog_sky_affect;
+	p_state->sky_light_scene[2] = ubo_data.ubo.fog_aerial_perspective;
+	p_state->sky_light_scene[3] = 0.2126f * ubo_data.ubo.fog_light_color[0] + 0.7152f * ubo_data.ubo.fog_light_color[1] + 0.0722f * ubo_data.ubo.fog_light_color[2];
 }
 
 RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_primary_from_gbuffer) {
@@ -3964,6 +3974,10 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 // The sky's sampling table (D54): rebuilt when the Environment's sky or the count of its
 // renders into the octmap changes, in one workgroup over the octmap's sharpest layer; cleared
 // when the sky goes, so the shader's share reads 0 and nothing samples a table that is stale.
+// Under the share by variance (D62) its moments follow (D65): their integrals for every receiver
+// normal of the grid, one workgroup per normal, built once per table while the share asks for
+// them, then their combination with the frame's weights of the delivered radiance, run when the
+// moments or the weights change, so the trace reads each normal's variance and mean ready made.
 void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags) {
 	ERR_FAIL_NULL(p_state);
 	if (!p_state->sky_light_buffer.is_valid() || (p_rt_flags & SceneShaderRaytracing::RT_FLAG_SKY_LIGHT) == 0) {
@@ -3979,11 +3993,38 @@ void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDa
 			rd->buffer_clear(p_state->sky_light_buffer, 0, RT_SKY_LIGHT_BUFFER_SIZE);
 			p_state->sky_light_sky = RID();
 			p_state->sky_light_version = 0;
+			p_state->sky_light_moments_built = false;
+			p_state->sky_light_mix_valid = false;
 		}
 		return;
 	}
 	uint64_t version = owner->sky.sky_get_radiance_version(sky_rid);
-	if (sky_rid == p_state->sky_light_sky && version == p_state->sky_light_version) {
+	const bool build_table = sky_rid != p_state->sky_light_sky || version != p_state->sky_light_version;
+	const bool variance_share = (p_rt_flags & SceneShaderRaytracing::RT_FLAG_SKY_LIGHT_VARIANCE_SHARE) != 0;
+	bool build_moments = variance_share && (build_table || !p_state->sky_light_moments_built);
+
+	// The frame's weights of L, L_f and 1 in the luminance sky_radiance delivers (D64): the sharpest
+	// level under the exposure mixed toward the fog by its sky affect, the fog's colour being the
+	// Environment's fog light mixed with the exposed fog level by the aerial perspective; without
+	// the fog, the exposure times L. Read from the trace's scene data copy, as update_uniform_set made
+	// it earlier in the frame (_update_scene_uniform_buffer).
+	float mix[3];
+	const float exposure = p_state->sky_light_scene[0];
+	if ((p_rt_flags & SceneShaderRaytracing::RT_FLAG_FOG_ENABLED) != 0) {
+		const float affect = p_state->sky_light_scene[1];
+		const float aerial = p_state->sky_light_scene[2] > 0.0f ? p_state->sky_light_scene[2] : 0.0f;
+		const float fog = p_state->sky_light_scene[3];
+		mix[0] = exposure * (1.0f - affect);
+		mix[1] = exposure * affect * aerial;
+		mix[2] = affect * (1.0f - aerial) * fog;
+	} else {
+		mix[0] = exposure;
+		mix[1] = 0.0f;
+		mix[2] = 0.0f;
+	}
+	const bool mix_changed = !p_state->sky_light_mix_valid || mix[0] != p_state->sky_light_mix[0] || mix[1] != p_state->sky_light_mix[1] || mix[2] != p_state->sky_light_mix[2];
+	bool combine = variance_share && (build_moments || mix_changed);
+	if (!build_table && !combine) {
 		return;
 	}
 	RID radiance = owner->sky.sky_get_radiance_2d_texture_rd(sky_rid);
@@ -4006,22 +4047,31 @@ void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDa
 	u_table.append_id(p_state->sky_light_buffer);
 	// Through the cache: a sky that re-renders every frame (a sun that moves) rebuilds every frame.
 	// In array mode the fog's level is a roughness layer, which the sharpest layer's own texture does
-	// not reach, so the array joins the set (D64).
+	// not reach, so the array joins the moments' set (D64).
 	const bool use_octmap_array = owner->is_using_radiance_octmap_array();
-	const int mode = use_octmap_array ? SkyLightShader::MODE_OCTMAP_ARRAY : SkyLightShader::MODE_OCTMAP_2D;
-	RID uniform_set;
-	if (use_octmap_array) {
-		RID layers = owner->sky.sky_get_radiance_texture_rd(sky_rid);
-		if (!layers.is_valid()) {
-			return;
+	const int moments_mode = use_octmap_array ? SkyLightShader::MODE_MOMENTS_OCTMAP_ARRAY : SkyLightShader::MODE_MOMENTS_OCTMAP_2D;
+	RID moments_set;
+	if (build_moments) {
+		if (use_octmap_array) {
+			RID layers = owner->sky.sky_get_radiance_texture_rd(sky_rid);
+			if (layers.is_valid()) {
+				RD::Uniform u_layers;
+				u_layers.binding = 3;
+				u_layers.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+				u_layers.append_id(layers);
+				moments_set = UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[moments_mode], 0, u_octmap, u_sampler, u_table, u_layers);
+			}
+		} else {
+			moments_set = UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[moments_mode], 0, u_octmap, u_sampler, u_table);
 		}
-		RD::Uniform u_layers;
-		u_layers.binding = 3;
-		u_layers.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
-		u_layers.append_id(layers);
-		uniform_set = UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[mode], 0, u_octmap, u_sampler, u_table, u_layers);
-	} else {
-		uniform_set = UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[mode], 0, u_octmap, u_sampler, u_table);
+		if (!moments_set.is_valid()) {
+			// No layers yet: the table alone, and the moments with a later frame, nothing to combine.
+			build_moments = false;
+			combine = false;
+			if (!build_table) {
+				return;
+			}
+		}
 	}
 
 	struct SkyLightPC {
@@ -4029,6 +4079,10 @@ void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDa
 		float border_scale;
 		float lod;
 		float floor_fraction;
+		float mix_level;
+		float mix_fog_level;
+		float mix_constant;
+		float pad;
 	} pc;
 	pc.border_pad = owner->sky.sky_get_uv_border_size(sky_rid);
 	pc.border_scale = 1.0f - 2.0f * pc.border_pad;
@@ -4039,16 +4093,52 @@ void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDa
 	// is read.
 	pc.lod = use_octmap_array ? MAX(0.0f, Math::log2((float)owner->sky.sky_get_radiance_size(sky_rid) / (float)RT_SKY_LIGHT_N)) : 0.0f;
 	pc.floor_fraction = 1.0e-3f;
+	pc.mix_level = mix[0];
+	pc.mix_fog_level = mix[1];
+	pc.mix_constant = mix[2];
+	pc.pad = 0.0f;
 
 	RD::ComputeListID compute_list = rd->compute_list_begin();
-	rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline[mode]);
-	rd->compute_list_bind_uniform_set(compute_list, uniform_set, 0);
-	rd->compute_list_set_push_constant(compute_list, &pc, sizeof(SkyLightPC));
-	rd->compute_list_dispatch(compute_list, 1, 1, 1);
+	if (build_table) {
+		rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline[SkyLightShader::MODE_TABLE]);
+		rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[SkyLightShader::MODE_TABLE], 0, u_octmap, u_sampler, u_table), 0);
+		rd->compute_list_set_push_constant(compute_list, &pc, sizeof(SkyLightPC));
+		rd->compute_list_dispatch(compute_list, 1, 1, 1);
+	}
+	if (build_moments) {
+		if (build_table) {
+			rd->compute_list_add_barrier(compute_list); // The moments read the table's density.
+		}
+		rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline[moments_mode]);
+		rd->compute_list_bind_uniform_set(compute_list, moments_set, 0);
+		rd->compute_list_set_push_constant(compute_list, &pc, sizeof(SkyLightPC));
+		rd->compute_list_dispatch(compute_list, RT_SKY_LIGHT_NORMALS, 1, 1);
+	}
+	if (combine) {
+		if (build_table || build_moments) {
+			rd->compute_list_add_barrier(compute_list); // The combination reads the moments.
+		}
+		rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline[SkyLightShader::MODE_COMBINE]);
+		rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[SkyLightShader::MODE_COMBINE], 0, u_table), 0);
+		rd->compute_list_set_push_constant(compute_list, &pc, sizeof(SkyLightPC));
+		rd->compute_list_dispatch(compute_list, (RT_SKY_LIGHT_NORMALS * RT_SKY_LIGHT_SHARES + 255) / 256, 1, 1);
+	}
 	rd->compute_list_end();
 
-	p_state->sky_light_sky = sky_rid;
-	p_state->sky_light_version = version;
+	if (build_table) {
+		p_state->sky_light_sky = sky_rid;
+		p_state->sky_light_version = version;
+		p_state->sky_light_moments_built = false;
+	}
+	if (build_moments) {
+		p_state->sky_light_moments_built = true;
+	}
+	if (combine) {
+		p_state->sky_light_mix_valid = true;
+		p_state->sky_light_mix[0] = mix[0];
+		p_state->sky_light_mix[1] = mix[1];
+		p_state->sky_light_mix[2] = mix[2];
+	}
 }
 
 void RenderRaytracing::register_raytracing_buffer_dependencies(RD::RaytracingListID p_list) {

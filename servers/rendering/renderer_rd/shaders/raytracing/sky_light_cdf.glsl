@@ -56,7 +56,8 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #define SKY_NORMAL_CELLS 8u // Must match RT_SKY_NORMAL_CELLS in raytracing_sky_inc.glsl and RT_SKY_LIGHT_NORMAL_CELLS.
 #define SKY_NORMALS ((SKY_NORMAL_CELLS + 1u) * (SKY_NORMAL_CELLS + 1u))
 
-// Written to the table's sky_share, which the trace reads, so the list lives here alone.
+// The candidate shares, written to the table's sky_share; must match RT_SKY_SHARES, the trace's
+// compile-time copy in raytracing_sky_inc.glsl (D67).
 const float SKY_SHARES[SKY_SHARE_COUNT] = float[](0.0, 1.0 / 32.0, 1.0 / 16.0, 0.125, 0.25, 0.5, 0.75, 0.9);
 
 #ifndef MODE_COMBINE

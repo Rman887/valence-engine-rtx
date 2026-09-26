@@ -442,19 +442,29 @@ class RenderRaytracing {
 		RID pipeline[MODE_MAX];
 	} mm_merge_shader;
 
-	// The sky's sampling table (D54): the compute shader that builds it from the radiance octmap.
+	// The sky's sampling table (D54): the compute shader that builds it from the radiance octmap, in
+	// the form the trace reads the octmap in (the roughness layers as an array, or one texture whose
+	// mips are the roughness levels), since the fog's level is read as the trace reads it (D64).
 	struct SkyLightShader {
+		enum Mode {
+			MODE_OCTMAP_2D = 0,
+			MODE_OCTMAP_ARRAY = 1,
+			MODE_MAX,
+		};
 		SkyLightCdfShaderRD shader;
 		RID version;
-		RID version_shader;
-		RID pipeline;
+		RID version_shader[MODE_MAX];
+		RID pipeline[MODE_MAX];
 	} sky_light_shader;
 	static constexpr uint32_t RT_SKY_LIGHT_N = 256; // Must match RT_SKY_N in raytracing_sky_inc.glsl.
 	static constexpr uint32_t RT_SKY_LIGHT_CELLS = RT_SKY_LIGHT_N * RT_SKY_LIGHT_N;
 	// The candidate shares the table judges the sky's variance at (D62); must match SKY_SHARE_COUNT in
 	// sky_light_cdf.glsl and RT_SKY_SHARE_COUNT in raytracing_sky_inc.glsl.
 	static constexpr uint32_t RT_SKY_LIGHT_SHARES = 8;
-	static constexpr uint32_t RT_SKY_LIGHT_BUFFER_SIZE = (4 + 3 * RT_SKY_LIGHT_SHARES + RT_SKY_LIGHT_N + 2 * RT_SKY_LIGHT_CELLS) * sizeof(float);
+	// The integrals the table holds per share (D64); must match SKY_BASIS in sky_light_cdf.glsl and
+	// RT_SKY_BASIS in raytracing_sky_inc.glsl.
+	static constexpr uint32_t RT_SKY_LIGHT_BASIS = 12;
+	static constexpr uint32_t RT_SKY_LIGHT_BUFFER_SIZE = (4 + RT_SKY_LIGHT_SHARES * (1 + RT_SKY_LIGHT_BASIS) + RT_SKY_LIGHT_N + 2 * RT_SKY_LIGHT_CELLS) * sizeof(float);
 
 	struct MMSurfaceHandles {
 		LocalVector<RID> per_surface; // Grown on demand; entry per touched surface index.

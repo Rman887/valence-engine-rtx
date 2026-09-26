@@ -21,16 +21,21 @@
 // BSDF's own directions, and a light sample spent on it is one taken from a light whose sample
 // had no variance, so the share the sky gets follows its concentrated light, not its total.
 // For the share by variance (D62) the table also reports, at each of eight candidate shares, the
-// variance of the sky's irradiance on a surface facing the sky's up when a share c of the light
-// samples draws from this table and the surface's cosine lobe draws the bounce, the two combined
-// by the balance heuristic: the second moment of the combined estimator, the integral of
-// f^2 / (p_bsdf + c p_sky), less the squares of the two strategies' weighted means, and the sky
-// strategy's weighted mean itself, which the share's covariance with the other lights needs
-// (raytracing_sky_inc.glsl). A smooth sky reads nearly zero at c = 0 (the cosine lobe alone
-// estimates it well) and rises with c; a sky that carries a small bright source reads high at
-// c = 0 and falls as c grows. The balance heuristic, the upward Lambertian receiver and the
-// sky without the fog's mix are a proxy for the trace's power heuristic over any surface: they
-// choose the share, and any share is unbiased.
+// integrals the variance of the sky's irradiance on a surface facing the sky's up is built from,
+// when a share c of the light samples draws from this table and the surface's cosine lobe draws
+// the bounce, the two combined by the power heuristic as the trace combines them: the second
+// moment of the combined estimator, the integral of f^2 (q^3 + p^3) / (q^2 + p^2)^2 with p the
+// lobe's density and q = c p_sky, and the two strategies' weighted means. The radiance the trace
+// delivers is not the octmap's (D64): sky_radiance mixes the sharpest level L toward the fog, whose
+// colour is the Environment's fog light mixed with a blurred level L_f by the aerial perspective,
+// so along any direction it is alpha L + beta L_f + gamma, the weights set per frame by the fog
+// and the exposure. The table therefore holds, per share, the second-moment integrals of every
+// product of L, L_f and 1 and the two means' integrals of each, and the trace combines them with
+// the frame's weights (raytracing_sky_inc.glsl), so the table is built only when the sky changes.
+// A smooth sky reads nearly zero variance at c = 0 (the cosine lobe alone estimates it well) and
+// rises with c; a sky that carries a small bright source reads high at c = 0 and falls as c grows.
+// The upward Lambertian receiver, whose cosine lobe stands for the material's density, is a proxy
+// for the trace's surfaces: it chooses the share, and any share is unbiased.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -42,6 +47,7 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #define SKY_FULL_SPHERE (4.0 * 3.14159265358979)
 #define SKY_PI 3.14159265358979
 #define SKY_SHARE_COUNT 8u
+#define SKY_BASIS 12u // Must match RT_SKY_BASIS in raytracing_sky_inc.glsl and RT_SKY_LIGHT_BASIS.
 
 // Written to the table's sky_share, which the trace reads, so the list lives here alone.
 const float SKY_SHARES[SKY_SHARE_COUNT] = float[](0.0, 1.0 / 32.0, 1.0 / 16.0, 0.125, 0.25, 0.5, 0.75, 0.9);
@@ -50,14 +56,21 @@ const float SKY_SHARES[SKY_SHARE_COUNT] = float[](0.0, 1.0 / 32.0, 1.0 / 16.0, 0
 layout(set = 0, binding = 0) uniform texture2D radiance_octmap;
 layout(set = 0, binding = 1) uniform sampler radiance_sampler;
 
+#ifdef USE_RADIANCE_OCTMAP_ARRAY
+// The octmap's roughness layers, for the fog's level, which is one of them.
+layout(set = 0, binding = 3) uniform texture2DArray radiance_layers;
+#endif
+
 // Must match SkyLightBuffer in raytracing_sky_inc.glsl and RT_SKY_LIGHT_BUFFER_SIZE.
 layout(set = 0, binding = 2, std430) restrict buffer SkyLightBuffer {
 	float sky_total; // The sum over cells of luminance times solid angle; 0 for a black sky.
 	float sky_concentrated; // The part of sky_total in cells brighter than the ratio times the mean.
 	float sky_pad[2];
 	float sky_share[SKY_SHARE_COUNT]; // The candidate shares, SKY_SHARES (D62).
-	float sky_variance[SKY_SHARE_COUNT]; // The sky term's variance at each share, before the exposure.
-	float sky_light_mean[SKY_SHARE_COUNT]; // The sky strategy's MIS-weighted mean at each share, before the exposure.
+	// Per share, SKY_BASIS integrals before the exposure (D64): the second moment's over the products
+	// L L, L_f L_f, 1, L L_f, L, L_f, then the bounce's weighted mean over L, L_f, 1, then the sky
+	// strategy's over L, L_f, 1.
+	float sky_basis[SKY_SHARE_COUNT * SKY_BASIS];
 	float sky_marginal[SKY_N]; // Inclusive CDF over the rows; the last entry reads 1.0.
 	float sky_conditional[SKY_CELLS]; // Inclusive CDF over each row's cells, each row to 1.0.
 	float sky_pdf_uv[SKY_CELLS]; // The density per unit octahedral area inside the cell.
@@ -73,12 +86,21 @@ params;
 
 shared float row_sum[SKY_N];
 shared float row_concentrated[SKY_N];
-shared float row_moment[SKY_N];
-shared float row_mean_bsdf[SKY_N];
-shared float row_mean_sky[SKY_N];
+shared float row_basis[SKY_BASIS][SKY_N + 1u]; // Padded: the twelve summing threads read one row each, a bank apart.
 
 float sky_luminance(vec3 p_color) {
 	return dot(p_color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// The luminance of the level the fog's aerial perspective reads: sky_radiance's sample at a
+// roughness of 1 / MAX_ROUGHNESS_LOD, which is the second roughness layer at its sharpest in array
+// mode and the texture's second mip otherwise.
+float sky_fog_luminance(vec2 p_tex_uv) {
+#ifdef USE_RADIANCE_OCTMAP_ARRAY
+	return sky_luminance(textureLod(sampler2DArray(radiance_layers, radiance_sampler), vec3(p_tex_uv, 1.0), 0.0).rgb);
+#else
+	return sky_luminance(textureLod(sampler2D(radiance_octmap, radiance_sampler), p_tex_uv, 1.0).rgb);
+#endif
 }
 
 void main() {
@@ -131,14 +153,12 @@ void main() {
 	float grand = total + floor_w * float(SKY_CELLS);
 	float row_total = sum + floor_w * float(SKY_N);
 	float acc = 0.0;
-	// Per share: the second moment and the two strategies' weighted means over this row's cells.
-	float moment[SKY_SHARE_COUNT];
-	float mean_bsdf[SKY_SHARE_COUNT];
-	float mean_sky[SKY_SHARE_COUNT];
+	// Per share, the integrals over this row's cells, in sky_basis's order.
+	float basis[SKY_SHARE_COUNT][SKY_BASIS];
 	for (uint k = 0u; k < SKY_SHARE_COUNT; k++) {
-		moment[k] = 0.0;
-		mean_bsdf[k] = 0.0;
-		mean_sky[k] = 0.0;
+		for (uint i = 0u; i < SKY_BASIS; i++) {
+			basis[k][i] = 0.0;
+		}
 	}
 	for (uint col = 0u; col < SKY_N; col++) {
 		uint cell = row_base + col;
@@ -148,22 +168,46 @@ void main() {
 		sky_conditional[cell] = (col == SKY_N - 1u) ? 1.0 : acc / row_total;
 		sky_pdf_uv[cell] = w / grand * float(SKY_CELLS);
 
-		// The cell at its centre as seen from a surface facing +Y: the irradiance integrand, the
-		// cosine lobe's density and the table's, each over solid angle.
+		// The cell at its centre as seen from a surface facing +Y: the cosine, the cosine lobe's
+		// density and the table's, each over solid angle, and the power heuristic's weights.
 		vec2 uv_centre = (vec2(col, row) + 0.5) / float(SKY_N);
 		vec3 dir_centre = oct_to_vec3(uv_centre * 2.0 - 1.0);
 		if (dir_centre.y > 0.0) {
 			float l1 = abs(dir_centre.x) + abs(dir_centre.y) + abs(dir_centre.z);
 			float solid_angle = 4.0 * l1 * l1 * l1 / float(SKY_CELLS);
-			float f = lum * dir_centre.y;
-			float p_bsdf = dir_centre.y / SKY_PI;
+			// The fog's level over the cell, from the same four taps as the cell's own luminance.
+			float lum_fog = 0.0;
+			for (uint t = 0u; t < 4u; t++) {
+				vec2 uv = (vec2(col, row) + vec2(0.25 + 0.5 * float(t & 1u), 0.25 + 0.5 * float(t >> 1u))) / float(SKY_N);
+				vec3 dir = oct_to_vec3(uv * 2.0 - 1.0);
+				lum_fog += sky_fog_luminance(vec3_to_oct_with_border(dir, vec2(params.border_pad, params.border_scale)));
+			}
+			lum_fog = max(lum_fog * 0.25, 0.0);
+			float cos_theta = dir_centre.y;
+			float p_bsdf = cos_theta / SKY_PI;
+			float p2 = p_bsdf * p_bsdf;
 			float p_sky = w / grand / solid_angle;
 			for (uint k = 0u; k < SKY_SHARE_COUNT; k++) {
+				// With q = c p_sky the weights are q^2 / (q^2 + p^2) and p^2 / (q^2 + p^2), and the two
+				// samples' second moments sum to f^2 (q^3 + p^3) / (q^2 + p^2)^2 over solid angle.
 				float q = SKY_SHARES[k] * p_sky;
-				float f_over = solid_angle * f / (p_bsdf + q);
-				moment[k] += f_over * f;
-				mean_bsdf[k] += f_over * p_bsdf;
-				mean_sky[k] += f_over * q;
+				float q2 = q * q;
+				float sum2 = q2 + p2;
+				float w_moment = solid_angle * cos_theta * cos_theta * (q2 * q + p2 * p_bsdf) / (sum2 * sum2);
+				float w_bsdf = solid_angle * cos_theta * p2 / sum2;
+				float w_sky = solid_angle * cos_theta * q2 / sum2;
+				basis[k][0] += w_moment * lum * lum;
+				basis[k][1] += w_moment * lum_fog * lum_fog;
+				basis[k][2] += w_moment;
+				basis[k][3] += w_moment * lum * lum_fog;
+				basis[k][4] += w_moment * lum;
+				basis[k][5] += w_moment * lum_fog;
+				basis[k][6] += w_bsdf * lum;
+				basis[k][7] += w_bsdf * lum_fog;
+				basis[k][8] += w_bsdf;
+				basis[k][9] += w_sky * lum;
+				basis[k][10] += w_sky * lum_fog;
+				basis[k][11] += w_sky;
 			}
 		}
 	}
@@ -181,25 +225,23 @@ void main() {
 		sky_concentrated = concentrated_total;
 	}
 
-	// The variance at each share, the rows reduced through shared memory one share at a time.
+	// The integrals at each share, the rows reduced through shared memory one share at a time, one
+	// thread per integral.
 	for (uint k = 0u; k < SKY_SHARE_COUNT; k++) {
 		barrier(); // The previous share's reduction has read the rows.
-		row_moment[row] = moment[k];
-		row_mean_bsdf[row] = mean_bsdf[k];
-		row_mean_sky[row] = mean_sky[k];
+		for (uint i = 0u; i < SKY_BASIS; i++) {
+			row_basis[i][row] = basis[k][i];
+		}
 		barrier();
-		if (row == 0u) {
-			float m = 0.0;
-			float b = 0.0;
+		if (row < SKY_BASIS) {
 			float s = 0.0;
 			for (uint r = 0u; r < SKY_N; r++) {
-				m += row_moment[r];
-				b += row_mean_bsdf[r];
-				s += row_mean_sky[r];
+				s += row_basis[row][r];
 			}
+			sky_basis[k * SKY_BASIS + row] = s;
+		}
+		if (row == 0u) {
 			sky_share[k] = SKY_SHARES[k];
-			sky_variance[k] = max(m - b * b - s * s, 0.0);
-			sky_light_mean[k] = s;
 		}
 	}
 }

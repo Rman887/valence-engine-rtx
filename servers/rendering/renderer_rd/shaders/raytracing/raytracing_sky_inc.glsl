@@ -21,6 +21,7 @@
 #define RT_SKY_N 256u
 #define RT_SKY_CELLS (RT_SKY_N * RT_SKY_N)
 #define RT_SKY_SHARE_COUNT 8u // Must match SKY_SHARE_COUNT in sky_light_cdf.glsl and RT_SKY_LIGHT_SHARES.
+#define RT_SKY_BASIS 12u // Must match SKY_BASIS in sky_light_cdf.glsl and RT_SKY_LIGHT_BASIS.
 
 // Must match SkyLightBuffer in sky_light_cdf.glsl (std430, RT_SKY_LIGHT_BUFFER_SIZE bytes).
 layout(set = 0, binding = RT_SKY_LIGHT_BINDING, std430) readonly buffer SkyLightBuffer {
@@ -28,8 +29,7 @@ layout(set = 0, binding = RT_SKY_LIGHT_BINDING, std430) readonly buffer SkyLight
 	float sky_concentrated; // The part of sky_total in cells brighter than four times the sky's mean.
 	float sky_pad[2];
 	float sky_share[RT_SKY_SHARE_COUNT]; // The candidate shares (D62), ascending from 0; the table writes them.
-	float sky_variance[RT_SKY_SHARE_COUNT]; // The sky term's variance at each share, before the exposure.
-	float sky_light_mean[RT_SKY_SHARE_COUNT]; // The sky strategy's MIS-weighted mean at each share, before the exposure.
+	float sky_basis[RT_SKY_SHARE_COUNT * RT_SKY_BASIS]; // Per share, the integrals sky_share_moments combines (D64).
 	float sky_marginal[RT_SKY_N]; // Inclusive CDF over the rows.
 	float sky_conditional[RT_SKY_CELLS]; // Inclusive CDF over each row's cells.
 	float sky_pdf_uv[RT_SKY_CELLS]; // The density per unit octahedral area inside the cell.
@@ -43,27 +43,58 @@ bool sky_variance_share_enabled() {
 	return (RT_FLAGS & RT_FLAG_SKY_LIGHT_VARIANCE_SHARE) != 0u;
 }
 
+/// The weights of the radiance the trace delivers along a direction (D64): sky_radiance mixes the
+/// octmap's sharpest level L under the exposure toward the fog by its sky affect, and the fog's
+/// colour is the Environment's fog light mixed with the exposed level L_f by the aerial
+/// perspective, so the delivered luminance is alpha L + beta L_f + gamma, returned as (alpha,
+/// beta, gamma); without the fog it is the exposure times L.
+vec3 sky_share_mix() {
+	float exposure = scene_data_block.data.IBL_exposure_normalization;
+	if ((RT_FLAGS & RT_FLAG_FOG_ENABLED) == 0u) {
+		return vec3(exposure, 0.0, 0.0);
+	}
+	float affect = scene_data_block.data.fog_sky_affect;
+	float aerial = (scene_data_block.data.fog_aerial_perspective > 0.0) ? scene_data_block.data.fog_aerial_perspective : 0.0;
+	float fog = dot(scene_data_block.data.fog_light_color, vec3(0.2126, 0.7152, 0.0722));
+	return vec3(exposure * (1.0 - affect), exposure * affect * aerial, affect * (1.0 - aerial) * fog);
+}
+
+/// The sky term's variance and its sky strategy's weighted mean at candidate share k, for the
+/// radiance sky_share_mix weighs: the table's integrals of each product of L, L_f and 1 combined
+/// into the second moment, and of each level into the two strategies' means (sky_light_cdf.glsl).
+void sky_share_moments(uint k, vec3 p_mix, out float r_variance, out float r_mean) {
+	uint b = k * RT_SKY_BASIS;
+	float moment = p_mix.x * p_mix.x * sky_basis[b] + p_mix.y * p_mix.y * sky_basis[b + 1u] + p_mix.z * p_mix.z * sky_basis[b + 2u] +
+			2.0 * (p_mix.x * p_mix.y * sky_basis[b + 3u] + p_mix.x * p_mix.z * sky_basis[b + 4u] + p_mix.y * p_mix.z * sky_basis[b + 5u]);
+	float mean_bsdf = dot(p_mix, vec3(sky_basis[b + 6u], sky_basis[b + 7u], sky_basis[b + 8u]));
+	r_mean = dot(p_mix, vec3(sky_basis[b + 9u], sky_basis[b + 10u], sky_basis[b + 11u]));
+	r_variance = max(moment - mean_bsdf * mean_bsdf - r_mean * r_mean, 0.0);
+}
+
 /// The sky's share by the variance it removes (D62): of the table's candidate shares, the one
 /// that minimizes the variance of the hit's light sample and the bounce's sky together. With
 /// the surface lights' summed score S taken as their sample's mean (a directional sun, a lamp
-/// in range: little variance of their own), a share c raises their second moment from S^2 to
-/// S^2 / (1 - c); the sky's term at c is the table's variance V(c), judged for a surface facing
-/// the sky's up with a cosine lobe; and since the one sample is either a light or the sky, the
-/// two branches covary by -2 S mu(c), mu the sky strategy's weighted mean:
-/// S^2 c / (1 - c) + V(c) - 2 S mu(c), each sky term under the exposure. A smooth sky beside a
-/// bright sun keeps a share near 0, a sky with its own small bright source a large one. The
-/// share steps between candidates as S moves, so a vertex on a step can read neighbouring
-/// shares on its two sides where the tree recomputes S (the 1e-7 of D55's origin), a density
-/// mismatch on a set of that measure.
+/// in range: little variance of their own, 2 to 4 % measured where 24 lanterns reach, D64), a
+/// share c raises their second moment from S^2 to S^2 / (1 - c); the sky's term at c is the
+/// table's variance V(c), judged for a surface facing the sky's up with a cosine lobe and the
+/// radiance the trace delivers; and since the one sample is either a light or the sky, the two
+/// branches covary by -2 S mu(c), mu the sky strategy's weighted mean:
+/// S^2 c / (1 - c) + V(c) - 2 S mu(c). A smooth sky beside a bright sun keeps a share near 0, a
+/// sky with its own small bright source a large one. The share steps between candidates as S
+/// moves, so a vertex on a step can read neighbouring shares on its two sides where the tree
+/// recomputes S (the 1e-7 of D55's origin), a density mismatch on a set of that measure.
 float sky_variance_share(float p_surface) {
-	float exposure = scene_data_block.data.IBL_exposure_normalization;
-	float e2 = exposure * exposure;
+	vec3 weights = sky_share_mix();
 	float s2 = p_surface * p_surface;
+	float variance;
+	float mean;
+	sky_share_moments(0u, weights, variance, mean);
 	float best_share = 0.0;
-	float best = e2 * sky_variance[0]; // The share 0 draws nothing from the sky: no covariance.
+	float best = variance; // The share 0 draws nothing from the sky: no covariance.
 	for (uint k = 1u; k < RT_SKY_SHARE_COUNT; k++) {
 		float c = sky_share[k];
-		float j = s2 * c / (1.0 - c) + e2 * sky_variance[k] - 2.0 * p_surface * exposure * sky_light_mean[k];
+		sky_share_moments(k, weights, variance, mean);
+		float j = s2 * c / (1.0 - c) + variance - 2.0 * p_surface * mean;
 		if (j < best) {
 			best = j;
 			best_share = c;

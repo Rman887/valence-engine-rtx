@@ -64,13 +64,16 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		mm_merge_shader.pipeline[i] = RD::get_singleton()->compute_pipeline_create(mm_merge_shader.version_shader[i]);
 	}
 
-	// The sky's sampling table (D54).
+	// The sky's sampling table (D54), in both forms of the radiance octmap (D64).
 	Vector<String> sky_light_modes;
 	sky_light_modes.push_back("\n");
+	sky_light_modes.push_back("\n#define USE_RADIANCE_OCTMAP_ARRAY\n");
 	sky_light_shader.shader.initialize(sky_light_modes);
 	sky_light_shader.version = sky_light_shader.shader.version_create();
-	sky_light_shader.version_shader = sky_light_shader.shader.version_get_shader(sky_light_shader.version, 0);
-	sky_light_shader.pipeline = RD::get_singleton()->compute_pipeline_create(sky_light_shader.version_shader);
+	for (int i = 0; i < SkyLightShader::MODE_MAX; i++) {
+		sky_light_shader.version_shader[i] = sky_light_shader.shader.version_get_shader(sky_light_shader.version, i);
+		sky_light_shader.pipeline[i] = RD::get_singleton()->compute_pipeline_create(sky_light_shader.version_shader[i]);
+	}
 }
 
 RenderRaytracing::~RenderRaytracing() {
@@ -4002,7 +4005,24 @@ void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDa
 	u_table.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 	u_table.append_id(p_state->sky_light_buffer);
 	// Through the cache: a sky that re-renders every frame (a sun that moves) rebuilds every frame.
-	RID uniform_set = UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader, 0, u_octmap, u_sampler, u_table);
+	// In array mode the fog's level is a roughness layer, which the sharpest layer's own texture does
+	// not reach, so the array joins the set (D64).
+	const bool use_octmap_array = owner->is_using_radiance_octmap_array();
+	const int mode = use_octmap_array ? SkyLightShader::MODE_OCTMAP_ARRAY : SkyLightShader::MODE_OCTMAP_2D;
+	RID uniform_set;
+	if (use_octmap_array) {
+		RID layers = owner->sky.sky_get_radiance_texture_rd(sky_rid);
+		if (!layers.is_valid()) {
+			return;
+		}
+		RD::Uniform u_layers;
+		u_layers.binding = 3;
+		u_layers.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
+		u_layers.append_id(layers);
+		uniform_set = UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[mode], 0, u_octmap, u_sampler, u_table, u_layers);
+	} else {
+		uniform_set = UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[mode], 0, u_octmap, u_sampler, u_table);
+	}
 
 	struct SkyLightPC {
 		float border_pad;
@@ -4017,11 +4037,11 @@ void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDa
 	// times, so the mip whose texel is half a cell wide averages the cell (the sharpest when the
 	// octmap is no finer than the table). In 2D mode the mips are roughness levels, so the sharpest
 	// is read.
-	pc.lod = owner->is_using_radiance_octmap_array() ? MAX(0.0f, Math::log2((float)owner->sky.sky_get_radiance_size(sky_rid) / (float)RT_SKY_LIGHT_N)) : 0.0f;
+	pc.lod = use_octmap_array ? MAX(0.0f, Math::log2((float)owner->sky.sky_get_radiance_size(sky_rid) / (float)RT_SKY_LIGHT_N)) : 0.0f;
 	pc.floor_fraction = 1.0e-3f;
 
 	RD::ComputeListID compute_list = rd->compute_list_begin();
-	rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline);
+	rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline[mode]);
 	rd->compute_list_bind_uniform_set(compute_list, uniform_set, 0);
 	rd->compute_list_set_push_constant(compute_list, &pc, sizeof(SkyLightPC));
 	rd->compute_list_dispatch(compute_list, 1, 1, 1);

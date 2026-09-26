@@ -270,7 +270,7 @@ public:
 		int processing_layer = 0;
 		Sky *dirty_list = nullptr;
 		float baked_exposure = 1.0;
-		uint64_t radiance_version = 0; // Counts the renders into the octmap's sharpest layer (D54).
+		uint64_t radiance_version = 0; // Counts the renders into the octmap's sharpest layer (D54) and its first roughness layer, the fog's level (D64).
 
 		// State to track when radiance octmap needs updating.
 		SkyMaterialData *prev_material = nullptr;

@@ -1366,6 +1366,11 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 				sky->reflection.update_reflection_mipmaps(sky->processing_layer, sky->processing_layer + 1);
 			}
 
+			// The path tracer's sky table reads the fog's level from the first roughness layer (D64), which
+			// lands here frames after the sharpest one: count it as a render too.
+			if (sky->processing_layer == 1) {
+				sky->radiance_version++;
+			}
 			sky->processing_layer++;
 		}
 	}

@@ -51,23 +51,31 @@ mat3 sky_world_to_sky() {
 	return scene_data_block.data.radiance_inverse_xform * mat3(scene_data_block.data.inv_view_matrix);
 }
 
-/// The sky's share by the variance it removes (D62): of the table's candidate shares, the one
-/// that minimizes the variance of the hit's light sample and the bounce's sky together. With
-/// the surface lights' summed score S taken as their sample's mean (a directional sun, a lamp
-/// in range: little variance of their own, 2 to 4 % measured where 24 lanterns reach, D64), a
-/// share c raises their second moment from S^2 to S^2 / (1 - c); the sky's term at c is the
-/// table's variance V(c), judged for a Lambertian receiver facing p_normal with the radiance the
-/// trace delivers (D64); and since the one sample is either a light or the sky, the two branches
-/// covary by -2 S mu(c), mu the sky strategy's weighted mean: S^2 c / (1 - c) + V(c) - 2 S mu(c).
-/// A smooth sky beside a bright sun keeps a share near 0, a sky with its own small bright source a
-/// large one. The receiver is the vertex's own (D65): the table holds V and mu at the vertices of a
-/// grid of normals over the octahedral square in the sky's frame, and they are read bilinearly
-/// between the four around p_normal, so both vary continuously with it. The share steps between
-/// candidates as S and the normal move, so a vertex on a step can read neighbouring shares on its
-/// two sides where the tree recomputes S (the 1e-7 of D55's origin), or where the two sides' stages
-/// round the normal's transform differently, a density mismatch on a set of that measure. p_normal
-/// must be the normal the other side of the weight reads: the geometry normal as the payload
-/// carries it on.
+/// The sky's share by the variance it removes (D62): the share that minimizes the variance of the
+/// hit's light sample and the bounce's sky together. With the surface lights' summed score S taken
+/// as their sample's mean (a directional sun, a lamp in range: little variance of their own, 2 to
+/// 4 % measured where 24 lanterns reach, D64), a share c raises their second moment from S^2 to
+/// S^2 / (1 - c); the sky's term at c is the table's variance V(c), judged for a Lambertian
+/// receiver facing p_normal with the radiance the trace delivers (D64); and since the one sample is
+/// either a light or the sky, the two branches covary by -2 S mu(c), mu the sky strategy's
+/// weighted mean: J(c) = S^2 c / (1 - c) + V(c) - 2 S mu(c). A smooth sky beside a bright sun
+/// keeps a share near 0, a sky with its own small bright source a large one. The receiver is the
+/// vertex's own (D65): the table holds V and mu at the vertices of a grid of normals over the
+/// octahedral square in the sky's frame, and they are read bilinearly between the four around
+/// p_normal, so both vary continuously with it. The table holds them at eight candidate shares;
+/// between two neighbours both are taken as linear in c, so on that interval
+/// J'(c) = S^2 / (1 - c)^2 + a, a the slope of the linear part, and J's minimum there is
+/// 1 - S / sqrt(-a) clamped to it. The share is the best of the intervals' minima (D66), which
+/// moves continuously with S and the normal wherever J has one minimum: a share that stepped
+/// between candidates left seams where S crossed a step (D62's seam capture, still there under
+/// D65's per-normal model). J has one minimum where the sky's part V - 2 S mu is convex across the
+/// candidates, which the table does not guarantee: on a receiver that sees only a smooth sky mu
+/// grows as c^2 at small c, so at a small S J can hold two minima, and the share still jumps where
+/// they tie; as S goes to 0 each interval's minimum is an end, a candidate again. Where the two
+/// sides of the weight read S or the normal a rounding apart (the tree recomputes S, the 1e-7 of
+/// D55's origin; the stages transform the normal) the densities differ by that rounding, and by a
+/// step only at such a tie, a set of that measure. p_normal must be the normal the other side of
+/// the weight reads: the geometry normal as the payload carries it on.
 float sky_variance_share(float p_surface, vec3 p_normal) {
 	// The grid's vertices are RT_SKY_NORMAL_CELLS cells a side over the octahedral square, so the
 	// four around any normal lie inside it and the weights need no wrap.
@@ -80,17 +88,26 @@ float sky_variance_share(float p_surface, vec3 p_normal) {
 	uint v11 = v01 + RT_SKY_SHARE_COUNT;
 	vec4 w = vec4((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
 	float s2 = p_surface * p_surface;
-	// The share 0 draws nothing from the sky: no covariance, V(0) alone.
-	float best = w.x * sky_share_moments[v00].x + w.y * sky_share_moments[v10].x + w.z * sky_share_moments[v01].x + w.w * sky_share_moments[v11].x;
+	// The sky's part of J at each candidate, V(c) - 2 S mu(c). The first candidate, sky_share[0], is
+	// the share 0, which draws nothing from the sky: no covariance, V(0) alone.
+	float c0 = 0.0;
+	float sky0 = w.x * sky_share_moments[v00].x + w.y * sky_share_moments[v10].x + w.z * sky_share_moments[v01].x + w.w * sky_share_moments[v11].x;
+	float best = sky0;
 	float best_share = 0.0;
 	for (uint k = 1u; k < RT_SKY_SHARE_COUNT; k++) {
-		float c = sky_share[k];
+		float c1 = sky_share[k];
 		vec2 moments = w.x * sky_share_moments[v00 + k] + w.y * sky_share_moments[v10 + k] + w.z * sky_share_moments[v01 + k] + w.w * sky_share_moments[v11 + k];
-		float j = s2 * c / (1.0 - c) + moments.x - 2.0 * p_surface * moments.y;
+		float sky1 = moments.x - 2.0 * p_surface * moments.y;
+		float a = (sky1 - sky0) / (c1 - c0);
+		// Where J rises through the interval its minimum is the left end, already judged.
+		float c = (a < 0.0) ? clamp(1.0 - p_surface * inversesqrt(-a), c0, c1) : c0;
+		float j = s2 * c / (1.0 - c) + sky0 + a * (c - c0);
 		if (j < best) {
 			best = j;
 			best_share = c;
 		}
+		c0 = c1;
+		sky0 = sky1;
 	}
 	return best_share;
 }

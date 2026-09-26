@@ -61,16 +61,20 @@
 // The receiver-side cosine bound's floor: a node wholly under the horizon is drawn at this rate.
 #define RT_LIGHT_TREE_RECEIVER_FLOOR 0.02
 
-// Must match C++ RT_LightTreeNode (std430, 48 bytes).
+// Must match C++ RT_LightTreeNode (std430, 64 bytes).
 struct RTLightTreeNode {
 	vec3 center; // Bounding sphere, trace space.
 	float radius;
-	vec3 axis; // Orientation cone: the spot directions under the node; unused when cos_theta_o is -1, except that an omni leaf's x is its attenuation exponent (D59).
+	vec3 axis; // Orientation cone: the spot directions under the node; unused when cos_theta_o is -1.
 	float cos_theta_o; // Cosine of the cone's half-angle, -1 for every direction (omni and emissive).
 	float power; // The luminance the node's lights deliver at unit distance, summed.
 	float max_range; // The largest range under the node, 0 for unbounded.
 	uint child; // An inner node: its right child (the left is the next node). A leaf: RT_LIGHT_TREE_LEAF_BIT | (RT_LIGHT_TREE_EMISSIVE_BIT) | index.
 	uint leaf_range; // The node's leaves in tree_leaf_list: first << 16 | count.
+	float analytic_share; // The omni and spot lights' share of power (D63): 1 without emitters, 0 without them.
+	float decay; // The slowest attenuation exponent among those lights, within [0, 2] on an inner node; 2 without them.
+	float analytic_range; // The largest range among those lights, 0 when one is unbounded or there are none.
+	float emissive_share; // The emitters' share of power.
 };
 
 layout(set = 0, binding = RT_LIGHT_TREE_BINDING, std430) readonly buffer LightTreeBuffer {
@@ -120,9 +124,37 @@ uint light_tree_emissive_slot(uint entry, bool indirect) {
 	return slot == 0xFFFFu ? RT_LIGHT_TREE_NO_NODE : slot;
 }
 
+/// The distance falloff of a node's power at d2, the squared distance from its centre (D63), its two
+/// kinds weighed by their shares of the power. The emitters fall off as the inverse square floored
+/// by the sphere, as they always have; the omni and spot lights by the curve lights_get_attenuation
+/// charges them: their slowest decay exponent over the distance floored by the sphere, capped at 1,
+/// inside the quartic window of their widest range taken from the sphere's near side. The inverse
+/// square read Godot's default decay of 1 as up to the distance times too dim past a metre (and too
+/// bright inside one), so the proposal and the sky's share by variance (D62) understated every such
+/// light in reach. A node of emitters alone reads inv_d2 exactly, as before; the analytic curve costs
+/// a square root for the window and a reciprocal square root at a decay of 1, or a logarithm and an
+/// exponential at a decay but 1 or 2.
+float light_tree_node_falloff(RTLightTreeNode n, float d2, float r2, float inv_d2) {
+	if (!(n.analytic_share > 0.0)) {
+		return inv_d2;
+	}
+	float dd = max(max(d2, r2), 1e-8);
+	float decayed = (n.decay == 2.0) ? inv_d2 : ((n.decay == 1.0) ? inversesqrt(dd) : exp2(-0.5 * n.decay * log2(dd)));
+	float analytic = min(decayed, 1.0);
+	if (n.analytic_range > 0.0) {
+		float nd = max(sqrt(d2) - n.radius, 0.0) / n.analytic_range;
+		nd *= nd;
+		nd *= nd;
+		nd = max(1.0 - nd, 0.0);
+		analytic *= nd * nd;
+	}
+	return n.analytic_share * analytic + n.emissive_share * inv_d2;
+}
+
 /// How much the lights under a node could deliver at x facing N, from the node's bounds: its
-/// power over the distance squared (floored by the sphere, so a receiver inside it reads the
-/// power), the cosine at the receiver and the cosine at the light each bounded over the sphere's
+/// power times its lights' falloff with distance (light_tree_node_falloff, D63; the distance
+/// floored by the sphere, so a receiver inside it reads the falloff at the radius), the cosine at
+/// the receiver and the cosine at the light each bounded over the sphere's
 /// angular extent. Zero beyond the node's range and outside its cone by more than a right angle,
 /// where the lights are zero too; the receiver bound is floored. Every angle is kept as its
 /// cosine and sine (the sum and difference identities), so a node costs one reciprocal square
@@ -139,9 +171,10 @@ float light_tree_node_importance(RTLightTreeNode n, vec3 x, vec3 N) {
 		}
 	}
 	float inv_d2 = 1.0 / max(max(d2, r2), 1e-8);
+	float falloff = light_tree_node_falloff(n, d2, r2, inv_d2);
 	if (d2 <= r2) {
 		// Inside the bound no angle is bounded.
-		return n.power * inv_d2;
+		return n.power * falloff;
 	}
 	float inv_d = inversesqrt(d2);
 	float sin_u = min(n.radius * inv_d, 1.0);
@@ -175,7 +208,7 @@ float light_tree_node_importance(RTLightTreeNode n, vec3 x, vec3 N) {
 			}
 		}
 	}
-	return n.power * cos_bi * cos_bl * inv_d2;
+	return n.power * cos_bi * cos_bl * falloff;
 }
 
 /// A directional light's irradiance at a surface facing N, floored as the nodes' receiver bound
@@ -497,8 +530,8 @@ float light_tree_analytic_target(RTLightData light, vec3 hit_pos, vec3 N) {
 /// contribution estimate from the cut copy alone, so the candidate reads no light. An emitter's is
 /// D51's proximity from the same sphere (the receiver's cosine raised by the angular size, floored
 /// just above zero, over the distance floored by the sphere). An omni light's is the analytic target
-/// itself: its luminance under Godot's attenuation (the light's own decay exponent, carried in the
-/// leaf's axis.x, inside the quartic window to its range) times the cosine raised by the angular
+/// itself: its luminance under Godot's attenuation (the light's own decay exponent, the leaf's
+/// decay, inside the quartic window to its range) times the cosine raised by the angular
 /// size and floored. An inverse-square stand-in for that curve cost the matrix 2.4 dB: the studio's
 /// lights decay linearly. A spot leaf keeps the full target: its cone's zero is not in the node.
 float light_tree_leaf_target(RTLightTreeNode n, vec3 hit_pos, vec3 N) {
@@ -513,7 +546,7 @@ float light_tree_leaf_target(RTLightTreeNode n, vec3 hit_pos, vec3 N) {
 	}
 	float dist = max(d, 1e-4);
 	float above = max(dot(N, to_c) / dist + n.radius / max(dist, n.radius), RT_LIGHT_TREE_RECEIVER_FLOOR);
-	float atten = min(pow(dist, -n.axis.x), 1.0);
+	float atten = min(pow(dist, -n.decay), 1.0);
 	if (n.max_range > 0.0) {
 		float nd = dist / n.max_range;
 		nd *= nd;

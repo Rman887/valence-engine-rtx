@@ -174,19 +174,23 @@ enum {
 };
 
 // A node of the light tree (D55): a bounding sphere, an orientation cone, the summed power and the
-// largest range of the lights under it, its right child and its leaves. Must match GLSL RTLightTreeNode
-// (std430, 48 bytes) in raytracing_light_tree_inc.glsl.
+// largest range of the lights under it, its right child and its leaves, and the falloff of its
+// analytic lights (D63). Must match GLSL RTLightTreeNode (std430, 64 bytes) in raytracing_light_tree_inc.glsl.
 struct alignas(16) RT_LightTreeNode {
 	float center[3]; // Trace space.
 	float radius;
-	float axis[3]; // The orientation cone's axis; unused when cos_theta_o is -1, except that an omni leaf's x is its attenuation exponent (D59).
+	float axis[3]; // The orientation cone's axis; unused when cos_theta_o is -1.
 	float cos_theta_o; // Cosine of the cone's half-angle, -1 for every direction.
 	float power; // Luminance at unit distance, summed over the leaves.
 	float max_range; // The largest light range under the node, 0 for unbounded.
 	uint32_t child; // An inner node: the right child (the left is the next node); a leaf: RT_LIGHT_TREE_LEAF_BIT | flags | index.
 	uint32_t leaf_range; // The node's leaves in the leaf list: first << 16 | count (D56).
+	float analytic_share; // The omni and spot lights' share of power (D63): 1 without emitters, 0 without them.
+	float decay; // The slowest attenuation exponent among those lights (Light3D's attenuation), within [0, 2] on an inner node; 2 without them.
+	float analytic_range; // The largest range among those lights, 0 when one is unbounded or there are none.
+	float emissive_share; // The emitters' share of power, which falls off as the inverse square.
 };
-static_assert(sizeof(RT_LightTreeNode) == 48, "RT_LightTreeNode must be 48 bytes for std430");
+static_assert(sizeof(RT_LightTreeNode) == 64, "RT_LightTreeNode must be 64 bytes for std430");
 
 // One leaf-list position's entry in its cut node's alias table (D60, D61): a pick lands on the
 // position by the leaf count, keeps it when the rescaled remainder is under the threshold and takes
@@ -513,6 +517,7 @@ class RenderRaytracing {
 		float cos_theta_o;
 		float power;
 		float max_range;
+		float decay; // The light's attenuation exponent (D63); 2 for an emissive entry.
 		uint32_t encoded; // RT_LIGHT_TREE_LEAF_BIT | flags | index.
 	};
 	LocalVector<LightTreeLeaf> light_tree_leaves;

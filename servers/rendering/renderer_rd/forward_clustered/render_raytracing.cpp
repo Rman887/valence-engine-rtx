@@ -3077,7 +3077,9 @@ static void _rt_cone_union(const Vector3 &p_a1, float p_cos1, const Vector3 &p_a
 /// tree over them balanced by count, split at the median of the leaf centres along the longest
 /// axis, in depth-first order so a node's left child follows it and a node's leaves are contiguous
 /// in the order. Each node carries the union of its children's spheres and cones, their summed
-/// power, their largest range and its leaves' range. Then the cuts: the tree's shallowest
+/// power, their largest range and its leaves' range, and the falloff its analytic lights and its
+/// emitters each take (D63): their shares of the power, the analytic lights' slowest decay and
+/// widest range. Then the cuts: the tree's shallowest
 /// nodes, at most p_cut_size of them, which the shader scores once per hit and picks a leaf under
 /// by power or uniformly (D56, D60), and a second, coarser cut of at most p_cut_indirect_size for
 /// the surfaces past the path's first diffuse bounce (D59). The nodes, the cuts, the leaf list,
@@ -3114,13 +3116,13 @@ uint32_t RenderRaytracing::build_light_tree(const RT_LightData *p_lights, uint32
 			leaf.axis = Vector3(l.spot_direction[0], l.spot_direction[1], l.spot_direction[2]);
 			leaf.cos_theta_o = l.cos_spot_angle;
 		} else {
-			// A leaf whose cone is every direction never has its axis read as one; its x carries the
-			// light's attenuation exponent so the shader can target a leaf slot from the cut copy (D59).
-			leaf.axis = Vector3(l.attenuation, 0, 0);
+			leaf.axis = Vector3(0, 0, 1);
 			leaf.cos_theta_o = -1.0f;
 		}
 		leaf.power = power;
 		leaf.max_range = l.max_range_squared > 0.0f ? Math::sqrt(l.max_range_squared) : 0.0f;
+		// The node importance and a leaf slot's target (D59) fall off by it (D63).
+		leaf.decay = l.attenuation;
 		leaf.encoded = RT_LIGHT_TREE_LEAF_BIT | i;
 		light_tree_leaves.push_back(leaf);
 	}
@@ -3140,6 +3142,7 @@ uint32_t RenderRaytracing::build_light_tree(const RT_LightData *p_lights, uint32
 		leaf.cos_theta_o = -1.0f;
 		leaf.power = power;
 		leaf.max_range = 0.0f;
+		leaf.decay = 2.0f;
 		leaf.encoded = RT_LIGHT_TREE_LEAF_BIT | RT_LIGHT_TREE_EMISSIVE_BIT | n;
 		light_tree_leaves.push_back(leaf);
 	}
@@ -3276,8 +3279,13 @@ uint32_t RenderRaytracing::_build_light_tree_node(uint32_t p_begin, uint32_t p_e
 		n.max_range = leaf.max_range;
 		n.child = leaf.encoded;
 		n.leaf_range = (p_begin << 16) | 1u;
+		const bool emissive = (leaf.encoded & RT_LIGHT_TREE_EMISSIVE_BIT) != 0;
+		n.analytic_share = emissive ? 0.0f : 1.0f;
+		n.decay = leaf.decay;
+		n.analytic_range = emissive ? 0.0f : leaf.max_range;
+		n.emissive_share = emissive ? 1.0f : 0.0f;
 		light_tree_leaf_list[p_begin] = node_index;
-		if (leaf.encoded & RT_LIGHT_TREE_EMISSIVE_BIT) {
+		if (emissive) {
 			// Where a chance hit on the entry finds its share under its cut node (D60).
 			light_tree_emissive_leaf[leaf.encoded & ~(RT_LIGHT_TREE_LEAF_BIT | RT_LIGHT_TREE_EMISSIVE_BIT)] = p_begin;
 		}
@@ -3329,6 +3337,27 @@ uint32_t RenderRaytracing::_build_light_tree_node(uint32_t p_begin, uint32_t p_e
 	n.max_range = (l.max_range > 0.0f && r.max_range > 0.0f) ? MAX(l.max_range, r.max_range) : 0.0f;
 	n.child = right;
 	n.leaf_range = (p_begin << 16) | (p_end - p_begin);
+	// The two kinds' shares of the power (D63), in double so neither kind's share is lost to the
+	// other's: the shader weighs their falloffs by them with no division and no subtraction.
+	const double power_sum = (double)l.power + (double)r.power;
+	const double analytic_power = (double)l.analytic_share * l.power + (double)r.analytic_share * r.power;
+	const double emissive_power = (double)l.emissive_share * l.power + (double)r.emissive_share * r.power;
+	n.analytic_share = power_sum > 0.0 ? (float)(analytic_power / power_sum) : 0.0f;
+	n.emissive_share = power_sum > 0.0 ? (float)(emissive_power / power_sum) : 0.0f;
+	// The analytic lights' falloff over the children that carry them: the slowest decay, so no such
+	// light falls off faster than its node reads past a metre, and the widest range.
+	if (l.analytic_share > 0.0f && r.analytic_share > 0.0f) {
+		n.decay = MIN(l.decay, r.decay);
+		n.analytic_range = (l.analytic_range > 0.0f && r.analytic_range > 0.0f) ? MAX(l.analytic_range, r.analytic_range) : 0.0f;
+	} else {
+		const RT_LightTreeNode &a = l.analytic_share > 0.0f ? l : r;
+		n.decay = a.decay;
+		n.analytic_range = a.analytic_range;
+	}
+	// A node is read at its centre's distance and a light inside it can be far nearer: never steeper
+	// than the inverse square, and a negative decay (capped at 1 by the light) reads flat. A leaf's
+	// distance is its light's own, so a leaf keeps its decay.
+	n.decay = CLAMP(n.decay, 0.0f, 2.0f);
 	return node_index;
 }
 

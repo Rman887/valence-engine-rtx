@@ -223,27 +223,22 @@ float light_tree_directional_importance(RTLightData light, vec3 N) {
 /// judged per hit; 0 without the sky light or a black sky. With the share by variance (D62) it
 /// is the importance that gives the sky sky_variance_share's share against the directional
 /// lights and the cut summed at this hit (p_surface), for a receiver facing N (D65):
-/// s / (s + p_surface) = share, at most the concentration importance (D71).
+/// s / (s + p_surface) = share.
 float light_tree_sky_importance(float p_surface, vec3 N) {
 	if (!sky_light_enabled() || !(sky_total > 0.0)) {
 		return 0.0;
 	}
-	float concentration = max(0.25 * sky_concentrated * scene_data_block.data.IBL_exposure_normalization, 0.0);
 	if (sky_variance_share_enabled()) {
-		// Bounded by the concentration importance (D71): the share is monotone in the importance,
-		// so the smaller importance is the smaller share, and a sky with no concentrated light
-		// takes none at any S (the non-tree path's early return), the search skipped.
-		if (!(concentration > 0.0)) {
-			return 0.0;
-		}
+		// The share by the clipped variance (D72) judges the image itself, so it takes no bound from
+		// the concentration importance (D71's, which the display objective replaced).
 		float share = sky_variance_share(p_surface, N);
 		if (!(share > 0.0)) {
 			return 0.0;
 		}
 		// The shares stop at 0.9; with nothing else in reach any positive importance is the whole.
-		return (p_surface > 0.0) ? min(p_surface * share / (1.0 - share), concentration) : 1.0;
+		return (p_surface > 0.0) ? p_surface * share / (1.0 - share) : 1.0;
 	}
-	return concentration;
+	return max(0.25 * sky_concentrated * scene_data_block.data.IBL_exposure_normalization, 0.0);
 }
 
 /// The importances at the top of the selection: the sky, every directional light and the cut

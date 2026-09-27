@@ -403,13 +403,15 @@ struct RTViewportState {
 	RID sky_light_buffer;
 	RID sky_light_sky;
 	uint64_t sky_light_version = 0;
-	// The share by variance's moments (D65): built for the table they follow, then combined with the
-	// frame's weights of the delivered radiance, which are kept to tell when they change. The weights
-	// come from what sky_radiance reads in this frame's scene data copy (the exposure, the fog's sky
-	// affect and aerial perspective, the fog light's luminance), taken where the copy is made.
+	// The share by variance's moments (D65): built for the table they follow with the frame's weights
+	// of the delivered radiance, which are kept to tell when their shape changes (D72: a change of
+	// their scale, the exposure normalisation, needs no rebuild). The weights come from what sky_radiance reads in
+	// this frame's scene data copy (the exposure, the fog's sky affect and aerial perspective, the fog
+	// light's luminance), taken where the copy is made.
 	bool sky_light_moments_built = false;
 	bool sky_light_mix_valid = false;
 	float sky_light_mix[3] = {};
+	float sky_light_scene_exposure = 0.0f; // The exposure normalisation the kept weights were divided by.
 	float sky_light_scene[4] = {};
 	RID scene_uniform_set;
 
@@ -455,7 +457,8 @@ class RenderRaytracing {
 	// they are too large for one workgroup, then the rest with the header in one), then the share by
 	// variance's moments per receiver normal (D65), in the form the trace reads the octmap in (the
 	// roughness layers as an array, or one texture whose mips are the roughness levels), since the
-	// fog's level is read as the trace reads it (D64), and their combination with the frame's weights.
+	// fog's level is read as the trace reads it (D64); the moments carry the frame's weights' shape and
+	// are clipped at multiples of the receiver's irradiance (D72), so there is no combine pass.
 	struct SkyLightShader {
 		enum Mode {
 			MODE_LEAF = 0,
@@ -463,7 +466,6 @@ class RenderRaytracing {
 			MODE_HEADER = 2,
 			MODE_MOMENTS_OCTMAP_2D = 3,
 			MODE_MOMENTS_OCTMAP_ARRAY = 4,
-			MODE_COMBINE = 5,
 			MODE_MAX,
 		};
 		SkyLightTableShaderRD shader;
@@ -486,19 +488,20 @@ class RenderRaytracing {
 	// The candidate shares the table judges the sky's variance at (D62); must match SKY_SHARE_COUNT in
 	// sky_light_table.glsl and RT_SKY_SHARE_COUNT in raytracing_sky_inc.glsl.
 	static constexpr uint32_t RT_SKY_LIGHT_SHARES = 8;
-	// The integrals the table holds per share (D64); must match SKY_BASIS in sky_light_table.glsl and
-	// RT_SKY_BASIS in raytracing_sky_inc.glsl.
-	static constexpr uint32_t RT_SKY_LIGHT_BASIS = 12;
+	// The clip levels the moments are taken at (D72); must match SKY_CLIP_LEVELS in sky_light_table.glsl
+	// and RT_SKY_CLIP_LEVELS in raytracing_sky_inc.glsl.
+	static constexpr uint32_t RT_SKY_LIGHT_CLIP_LEVELS = 6;
 	// The cells a side of the receiver normals' grid over the octahedral square, a normal at every
 	// vertex (D65); must match SKY_NORMAL_CELLS in sky_light_table.glsl and RT_SKY_NORMAL_CELLS in
 	// raytracing_sky_inc.glsl.
 	static constexpr uint32_t RT_SKY_LIGHT_NORMAL_CELLS = 8;
 	static constexpr uint32_t RT_SKY_LIGHT_NORMALS = (RT_SKY_LIGHT_NORMAL_CELLS + 1) * (RT_SKY_LIGHT_NORMAL_CELLS + 1);
-	// The header, the shares, per normal and share the combined variance and mean and the basis, then
-	// the pyramid at its largest.
-	static constexpr uint32_t RT_SKY_LIGHT_BUFFER_SIZE = (RT_SKY_LIGHT_HEADER_WORDS + RT_SKY_LIGHT_SHARES + RT_SKY_LIGHT_NORMALS * RT_SKY_LIGHT_SHARES * (2 + RT_SKY_LIGHT_BASIS) + RT_SKY_LIGHT_PYRAMID_FLOATS) * sizeof(float);
-	static_assert((RT_SKY_LIGHT_HEADER_WORDS + RT_SKY_LIGHT_SHARES) % 2 == 0, "The per-normal vec2 array must start 8-byte aligned in std430, or the shaders pad where the size does not.");
-	static_assert((RT_SKY_LIGHT_HEADER_WORDS + RT_SKY_LIGHT_SHARES + RT_SKY_LIGHT_NORMALS * RT_SKY_LIGHT_SHARES * (2 + RT_SKY_LIGHT_BASIS)) % 4 == 0, "The pyramid's vec4 array must start 16-byte aligned in std430, or the shaders pad where the size does not.");
+	// The header, the shares, per normal, clip level and share the four moments, then the pyramid at
+	// its largest.
+	static constexpr uint32_t RT_SKY_LIGHT_MOMENT_FLOATS = RT_SKY_LIGHT_NORMALS * RT_SKY_LIGHT_CLIP_LEVELS * RT_SKY_LIGHT_SHARES * 4;
+	static constexpr uint32_t RT_SKY_LIGHT_BUFFER_SIZE = (RT_SKY_LIGHT_HEADER_WORDS + RT_SKY_LIGHT_SHARES + RT_SKY_LIGHT_MOMENT_FLOATS + RT_SKY_LIGHT_PYRAMID_FLOATS) * sizeof(float);
+	static_assert((RT_SKY_LIGHT_HEADER_WORDS + RT_SKY_LIGHT_SHARES) % 4 == 0, "The moments' vec4 array must start 16-byte aligned in std430, or the shaders pad where the size does not.");
+	static_assert((RT_SKY_LIGHT_HEADER_WORDS + RT_SKY_LIGHT_SHARES + RT_SKY_LIGHT_MOMENT_FLOATS) % 4 == 0, "The pyramid's vec4 array must start 16-byte aligned in std430, or the shaders pad where the size does not.");
 
 	struct MMSurfaceHandles {
 		LocalVector<RID> per_surface; // Grown on demand; entry per touched surface index.

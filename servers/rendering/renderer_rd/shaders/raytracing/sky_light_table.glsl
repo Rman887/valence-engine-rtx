@@ -2,6 +2,8 @@
 
 #version 450
 
+#extension GL_EXT_control_flow_attributes : enable
+
 #VERSION_DEFINES
 
 // The sky's sampling table for the path tracer (D54): a luminance distribution over the sky's
@@ -30,12 +32,11 @@
 // BSDF's own directions, and a light sample spent on it is one taken from a light whose sample
 // had no variance, so the share the sky gets follows its concentrated light, not its total.
 // For the share by variance (D62) MODE_MOMENTS then reports, at each of eight candidate shares, the
-// integrals the variance of the sky's irradiance on a Lambertian receiver is built from, when a
+// moments the variance of the sky's irradiance on a Lambertian receiver is built from, when a
 // share c of the light samples draws from this table and the receiver's cosine lobe draws the
-// bounce, the two combined by the power heuristic as the trace combines them: the second moment of
-// the combined estimator, the integral of f^2 (q^3 + p^3) / (q^2 + p^2)^2 with p the lobe's
-// density and q = c p_sky, and the two strategies' weighted means, over the 256-grid's cells with
-// the pyramid's density at that level. The receiver is not only the one facing the sky's up
+// bounce, the two combined by the power heuristic as the trace combines them: each strategy's
+// second moment and mean, its sample's value its weight times f over its density (p the lobe's,
+// q = c p_sky the table's), over the 256-grid's cells with the pyramid's density at that level. The receiver is not only the one facing the sky's up
 // (D65): one workgroup per normal of a grid over the octahedral square in the sky's frame,
 // SKY_NORMAL_CELLS cells a side and a normal at every vertex, so the trace reads the four around
 // its own normal bilinearly without a wrap (the vertices on the square's border that the
@@ -43,13 +44,20 @@
 // radiance the trace delivers is not the octmap's (D64): sky_radiance mixes the sharpest level L
 // toward the fog, whose colour is the Environment's fog light mixed with a blurred level L_f by the
 // aerial perspective, so along any direction it is alpha L + beta L_f + gamma, the weights set per
-// frame by the fog and the exposure. The moments therefore hold, per normal and share, the
-// second-moment integrals of every product of L, L_f and 1 and the two means' integrals of each,
-// built only when the sky changes, and MODE_COMBINE folds them with the frame's weights into the
-// variance and the sky strategy's mean the trace reads, run when the table or the weights change.
-// A smooth sky reads nearly zero variance at c = 0 (the cosine lobe alone estimates it well) and
-// rises with c; a sky that carries a small bright source reads high at c = 0 and falls as c grows.
-// The Lambertian receiver, whose cosine lobe stands for the material's density, is a proxy for the
+// frame by the fog and the exposure; the moments are built with the weights over the exposure
+// normalisation, since it only scales every term (the trace reads its S over it) while the
+// weights' shape asks for a rebuild. The objective is not the variance of the linear irradiance
+// (D72): the image the captures judge is a tonemapped accumulation of a few frames, so
+// a sample far above the pixel's mean saturates (its error bounded, its energy lost) while a
+// sample below it is not compressed. The moments therefore hold, per normal, share and clip level
+// (a multiple of the receiver's irradiance, SKY_CLIP_RATIOS), the variance of the sky term with
+// every sample held to the level, the sky strategy's clipped mean and the two strategies' clipped
+// means summed, from which the trace forms the variance of the clipped estimator and the energy
+// the clipping loses, the clip being a fixed multiple of the vertex's mean (its lights' score plus
+// this irradiance) interpolated between the levels. A smooth sky reads nearly zero variance at
+// c = 0 (the cosine lobe alone estimates it well) and rises with c; a sky that carries a small
+// bright source reads high at c = 0 and falls as c grows until its spikes are clipped. The
+// Lambertian receiver, whose cosine lobe stands for the material's density, is a proxy for the
 // trace's surfaces: it chooses the share, and any share is unbiased.
 
 #ifdef MODE_LEAF
@@ -68,13 +76,18 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #define SKY_FULL_SPHERE (4.0 * 3.14159265358979)
 #define SKY_PI 3.14159265358979
 #define SKY_SHARE_COUNT 8u
-#define SKY_BASIS 12u // Must match RT_SKY_BASIS in raytracing_sky_inc.glsl and RT_SKY_LIGHT_BASIS.
+#define SKY_CLIP_LEVELS 6u // Must match RT_SKY_CLIP_LEVELS in raytracing_sky_inc.glsl and RT_SKY_LIGHT_CLIP_LEVELS.
+#define SKY_MOMENT_TERMS 3u // Per share and clip level the row sums: the two strategies' clipped second moments, the sky strategy's clipped mean, the bounce's.
 #define SKY_NORMAL_CELLS 8u // Must match RT_SKY_NORMAL_CELLS in raytracing_sky_inc.glsl and RT_SKY_LIGHT_NORMAL_CELLS.
 #define SKY_NORMALS ((SKY_NORMAL_CELLS + 1u) * (SKY_NORMAL_CELLS + 1u))
 
 // The candidate shares, written to the table's sky_share; must match RT_SKY_SHARES, the trace's
 // compile-time copy in raytracing_sky_inc.glsl (D67).
 const float SKY_SHARES[SKY_SHARE_COUNT] = float[](0.0, 1.0 / 32.0, 1.0 / 16.0, 0.125, 0.25, 0.5, 0.75, 0.9);
+// The clip levels the moments are taken at, as multiples of the receiver's sky irradiance (D72): a
+// sample's value above the level counts as the level. Must match the trace's reading in
+// raytracing_sky_inc.glsl (level j is 2^(j + 1); past the last the trace clips at the last).
+const float SKY_CLIP_RATIOS[SKY_CLIP_LEVELS] = float[](2.0, 4.0, 8.0, 16.0, 32.0, 64.0);
 
 #if defined(MODE_LEAF) || defined(MODE_MOMENTS)
 // The radiance octmap's sharpest layer as a 2D texture with its mip chain.
@@ -97,13 +110,12 @@ layout(set = 0, binding = 2, std430) restrict buffer SkyLightBuffer {
 	uint sky_leaf_n; // 2^sky_levels.
 	uint sky_pad[2];
 	float sky_share[SKY_SHARE_COUNT]; // The candidate shares, SKY_SHARES (D62).
-	// Per receiver normal and share, the sky term's variance and the sky strategy's weighted mean
-	// under the frame's weights (D65), what the trace reads.
-	vec2 sky_share_moments[SKY_NORMALS * SKY_SHARE_COUNT];
-	// Per receiver normal and share, SKY_BASIS integrals before the exposure (D64): the second
-	// moment's over the products L L, L_f L_f, 1, L L_f, L, L_f, then the bounce's weighted mean over
-	// L, L_f, 1, then the sky strategy's over L, L_f, 1.
-	float sky_basis[SKY_NORMALS * SKY_SHARE_COUNT * SKY_BASIS];
+	// Per receiver normal, clip level and share (D72), in the table's units (the delivered luminance
+	// over the sharpest level's weight in it, the trace's S read the same way): x the variance of the
+	// sky term with every sample clipped at the level, y the sky strategy's clipped mean, z both
+	// strategies' clipped means summed (what the clipped estimator delivers of the irradiance), w the
+	// receiver's irradiance. Index (normal * SKY_CLIP_LEVELS + level) * SKY_SHARE_COUNT + share.
+	vec4 sky_share_moments[SKY_NORMALS * SKY_CLIP_LEVELS * SKY_SHARE_COUNT];
 	// The pyramid, levels 1 to sky_levels (D69): level l holds 2^l x 2^l node weights as the quads of
 	// the level above's nodes, row-major over those, each quad the node's four children in the order
 	// (2x, 2y), (2x + 1, 2y), (2x, 2y + 1), (2x + 1, 2y + 1). The floor is not stored.
@@ -115,8 +127,9 @@ layout(push_constant, std430) uniform Params {
 	float border_scale; // 1 - 2 * border_pad.
 	float lod_cell; // For the moments' cells: the octmap mip whose texel is about half a cell wide (0 when the mips are roughness levels, or the sharpest is already coarser).
 	float floor_fraction; // The share of the sky's total spread evenly, so no leaf has zero density.
-	// The frame's weights of L, L_f and 1 in the delivered luminance (MODE_COMBINE), as the renderer
-	// reads them from the scene data sky_radiance reads.
+	// The weights of L, L_f and 1 in the delivered luminance (MODE_MOMENTS), as the renderer reads
+	// them from the scene data sky_radiance reads, over the exposure normalisation, which the trace
+	// reads its S over.
 	float mix_level;
 	float mix_fog_level;
 	float mix_constant;
@@ -323,7 +336,9 @@ void main() {
 
 #ifdef MODE_MOMENTS
 
-shared float row_basis[SKY_BASIS][SKY_CELL_N + 1u]; // Padded: the twelve summing threads read one row each, a bank apart.
+shared float row_sums[SKY_MOMENT_TERMS][SKY_CELL_N + 1u]; // Padded: the summing thread reads one row at a time, a bank apart.
+shared float row_irradiance[SKY_CELL_N];
+shared float receiver_irradiance;
 
 // The luminance of the level the fog's aerial perspective reads: sky_radiance's sample at a
 // roughness of 1 / MAX_ROUGHNESS_LOD, which is the second roughness layer at its sharpest in array
@@ -346,7 +361,8 @@ float sky_cell_fog_luminance(uvec2 p_cell) {
 }
 
 // One workgroup per receiver normal of the grid, one thread per row of the 256-grid, which is the
-// pyramid's level SKY_CELL_LEVEL.
+// pyramid's level SKY_CELL_LEVEL. Two passes over the row: the receiver's irradiance first, since the
+// clip levels are multiples of it, then the clipped moments (D72).
 void main() {
 	uint row = gl_LocalInvocationID.x;
 	uint normal_index = gl_WorkGroupID.x;
@@ -358,11 +374,45 @@ void main() {
 	float leaves_per_cell = float(1u << (2u * (sky_levels - SKY_CELL_LEVEL)));
 	float cell_floor = sky_floor_leaf * leaves_per_cell;
 	float cell_scale = sky_pdf_scale / leaves_per_cell;
-	// Per share, the integrals over this row's cells, in sky_basis's order.
-	float basis[SKY_SHARE_COUNT][SKY_BASIS];
-	for (uint k = 0u; k < SKY_SHARE_COUNT; k++) {
-		for (uint i = 0u; i < SKY_BASIS; i++) {
-			basis[k][i] = 0.0;
+	vec3 mix_weights = vec3(params.mix_level, params.mix_fog_level, params.mix_constant);
+
+	// The receiver's irradiance from the delivered luminance, the row's part then the sum. The fog's
+	// level is read only where it is delivered (the weight is uniform over the dispatch).
+	const bool read_fog = params.mix_fog_level != 0.0;
+	float irradiance = 0.0;
+	for (uint col = 0u; col < SKY_CELL_N; col++) {
+		uvec2 cell = uvec2(col, row);
+		float solid_angle;
+		vec3 dir_centre = sky_grid_centre(cell, SKY_CELL_N, solid_angle);
+		float cos_theta = dot(receiver, dir_centre);
+		if (!(cos_theta > 1e-6)) {
+			continue;
+		}
+		float lum_mix = dot(mix_weights, vec3(sky_grid_luminance(cell, SKY_CELL_N, params.lod_cell, 0.25), read_fog ? sky_cell_fog_luminance(cell) : 0.0, 1.0));
+		irradiance += lum_mix * cos_theta * solid_angle;
+	}
+	row_irradiance[row] = irradiance;
+	barrier();
+	if (row == 0u) {
+		float e = 0.0;
+		for (uint r = 0u; r < SKY_CELL_N; r++) {
+			e += row_irradiance[r];
+		}
+		receiver_irradiance = e;
+	}
+	barrier();
+	irradiance = receiver_irradiance;
+
+	// Per share and clip level, the row's sums of the two strategies' clipped second moments (one
+	// accumulator: only their sum is read), the sky strategy's clipped mean and the bounce's.
+	// The loops over the shares and the levels are unrolled wherever the sums are indexed, so the
+	// array stays in registers (a run-time index would send it to local memory).
+	float sums[SKY_SHARE_COUNT][SKY_CLIP_LEVELS][SKY_MOMENT_TERMS];
+	[[unroll]] for (uint k = 0u; k < SKY_SHARE_COUNT; k++) {
+		[[unroll]] for (uint j = 0u; j < SKY_CLIP_LEVELS; j++) {
+			[[unroll]] for (uint i = 0u; i < SKY_MOMENT_TERMS; i++) {
+				sums[k][j][i] = 0.0;
+			}
 		}
 	}
 	for (uint col = 0u; col < SKY_CELL_N; col++) {
@@ -374,81 +424,69 @@ void main() {
 		float cos_theta = dot(receiver, dir_centre);
 		// Not merely positive: a receiver in the octahedron's equator at 45 degrees ((+-a, +-a, 0))
 		// meets the cells whose centre has y = -x as the rounding residue of a*x - a*x, and at the
-		// share 0 the second moment's (cos/pi)^4 then underflows to 0 / 0. Such a cell carries under
-		// 1e-6 of a cell's cosine weight; at the floor every term stays a normal float.
+		// share 0 the weights' (cos/pi)^2 then underflows to 0 / 0. Such a cell carries under 1e-6 of
+		// a cell's cosine weight; at the floor every term stays a normal float.
 		if (!(cos_theta > 1e-6)) {
 			continue;
 		}
-		float lum = sky_grid_luminance(cell, SKY_CELL_N, params.lod_cell, 0.25);
-		float lum_fog = sky_cell_fog_luminance(cell);
+		float lum_mix = dot(mix_weights, vec3(sky_grid_luminance(cell, SKY_CELL_N, params.lod_cell, 0.25), read_fog ? sky_cell_fog_luminance(cell) : 0.0, 1.0));
+		float f_cos = lum_mix * cos_theta;
 		float p_bsdf = cos_theta / SKY_PI;
 		float p2 = p_bsdf * p_bsdf;
+		// The bounce's sample lands in the cell with this probability and, before its weight, reads
+		// f over its density: L pi.
+		float prob_bsdf = p_bsdf * solid_angle;
+		float x_bsdf_full = lum_mix * SKY_PI;
 		// The table's density over solid angle: per octahedral area over the Jacobian 4 |d|_1^3, which
 		// is the cell's solid angle times the cell count, as sky_pdf reads it at a leaf.
 		float w_cell = sky_pyramid[sky_node_quad(SKY_CELL_LEVEL, cell)][sky_node_component(cell)] + cell_floor;
 		float p_sky = w_cell * cell_scale / (solid_angle * float(SKY_CELLS));
-		for (uint k = 0u; k < SKY_SHARE_COUNT; k++) {
-			// With q = c p_sky the weights are q^2 / (q^2 + p^2) and p^2 / (q^2 + p^2), and the two
-			// samples' second moments sum to f^2 (q^3 + p^3) / (q^2 + p^2)^2 over solid angle.
+		[[unroll]] for (uint k = 0u; k < SKY_SHARE_COUNT; k++) {
+			// With q = c p_sky the weights are q^2 / (q^2 + p^2) and p^2 / (q^2 + p^2). The sky sample
+			// lands in the cell with probability q over solid angle (the share c included: the other
+			// 1 - c of the light samples go to the lights) and delivers its weight times f over q; the
+			// bounce's delivers its weight times L pi. Each value is then held to the clip level.
 			float q = SKY_SHARES[k] * p_sky;
 			float q2 = q * q;
 			float sum2 = q2 + p2;
-			float w_moment = solid_angle * cos_theta * cos_theta * (q2 * q + p2 * p_bsdf) / (sum2 * sum2);
-			float w_bsdf = solid_angle * cos_theta * p2 / sum2;
-			float w_sky = solid_angle * cos_theta * q2 / sum2;
-			basis[k][0] += w_moment * lum * lum;
-			basis[k][1] += w_moment * lum_fog * lum_fog;
-			basis[k][2] += w_moment;
-			basis[k][3] += w_moment * lum * lum_fog;
-			basis[k][4] += w_moment * lum;
-			basis[k][5] += w_moment * lum_fog;
-			basis[k][6] += w_bsdf * lum;
-			basis[k][7] += w_bsdf * lum_fog;
-			basis[k][8] += w_bsdf;
-			basis[k][9] += w_sky * lum;
-			basis[k][10] += w_sky * lum_fog;
-			basis[k][11] += w_sky;
+			float prob_sky = q * solid_angle;
+			float x_sky = (q > 0.0) ? (q2 / sum2) * f_cos / q : 0.0;
+			float x_bsdf = (p2 / sum2) * x_bsdf_full;
+			[[unroll]] for (uint j = 0u; j < SKY_CLIP_LEVELS; j++) {
+				float clip = SKY_CLIP_RATIOS[j] * irradiance;
+				float y_sky = min(x_sky, clip);
+				float y_bsdf = min(x_bsdf, clip);
+				sums[k][j][0] += prob_sky * y_sky * y_sky + prob_bsdf * y_bsdf * y_bsdf;
+				sums[k][j][1] += prob_sky * y_sky;
+				sums[k][j][2] += prob_bsdf * y_bsdf;
+			}
 		}
 	}
 
-	// The integrals at each share, the rows reduced through shared memory one share at a time, one
-	// thread per integral.
-	for (uint k = 0u; k < SKY_SHARE_COUNT; k++) {
-		barrier(); // The previous share's reduction has read the rows.
-		for (uint i = 0u; i < SKY_BASIS; i++) {
-			row_basis[i][row] = basis[k][i];
-		}
-		barrier();
-		if (row < SKY_BASIS) {
-			float s = 0.0;
-			for (uint r = 0u; r < SKY_CELL_N; r++) {
-				s += row_basis[row][r];
+	// The sums at each share and level, the rows reduced through shared memory one pair at a time,
+	// and the moments the trace reads from them: the variance of the clipped sky term (both
+	// strategies' second moments less each clipped mean's square), the sky strategy's clipped mean,
+	// the two clipped means' sum and the receiver's irradiance.
+	[[unroll]] for (uint k = 0u; k < SKY_SHARE_COUNT; k++) {
+		[[unroll]] for (uint j = 0u; j < SKY_CLIP_LEVELS; j++) {
+			barrier(); // The previous pair's reduction has read the rows.
+			[[unroll]] for (uint i = 0u; i < SKY_MOMENT_TERMS; i++) {
+				row_sums[i][row] = sums[k][j][i];
 			}
-			sky_basis[(normal_index * SKY_SHARE_COUNT + k) * SKY_BASIS + row] = s;
+			barrier();
+			if (row == 0u) {
+				float second = 0.0;
+				float mean_sky = 0.0;
+				float mean_bsdf = 0.0;
+				for (uint r = 0u; r < SKY_CELL_N; r++) {
+					second += row_sums[0][r];
+					mean_sky += row_sums[1][r];
+					mean_bsdf += row_sums[2][r];
+				}
+				sky_share_moments[(normal_index * SKY_CLIP_LEVELS + j) * SKY_SHARE_COUNT + k] = vec4(max(second - mean_sky * mean_sky - mean_bsdf * mean_bsdf, 0.0), mean_sky, mean_sky + mean_bsdf, irradiance);
+			}
 		}
 	}
 }
 
 #endif // MODE_MOMENTS
-
-#ifdef MODE_COMBINE
-
-// One thread per receiver normal and share: the moments' integrals of each product of L, L_f and 1
-// combined with the frame's weights into the second moment, and of each level into the two
-// strategies' means, then the variance (the two strategies' means both leave the second moment,
-// since one sample of each is taken) and the sky strategy's mean the covariance reads.
-void main() {
-	uint i = gl_GlobalInvocationID.x;
-	if (i >= SKY_NORMALS * SKY_SHARE_COUNT) {
-		return;
-	}
-	uint b = i * SKY_BASIS;
-	vec3 m = vec3(params.mix_level, params.mix_fog_level, params.mix_constant);
-	float moment = m.x * m.x * sky_basis[b] + m.y * m.y * sky_basis[b + 1u] + m.z * m.z * sky_basis[b + 2u] +
-			2.0 * (m.x * m.y * sky_basis[b + 3u] + m.x * m.z * sky_basis[b + 4u] + m.y * m.z * sky_basis[b + 5u]);
-	float mean_bsdf = dot(m, vec3(sky_basis[b + 6u], sky_basis[b + 7u], sky_basis[b + 8u]));
-	float mean_sky = dot(m, vec3(sky_basis[b + 9u], sky_basis[b + 10u], sky_basis[b + 11u]));
-	sky_share_moments[i] = vec2(max(moment - mean_bsdf * mean_bsdf - mean_sky * mean_sky, 0.0), mean_sky);
-}
-
-#endif // MODE_COMBINE

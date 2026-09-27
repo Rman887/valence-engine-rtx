@@ -24,7 +24,14 @@
 #endif
 
 #define RT_SKY_SHARE_COUNT 8u // Must match SKY_SHARE_COUNT in sky_light_table.glsl and RT_SKY_LIGHT_SHARES.
-#define RT_SKY_BASIS 12u // Must match SKY_BASIS in sky_light_table.glsl and RT_SKY_LIGHT_BASIS.
+#define RT_SKY_CLIP_LEVELS 6u // Must match SKY_CLIP_LEVELS in sky_light_table.glsl and RT_SKY_LIGHT_CLIP_LEVELS; level j clips at 2^(j + 1) times the receiver's irradiance.
+// The share's objective in the display domain (D72): a sample's value is held to RT_SKY_CLIP_RATIO
+// times the vertex's mean (the lights' score plus the sky's irradiance), and the energy the clip
+// loses counts RT_SKY_CLIP_ACCUMULATION times its square against the clipped variance, the frames
+// the upscaler's accumulation averages a still over. Both fitted to a fixed-share sweep of the
+// HDRI captures against their references (docs/performance.md, D72).
+#define RT_SKY_CLIP_RATIO 2.0
+#define RT_SKY_CLIP_ACCUMULATION 16.0
 #define RT_SKY_NORMAL_CELLS 8u // Must match SKY_NORMAL_CELLS in sky_light_table.glsl and RT_SKY_LIGHT_NORMAL_CELLS.
 #define RT_SKY_NORMALS ((RT_SKY_NORMAL_CELLS + 1u) * (RT_SKY_NORMAL_CELLS + 1u))
 
@@ -38,8 +45,12 @@ layout(set = 0, binding = RT_SKY_LIGHT_BINDING, std430) readonly buffer SkyLight
 	uint sky_leaf_n; // 2^sky_levels, the leaves a side.
 	uint sky_pad[2];
 	float sky_share[RT_SKY_SHARE_COUNT]; // The candidate shares (D62), ascending from 0, as the table writes them; the trace reads RT_SKY_SHARES.
-	vec2 sky_share_moments[RT_SKY_NORMALS * RT_SKY_SHARE_COUNT]; // Per receiver normal and share, the sky term's variance and its sky strategy's mean this frame (D65).
-	float sky_basis[RT_SKY_NORMALS * RT_SKY_SHARE_COUNT * RT_SKY_BASIS]; // What the table's combine stage folds into sky_share_moments (D64); the trace reads none of it.
+	// Per receiver normal, clip level and share (D72), in the table's units (the delivered luminance
+	// over the sharpest level's weight in it): the variance of the sky term with every sample clipped
+	// at the level, the sky strategy's clipped mean, the two strategies' clipped means summed, the
+	// receiver's irradiance, at the index (normal * RT_SKY_CLIP_LEVELS + level) * RT_SKY_SHARE_COUNT
+	// + share.
+	vec4 sky_share_moments[RT_SKY_NORMALS * RT_SKY_CLIP_LEVELS * RT_SKY_SHARE_COUNT];
 	// The pyramid (D69): level l's quads, row-major over the level above's nodes, each a node's four
 	// children in the order (2x, 2y), (2x + 1, 2y), (2x, 2y + 1), (2x + 1, 2y + 1), levels 1 to sky_levels.
 	vec4 sky_pyramid[];
@@ -61,6 +72,21 @@ bool sky_variance_share_enabled() {
 /// World direction to the octmap's frame, as the miss maps its ray.
 mat3 sky_world_to_sky() {
 	return scene_data_block.data.radiance_inverse_xform * mat3(scene_data_block.data.inv_view_matrix);
+}
+
+/// The sky's part of the objective at one candidate share (D72): the clipped variance less the
+/// covariance with the lights' sample, plus the accumulation's weight on the squared energy the
+/// clip loses of the irradiance, from the table's moments in its units and S in them.
+float sky_share_objective(vec4 p_moments, float p_surface, float p_irradiance) {
+	float lost = p_irradiance - p_moments.z;
+	return p_moments.x - 2.0 * p_surface * p_moments.y + RT_SKY_CLIP_ACCUMULATION * lost * lost;
+}
+
+/// The moments' unit: the exposure normalisation the frame's weights of the delivered luminance
+/// are divided by in the table (the camera exposure and the background's intensity over the sky's
+/// baked exposure), never 0 while the sky renders.
+float sky_moments_unit() {
+	return scene_data_block.data.IBL_exposure_normalization;
 }
 
 /// The sky's share by the variance it removes (D62): the share that minimizes the variance of the
@@ -104,19 +130,44 @@ float sky_variance_share(float p_surface, vec3 p_normal) {
 	vec2 g = vec3_to_oct(sky_world_to_sky() * p_normal) * float(RT_SKY_NORMAL_CELLS);
 	uvec2 lo = min(uvec2(g), uvec2(RT_SKY_NORMAL_CELLS - 1u));
 	vec2 f = clamp(g - vec2(lo), 0.0, 1.0);
-	uint v00 = (lo.y * (RT_SKY_NORMAL_CELLS + 1u) + lo.x) * RT_SKY_SHARE_COUNT;
-	uint v10 = v00 + RT_SKY_SHARE_COUNT;
-	uint v01 = v00 + (RT_SKY_NORMAL_CELLS + 1u) * RT_SKY_SHARE_COUNT;
-	uint v11 = v01 + RT_SKY_SHARE_COUNT;
+	const uint vertex_stride = RT_SKY_CLIP_LEVELS * RT_SKY_SHARE_COUNT;
+	uint v00 = (lo.y * (RT_SKY_NORMAL_CELLS + 1u) + lo.x) * vertex_stride;
+	uint v10 = v00 + vertex_stride;
+	uint v01 = v00 + (RT_SKY_NORMAL_CELLS + 1u) * vertex_stride;
+	uint v11 = v01 + vertex_stride;
 	vec4 w = vec4((1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y), (1.0 - f.x) * f.y, f.x * f.y);
-	float s2 = p_surface * p_surface;
-	// The sky's part of J at each candidate, g_k = V(c_k) - 2 S mu(c_k), read bilinearly. The
-	// candidate 0 is the share 0, which draws nothing from the sky: no covariance, V(0) alone. Eight
-	// scalars, and the candidates' shares read by literal index from a compile-time array: a
-	// ray-tracing stage pays two to three times for a local array it indexes at run time (D56).
-#define SKY_MOMENTS(k) (w.x * sky_share_moments[v00 + k] + w.y * sky_share_moments[v10 + k] + w.z * sky_share_moments[v01 + k] + w.w * sky_share_moments[v11 + k])
-#define SKY_G(k) dot(SKY_MOMENTS(k), vec2(1.0, -2.0 * p_surface))
-	float g0 = SKY_MOMENTS(0u).x;
+	// The moments are per unit of the exposure normalisation, and every term of J scales with its
+	// square when S is taken over it, so the search runs in the table's units at S over the frame's
+	// unit (D72).
+	float unit = sky_moments_unit();
+	if (!(unit > 0.0)) {
+		return 0.0;
+	}
+	float s = p_surface / unit;
+	float s2 = s * s;
+	// The receiver's irradiance, and the clip as a multiple of it: RT_SKY_CLIP_RATIO times the
+	// vertex's mean, read between the two levels around it (level j clips at 2^(j + 1) times the
+	// irradiance); past the last level the clip stays at the last, which errs toward the share 0,
+	// the side the lights' own term already takes there.
+	float irradiance = w.x * sky_share_moments[v00].w + w.y * sky_share_moments[v10].w + w.z * sky_share_moments[v01].w + w.w * sky_share_moments[v11].w;
+	if (!(irradiance > 0.0)) {
+		return 0.0;
+	}
+	float level = clamp(log2(RT_SKY_CLIP_RATIO * (s + irradiance) / irradiance) - 1.0, 0.0, float(RT_SKY_CLIP_LEVELS - 1u));
+	uint j0 = min(uint(level), RT_SKY_CLIP_LEVELS - 2u);
+	float fj = clamp(level - float(j0), 0.0, 1.0);
+	uint o0 = j0 * RT_SKY_SHARE_COUNT;
+	uint o1 = o0 + RT_SKY_SHARE_COUNT;
+	// The sky's part of J at each candidate, g_k = V'(c_k) - 2 S B(c_k) + A (E - M(c_k))^2 with V' the
+	// clipped variance, B the sky strategy's clipped mean, M both strategies' and A the accumulation
+	// (RT_SKY_CLIP_ACCUMULATION), read bilinearly over the normal and linearly between the levels.
+	// The candidate 0 is the share 0, which draws nothing from the sky: no covariance. Eight scalars,
+	// and the candidates' shares read by literal index from a compile-time array: a ray-tracing stage
+	// pays two to three times for a local array it indexes at run time (D56).
+#define SKY_LEVEL(o, k) (w.x * sky_share_moments[v00 + o + k] + w.y * sky_share_moments[v10 + o + k] + w.z * sky_share_moments[v01 + o + k] + w.w * sky_share_moments[v11 + o + k])
+#define SKY_MOMENTS(k) mix(SKY_LEVEL(o0, k), SKY_LEVEL(o1, k), fj)
+#define SKY_G(k) sky_share_objective(SKY_MOMENTS(k), s, irradiance)
+	float g0 = SKY_G(0u);
 	float g1 = SKY_G(1u);
 	float g2 = SKY_G(2u);
 	float g3 = SKY_G(3u);
@@ -126,6 +177,7 @@ float sky_variance_share(float p_surface, vec3 p_normal) {
 	float g7 = SKY_G(7u);
 #undef SKY_G
 #undef SKY_MOMENTS
+#undef SKY_LEVEL
 	// Most hits take the share 0 (a sun over a smooth sky, D62). J over the hull has its minimum at
 	// 0 exactly when its right derivative there, S^2 plus the least slope from candidate 0, is not
 	// negative, and being convex it then beats every chord: those hits skip the search.
@@ -174,7 +226,7 @@ float sky_variance_share(float p_surface, vec3 p_normal) {
 	{                                                                            \
 		float a = (gj - gi) * (1.0 / (RT_SKY_SHARES[j] - RT_SKY_SHARES[i]));     \
 		if (-a > s2 * SKY_INV_SQ(i) && -a < s2 * SKY_INV_SQ(j)) {                \
-			float d = p_surface * (1.0 / (1.0 - RT_SKY_SHARES[j])) - sqrt(-a);   \
+			float d = s * (1.0 / (1.0 - RT_SKY_SHARES[j])) - sqrt(-a);           \
 			float jc = gj + s2 * SKY_ODDS(j) - (1.0 - RT_SKY_SHARES[j]) * d * d; \
 			if (jc < best) {                                                     \
 				best = jc;                                                       \
@@ -216,8 +268,11 @@ float sky_variance_share(float p_surface, vec3 p_normal) {
 	// An interior minimum's share, 1 - S / sqrt(-a), computed once; a chord's a is negative
 	// wherever it won. The gate holds the point inside the chord in exact arithmetic; an inverse
 	// square root a rounding high can put it an ulp past 0 or 0.9, and the readers of the share
-	// (`light_tree_sky_importance`, the emissive density's 1 - share) hold to that range.
-	return (best_a < 0.0) ? clamp(1.0 - p_surface * inversesqrt(-best_a), 0.0, RT_SKY_SHARES[7]) : best_share;
+	// (`light_tree_sky_importance`, the emissive density's 1 - share) hold to that range. The lights'
+	// own sample, S / (1 - c), is below the clip up to the share 1 - S / clip, which caps the result:
+	// past it the objective's form no longer holds and the sample would saturate (D72).
+	float share = (best_a < 0.0) ? clamp(1.0 - s * inversesqrt(-best_a), 0.0, RT_SKY_SHARES[7]) : best_share;
+	return min(share, 1.0 - s / (RT_SKY_CLIP_RATIO * (s + irradiance)));
 }
 
 /// The sky's radiance along a direction in the octmap's frame, as the miss reports it: the
@@ -256,7 +311,8 @@ vec3 sky_radiance(vec3 p_sky_dir) {
 /// share in [0, 1] is unbiased (at 0 the miss keeps its whole weight). With the share by
 /// variance (D62) the same summed score is the S sky_variance_share judges against, for the
 /// receiver p_normal (D65), so the share is the vertex's: its geometry normal as the payload
-/// carries it on, which the miss and the emitter found after it read back.
+/// carries it on, which the miss and the emitter found after it read back. Since D72 that share
+/// judges the clipped estimator the display shows, not the linear irradiance.
 float sky_light_probability(vec3 p_normal) {
 	if (!sky_light_enabled()) {
 		return 0.0;
@@ -269,18 +325,16 @@ float sky_light_probability(vec3 p_normal) {
 	}
 	// A listed light of no or negative score still takes its share: the gate is the counts.
 	float surface_score = max(get_rt_param(RT_PARAM_SKY_SURFACE_SCORE), 0.0);
+	if (sky_variance_share_enabled()) {
+		// The share by the clipped variance (D72) judges the image itself, so it takes no bound from
+		// the concentration share (D71's, which the display objective replaced).
+		return sky_variance_share(surface_score, p_normal);
+	}
 	float sky_score = 0.25 * sky_concentrated * scene_data_block.data.IBL_exposure_normalization;
 	if (!(sky_score > 0.0)) {
 		return 0.0;
 	}
-	float concentration_share = min(sky_score / (sky_score + surface_score), 0.9);
-	if (sky_variance_share_enabled()) {
-		// The share by variance, bounded by the share by concentration (D71): the variance model
-		// judges the linear irradiance, and at one sample per pixel the tonemapped image prefers the
-		// delta lights' certain sample over the sky's share past the sky's concentrated light.
-		return min(sky_variance_share(surface_score, p_normal), concentration_share);
-	}
-	return concentration_share;
+	return min(sky_score / (sky_score + surface_score), 0.9);
 }
 
 /// The power-heuristic weight of the strategy with density p_this against the other's p_other

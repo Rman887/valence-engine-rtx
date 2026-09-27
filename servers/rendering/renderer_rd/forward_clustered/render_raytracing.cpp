@@ -64,10 +64,13 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		mm_merge_shader.pipeline[i] = RD::get_singleton()->compute_pipeline_create(mm_merge_shader.version_shader[i]);
 	}
 
-	// The sky's sampling table (D54), its moments per receiver normal in both forms of the radiance
+	// The sky's sampling table (D54): the pyramid's leaves, a level from the one below, the top
+	// levels with the header (D69), its moments per receiver normal in both forms of the radiance
 	// octmap (D64, D65), and their combination with the frame's weights.
 	Vector<String> sky_light_modes;
-	sky_light_modes.push_back("\n#define MODE_TABLE\n");
+	sky_light_modes.push_back("\n#define MODE_LEAF\n");
+	sky_light_modes.push_back("\n#define MODE_REDUCE\n");
+	sky_light_modes.push_back("\n#define MODE_HEADER\n");
 	sky_light_modes.push_back("\n#define MODE_MOMENTS\n");
 	sky_light_modes.push_back("\n#define MODE_MOMENTS\n#define USE_RADIANCE_OCTMAP_ARRAY\n");
 	sky_light_modes.push_back("\n#define MODE_COMBINE\n");
@@ -3972,8 +3975,10 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 // ---------------------------------------------------------------------------
 
 // The sky's sampling table (D54): rebuilt when the Environment's sky or the count of its
-// renders into the octmap changes, in one workgroup over the octmap's sharpest layer; cleared
-// when the sky goes, so the shader's share reads 0 and nothing samples a table that is stale.
+// renders into the octmap changes, as a pyramid over the octmap's sharpest layer (D69): its
+// leaves, one thread per texel, the levels above one dispatch each while they hold more nodes
+// than one workgroup, then the rest and the header in one workgroup; cleared when the sky goes,
+// so the shader's share reads 0 and nothing samples a table that is stale.
 // Under the share by variance (D62) its moments follow (D65): their integrals for every receiver
 // normal of the grid, one workgroup per normal, built once per table while the share asks for
 // them, then their combination with the frame's weights of the delivered radiance, run when the
@@ -4077,37 +4082,71 @@ void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDa
 	struct SkyLightPC {
 		float border_pad;
 		float border_scale;
-		float lod;
+		float lod_cell;
 		float floor_fraction;
 		float mix_level;
 		float mix_fog_level;
 		float mix_constant;
-		float pad;
+		float lod_leaf;
+		float tap_offset;
+		uint32_t leaf_level;
+		uint32_t reduce_level;
+		uint32_t pad;
 	} pc;
 	pc.border_pad = owner->sky.sky_get_uv_border_size(sky_rid);
 	pc.border_scale = 1.0f - 2.0f * pc.border_pad;
-	// In array mode the layer's mips are box averages: a cell of the table spans
-	// radiance_size * 2 / RT_SKY_LIGHT_N texels of the sharpest mip and the build taps it four
-	// times, so the mip whose texel is half a cell wide averages the cell (the sharpest when the
-	// octmap is no finer than the table). In 2D mode the mips are roughness levels, so the sharpest
-	// is read.
-	pc.lod = use_octmap_array ? MAX(0.0f, Math::log2((float)owner->sky.sky_get_radiance_size(sky_rid) / (float)RT_SKY_LIGHT_N)) : 0.0f;
+	// The octmap's texels inside its padding, which the pyramid's leaves are (D69): the largest power
+	// of two that fits, held to the moments' grid at the least and RT_SKY_LIGHT_MAX_LEVELS at the most.
+	const RD::TextureFormat radiance_format = rd->texture_get_format(radiance);
+	const uint32_t padding = (uint32_t)Math::round(pc.border_pad * (float)radiance_format.width);
+	const uint32_t interior = radiance_format.width > 2 * padding ? radiance_format.width - 2 * padding : radiance_format.width;
+	uint32_t leaf_level = RT_SKY_LIGHT_CELL_LEVEL;
+	while (leaf_level < RT_SKY_LIGHT_MAX_LEVELS && (2u << leaf_level) <= interior) {
+		leaf_level++;
+	}
+	const uint32_t leaf_n = 1u << leaf_level;
+	// In array mode the layer's mips are box averages: a cell of the moments' grid spans
+	// radiance_size * 2 / 256 texels of the sharpest mip and the build taps it four times, so the mip
+	// whose texel is half a cell wide averages the cell (the sharpest when the octmap is no finer than
+	// the grid). In 2D mode the mips are roughness levels, so the sharpest is read. A leaf is read the
+	// same way at its own mip; where it is one texel or less, one tap at its centre reads that texel.
+	pc.lod_cell = use_octmap_array ? MAX(0.0f, Math::log2((float)owner->sky.sky_get_radiance_size(sky_rid) / (float)(1u << RT_SKY_LIGHT_CELL_LEVEL))) : 0.0f;
+	const bool leaf_is_texel = interior <= leaf_n;
+	pc.lod_leaf = (use_octmap_array && !leaf_is_texel) ? MAX(0.0f, Math::log2((float)interior / (float)leaf_n) - 1.0f) : 0.0f;
+	pc.tap_offset = leaf_is_texel ? 0.0f : 0.25f;
+	pc.leaf_level = leaf_level;
+	pc.reduce_level = 0;
 	pc.floor_fraction = 1.0e-3f;
 	pc.mix_level = mix[0];
 	pc.mix_fog_level = mix[1];
 	pc.mix_constant = mix[2];
-	pc.pad = 0.0f;
+	pc.pad = 0;
 
 	RD::ComputeListID compute_list = rd->compute_list_begin();
 	if (build_table) {
-		rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline[SkyLightShader::MODE_TABLE]);
-		rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[SkyLightShader::MODE_TABLE], 0, u_octmap, u_sampler, u_table), 0);
+		rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline[SkyLightShader::MODE_LEAF]);
+		rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[SkyLightShader::MODE_LEAF], 0, u_octmap, u_sampler, u_table), 0);
+		rd->compute_list_set_push_constant(compute_list, &pc, sizeof(SkyLightPC));
+		rd->compute_list_dispatch(compute_list, (leaf_n + 15) / 16, (leaf_n + 15) / 16, 1);
+		// Each level from the one below, down to the first the header pass reduces itself.
+		RID table_set = UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[SkyLightShader::MODE_REDUCE], 0, u_table);
+		rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline[SkyLightShader::MODE_REDUCE]);
+		rd->compute_list_bind_uniform_set(compute_list, table_set, 0);
+		for (uint32_t level = leaf_level - 1; level > RT_SKY_LIGHT_HEADER_LEVELS; level--) {
+			rd->compute_list_add_barrier(compute_list); // The level reads the one below.
+			pc.reduce_level = level;
+			rd->compute_list_set_push_constant(compute_list, &pc, sizeof(SkyLightPC));
+			rd->compute_list_dispatch(compute_list, ((1u << (2 * level)) + 255) / 256, 1, 1);
+		}
+		rd->compute_list_add_barrier(compute_list); // The header reads the last reduced level and the cells' level.
+		rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline[SkyLightShader::MODE_HEADER]);
+		rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[SkyLightShader::MODE_HEADER], 0, u_table), 0);
 		rd->compute_list_set_push_constant(compute_list, &pc, sizeof(SkyLightPC));
 		rd->compute_list_dispatch(compute_list, 1, 1, 1);
 	}
 	if (build_moments) {
 		if (build_table) {
-			rd->compute_list_add_barrier(compute_list); // The moments read the table's density.
+			rd->compute_list_add_barrier(compute_list); // The moments read the pyramid's cells and the header.
 		}
 		rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline[moments_mode]);
 		rd->compute_list_bind_uniform_set(compute_list, moments_set, 0);

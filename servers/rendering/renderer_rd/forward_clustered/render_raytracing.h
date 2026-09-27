@@ -38,7 +38,7 @@
 #include "core/templates/vector.h"
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
-#include "servers/rendering/renderer_rd/shaders/raytracing/sky_light_cdf.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/raytracing/sky_light_table.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
 
 #define RB_TEX_RAYTRACING SNAME("raytracing")
@@ -450,41 +450,55 @@ class RenderRaytracing {
 		RID pipeline[MODE_MAX];
 	} mm_merge_shader;
 
-	// The sky's sampling table (D54): the compute shader that builds it from the radiance octmap, then
-	// the share by variance's moments per receiver normal (D65), in the form the trace reads the
-	// octmap in (the roughness layers as an array, or one texture whose mips are the roughness
-	// levels), since the fog's level is read as the trace reads it (D64), and their combination with
-	// the frame's weights.
+	// The sky's sampling table (D54): the compute shader that builds it from the radiance octmap as a
+	// pyramid over the octmap's texels (D69: the leaves, the levels above them one dispatch each while
+	// they are too large for one workgroup, then the rest with the header in one), then the share by
+	// variance's moments per receiver normal (D65), in the form the trace reads the octmap in (the
+	// roughness layers as an array, or one texture whose mips are the roughness levels), since the
+	// fog's level is read as the trace reads it (D64), and their combination with the frame's weights.
 	struct SkyLightShader {
 		enum Mode {
-			MODE_TABLE = 0,
-			MODE_MOMENTS_OCTMAP_2D = 1,
-			MODE_MOMENTS_OCTMAP_ARRAY = 2,
-			MODE_COMBINE = 3,
+			MODE_LEAF = 0,
+			MODE_REDUCE = 1,
+			MODE_HEADER = 2,
+			MODE_MOMENTS_OCTMAP_2D = 3,
+			MODE_MOMENTS_OCTMAP_ARRAY = 4,
+			MODE_COMBINE = 5,
 			MODE_MAX,
 		};
-		SkyLightCdfShaderRD shader;
+		SkyLightTableShaderRD shader;
 		RID version;
 		RID version_shader[MODE_MAX];
 		RID pipeline[MODE_MAX];
 	} sky_light_shader;
-	static constexpr uint32_t RT_SKY_LIGHT_N = 256; // Must match RT_SKY_N in raytracing_sky_inc.glsl.
-	static constexpr uint32_t RT_SKY_LIGHT_CELLS = RT_SKY_LIGHT_N * RT_SKY_LIGHT_N;
+	// The pyramid's level the moments and the concentrated light are taken at, 256 cells a side; the
+	// leaves are never coarser. Must match SKY_CELL_LEVEL in sky_light_table.glsl.
+	static constexpr uint32_t RT_SKY_LIGHT_CELL_LEVEL = 8;
+	// The finest leaves: 1024 a side, 5.6 MB of pyramid, which the buffer is sized for.
+	static constexpr uint32_t RT_SKY_LIGHT_MAX_LEVELS = 10;
+	// The header pass reduces this level and the ones above it; must match SKY_HEADER_LEVELS in
+	// sky_light_table.glsl.
+	static constexpr uint32_t RT_SKY_LIGHT_HEADER_LEVELS = 5;
+	static_assert(RT_SKY_LIGHT_HEADER_LEVELS == 5 && RT_SKY_LIGHT_CELL_LEVEL == 8 && RT_SKY_LIGHT_CELL_LEVEL <= RT_SKY_LIGHT_MAX_LEVELS, "MODE_HEADER in sky_light_table.glsl is written for these: level 5 from level 6 in shared memory, 64 level-8 quads per thread for the concentrated light.");
+	// Levels 1 to RT_SKY_LIGHT_MAX_LEVELS, 4^l floats each: (4^(max + 1) - 4) / 3.
+	static constexpr uint32_t RT_SKY_LIGHT_PYRAMID_FLOATS = ((1u << (2 * (RT_SKY_LIGHT_MAX_LEVELS + 1))) - 4) / 3;
+	static constexpr uint32_t RT_SKY_LIGHT_HEADER_WORDS = 8; // The total, the concentrated part, the density scale, the leaf floor, the levels, the leaves a side, two pads.
 	// The candidate shares the table judges the sky's variance at (D62); must match SKY_SHARE_COUNT in
-	// sky_light_cdf.glsl and RT_SKY_SHARE_COUNT in raytracing_sky_inc.glsl.
+	// sky_light_table.glsl and RT_SKY_SHARE_COUNT in raytracing_sky_inc.glsl.
 	static constexpr uint32_t RT_SKY_LIGHT_SHARES = 8;
-	// The integrals the table holds per share (D64); must match SKY_BASIS in sky_light_cdf.glsl and
+	// The integrals the table holds per share (D64); must match SKY_BASIS in sky_light_table.glsl and
 	// RT_SKY_BASIS in raytracing_sky_inc.glsl.
 	static constexpr uint32_t RT_SKY_LIGHT_BASIS = 12;
 	// The cells a side of the receiver normals' grid over the octahedral square, a normal at every
-	// vertex (D65); must match SKY_NORMAL_CELLS in sky_light_cdf.glsl and RT_SKY_NORMAL_CELLS in
+	// vertex (D65); must match SKY_NORMAL_CELLS in sky_light_table.glsl and RT_SKY_NORMAL_CELLS in
 	// raytracing_sky_inc.glsl.
 	static constexpr uint32_t RT_SKY_LIGHT_NORMAL_CELLS = 8;
 	static constexpr uint32_t RT_SKY_LIGHT_NORMALS = (RT_SKY_LIGHT_NORMAL_CELLS + 1) * (RT_SKY_LIGHT_NORMAL_CELLS + 1);
-	// The header, the shares, per normal and share the combined variance and mean and the basis, the
-	// marginal, and per cell the conditional and the density.
-	static constexpr uint32_t RT_SKY_LIGHT_BUFFER_SIZE = (4 + RT_SKY_LIGHT_SHARES + RT_SKY_LIGHT_NORMALS * RT_SKY_LIGHT_SHARES * (2 + RT_SKY_LIGHT_BASIS) + RT_SKY_LIGHT_N + 2 * RT_SKY_LIGHT_CELLS) * sizeof(float);
-	static_assert((4 + RT_SKY_LIGHT_SHARES) % 2 == 0, "The per-normal vec2 array must start 8-byte aligned in std430, or the shaders pad where the size does not.");
+	// The header, the shares, per normal and share the combined variance and mean and the basis, then
+	// the pyramid at its largest.
+	static constexpr uint32_t RT_SKY_LIGHT_BUFFER_SIZE = (RT_SKY_LIGHT_HEADER_WORDS + RT_SKY_LIGHT_SHARES + RT_SKY_LIGHT_NORMALS * RT_SKY_LIGHT_SHARES * (2 + RT_SKY_LIGHT_BASIS) + RT_SKY_LIGHT_PYRAMID_FLOATS) * sizeof(float);
+	static_assert((RT_SKY_LIGHT_HEADER_WORDS + RT_SKY_LIGHT_SHARES) % 2 == 0, "The per-normal vec2 array must start 8-byte aligned in std430, or the shaders pad where the size does not.");
+	static_assert((RT_SKY_LIGHT_HEADER_WORDS + RT_SKY_LIGHT_SHARES + RT_SKY_LIGHT_NORMALS * RT_SKY_LIGHT_SHARES * (2 + RT_SKY_LIGHT_BASIS)) % 4 == 0, "The pyramid's vec4 array must start 16-byte aligned in std430, or the shaders pad where the size does not.");
 
 	struct MMSurfaceHandles {
 		LocalVector<RID> per_surface; // Grown on demand; entry per touched surface index.

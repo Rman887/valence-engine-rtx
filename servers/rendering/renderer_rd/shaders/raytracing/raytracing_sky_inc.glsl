@@ -1,13 +1,18 @@
 // The sky as a light (D54): a share of every hit's light samples is drawn from the sky's
-// radiance octmap in proportion to its brightness, through the table sky_light_cdf.glsl builds
+// radiance octmap in proportion to its brightness, through the table sky_light_table.glsl builds
 // once per sky change, shadowed like any light and weighed with the power heuristic against the
 // bounce that reaches the sky on its own, which the miss weighs the same way, so the sky is
 // counted once. The sun is a directional light and stays one; the sky's own picture of it is
-// part of the sky. The table is a 256 x 256 grid over the octahedral square with an inclusive CDF
-// over the rows and one over each row's cells, and a density per unit octahedral area for each
-// cell; the density over solid angle follows from the octahedral map's Jacobian at the
-// direction (4 |d|_1^3 of solid angle per unit of area at the unit direction d), which both
-// sides evaluate through sky_pdf, so the sample's density and the miss's are one function.
+// part of the sky. The table is a pyramid over the octahedral square (D69) whose leaves are the
+// octmap's own texels (2^sky_levels a side), each level the sums of four children stored as one
+// vec4 per parent: a hit draws a leaf by descending from the top, choosing a column then a row of
+// each quad in proportion to their sums and rescaling its two random numbers inside the part
+// chosen (one 16-byte read per level, a stratified pair kept stratified), so a sun painted in an
+// HDRI is drawn inside its own texel. A leaf's density is its weight over the sum per unit
+// octahedral area, and the density over solid angle follows from the octahedral map's Jacobian
+// at the direction (4 |d|_1^3 of solid angle per unit of area at the unit direction d), which
+// both sides evaluate through sky_leaf_pdf: the sample's density and the miss's (sky_pdf, the
+// leaf found from the direction) are one function of the leaf's weight.
 //
 // Requires: raytracing_inc.glsl (oct_inc.glsl, rand2), scene_data_inc.glsl,
 // raytracing_common_inc.glsl (RT_FLAGS, get_rt_param), radiance_octmap_sample and
@@ -18,28 +23,30 @@
 #define RT_SKY_LIGHT_BINDING 43
 #endif
 
-#define RT_SKY_N 256u
-#define RT_SKY_CELLS (RT_SKY_N * RT_SKY_N)
-#define RT_SKY_SHARE_COUNT 8u // Must match SKY_SHARE_COUNT in sky_light_cdf.glsl and RT_SKY_LIGHT_SHARES.
-#define RT_SKY_BASIS 12u // Must match SKY_BASIS in sky_light_cdf.glsl and RT_SKY_LIGHT_BASIS.
-#define RT_SKY_NORMAL_CELLS 8u // Must match SKY_NORMAL_CELLS in sky_light_cdf.glsl and RT_SKY_LIGHT_NORMAL_CELLS.
+#define RT_SKY_SHARE_COUNT 8u // Must match SKY_SHARE_COUNT in sky_light_table.glsl and RT_SKY_LIGHT_SHARES.
+#define RT_SKY_BASIS 12u // Must match SKY_BASIS in sky_light_table.glsl and RT_SKY_LIGHT_BASIS.
+#define RT_SKY_NORMAL_CELLS 8u // Must match SKY_NORMAL_CELLS in sky_light_table.glsl and RT_SKY_LIGHT_NORMAL_CELLS.
 #define RT_SKY_NORMALS ((RT_SKY_NORMAL_CELLS + 1u) * (RT_SKY_NORMAL_CELLS + 1u))
 
-// Must match SkyLightBuffer in sky_light_cdf.glsl (std430, RT_SKY_LIGHT_BUFFER_SIZE bytes).
+// Must match SkyLightBuffer in sky_light_table.glsl (std430, RT_SKY_LIGHT_BUFFER_SIZE bytes).
 layout(set = 0, binding = RT_SKY_LIGHT_BINDING, std430) readonly buffer SkyLightBuffer {
-	float sky_total; // The sum over cells of luminance times solid angle; 0 for a black sky or none built.
-	float sky_concentrated; // The part of sky_total in cells brighter than four times the sky's mean.
-	float sky_pad[2];
+	float sky_total; // The sum over the leaves of luminance times solid angle; 0 for a black sky or none built.
+	float sky_concentrated; // The part of sky_total in the 256-grid's cells brighter than four times the sky's mean.
+	float sky_pdf_scale; // A leaf's floored weight times this is its density per unit octahedral area.
+	float sky_floor_leaf; // The floor every leaf's weight carries, not stored in the pyramid.
+	uint sky_levels; // The pyramid's levels below the top; the leaves are level sky_levels.
+	uint sky_leaf_n; // 2^sky_levels, the leaves a side.
+	uint sky_pad[2];
 	float sky_share[RT_SKY_SHARE_COUNT]; // The candidate shares (D62), ascending from 0, as the table writes them; the trace reads RT_SKY_SHARES.
 	vec2 sky_share_moments[RT_SKY_NORMALS * RT_SKY_SHARE_COUNT]; // Per receiver normal and share, the sky term's variance and its sky strategy's mean this frame (D65).
 	float sky_basis[RT_SKY_NORMALS * RT_SKY_SHARE_COUNT * RT_SKY_BASIS]; // What the table's combine stage folds into sky_share_moments (D64); the trace reads none of it.
-	float sky_marginal[RT_SKY_N]; // Inclusive CDF over the rows.
-	float sky_conditional[RT_SKY_CELLS]; // Inclusive CDF over each row's cells.
-	float sky_pdf_uv[RT_SKY_CELLS]; // The density per unit octahedral area inside the cell.
+	// The pyramid (D69): level l's quads, row-major over the level above's nodes, each a node's four
+	// children in the order (2x, 2y), (2x + 1, 2y), (2x, 2y + 1), (2x + 1, 2y + 1), levels 1 to sky_levels.
+	vec4 sky_pyramid[];
 };
 
 // The candidate shares the table's moments are built at, ascending from 0. Must match SKY_SHARES in
-// sky_light_cdf.glsl (which writes them to sky_share). A copy at compile time so that
+// sky_light_table.glsl (which writes them to sky_share). A copy at compile time so that
 // sky_variance_share reads them by literal index and the chords' spans fold to constants.
 const float RT_SKY_SHARES[RT_SKY_SHARE_COUNT] = float[](0.0, 1.0 / 32.0, 1.0 / 16.0, 0.125, 0.25, 0.5, 0.75, 0.9);
 
@@ -280,66 +287,93 @@ float sky_mis_weight(float p_this, float p_other) {
 	return a / max(a + b, 1e-20);
 }
 
-/// The sky strategy's density over solid angle at a unit direction in the octmap's frame.
-float sky_pdf(vec3 p_sky_dir) {
-	vec2 uv = vec3_to_oct(p_sky_dir);
-	uvec2 cell = min(uvec2(uv * float(RT_SKY_N)), uvec2(RT_SKY_N - 1u));
+/// The pyramid's quads of level p_level start after the (4^(l - 1) - 1) / 3 quads of the levels
+/// above. Must match sky_light_table.glsl.
+uint sky_quad_base(uint p_level) {
+	return ((1u << (2u * p_level - 2u)) - 1u) / 3u;
+}
+
+/// The sky strategy's density over solid angle at a unit direction in the octmap's frame, for a
+/// leaf of floored weight p_weight that holds the direction: the density per unit octahedral area
+/// over the map's Jacobian there. Both sides of the MIS weight evaluate it.
+float sky_leaf_pdf(float p_weight, vec3 p_sky_dir) {
 	float l1 = abs(p_sky_dir.x) + abs(p_sky_dir.y) + abs(p_sky_dir.z);
-	return sky_pdf_uv[cell.y * RT_SKY_N + cell.x] / (4.0 * l1 * l1 * l1);
+	return p_weight * sky_pdf_scale / (4.0 * l1 * l1 * l1);
+}
+
+/// The sky strategy's density at a direction: its leaf, read from the pyramid by its coordinates.
+/// 0 without a table: the buffer is zero until the first build and cleared when the Environment
+/// has no sky, and the miss asks whatever the share, so the header's levels must not index it.
+float sky_pdf(vec3 p_sky_dir) {
+	if (!(sky_total > 0.0)) {
+		return 0.0;
+	}
+	vec2 uv = vec3_to_oct(p_sky_dir);
+	uint n = sky_leaf_n;
+	uvec2 leaf = min(uvec2(uv * float(n)), uvec2(n - 1u));
+	uint quad = sky_quad_base(sky_levels) + (leaf.y >> 1u) * (n >> 1u) + (leaf.x >> 1u);
+	float w = sky_pyramid[quad][((leaf.y & 1u) << 1u) | (leaf.x & 1u)] + sky_floor_leaf;
+	return sky_leaf_pdf(w, p_sky_dir);
 }
 
 #ifndef RT_STAGE_MISS
 
-/// The first row whose inclusive CDF reaches u.
-uint sky_search_marginal(float u) {
-	uint lo = 0u;
-	uint hi = RT_SKY_N - 1u;
-	while (lo < hi) {
-		uint mid = (lo + hi) >> 1u;
-		if (sky_marginal[mid] < u) {
-			lo = mid + 1u;
-		} else {
-			hi = mid;
-		}
-	}
-	return lo;
-}
-
-/// The first cell of a row whose inclusive CDF reaches u.
-uint sky_search_conditional(uint p_row, float u) {
-	uint base = p_row * RT_SKY_N;
-	uint lo = 0u;
-	uint hi = RT_SKY_N - 1u;
-	while (lo < hi) {
-		uint mid = (lo + hi) >> 1u;
-		if (sky_conditional[base + mid] < u) {
-			lo = mid + 1u;
-		} else {
-			hi = mid;
-		}
-	}
-	return lo;
-}
-
-/// Draws one sky direction for next-event estimation from the table (two random numbers, the
-/// remainders inside the chosen cell reused as the position within it), in the shape the
+/// Draws one sky direction for next-event estimation by warping two random numbers down the
+/// pyramid: at each level the quad of the node so far is read, a column is chosen by the two
+/// columns' sums and the first number rescaled inside it, then a row of that column by its two
+/// weights and the second number rescaled, so the pair that arrives at the leaf is uniform inside
+/// it and is its position there. The floor is added level by level (a level's node covers four
+/// times the leaves of the one below), never read from memory. Returns the sample in the shape the
 /// analytic and emissive strategies return: the weight carries the MIS weight against the BSDF
 /// over the sample's density, and the caller divides by the strategy's share. False when the
 /// direction lies under the surface, as a wasted light sample.
 bool sky_sample_direct(vec3 N, vec3 V, MaterialProperties p_material, inout uint rng_state, float strategy_probability, out LightSampleNEE r_sample) {
 	vec2 u = rand2(rng_state);
-	uint row = sky_search_marginal(u.y);
-	float row_lo = (row > 0u) ? sky_marginal[row - 1u] : 0.0;
-	float row_in = clamp((u.y - row_lo) / max(sky_marginal[row] - row_lo, 1e-10), 0.0, 0.999999);
-	uint col = sky_search_conditional(row, u.x);
-	uint cell = row * RT_SKY_N + col;
-	float col_lo = (col > 0u) ? sky_conditional[cell - 1u] : 0.0;
-	float col_in = clamp((u.x - col_lo) / max(sky_conditional[cell] - col_lo, 1e-10), 0.0, 0.999999);
-	vec2 uv = (vec2(col, row) + vec2(col_in, row_in)) / float(RT_SKY_N);
+	uint levels = sky_levels;
+	uint n = sky_leaf_n;
+	float floor_node = sky_floor_leaf * float((n * n) >> 2u); // A level-1 node's: a quarter of the leaves.
+	uvec2 node = uvec2(0u);
+	uint quad = 0u;
+	float weight = 0.0;
+	for (uint level = 1u; level <= levels; level++) {
+		// Below 1: the hash sampler's rand and a rescaling's rounding can both reach 1.0 exactly, and a
+		// split whose other part holds only the floor rounds to 1.0 too; with u under 1 a number that
+		// takes the upper part has the part's probability under 1 as well, so no rescaling is 0 / 0.
+		u = min(u, vec2(0.99999994));
+		vec4 q = sky_pyramid[quad] + vec4(floor_node);
+		float left = q.x + q.z;
+		float p_left = left / (left + (q.y + q.w));
+		uvec2 child;
+		vec2 column;
+		if (u.x < p_left) {
+			child.x = 0u;
+			u.x /= p_left;
+			column = q.xz;
+		} else {
+			child.x = 1u;
+			u.x = (u.x - p_left) / (1.0 - p_left);
+			column = q.yw;
+		}
+		float p_low = column.x / (column.x + column.y);
+		if (u.y < p_low) {
+			child.y = 0u;
+			u.y /= p_low;
+			weight = column.x;
+		} else {
+			child.y = 1u;
+			u.y = (u.y - p_low) / (1.0 - p_low);
+			weight = column.y;
+		}
+		node = (node << 1u) + child;
+		quad = sky_quad_base(level + 1u) + node.y * (1u << level) + node.x;
+		floor_node *= 0.25;
+	}
+	u = clamp(u, vec2(0.0), vec2(0.999999));
+	vec2 uv = (vec2(node) + u) / float(n);
 	vec3 sky_dir = oct_to_vec3(uv * 2.0 - 1.0);
-	float pdf = sky_pdf(sky_dir);
+	float pdf = sky_leaf_pdf(weight, sky_dir);
 	vec3 L = sky_dir * sky_world_to_sky();
-	if (dot(N, L) <= 0.0 || pdf <= 0.0) {
+	if (dot(N, L) <= 0.0 || !(pdf > 0.0)) {
 		return false;
 	}
 	r_sample.direction = L;

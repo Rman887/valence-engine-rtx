@@ -269,14 +269,18 @@ float sky_light_probability(vec3 p_normal) {
 	}
 	// A listed light of no or negative score still takes its share: the gate is the counts.
 	float surface_score = max(get_rt_param(RT_PARAM_SKY_SURFACE_SCORE), 0.0);
-	if (sky_variance_share_enabled()) {
-		return sky_variance_share(surface_score, p_normal);
-	}
 	float sky_score = 0.25 * sky_concentrated * scene_data_block.data.IBL_exposure_normalization;
 	if (!(sky_score > 0.0)) {
 		return 0.0;
 	}
-	return min(sky_score / (sky_score + surface_score), 0.9);
+	float concentration_share = min(sky_score / (sky_score + surface_score), 0.9);
+	if (sky_variance_share_enabled()) {
+		// The share by variance, bounded by the share by concentration (D71): the variance model
+		// judges the linear irradiance, and at one sample per pixel the tonemapped image prefers the
+		// delta lights' certain sample over the sky's share past the sky's concentrated light.
+		return min(sky_variance_share(surface_score, p_normal), concentration_share);
+	}
+	return concentration_share;
 }
 
 /// The power-heuristic weight of the strategy with density p_this against the other's p_other

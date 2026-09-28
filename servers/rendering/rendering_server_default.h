@@ -904,6 +904,7 @@ public:
 	FUNC2(environment_set_pathtracing_light_tree_cut_indirect, RID, int)
 	FUNC2(environment_set_pathtracing_light_tree_power_pick, RID, bool)
 	FUNC2(environment_set_pathtracing_sky_light_variance_share, RID, bool)
+	FUNC2(environment_set_pathtracing_russian_roulette, RID, bool)
 	FUNC5(environment_set_camera_medium, RID, bool, const Color &, const Color &, float)
 
 	FUNC3R(Ref<Image>, environment_bake_panorama, RID, bool, const Size2i &)

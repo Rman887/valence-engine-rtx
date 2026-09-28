@@ -208,6 +208,7 @@ private:
 	int pathtracing_light_tree_cut_indirect = 32;
 	bool pathtracing_light_tree_power_pick = false;
 	bool pathtracing_sky_light_variance_share = false;
+	bool pathtracing_russian_roulette = false;
 	void _update_pathtracing();
 	void _update_pathtracing_clamp();
 
@@ -440,6 +441,8 @@ public:
 	bool is_pathtracing_light_tree_power_pick() const;
 	void set_pathtracing_sky_light_variance_share(bool p_enable);
 	bool is_pathtracing_sky_light_variance_share() const;
+	void set_pathtracing_russian_roulette(bool p_enable);
+	bool is_pathtracing_russian_roulette() const;
 
 	// Camera medium
 	void set_camera_medium_enabled(bool p_enabled);

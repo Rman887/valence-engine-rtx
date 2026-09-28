@@ -762,6 +762,15 @@ bool Environment::is_pathtracing_sky_light_variance_share() const {
 	return pathtracing_sky_light_variance_share;
 }
 
+void Environment::set_pathtracing_russian_roulette(bool p_enable) {
+	pathtracing_russian_roulette = p_enable;
+	RS::get_singleton()->environment_set_pathtracing_russian_roulette(environment, pathtracing_russian_roulette);
+}
+
+bool Environment::is_pathtracing_russian_roulette() const {
+	return pathtracing_russian_roulette;
+}
+
 void Environment::_update_pathtracing() {
 	RS::get_singleton()->environment_set_pathtracing(
 			environment,
@@ -1682,6 +1691,8 @@ void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_pathtracing_light_tree_power_pick"), &Environment::is_pathtracing_light_tree_power_pick);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_sky_light_variance_share", "enable"), &Environment::set_pathtracing_sky_light_variance_share);
 	ClassDB::bind_method(D_METHOD("is_pathtracing_sky_light_variance_share"), &Environment::is_pathtracing_sky_light_variance_share);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_russian_roulette", "enable"), &Environment::set_pathtracing_russian_roulette);
+	ClassDB::bind_method(D_METHOD("is_pathtracing_russian_roulette"), &Environment::is_pathtracing_russian_roulette);
 	GLOBAL_DEF("rendering/pathtracing/use_simple_shadows", false);
 
 	ADD_GROUP("Pathtracing", "pathtracing_");
@@ -1689,6 +1700,7 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_debug_mode", PROPERTY_HINT_ENUM, "Disabled,Mirror Reflection,Geometry Normals,Final Normals,Normal Map,Tangent,Bitangent,UV,Albedo,ORM,Diffuse Albedo,Specular Albedo,Normal+Roughness,Specular Hit Dist,Metalness,Roughness,View Normals,Diffuse+Specular,Fresnel F0,Front/Back Face,Depth,Emissive,BRDF Rejection"), "set_pathtracing_debug_mode", "get_pathtracing_debug_mode");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_samples_per_pixel", PROPERTY_HINT_RANGE, "1,16,1"), "set_pathtracing_samples_per_pixel", "get_pathtracing_samples_per_pixel");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_max_bounces", PROPERTY_HINT_RANGE, "1,8,1"), "set_pathtracing_max_bounces", "get_pathtracing_max_bounces");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_russian_roulette"), "set_pathtracing_russian_roulette", "is_pathtracing_russian_roulette");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_denoiser", PROPERTY_HINT_ENUM, "None,DLSS Ray Reconstruction"), "set_pathtracing_denoiser", "get_pathtracing_denoiser");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_primary_surface", PROPERTY_HINT_ENUM, "G-Buffer,Traced"), "set_pathtracing_primary_surface", "get_pathtracing_primary_surface");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_emissive_lights"), "set_pathtracing_emissive_lights", "is_pathtracing_emissive_lights");

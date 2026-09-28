@@ -650,6 +650,27 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 
 	ps.throughput *= brdf_weight;
 
+	// Russian roulette (D73): once an earlier vertex has scattered (D53's flag: a non-delta lobe,
+	// so a surface seen through glass, water or a mirror is exempt as a directly seen one is), the
+	// path continues with the probability of its throughput's brightest channel and, when it does,
+	// carries the weight 1 / p, so the estimator is unchanged in expectation while a path that has
+	// gone dim stops paying for traversal. Direct light at this vertex is already counted above, so
+	// only the next segment is at stake. A path at full throughput draws nothing; the draw takes
+	// its own dimension so this bounce's other draws are unchanged, and the negated comparison
+	// ends a path whose throughput is not a number.
+	if ((RT_FLAGS & RT_FLAG_RUSSIAN_ROULETTE) != 0u && is_scattered(ps.packed_bounces_flags)) {
+		float survive = max(ps.throughput.r, max(ps.throughput.g, ps.throughput.b));
+		if (!(survive >= 1.0)) {
+			rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_ROULETTE);
+			if (!(rand(ps.rng_state) < survive)) {
+				ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+				path_pack(payload, ps);
+				return;
+			}
+			ps.throughput /= survive;
+		}
+	}
+
 	if (brdfType == DIFFUSE_TYPE) {
 		ps.packed_bounces_flags = inc_diffuse_bounce(ps.packed_bounces_flags);
 	} else {

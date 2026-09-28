@@ -757,6 +757,10 @@ void RendererSceneRender::environment_set_pathtracing_sky_light_variance_share(R
 	environment_storage.environment_set_pathtracing_sky_light_variance_share(p_env, p_enable);
 }
 
+void RendererSceneRender::environment_set_pathtracing_russian_roulette(RID p_env, bool p_enable) {
+	environment_storage.environment_set_pathtracing_russian_roulette(p_env, p_enable);
+}
+
 void RendererSceneRender::environment_set_camera_medium(RID p_env, bool p_enable, const Color &p_absorption, const Color &p_scattering, float p_height) {
 	environment_storage.environment_set_camera_medium(p_env, p_enable, p_absorption, p_scattering, p_height);
 }
@@ -827,6 +831,10 @@ bool RendererSceneRender::environment_get_pathtracing_light_tree_power_pick(RID 
 
 bool RendererSceneRender::environment_get_pathtracing_sky_light_variance_share(RID p_env) const {
 	return environment_storage.environment_get_pathtracing_sky_light_variance_share(p_env);
+}
+
+bool RendererSceneRender::environment_get_pathtracing_russian_roulette(RID p_env) const {
+	return environment_storage.environment_get_pathtracing_russian_roulette(p_env);
 }
 
 void RendererSceneRender::environment_set_adjustment(RID p_env, bool p_enable, float p_brightness, float p_contrast, float p_saturation, bool p_use_1d_color_correction, RID p_color_correction) {

@@ -247,12 +247,14 @@ const uint FLAG_DEFORMED = 4u;
 #define RT_SOBOL_DIM_BITS 12u
 #define RT_SOBOL_DIM_MASK 0xFFFu
 #define RT_SOBOL_INDEX_MASK 0xFFFFFu
-// Each bounce owns a block of dimensions (worst case 38 draws: the two strategy choices, up to 16 light
-// picks and 16 acceptances, the cone pair, the transmission and lobe choices, the direction pair),
+// Each bounce owns a block of dimensions (worst case 39 draws: the two strategy choices, up to 16 light
+// picks and 16 acceptances, the cone pair, the transmission and lobe choices, the direction pair, the
+// roulette),
 // so a draw keeps its dimension across frames whatever the blocks before it consumed; 8 bounces
 // use 512 of the 4096 available.
 #define RT_SOBOL_DIMS_PER_BOUNCE 64u
 #define RT_SOBOL_DIM_SCATTER 40u // The transmission, lobe and direction draws inside a bounce's block.
+#define RT_SOBOL_DIM_ROULETTE 43u // The Russian roulette draw (D73), after the scatter's three (a fourth scatter draw must move it; the u suffix keeps it out of #if).
 
 // Both in raytracing_common_inc.glsl, which every stage includes after this file, after its
 // ray-tracing extensions are enabled and where the specialization constant is declared.

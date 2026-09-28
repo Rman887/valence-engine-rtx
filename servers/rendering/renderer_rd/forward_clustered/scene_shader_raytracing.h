@@ -84,6 +84,7 @@ public:
 		RT_FLAG_LIGHT_TREE = (1 << 7), // Light selection over the light tree (D55); clear, the per-frame shares and candidate picks.
 		RT_FLAG_LIGHT_TREE_POWER_PICK = (1 << 8), // The pick under a cut node by the lights' power (D60); clear, uniform. Set only with RT_FLAG_LIGHT_TREE.
 		RT_FLAG_SKY_LIGHT_VARIANCE_SHARE = (1 << 9), // The sky's share by the variance it removes (D62); clear, by its concentrated light (D54). Set only with RT_FLAG_SKY_LIGHT.
+		RT_FLAG_RUSSIAN_ROULETTE = (1 << 10), // Paths end by Russian roulette on their throughput once a vertex has scattered (D73); clear, only at the bounce limits.
 	};
 
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 21;

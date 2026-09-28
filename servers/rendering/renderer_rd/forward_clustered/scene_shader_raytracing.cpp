@@ -734,6 +734,9 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_e
 				flags |= RT_FLAG_SKY_LIGHT_VARIANCE_SHARE;
 			}
 		}
+		if (env_storage->environment_get_pathtracing_russian_roulette(p_environment)) {
+			flags |= RT_FLAG_RUSSIAN_ROULETTE;
+		}
 		if (env_storage->environment_get_pathtracing_light_tree(p_environment)) {
 			flags |= RT_FLAG_LIGHT_TREE;
 			if (env_storage->environment_get_pathtracing_light_tree_power_pick(p_environment)) {

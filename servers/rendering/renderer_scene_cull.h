@@ -1398,6 +1398,7 @@ public:
 	PASS2(environment_set_pathtracing_light_tree_cut_indirect, RID, int)
 	PASS2(environment_set_pathtracing_light_tree_power_pick, RID, bool)
 	PASS2(environment_set_pathtracing_sky_light_variance_share, RID, bool)
+	PASS2(environment_set_pathtracing_russian_roulette, RID, bool)
 	PASS5(environment_set_camera_medium, RID, bool, const Color &, const Color &, float)
 
 	PASS1RC(bool, environment_get_pathtracing_enabled, RID)
@@ -1417,6 +1418,7 @@ public:
 	PASS1RC(int, environment_get_pathtracing_light_tree_cut_indirect, RID)
 	PASS1RC(bool, environment_get_pathtracing_light_tree_power_pick, RID)
 	PASS1RC(bool, environment_get_pathtracing_sky_light_variance_share, RID)
+	PASS1RC(bool, environment_get_pathtracing_russian_roulette, RID)
 
 	// Adjustment
 	PASS7(environment_set_adjustment, RID, bool, float, float, float, bool, RID)

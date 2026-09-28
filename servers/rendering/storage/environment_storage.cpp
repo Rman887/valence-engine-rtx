@@ -975,6 +975,12 @@ void RendererEnvironmentStorage::environment_set_pathtracing_sky_light_variance_
 	env->pathtracing_sky_light_variance_share = p_enable;
 }
 
+void RendererEnvironmentStorage::environment_set_pathtracing_russian_roulette(RID p_env, bool p_enable) {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL(env);
+	env->pathtracing_russian_roulette = p_enable;
+}
+
 bool RendererEnvironmentStorage::environment_get_pathtracing_enabled(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, false);
@@ -1075,6 +1081,12 @@ bool RendererEnvironmentStorage::environment_get_pathtracing_sky_light_variance_
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, false);
 	return env->pathtracing_sky_light_variance_share;
+}
+
+bool RendererEnvironmentStorage::environment_get_pathtracing_russian_roulette(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, false);
+	return env->pathtracing_russian_roulette;
 }
 
 // Camera medium

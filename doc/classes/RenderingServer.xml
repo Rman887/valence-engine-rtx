@@ -1486,6 +1486,14 @@
 				Selects how the path tracer finds the visible surface for the specified environment RID. See [member Environment.pathtracing_primary_surface].
 			</description>
 		</method>
+		<method name="environment_set_pathtracing_russian_roulette">
+			<return type="void" />
+			<param index="0" name="env" type="RID" />
+			<param index="1" name="enable" type="bool" />
+			<description>
+				Sets whether the path tracer ends paths early by Russian roulette on their throughput for the specified environment RID. See [member Environment.pathtracing_russian_roulette].
+			</description>
+		</method>
 		<method name="environment_set_pathtracing_sampler">
 			<return type="void" />
 			<param index="0" name="env" type="RID" />

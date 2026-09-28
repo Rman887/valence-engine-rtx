@@ -330,6 +330,7 @@ public:
 	virtual void environment_set_pathtracing_light_tree_power_pick(RID p_env, bool p_enable) = 0;
 	virtual void environment_set_pathtracing_sky_light_variance_share(RID p_env, bool p_enable) = 0;
 	virtual void environment_set_pathtracing_russian_roulette(RID p_env, bool p_enable) = 0;
+	virtual void environment_set_pathtracing_max_diffuse_bounces(RID p_env, int p_bounces) = 0;
 	virtual void environment_set_camera_medium(RID p_env, bool p_enable, const Color &p_absorption, const Color &p_scattering, float p_height) = 0;
 
 	virtual bool environment_get_pathtracing_enabled(RID p_env) const = 0;
@@ -350,6 +351,7 @@ public:
 	virtual bool environment_get_pathtracing_light_tree_power_pick(RID p_env) const = 0;
 	virtual bool environment_get_pathtracing_sky_light_variance_share(RID p_env) const = 0;
 	virtual bool environment_get_pathtracing_russian_roulette(RID p_env) const = 0;
+	virtual int environment_get_pathtracing_max_diffuse_bounces(RID p_env) const = 0;
 
 	virtual void environment_set_adjustment(RID p_env, bool p_enable, float p_brightness, float p_contrast, float p_saturation, bool p_use_1d_color_correction, RID p_color_correction) = 0;
 

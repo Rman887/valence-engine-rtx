@@ -195,6 +195,7 @@ private:
 	PathtracingDebugMode pathtracing_debug_mode = RT_DEBUG_DISABLED;
 	int pathtracing_samples_per_pixel = 1;
 	int pathtracing_max_bounces = 3;
+	int pathtracing_max_diffuse_bounces = 2;
 	RSE::PathtracingDenoiser pathtracing_denoiser = RSE::PT_DENOISER_DLSS_RAY_RECONSTRUCTION;
 	RSE::PathtracingPrimarySurface pathtracing_primary_surface = RSE::PT_PRIMARY_SURFACE_GBUFFER;
 	bool pathtracing_emissive_lights = true;
@@ -415,6 +416,8 @@ public:
 	int get_pathtracing_samples_per_pixel() const;
 	void set_pathtracing_max_bounces(int p_bounces);
 	int get_pathtracing_max_bounces() const;
+	void set_pathtracing_max_diffuse_bounces(int p_bounces);
+	int get_pathtracing_max_diffuse_bounces() const;
 	void set_pathtracing_denoiser(RSE::PathtracingDenoiser p_denoiser);
 	RSE::PathtracingDenoiser get_pathtracing_denoiser() const;
 	void set_pathtracing_primary_surface(RSE::PathtracingPrimarySurface p_primary_surface);

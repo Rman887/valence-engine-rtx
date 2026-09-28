@@ -641,6 +641,15 @@ int Environment::get_pathtracing_max_bounces() const {
 	return pathtracing_max_bounces;
 }
 
+void Environment::set_pathtracing_max_diffuse_bounces(int p_bounces) {
+	pathtracing_max_diffuse_bounces = CLAMP(p_bounces, 1, 8);
+	RS::get_singleton()->environment_set_pathtracing_max_diffuse_bounces(environment, pathtracing_max_diffuse_bounces);
+}
+
+int Environment::get_pathtracing_max_diffuse_bounces() const {
+	return pathtracing_max_diffuse_bounces;
+}
+
 void Environment::set_pathtracing_denoiser(RSE::PathtracingDenoiser p_denoiser) {
 	pathtracing_denoiser = p_denoiser;
 	_update_pathtracing();
@@ -1665,6 +1674,8 @@ void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pathtracing_samples_per_pixel"), &Environment::get_pathtracing_samples_per_pixel);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_max_bounces", "bounces"), &Environment::set_pathtracing_max_bounces);
 	ClassDB::bind_method(D_METHOD("get_pathtracing_max_bounces"), &Environment::get_pathtracing_max_bounces);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_max_diffuse_bounces", "bounces"), &Environment::set_pathtracing_max_diffuse_bounces);
+	ClassDB::bind_method(D_METHOD("get_pathtracing_max_diffuse_bounces"), &Environment::get_pathtracing_max_diffuse_bounces);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_denoiser", "denoiser"), &Environment::set_pathtracing_denoiser);
 	ClassDB::bind_method(D_METHOD("get_pathtracing_denoiser"), &Environment::get_pathtracing_denoiser);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_primary_surface", "primary_surface"), &Environment::set_pathtracing_primary_surface);
@@ -1700,6 +1711,7 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_debug_mode", PROPERTY_HINT_ENUM, "Disabled,Mirror Reflection,Geometry Normals,Final Normals,Normal Map,Tangent,Bitangent,UV,Albedo,ORM,Diffuse Albedo,Specular Albedo,Normal+Roughness,Specular Hit Dist,Metalness,Roughness,View Normals,Diffuse+Specular,Fresnel F0,Front/Back Face,Depth,Emissive,BRDF Rejection"), "set_pathtracing_debug_mode", "get_pathtracing_debug_mode");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_samples_per_pixel", PROPERTY_HINT_RANGE, "1,16,1"), "set_pathtracing_samples_per_pixel", "get_pathtracing_samples_per_pixel");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_max_bounces", PROPERTY_HINT_RANGE, "1,8,1"), "set_pathtracing_max_bounces", "get_pathtracing_max_bounces");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_max_diffuse_bounces", PROPERTY_HINT_RANGE, "1,8,1"), "set_pathtracing_max_diffuse_bounces", "get_pathtracing_max_diffuse_bounces");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_russian_roulette"), "set_pathtracing_russian_roulette", "is_pathtracing_russian_roulette");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_denoiser", PROPERTY_HINT_ENUM, "None,DLSS Ray Reconstruction"), "set_pathtracing_denoiser", "get_pathtracing_denoiser");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_primary_surface", PROPERTY_HINT_ENUM, "G-Buffer,Traced"), "set_pathtracing_primary_surface", "get_pathtracing_primary_surface");

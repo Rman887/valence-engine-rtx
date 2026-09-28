@@ -37,6 +37,7 @@
 #define RT_PARAM_CLAMP_INDIRECT 16 // rt_params[4].x - Luminance clamp on an indirect contribution, 0 for none (D53)
 #define RT_PARAM_SKY_SURFACE_SCORE 17 // rt_params[4].y - The analytic and emissive lights' summed score the sky's share is judged against (D54)
 #define RT_PARAM_DIRECTIONAL_COUNT 18 // rt_params[4].z - The directional lights at the head of the light buffer, the light tree's top-level entries (D55)
+#define RT_PARAM_MAX_DIFFUSE_BOUNCES 19 // rt_params[4].w - The diffuse bounce limit, Environment.pathtracing_max_diffuse_bounces (D74)
 
 // ============================================================================
 // PATHTRACING PAYLOAD (52 bytes, fp16/unorm-packed)
@@ -217,8 +218,8 @@ bool is_path_terminated(uint packed) {
 	return (packed & PATH_TERMINATED_FLAG) != 0u;
 }
 
-// Bounce limits
-#define MAX_DIFFUSE_BOUNCES 2u
+// Bounce limits. The whole-path limit is RT_GET_MAX_BOUNCES() (a specialization constant) and the
+// diffuse limit RT_PARAM_MAX_DIFFUSE_BOUNCES (a uniform, so changing it rebuilds no hit group; D74).
 #define MAX_DENOISER_SPECULAR_HIT_THRESHOLD 0.25
 
 // ============================================================================

@@ -3526,6 +3526,8 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			float camera_medium_scatter[4];
 		} rt_ubo = {};
 		static_assert(sizeof(rt_ubo) == 64 * sizeof(float));
+		// Without an Environment the trace keeps the diffuse bounce limit it had before it was a knob (D74); a 0 would end every path at its first hit.
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_MAX_DIFFUSE_BOUNCES] = 2.0f;
 
 		if (p_render_data && p_render_data->environment.is_valid()) {
 			RendererEnvironmentStorage *env_storage = RendererEnvironmentStorage::get_singleton();
@@ -3533,6 +3535,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_VIS_MODE] = (float)env_storage->environment_get_pathtracing_debug_mode(env);
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_SAMPLE_COUNT] = (float)env_storage->environment_get_pathtracing_samples_per_pixel(env);
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_MAX_BOUNCES] = (float)env_storage->environment_get_pathtracing_max_bounces(env);
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_MAX_DIFFUSE_BOUNCES] = (float)env_storage->environment_get_pathtracing_max_diffuse_bounces(env);
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_DENOISER] = (float)(int)env_storage->environment_get_pathtracing_denoiser(env);
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_CLAMP_DIRECT] = env_storage->environment_get_pathtracing_clamp_direct(env);
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_CLAMP_INDIRECT] = env_storage->environment_get_pathtracing_clamp_indirect(env);

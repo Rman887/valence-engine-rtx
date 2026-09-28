@@ -1478,6 +1478,14 @@
 				Sets whether the path tracer picks a light under a node of the light tree's cut by the lights' power rather than uniformly for the specified environment RID. See [member Environment.pathtracing_light_tree_power_pick].
 			</description>
 		</method>
+		<method name="environment_set_pathtracing_max_diffuse_bounces">
+			<return type="void" />
+			<param index="0" name="env" type="RID" />
+			<param index="1" name="bounces" type="int" />
+			<description>
+				Sets the number of diffuse bounces a path may take before it is terminated for the specified environment RID, clamped to 1 to 8. See [member Environment.pathtracing_max_diffuse_bounces].
+			</description>
+		</method>
 		<method name="environment_set_pathtracing_primary_surface">
 			<return type="void" />
 			<param index="0" name="env" type="RID" />

@@ -120,6 +120,7 @@ public:
 	static constexpr int RT_PARAM_CLAMP_INDIRECT = 16; // Luminance clamp on an indirect contribution, 0 for none (D53).
 	static constexpr int RT_PARAM_SKY_SURFACE_SCORE = 17; // The analytic and emissive lights' summed score the sky's share is judged against (D54).
 	static constexpr int RT_PARAM_DIRECTIONAL_COUNT = 18; // The directional lights at the head of the light buffer (D55).
+	static constexpr int RT_PARAM_MAX_DIFFUSE_BOUNCES = 19; // The diffuse bounce limit, Environment.pathtracing_max_diffuse_bounces (D74).
 	static constexpr int RT_PARAM_COUNT = 20;
 
 	static inline uint32_t rt_flags_pack(uint32_t p_flags, uint32_t p_sample_count, uint32_t p_max_bounces) {

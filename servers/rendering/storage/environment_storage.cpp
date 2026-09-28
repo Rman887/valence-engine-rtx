@@ -981,6 +981,12 @@ void RendererEnvironmentStorage::environment_set_pathtracing_russian_roulette(RI
 	env->pathtracing_russian_roulette = p_enable;
 }
 
+void RendererEnvironmentStorage::environment_set_pathtracing_max_diffuse_bounces(RID p_env, int p_bounces) {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL(env);
+	env->pathtracing_max_diffuse_bounces = CLAMP(p_bounces, 1, 8);
+}
+
 bool RendererEnvironmentStorage::environment_get_pathtracing_enabled(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, false);
@@ -1087,6 +1093,12 @@ bool RendererEnvironmentStorage::environment_get_pathtracing_russian_roulette(RI
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, false);
 	return env->pathtracing_russian_roulette;
+}
+
+int RendererEnvironmentStorage::environment_get_pathtracing_max_diffuse_bounces(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, 2);
+	return env->pathtracing_max_diffuse_bounces;
 }
 
 // Camera medium

@@ -208,7 +208,7 @@ private:
 	int pathtracing_light_tree_cut_indirect = 32;
 	bool pathtracing_light_tree_power_pick = false;
 	bool pathtracing_sky_light_variance_share = false;
-	bool pathtracing_russian_roulette = false;
+	bool pathtracing_russian_roulette = true;
 	void _update_pathtracing();
 	void _update_pathtracing_clamp();
 

@@ -61,9 +61,22 @@ void get_triangle_indices_ex(in GeometryData geom, uint primitive_id, out uint i
 }
 
 #ifndef RT_STAGE_RAYGEN
-/// Convenience wrapper using gl_PrimitiveID (hit shaders only).
+/// The hit triangle's index into the surface's index buffer (hit shaders only). In a cluster
+/// BLAS (D79) gl_PrimitiveID counts inside the cluster and the cluster's ID carries its first
+/// triangle; a hit on a triangle BLAS reports no cluster and keeps gl_PrimitiveID.
+uint rt_primitive_index() {
+#if defined(USE_CLUSTER_AS) && (defined(RT_STAGE_CLOSEST_HIT) || defined(RT_STAGE_ANY_HIT))
+	int cluster_id = gl_ClusterIDNV;
+	if (cluster_id != gl_ClusterIDNoneNV) {
+		return uint(cluster_id) + uint(gl_PrimitiveID);
+	}
+#endif
+	return uint(gl_PrimitiveID);
+}
+
+/// Convenience wrapper over rt_primitive_index() (hit shaders only).
 void get_triangle_indices(in GeometryData geom, out uint i0, out uint i1, out uint i2) {
-	get_triangle_indices_ex(geom, gl_PrimitiveID, i0, i1, i2);
+	get_triangle_indices_ex(geom, rt_primitive_index(), i0, i1, i2);
 }
 #endif
 

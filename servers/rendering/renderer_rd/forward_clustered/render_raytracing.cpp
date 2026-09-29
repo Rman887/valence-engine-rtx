@@ -53,6 +53,15 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 	owner = p_owner;
 	bindless_block = memnew(BindlessBlock);
 
+	cluster_blas_enabled = RD::get_singleton()->has_feature(RD::SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE);
+	if (cluster_blas_enabled) {
+		const RD::ClusterAccelerationStructureCapabilities &caps = RD::get_singleton()->get_cluster_acceleration_structure_capabilities();
+		// One line on the console (the setting is off by default): the harness reads it as proof the path is active.
+		print_line(vformat("RT: static BLAS built from clusters of up to %d triangles and %d vertices (D79).", caps.max_triangles_per_cluster, caps.max_vertices_per_cluster));
+	} else if (GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
+		WARN_PRINT("rendering/pathtracing/cluster_blas is on but the device has no VK_NV_cluster_acceleration_structure; static BLAS stay triangle BLAS.");
+	}
+
 	// Initialize merged MultiMesh BLAS compute shader.
 	Vector<String> merge_modes;
 	merge_modes.push_back("\n");
@@ -423,6 +432,7 @@ void RenderRaytracing::cleanup_caches() {
 			for (uint32_t j = 0; j < RT_CACHE_CHUNK_SIZE; j++) {
 				RTCacheEntry *entry = &surface_chunks[i][j];
 				if (entry->ptr) {
+					_release_surface_data(entry->ptr);
 					memdelete(entry->ptr);
 					entry->ptr = nullptr;
 				}
@@ -757,13 +767,11 @@ RTSurfaceData *RenderRaytracing::process_surface(
 	// Allocate or reuse entry
 	if (!entry->ptr) {
 		entry->ptr = memnew(RTSurfaceData);
-	} else if (entry->ptr->blas.is_valid()) {
+	} else {
 		// Surface data changed on a live mesh: the BLAS is still there, free it.
-		// A deleted mesh or cleared surface cascade-freed it through its buffers.
-		if (RD::get_singleton()->acceleration_structure_is_valid(entry->ptr->blas)) {
-			RD::get_singleton()->free_rid(entry->ptr->blas);
-		}
-		entry->ptr->blas = RID();
+		// A deleted mesh or cleared surface cascade-freed a triangle BLAS through its buffers;
+		// a cluster BLAS and its storage wait here for the slot's reuse.
+		_release_surface_data(entry->ptr);
 	}
 
 	RTSurfaceData *surf_data = entry->ptr;
@@ -1102,6 +1110,18 @@ void RenderRaytracing::_populate_surface_blas(
 	bool is_2d = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_format(p_mesh_surface) & RSE::ARRAY_FLAG_USE_2D_VERTICES;
 	bool compressed = r_surf_data->is_compressed;
 
+	// A static indexed 3D surface builds from clusters (D79); the deformed path refits a
+	// triangle BLAS in place and keeps it, as do 2D and non-indexed surfaces.
+	if (cluster_blas_enabled) {
+		if (p_vertex_buffer_override.is_null() && !p_allow_update && !is_2d && index_buffer.is_valid() && index_count > 0) {
+			if (_populate_surface_cluster_blas(vertex_buffer, index_buffer, p_cache_key, r_surf_data)) {
+				return;
+			}
+		} else {
+			print_verbose(vformat("RT: surface [%d] on the triangle BLAS path (deformed %d, 2D %d, indexed %d).", p_cache_key, int(p_vertex_buffer_override.is_valid() || p_allow_update), int(is_2d), int(index_buffer.is_valid() && index_count > 0)));
+		}
+	}
+
 	// Create BLAS using the new geometry-based API.
 	{
 		RD::DataFormat pos_format;
@@ -1140,6 +1160,197 @@ void RenderRaytracing::_populate_surface_blas(
 		RD::get_singleton()->set_resource_name(r_surf_data->blas,
 				String(p_vertex_buffer_override.is_valid() ? "RT BLAS deformed [" : "RT BLAS [") + itos(p_cache_key) + "]");
 		r_dirty_blas_list.push_back(r_surf_data->blas);
+	}
+}
+
+bool RenderRaytracing::_populate_surface_cluster_blas(RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data) {
+	RD *rd = RD::get_singleton();
+	const RT_GeometryData &geom = r_surf_data->geometry;
+	const RD::ClusterAccelerationStructureCapabilities &caps = rd->get_cluster_acceleration_structure_capabilities();
+
+	// Clusters are runs of the index buffer, so no index is read on the CPU: a run of T
+	// triangles reaches at most 3T distinct vertices, and T is chosen so that bound fits the
+	// device's vertex limit. The cluster's ID is its first triangle, which is what the hit
+	// shaders add to gl_PrimitiveID (rt_primitive_index).
+	const uint32_t triangles_per_cluster = MIN(caps.max_triangles_per_cluster, caps.max_vertices_per_cluster / 3u);
+	const uint32_t primitive_count = geom.primitive_count;
+	if (triangles_per_cluster == 0 || primitive_count == 0 || geom.vertex_buffer_address == 0 || geom.index_buffer_address == 0) {
+		print_verbose(vformat("RT: surface [%d] on the triangle BLAS path: %d triangles per cluster, %d triangles, addresses %d/%d.", p_cache_key, triangles_per_cluster, primitive_count, int(geom.vertex_buffer_address != 0), int(geom.index_buffer_address != 0)));
+		return false;
+	}
+	const uint32_t cluster_count = (primitive_count + triangles_per_cluster - 1) / triangles_per_cluster;
+	const uint32_t index_size = geom.index_format == RT_INDEX_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t);
+	const RD::DataFormat pos_format = r_surf_data->is_compressed ? RD::DATA_FORMAT_R16G16B16A16_UNORM : RD::DATA_FORMAT_R32G32B32_SFLOAT;
+
+	// Sizes: explicit destinations, so the CLAS size is the worst case of one cluster and
+	// the BLAS size the worst case for this many clusters.
+	RD::ClusterAccelerationStructureInput clas_input;
+	clas_input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER;
+	clas_input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
+	clas_input.max_acceleration_structure_count = cluster_count;
+	clas_input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
+	clas_input.vertex_format = pos_format;
+	clas_input.max_cluster_triangle_count = triangles_per_cluster;
+	clas_input.max_cluster_vertex_count = MIN(triangles_per_cluster * 3u, caps.max_vertices_per_cluster);
+	clas_input.max_total_triangle_count = primitive_count;
+	clas_input.max_total_vertex_count = MIN(primitive_count * 3u, cluster_count * clas_input.max_cluster_vertex_count);
+
+	RD::ClusterAccelerationStructureInput blas_input;
+	blas_input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
+	blas_input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
+	blas_input.max_acceleration_structure_count = 1;
+	blas_input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
+	blas_input.max_total_cluster_count = cluster_count;
+	blas_input.max_cluster_count_per_acceleration_structure = cluster_count;
+
+	uint64_t clas_size = 0, clas_scratch = 0, blas_size = 0, blas_scratch = 0;
+	rd->cluster_acceleration_structure_get_build_sizes(clas_input, clas_size, clas_scratch);
+	rd->cluster_acceleration_structure_get_build_sizes(blas_input, blas_size, blas_scratch);
+	if (clas_size == 0 || blas_size == 0) {
+		print_verbose(vformat("RT: surface [%d] on the triangle BLAS path: the driver sized a CLAS at %d and the BLAS at %d bytes.", p_cache_key, clas_size, blas_size));
+		return false;
+	}
+
+	// Storage: the BLAS first, then the CLAS at their alignment. The buffer's own address is
+	// aligned only as the allocator saw fit, so the base is aligned inside a padded buffer.
+	auto align_up = [](uint64_t p_value, uint64_t p_alignment) -> uint64_t {
+		return p_alignment > 1 ? (p_value + p_alignment - 1) / p_alignment * p_alignment : p_value;
+	};
+	const uint64_t base_alignment = MAX(caps.cluster_byte_alignment, caps.cluster_bottom_level_byte_alignment);
+	const uint64_t clas_stride = align_up(clas_size, caps.cluster_byte_alignment);
+	const uint64_t clas_region = align_up(blas_size, base_alignment);
+	const uint64_t storage_size = base_alignment + clas_region + clas_stride * cluster_count;
+	ERR_FAIL_COND_V_MSG(storage_size > UINT32_MAX, false, "RT: a cluster BLAS's storage exceeds 4 GB.");
+
+	RID storage = rd->storage_buffer_create(uint32_t(storage_size), {}, 0,
+			RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+	if (storage.is_null()) {
+		return false;
+	}
+	const uint64_t buffer_address = rd->buffer_get_device_address(storage);
+	const uint64_t storage_address = align_up(buffer_address, base_alignment);
+	const uint64_t blas_offset = storage_address - buffer_address;
+
+	// Arguments, read-only for the builds: the CLAS infos, the BLAS info and the destination
+	// addresses (cluster_count CLAS, then the BLAS), each section 16-byte aligned. Explicit
+	// destinations write no sizes, so none are asked for.
+	const uint32_t clas_info_stride = caps.triangle_build_info_size;
+	const uint32_t blas_info_stride = caps.bottom_level_build_info_size;
+	const uint64_t clas_infos_offset = 0;
+	const uint64_t blas_info_offset = align_up(clas_infos_offset + uint64_t(clas_info_stride) * cluster_count, 16);
+	const uint64_t dst_addresses_offset = align_up(blas_info_offset + blas_info_stride, 16);
+	const uint64_t args_size = align_up(dst_addresses_offset + sizeof(uint64_t) * (cluster_count + 1), 16);
+
+	LocalVector<uint8_t> args;
+	args.resize(args_size);
+	memset(args.ptr(), 0, args_size);
+
+	uint64_t *dst_addresses = reinterpret_cast<uint64_t *>(args.ptr() + dst_addresses_offset);
+	for (uint32_t c = 0; c < cluster_count; c++) {
+		const uint32_t first_triangle = c * triangles_per_cluster;
+		const uint32_t triangle_count = MIN(triangles_per_cluster, primitive_count - first_triangle);
+
+		RD::ClusterTriangleBuildInfo info;
+		info.cluster_id = first_triangle;
+		info.triangle_count = triangle_count;
+		info.vertex_count = MIN(triangle_count * 3u, caps.max_vertices_per_cluster);
+		info.index_type = geom.index_format == RT_INDEX_FORMAT_UINT16 ? RD::ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT16 : RD::ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT32;
+		info.index_address = geom.index_buffer_address + uint64_t(first_triangle) * 3u * index_size;
+		info.index_stride = index_size;
+		info.vertex_address = geom.vertex_buffer_address;
+		info.vertex_stride = geom.position_stride;
+		rd->cluster_triangle_build_info_write(args.ptr() + clas_infos_offset + uint64_t(c) * clas_info_stride, info);
+
+		dst_addresses[c] = storage_address + clas_region + clas_stride * c;
+	}
+	dst_addresses[cluster_count] = storage_address;
+
+	RID args_buffer = rd->storage_buffer_create(uint32_t(args_size), {}, 0,
+			RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+	if (args_buffer.is_null()) {
+		rd->free_rid(storage);
+		return false;
+	}
+	const uint64_t args_address = rd->buffer_get_device_address(args_buffer);
+	{
+		RD::ClusterBottomLevelBuildInfo blas_info;
+		blas_info.cluster_references_count = cluster_count;
+		blas_info.cluster_references_stride = sizeof(uint64_t);
+		blas_info.cluster_references_address = args_address + dst_addresses_offset;
+		rd->cluster_bottom_level_build_info_write(args.ptr() + blas_info_offset, blas_info);
+	}
+	rd->buffer_update(args_buffer, 0, uint32_t(args_size), args.ptr());
+
+	// The two builds this frame: every CLAS, then the BLAS over their addresses. The graph
+	// orders them on the storage and argument buffers, and the TLAS after both.
+	{
+		RD::ClusterAccelerationStructureBuild build;
+		build.input = clas_input;
+		build.dst_storage_buffer = storage;
+		build.dst_addresses_buffer = args_buffer;
+		build.dst_addresses_offset = dst_addresses_offset;
+		build.dst_addresses_stride = sizeof(uint64_t);
+		build.src_infos_buffer = args_buffer;
+		build.src_infos_offset = clas_infos_offset;
+		build.src_infos_stride = clas_info_stride;
+		build.source_buffers.push_back(p_vertex_buffer);
+		build.source_buffers.push_back(p_index_buffer);
+		if (rd->cluster_acceleration_structure_build(build) != OK) {
+			rd->free_rid(args_buffer);
+			rd->free_rid(storage);
+			return false;
+		}
+	}
+	{
+		RD::ClusterAccelerationStructureBuild build;
+		build.input = blas_input;
+		build.dst_storage_buffer = storage;
+		build.dst_addresses_buffer = args_buffer;
+		build.dst_addresses_offset = dst_addresses_offset + sizeof(uint64_t) * cluster_count;
+		build.dst_addresses_stride = sizeof(uint64_t);
+		build.src_infos_buffer = args_buffer;
+		build.src_infos_offset = blas_info_offset;
+		build.src_infos_stride = blas_info_stride;
+		if (rd->cluster_acceleration_structure_build(build) != OK) {
+			rd->free_rid(args_buffer);
+			rd->free_rid(storage);
+			return false;
+		}
+	}
+
+	r_surf_data->blas = rd->cluster_blas_create(storage, blas_offset);
+	if (r_surf_data->blas.is_null()) {
+		rd->free_rid(args_buffer);
+		rd->free_rid(storage);
+		return false;
+	}
+	rd->set_resource_name(r_surf_data->blas, "RT cluster BLAS [" + itos(p_cache_key) + "]");
+	rd->set_resource_name(storage, "RT cluster storage [" + itos(p_cache_key) + "]");
+	rd->set_resource_name(args_buffer, "RT cluster args [" + itos(p_cache_key) + "]");
+	r_surf_data->cluster_storage = storage;
+	r_surf_data->cluster_args = args_buffer;
+	r_surf_data->blas_size = storage_size + args_size;
+	cluster_blas_builds++;
+	cluster_triangles_built += primitive_count;
+	print_verbose(vformat("RT: cluster BLAS [%d]: %d triangles in %d clusters of %d, %d KB storage, %d KB arguments.", p_cache_key, primitive_count, cluster_count, triangles_per_cluster, storage_size / 1024, args_size / 1024));
+	return true;
+}
+
+void RenderRaytracing::_release_surface_data(RTSurfaceData *p_surf_data) {
+	RD *rd = RD::get_singleton();
+	// A triangle BLAS may already be gone with its mesh's buffers; a cluster BLAS goes with its storage.
+	if (p_surf_data->blas.is_valid() && rd->acceleration_structure_is_valid(p_surf_data->blas)) {
+		rd->free_rid(p_surf_data->blas);
+	}
+	p_surf_data->blas = RID();
+	p_surf_data->blas_size = 0;
+	if (p_surf_data->cluster_storage.is_valid()) {
+		rd->free_rid(p_surf_data->cluster_storage);
+		p_surf_data->cluster_storage = RID();
+	}
+	if (p_surf_data->cluster_args.is_valid()) {
+		rd->free_rid(p_surf_data->cluster_args);
+		p_surf_data->cluster_args = RID();
 	}
 }
 
@@ -2150,6 +2361,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	uint32_t rt_blas_refits = 0;
 	uint32_t rt_triangles_built = 0;
 	uint32_t rt_triangles_refit = 0;
+	cluster_blas_builds = 0;
+	cluster_triangles_built = 0;
 	// Instances left out of this TLAS because their custom hit group is still compiling.
 	uint32_t rt_instances_compiling = 0;
 	const bool collect_render_info = (p_render_data->render_info != nullptr);
@@ -2674,9 +2887,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_OBJECTS_IN_FRAME] += tlas_instance_count;
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME] += tlas_primitive_count;
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_TLAS_INSTANCES] += tlas_instance_count;
-		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_BLAS_BUILDS] += rt_blas_builds;
+		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_BLAS_BUILDS] += rt_blas_builds + cluster_blas_builds;
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_BLAS_REFITS] += rt_blas_refits;
-		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_TRIANGLES_BUILT] += rt_triangles_built;
+		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_TRIANGLES_BUILT] += rt_triangles_built + cluster_triangles_built;
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_TRIANGLES_REFIT] += rt_triangles_refit;
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_INSTANCES_COMPILING] += rt_instances_compiling;
 	}

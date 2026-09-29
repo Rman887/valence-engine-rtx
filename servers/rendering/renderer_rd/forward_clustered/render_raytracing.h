@@ -272,6 +272,10 @@ struct RTSurfaceData {
 	Transform3D aabb_transform;
 	bool is_compressed = false;
 	uint64_t blas_size = 0;
+	// A cluster BLAS (D79) lives in buffers this surface owns: the structures themselves and the
+	// build's arguments. `blas` is then a handle into `cluster_storage` and is freed with it.
+	RID cluster_storage;
+	RID cluster_args;
 };
 
 /// Inputs for a surface backed by a per-frame-deformed vertex buffer.
@@ -438,6 +442,13 @@ class RenderRaytracing {
 	// Caching (chunked sparse caches indexed by RID low bits / 256).
 	Vector<RTCacheEntry *> surface_chunks;
 	Vector<RTMaterialCacheEntry *> material_chunks;
+
+	// Static indexed surfaces build their BLAS from triangle clusters (D79): the device has
+	// VK_NV_cluster_acceleration_structure and rendering/pathtracing/cluster_blas asked for it.
+	bool cluster_blas_enabled = false;
+	// Cluster builds recorded this frame, for the render-info counters (they never enter dirty_blas_list).
+	uint32_t cluster_blas_builds = 0;
+	uint32_t cluster_triangles_built = 0;
 
 	// Merged MultiMesh BLAS cache and compute shader.
 	struct MergeShader {
@@ -637,6 +648,12 @@ class RenderRaytracing {
 			uint32_t p_cache_key,
 			RTSurfaceData *r_surf_data,
 			LocalVector<RID> &r_dirty_blas_list);
+	// The cluster path of _populate_surface_blas (D79): the surface's triangles in runs of at most
+	// the device's cluster size, each a CLAS, one cluster BLAS over them, both built this frame into
+	// the surface's own storage. Returns false, with nothing created, if the surface does not fit.
+	bool _populate_surface_cluster_blas(RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data);
+	// Frees the surface's BLAS and, on the cluster path, the buffers it lives in.
+	void _release_surface_data(RTSurfaceData *p_surf_data);
 	RTMaterialData *process_material(RID p_material_rid, uint16_t p_material_invalidation_counter);
 	bool _build_merged_mm_blas(
 			RID p_mm_rid,

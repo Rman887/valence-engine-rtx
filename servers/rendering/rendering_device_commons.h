@@ -935,6 +935,92 @@ public:
 		ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT = (1 << 3),
 	};
 
+	// ----- CLUSTER ACCELERATION STRUCTURES (VK_NV_cluster_acceleration_structure) -----
+	//
+	// A cluster acceleration structure (CLAS) holds up to a few hundred triangles; a cluster
+	// BLAS references CLAS instead of triangles and is what a TLAS instance points at. Both are
+	// built by one indirect command whose per-structure arguments live in a device buffer,
+	// written with cluster_*_build_info_write(). Neither is a driver object: a CLAS or a cluster
+	// BLAS is a device address inside a storage buffer the caller owns.
+
+	struct ClusterAccelerationStructureCapabilities {
+		bool supported = false;
+		uint32_t max_vertices_per_cluster = 0;
+		uint32_t max_triangles_per_cluster = 0;
+		uint32_t cluster_byte_alignment = 0; // Of each CLAS destination address.
+		uint32_t cluster_bottom_level_byte_alignment = 0; // Of each cluster BLAS destination address.
+		uint32_t cluster_scratch_byte_alignment = 0; // Of a build's scratch address.
+		uint32_t triangle_build_info_size = 0; // Bytes per ClusterTriangleBuildInfo the driver writes.
+		uint32_t bottom_level_build_info_size = 0; // Bytes per ClusterBottomLevelBuildInfo the driver writes.
+	};
+
+	struct ClusterAccelerationStructureInput {
+		enum OpType {
+			CLUSTER_OP_BUILD_TRIANGLE_CLUSTER,
+			CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL,
+		};
+
+		enum OpMode {
+			// The driver sub-allocates every structure from one destination region and writes
+			// the addresses it chose to the destination-address array.
+			CLUSTER_OP_MODE_IMPLICIT_DESTINATIONS,
+			// The caller writes each structure's destination address in the array beforehand;
+			// the size query then returns the worst case for one structure.
+			CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS,
+			// Only the per-structure sizes are written; nothing is built.
+			CLUSTER_OP_MODE_COMPUTE_SIZES,
+		};
+
+		OpType op_type = CLUSTER_OP_BUILD_TRIANGLE_CLUSTER;
+		OpMode op_mode = CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
+		uint32_t max_acceleration_structure_count = 0;
+		BitField<AccelerationStructureFlagBits> flags = {};
+
+		// CLUSTER_OP_BUILD_TRIANGLE_CLUSTER.
+		DataFormat vertex_format = DATA_FORMAT_R32G32B32_SFLOAT;
+		uint32_t max_geometry_index_value = 0;
+		uint32_t max_cluster_unique_geometry_count = 1;
+		uint32_t max_cluster_triangle_count = 0;
+		uint32_t max_cluster_vertex_count = 0;
+		uint32_t max_total_triangle_count = 0;
+		uint32_t max_total_vertex_count = 0;
+		uint32_t min_position_truncate_bit_count = 0;
+
+		// CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL.
+		uint32_t max_total_cluster_count = 0;
+		uint32_t max_cluster_count_per_acceleration_structure = 0;
+	};
+
+	// One CLAS build's arguments: the triangles [0, triangle_count) of an index buffer over one
+	// vertex buffer, both by device address. Indices address the vertex buffer directly, so
+	// vertex_count is the number of distinct vertices the cluster's indices reach.
+	struct ClusterTriangleBuildInfo {
+		enum IndexType {
+			CLUSTER_INDEX_TYPE_UINT8,
+			CLUSTER_INDEX_TYPE_UINT16,
+			CLUSTER_INDEX_TYPE_UINT32,
+		};
+
+		uint32_t cluster_id = 0; // Read back by hit shaders as gl_ClusterIDNV; 0xFFFFFFFF is reserved.
+		uint32_t triangle_count = 0;
+		uint32_t vertex_count = 0;
+		uint32_t position_truncate_bit_count = 0;
+		IndexType index_type = CLUSTER_INDEX_TYPE_UINT32;
+		uint32_t geometry_index = 0;
+		BitField<AccelerationStructureGeometryFlagBits> geometry_flags = {};
+		uint64_t index_address = 0;
+		uint32_t index_stride = 0;
+		uint64_t vertex_address = 0;
+		uint32_t vertex_stride = 0;
+	};
+
+	// One cluster BLAS build's arguments: a strided array of CLAS device addresses.
+	struct ClusterBottomLevelBuildInfo {
+		uint32_t cluster_references_count = 0;
+		uint32_t cluster_references_stride = 0;
+		uint64_t cluster_references_address = 0;
+	};
+
 	/**************/
 	/**** MISC ****/
 	/**************/
@@ -1038,6 +1124,7 @@ public:
 		SUPPORTS_RAY_QUERY,
 		SUPPORTS_RAYTRACING_PIPELINE,
 		SUPPORTS_HDR_OUTPUT,
+		SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE,
 	};
 
 	enum SubgroupOperations {

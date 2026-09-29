@@ -2383,6 +2383,9 @@
 			[/gdscript]
 			[/codeblocks]
 		</constant>
+		<constant name="BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT" value="16" enum="BufferCreationBits" is_bitfield="true" experimental="">
+			Allows cluster acceleration structures to be built into this storage buffer. Requires [constant SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE].
+		</constant>
 		<constant name="ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT" value="1" enum="AccelerationStructureFlagBits" is_bitfield="true" experimental="">
 			Allows the acceleration structure to be updated after it has been built.
 		</constant>
@@ -2854,6 +2857,9 @@
 		</constant>
 		<constant name="SUPPORTS_HDR_OUTPUT" value="13" enum="Features">
 			Support for high dynamic range (HDR) output.
+		</constant>
+		<constant name="SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE" value="14" enum="Features">
+			Support for cluster acceleration structures ([code]VK_NV_cluster_acceleration_structure[/code]): bottom-level acceleration structures built from clusters of triangles. Only reported when [member ProjectSettings.rendering/pathtracing/cluster_blas] is enabled and the device exposes the extension.
 		</constant>
 		<constant name="LIMIT_MAX_BOUND_UNIFORM_SETS" value="0" enum="Limit">
 			Maximum number of uniform sets that can be bound at a given time.

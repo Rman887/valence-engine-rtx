@@ -464,7 +464,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 				if (rayQueryGetIntersectionTypeEXT(spec_rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
 					if (ray_query_alpha_test(
 								rayQueryGetIntersectionInstanceCustomIndexEXT(spec_rq, false),
-								rayQueryGetIntersectionPrimitiveIndexEXT(spec_rq, false),
+								rt_ray_query_primitive_index(spec_rq),
 								rayQueryGetIntersectionBarycentricsEXT(spec_rq, false))) {
 						rayQueryConfirmIntersectionEXT(spec_rq);
 					}

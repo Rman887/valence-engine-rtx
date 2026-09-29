@@ -87,6 +87,7 @@ public:
 		RT_FLAG_LIGHT_TREE_POWER_PICK = (1 << 8), // The pick under a cut node by the lights' power (D60); clear, uniform. Set only with RT_FLAG_LIGHT_TREE.
 		RT_FLAG_SKY_LIGHT_VARIANCE_SHARE = (1 << 9), // The sky's share by the variance it removes (D62); clear, by its concentrated light (D54). Set only with RT_FLAG_SKY_LIGHT.
 		RT_FLAG_RUSSIAN_ROULETTE = (1 << 10), // Paths end by Russian roulette on their throughput once a vertex has scattered (D73); clear, only at the bounce limits.
+		RT_FLAG_CLUSTER_AS = (1 << 13), // Static BLAS built from triangle clusters (D79): hit shaders add gl_ClusterIDNV to gl_PrimitiveID. Set when rendering/pathtracing/cluster_blas is on and the device has the extension.
 	};
 
 	// The coherence hint the raygen hands reorderThreadEXT beside the hit's shader (D75), the

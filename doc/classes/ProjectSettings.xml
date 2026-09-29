@@ -3258,6 +3258,10 @@
 		<member name="rendering/pathtracing/async_shader_compilation" type="bool" setter="" getter="" default="true">
 			If [code]true[/code], path tracing ray hit shaders are compiled asynchronously in the background. This avoids frame stalls when new shader variants are first encountered during rendering. While a shader is compiling, a fallback shader may be used, which can cause temporary visual artifacts. Disable this if you require fully deterministic rendering from the first frame at the cost of potential stalls on shader warm-up.
 		</member>
+		<member name="rendering/pathtracing/cluster_blas" type="bool" setter="" getter="" default="false">
+			If [code]true[/code], the path tracer builds the bottom-level acceleration structures of static indexed meshes from clusters of triangles ([code]VK_NV_cluster_acceleration_structure[/code], RTX Mega Geometry) instead of one triangle geometry each; the image is the same. Skinned and vertex-displaced meshes, merged MultiMesh instances and procedural geometry keep their triangle acceleration structures. Has no effect on hardware or drivers without the extension.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
 		<member name="rendering/pathtracing/deformed_mesh_cache_ttl_frames" type="int" setter="" getter="" default="60">
 			Number of frames a skinned or vertex-displaced deformed-mesh BLAS is kept alive in the path tracer cache after its last visible frame. Once this threshold is exceeded the BLAS and its associated buffers are freed. Increase this value if deformed meshes flicker back into view after brief occlusion; decrease it to reclaim GPU memory sooner.
 			[b]Note:[/b] Requires a restart to take effect.

@@ -806,6 +806,41 @@ public:
 	virtual void acceleration_structure_free(AccelerationStructureID p_acceleration_structure) = 0;
 	virtual uint32_t acceleration_structure_get_scratch_size_bytes(AccelerationStructureID p_acceleration_structure) = 0;
 
+	// ----- CLUSTER ACCELERATION STRUCTURE -----
+
+	// Every region is (buffer, offset, stride, size). The scratch buffer's address is aligned by the driver.
+	struct ClusterAccelerationStructureBuild {
+		ClusterAccelerationStructureInput input;
+		BufferID scratch_buffer;
+		// CLUSTER_OP_MODE_IMPLICIT_DESTINATIONS: the region every structure is sub-allocated from.
+		BufferID dst_implicit_buffer;
+		uint64_t dst_implicit_offset = 0;
+		// Written (implicit) or read (explicit): one device address per structure.
+		BufferID dst_addresses_buffer;
+		uint64_t dst_addresses_offset = 0;
+		uint32_t dst_addresses_stride = 0;
+		uint64_t dst_addresses_size = 0;
+		// Written in implicit and compute-sizes mode, one uint32 size per structure; may be left null.
+		BufferID dst_sizes_buffer;
+		uint64_t dst_sizes_offset = 0;
+		uint32_t dst_sizes_stride = 0;
+		uint64_t dst_sizes_size = 0;
+		// Read: one build info per structure, as written by cluster_*_build_info_write().
+		BufferID src_infos_buffer;
+		uint64_t src_infos_offset = 0;
+		uint32_t src_infos_stride = 0;
+		uint64_t src_infos_size = 0;
+	};
+
+	virtual const ClusterAccelerationStructureCapabilities &get_cluster_acceleration_structure_capabilities() = 0;
+	// Implicit mode returns the region for every structure, explicit mode the size of one; the scratch covers all.
+	virtual void cluster_acceleration_structure_get_build_sizes(const ClusterAccelerationStructureInput &p_input, uint64_t &r_acceleration_structure_size, uint64_t &r_scratch_size) = 0;
+	virtual void cluster_triangle_build_info_write(uint8_t *r_driver_info, const ClusterTriangleBuildInfo &p_info) = 0;
+	virtual void cluster_bottom_level_build_info_write(uint8_t *r_driver_info, const ClusterBottomLevelBuildInfo &p_info) = 0;
+	// A BLAS handle over a cluster BLAS the caller built at p_offset inside p_buffer, for TLAS instances
+	// and barriers. Owns neither the buffer nor a driver object; freeing it releases the handle alone.
+	virtual AccelerationStructureID cluster_blas_create(BufferID p_buffer, uint64_t p_offset) = 0;
+
 	// ----- PIPELINE -----
 
 	struct PipelineShader {
@@ -832,6 +867,7 @@ public:
 	// Geometry topology / counts must be unchanged; only vertex positions may differ.
 	virtual void command_update_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) = 0;
 	virtual void command_build_tlas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count) = 0;
+	virtual void command_build_cluster_acceleration_structures(CommandBufferID p_cmd_buffer, const ClusterAccelerationStructureBuild &p_build) = 0;
 	virtual void command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) = 0;
 	virtual void command_bind_raytracing_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) = 0;
 

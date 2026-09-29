@@ -858,6 +858,8 @@ public:
 		BUFFER_CREATION_AS_STORAGE_BIT = (1 << 1),
 		BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT = (1 << 2),
 		BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT = (1 << 3),
+		// The buffer holds acceleration structures built into it by cluster_acceleration_structure_build().
+		BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT = (1 << 4),
 	};
 
 	enum StorageBufferUsage {
@@ -1331,6 +1333,9 @@ private:
 		RDD::AccelerationStructureID driver_id;
 		RDD::AccelerationStructureType type = {};
 		RDG::ResourceTracker *draw_tracker = nullptr;
+		// A cluster BLAS shares the tracker of the storage buffer it was built into, so the
+		// build that wrote it and the TLAS that reads it order on the same resource.
+		bool shared_draw_tracker = false;
 
 		// BLAS/TLAS are weakly linked, as opposed to RD dependencies.
 		HashSet<RID> acceleration_structure_dependencies;
@@ -1423,6 +1428,46 @@ public:
 	Error blas_build(RID p_blas);
 	Error blas_update(RID p_blas);
 	Error tlas_build(RID p_tlas, Span<AccelerationStructureInstance> p_instances);
+
+	// ----- CLUSTER ACCELERATION STRUCTURES -----
+	//
+	// The caller lays out its own buffers: storage created with
+	// BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT for the CLAS and cluster BLAS, an
+	// argument buffer holding the build infos (cluster_*_build_info_write()), the destination
+	// addresses and the sizes, all with BUFFER_CREATION_DEVICE_ADDRESS_BIT. A build records
+	// one indirect command on the render graph; the scratch is allocated per build and
+	// released with the frame.
+
+	struct ClusterAccelerationStructureBuild {
+		ClusterAccelerationStructureInput input;
+		// CLUSTER_OP_MODE_IMPLICIT_DESTINATIONS: the region the structures are sub-allocated from.
+		RID dst_implicit_buffer;
+		uint64_t dst_implicit_offset = 0;
+		// CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS: the storage the written destination addresses point into.
+		RID dst_storage_buffer;
+		RID dst_addresses_buffer;
+		uint64_t dst_addresses_offset = 0;
+		uint32_t dst_addresses_stride = 0;
+		// Optional: the built sizes, written in implicit and compute-sizes mode.
+		RID dst_sizes_buffer;
+		uint64_t dst_sizes_offset = 0;
+		uint32_t dst_sizes_stride = 0;
+		RID src_infos_buffer;
+		uint64_t src_infos_offset = 0;
+		uint32_t src_infos_stride = 0;
+		// The buffers the build infos point at by device address (vertex and index buffers); the
+		// build is ordered after their uploads and reads them under the indirect access type.
+		Vector<RID> source_buffers;
+	};
+
+	const ClusterAccelerationStructureCapabilities &get_cluster_acceleration_structure_capabilities() const;
+	void cluster_acceleration_structure_get_build_sizes(const ClusterAccelerationStructureInput &p_input, uint64_t &r_acceleration_structure_size, uint64_t &r_scratch_size);
+	void cluster_triangle_build_info_write(uint8_t *r_driver_info, const ClusterTriangleBuildInfo &p_info);
+	void cluster_bottom_level_build_info_write(uint8_t *r_driver_info, const ClusterBottomLevelBuildInfo &p_info);
+	Error cluster_acceleration_structure_build(const ClusterAccelerationStructureBuild &p_build);
+	// A BLAS over the cluster BLAS built at p_offset in p_storage_buffer, usable as an instance's blas
+	// once its build is recorded. Freed with the storage buffer.
+	RID cluster_blas_create(RID p_storage_buffer, uint64_t p_offset);
 
 private:
 	/**********************************/

@@ -166,6 +166,19 @@ float lights_get_specular_multiplier(float specular_amount, float roughness) {
 // Inline Alpha Test (shared by all ray query proceed loops)
 // ============================================================================
 
+/// The candidate triangle's index into its surface's index buffer, the ray-query twin of
+/// rt_primitive_index() (D79): inside a cluster BLAS the primitive index counts within the
+/// cluster and the cluster ID carries its first triangle.
+uint rt_ray_query_primitive_index(rayQueryEXT q) {
+#ifdef USE_CLUSTER_AS
+	int cluster_id = rayQueryGetIntersectionClusterIdNV(q, false);
+	if (cluster_id != gl_ClusterIDNoneNV) {
+		return uint(cluster_id) + uint(rayQueryGetIntersectionPrimitiveIndexEXT(q, false));
+	}
+#endif
+	return uint(rayQueryGetIntersectionPrimitiveIndexEXT(q, false));
+}
+
 /// Inline alpha test for ray query candidates. Returns true if the hit is opaque (alpha >= 0.5).
 /// Mirrors the any-hit shader logic for use with inline ray queries.
 bool ray_query_alpha_test(uint geometry_idx, uint primitive_id, vec2 candidate_bary) {
@@ -205,7 +218,7 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 			// this completely ignores the actual material, so might not be accurate
 			if (ray_query_alpha_test(
 						rayQueryGetIntersectionInstanceCustomIndexEXT(shadow_rq, false),
-						rayQueryGetIntersectionPrimitiveIndexEXT(shadow_rq, false),
+						rt_ray_query_primitive_index(shadow_rq),
 						rayQueryGetIntersectionBarycentricsEXT(shadow_rq, false))) {
 				rayQueryConfirmIntersectionEXT(shadow_rq);
 			}

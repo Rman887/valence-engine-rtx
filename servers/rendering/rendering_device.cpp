@@ -646,6 +646,177 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 	return OK;
 }
 
+/******************************************/
+/**** CLUSTER ACCELERATION STRUCTURES ****/
+/******************************************/
+
+const RDD::ClusterAccelerationStructureCapabilities &RenderingDevice::get_cluster_acceleration_structure_capabilities() const {
+	return driver->get_cluster_acceleration_structure_capabilities();
+}
+
+void RenderingDevice::cluster_acceleration_structure_get_build_sizes(const ClusterAccelerationStructureInput &p_input, uint64_t &r_acceleration_structure_size, uint64_t &r_scratch_size) {
+	ERR_RENDER_THREAD_GUARD();
+	r_acceleration_structure_size = 0;
+	r_scratch_size = 0;
+	ERR_FAIL_COND_MSG(!has_feature(SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE), "The current rendering device has no cluster acceleration structure support.");
+	driver->cluster_acceleration_structure_get_build_sizes(p_input, r_acceleration_structure_size, r_scratch_size);
+}
+
+void RenderingDevice::cluster_triangle_build_info_write(uint8_t *r_driver_info, const ClusterTriangleBuildInfo &p_info) {
+	driver->cluster_triangle_build_info_write(r_driver_info, p_info);
+}
+
+void RenderingDevice::cluster_bottom_level_build_info_write(uint8_t *r_driver_info, const ClusterBottomLevelBuildInfo &p_info) {
+	driver->cluster_bottom_level_build_info_write(r_driver_info, p_info);
+}
+
+Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAccelerationStructureBuild &p_build) {
+	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+	ERR_FAIL_COND_V_MSG(!has_feature(SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE), ERR_UNAVAILABLE, "The current rendering device has no cluster acceleration structure support.");
+	ERR_FAIL_COND_V_MSG(draw_list.active, ERR_INVALID_PARAMETER, "Cluster acceleration structures can't be built while a draw list is active.");
+	ERR_FAIL_COND_V_MSG(compute_list.active, ERR_INVALID_PARAMETER, "Cluster acceleration structures can't be built while a compute list is active.");
+	ERR_FAIL_COND_V_MSG(raytracing_list.active, ERR_INVALID_PARAMETER, "Cluster acceleration structures can't be built while a raytracing list is active.");
+	ERR_FAIL_COND_V_MSG(p_build.input.max_acceleration_structure_count == 0, ERR_INVALID_PARAMETER, "A cluster acceleration structure build needs at least one structure.");
+
+	const bool implicit = p_build.input.op_mode == ClusterAccelerationStructureInput::CLUSTER_OP_MODE_IMPLICIT_DESTINATIONS;
+	const bool explicit_destinations = p_build.input.op_mode == ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
+	ERR_FAIL_COND_V_MSG(implicit && p_build.dst_implicit_buffer.is_null(), ERR_INVALID_PARAMETER, "Implicit destinations need a destination region.");
+	ERR_FAIL_COND_V_MSG(explicit_destinations && (p_build.dst_storage_buffer.is_null() || p_build.dst_addresses_buffer.is_null()), ERR_INVALID_PARAMETER, "Explicit destinations need the storage buffer and the addresses written into it.");
+	ERR_FAIL_COND_V_MSG(p_build.src_infos_buffer.is_null(), ERR_INVALID_PARAMETER, "A cluster acceleration structure build needs its build infos.");
+
+	RDD::ClusterAccelerationStructureBuild rdd_build;
+	rdd_build.input = p_build.input;
+
+	// The trackers the graph orders this build against, one entry per buffer: a buffer that
+	// is both read and written under this command keeps the write usage.
+	LocalVector<RDG::ResourceTracker *> trackers;
+	LocalVector<RDG::ResourceUsage> usages;
+	auto track = [&](Buffer *p_buffer, RDG::ResourceUsage p_usage) {
+		if (p_buffer->draw_tracker == nullptr) {
+			return;
+		}
+		for (uint32_t i = 0; i < trackers.size(); i++) {
+			if (trackers[i] == p_buffer->draw_tracker) {
+				if (p_usage == RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE) {
+					usages[i] = p_usage;
+				}
+				return;
+			}
+		}
+		trackers.push_back(p_buffer->draw_tracker);
+		usages.push_back(p_usage);
+	};
+	auto resolve = [&](RID p_rid, const char *p_what, Buffer **r_buffer) -> bool {
+		*r_buffer = _get_buffer_from_owner(p_rid);
+		ERR_FAIL_NULL_V_MSG(*r_buffer, false, vformat("The cluster acceleration structure build's %s is not a valid buffer.", p_what));
+		ERR_FAIL_COND_V_MSG(!(*r_buffer)->usage.has_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT), false, vformat("The cluster acceleration structure build's %s was not created with the device address flag.", p_what));
+		_check_transfer_worker_buffer(*r_buffer);
+		return true;
+	};
+
+	Buffer *buffer = nullptr;
+	if (p_build.dst_implicit_buffer.is_valid()) {
+		ERR_FAIL_COND_V(!resolve(p_build.dst_implicit_buffer, "implicit destination", &buffer), ERR_INVALID_PARAMETER);
+		ERR_FAIL_COND_V_MSG(!buffer->usage.has_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT), ERR_INVALID_PARAMETER, "The implicit destination was not created with BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT.");
+		rdd_build.dst_implicit_buffer = buffer->driver_id;
+		rdd_build.dst_implicit_offset = p_build.dst_implicit_offset;
+		track(buffer, RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE);
+	}
+	if (p_build.dst_storage_buffer.is_valid()) {
+		ERR_FAIL_COND_V(!resolve(p_build.dst_storage_buffer, "destination storage", &buffer), ERR_INVALID_PARAMETER);
+		ERR_FAIL_COND_V_MSG(!buffer->usage.has_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT), ERR_INVALID_PARAMETER, "The destination storage was not created with BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT.");
+		track(buffer, RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE);
+	}
+	if (p_build.dst_addresses_buffer.is_valid()) {
+		ERR_FAIL_COND_V(!resolve(p_build.dst_addresses_buffer, "destination addresses", &buffer), ERR_INVALID_PARAMETER);
+		ERR_FAIL_COND_V_MSG(p_build.dst_addresses_stride < sizeof(uint64_t), ERR_INVALID_PARAMETER, "The destination address stride must hold a device address.");
+		rdd_build.dst_addresses_buffer = buffer->driver_id;
+		rdd_build.dst_addresses_offset = p_build.dst_addresses_offset;
+		rdd_build.dst_addresses_stride = p_build.dst_addresses_stride;
+		rdd_build.dst_addresses_size = uint64_t(p_build.dst_addresses_stride) * p_build.input.max_acceleration_structure_count;
+		ERR_FAIL_COND_V_MSG(p_build.dst_addresses_offset + rdd_build.dst_addresses_size > buffer->size, ERR_INVALID_PARAMETER, "The destination addresses run past their buffer.");
+		// Written by the build unless the caller placed the structures itself, then read as indirect input.
+		track(buffer, explicit_destinations ? RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ : RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE);
+	}
+	if (p_build.dst_sizes_buffer.is_valid()) {
+		ERR_FAIL_COND_V(!resolve(p_build.dst_sizes_buffer, "destination sizes", &buffer), ERR_INVALID_PARAMETER);
+		ERR_FAIL_COND_V_MSG(p_build.dst_sizes_stride < sizeof(uint32_t), ERR_INVALID_PARAMETER, "The destination size stride must hold a 32-bit size.");
+		rdd_build.dst_sizes_buffer = buffer->driver_id;
+		rdd_build.dst_sizes_offset = p_build.dst_sizes_offset;
+		rdd_build.dst_sizes_stride = p_build.dst_sizes_stride;
+		rdd_build.dst_sizes_size = uint64_t(p_build.dst_sizes_stride) * p_build.input.max_acceleration_structure_count;
+		ERR_FAIL_COND_V_MSG(p_build.dst_sizes_offset + rdd_build.dst_sizes_size > buffer->size, ERR_INVALID_PARAMETER, "The destination sizes run past their buffer.");
+		track(buffer, RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE);
+	}
+	{
+		ERR_FAIL_COND_V(!resolve(p_build.src_infos_buffer, "build infos", &buffer), ERR_INVALID_PARAMETER);
+		const ClusterAccelerationStructureCapabilities &caps = driver->get_cluster_acceleration_structure_capabilities();
+		uint32_t info_size = p_build.input.op_type == ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER ? caps.triangle_build_info_size : caps.bottom_level_build_info_size;
+		ERR_FAIL_COND_V_MSG(p_build.src_infos_stride < info_size, ERR_INVALID_PARAMETER, "The build info stride must hold one driver build info.");
+		rdd_build.src_infos_buffer = buffer->driver_id;
+		rdd_build.src_infos_offset = p_build.src_infos_offset;
+		rdd_build.src_infos_stride = p_build.src_infos_stride;
+		rdd_build.src_infos_size = uint64_t(p_build.src_infos_stride) * p_build.input.max_acceleration_structure_count;
+		ERR_FAIL_COND_V_MSG(p_build.src_infos_offset + rdd_build.src_infos_size > buffer->size, ERR_INVALID_PARAMETER, "The build infos run past their buffer.");
+		// The spec reads the infos and the data they point at under VK_ACCESS_INDIRECT_COMMAND_READ_BIT.
+		track(buffer, RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ);
+	}
+	for (const RID &source : p_build.source_buffers) {
+		ERR_FAIL_COND_V(!resolve(source, "source buffer", &buffer), ERR_INVALID_PARAMETER);
+		track(buffer, RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ);
+	}
+
+	// The scratch lives for this frame's build alone.
+	uint64_t acceleration_structure_size = 0;
+	uint64_t scratch_size = 0;
+	driver->cluster_acceleration_structure_get_build_sizes(p_build.input, acceleration_structure_size, scratch_size);
+	if (implicit) {
+		Buffer *implicit_buffer = _get_buffer_from_owner(p_build.dst_implicit_buffer);
+		ERR_FAIL_COND_V_MSG(p_build.dst_implicit_offset + acceleration_structure_size > implicit_buffer->size, ERR_INVALID_PARAMETER, "The implicit destination is smaller than the build needs.");
+	}
+	const ClusterAccelerationStructureCapabilities &caps = driver->get_cluster_acceleration_structure_capabilities();
+	uint64_t scratch_alloc_size = MAX(scratch_size + caps.cluster_scratch_byte_alignment, uint64_t(caps.cluster_scratch_byte_alignment));
+	Buffer scratch = Buffer();
+	scratch.driver_id = driver->buffer_create(scratch_alloc_size, RDD::BUFFER_USAGE_STORAGE_BIT | RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
+	ERR_FAIL_COND_V(!scratch.driver_id, ERR_CANT_CREATE);
+	DEV_ASSERT(scratch_alloc_size <= UINT32_MAX);
+	scratch.size = scratch_alloc_size;
+	buffer_memory.add(scratch.size);
+	frames[frame].buffers_to_dispose_of.push_back(scratch);
+	rdd_build.scratch_buffer = scratch.driver_id;
+
+	draw_graph.add_cluster_acceleration_structure_build(rdd_build, trackers, usages);
+
+	return OK;
+}
+
+RID RenderingDevice::cluster_blas_create(RID p_storage_buffer, uint64_t p_offset) {
+	ERR_RENDER_THREAD_GUARD_V(RID());
+	ERR_FAIL_COND_V_MSG(!has_feature(SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE), RID(), "The current rendering device has no cluster acceleration structure support.");
+
+	Buffer *storage = _get_buffer_from_owner(p_storage_buffer);
+	ERR_FAIL_NULL_V_MSG(storage, RID(), "The cluster BLAS storage is not a valid buffer.");
+	ERR_FAIL_COND_V_MSG(!storage->usage.has_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT), RID(), "The cluster BLAS storage was not created with BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT.");
+	ERR_FAIL_NULL_V_MSG(storage->draw_tracker, RID(), "The cluster BLAS storage must be a tracked buffer.");
+	ERR_FAIL_COND_V_MSG(p_offset >= storage->size, RID(), "The cluster BLAS offset is outside its storage.");
+
+	AccelerationStructure acceleration_structure;
+	acceleration_structure.type = RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+	acceleration_structure.driver_id = driver->cluster_blas_create(storage->driver_id, p_offset);
+	ERR_FAIL_COND_V_MSG(!acceleration_structure.driver_id, RID(), "Failed to create the cluster BLAS.");
+	acceleration_structure.draw_tracker = storage->draw_tracker;
+	acceleration_structure.shared_draw_tracker = true;
+	// Built by cluster_acceleration_structure_build() before any TLAS reads it; the graph orders the two.
+	acceleration_structure.invalidated = false;
+
+	RID id = acceleration_structure_owner.make_rid(acceleration_structure);
+#ifdef DEV_ENABLED
+	set_resource_name(id, "RID:" + itos(id.get_id()));
+#endif
+	_add_dependency(id, p_storage_buffer);
+	return id;
+}
+
 /**********************************/
 /**** HIT SHADER BINDING TABLE ****/
 /**********************************/
@@ -1550,6 +1721,13 @@ RID RenderingDevice::storage_buffer_create(uint32_t p_size_bytes, Span<uint8_t> 
 				"The GPU doesn't support acceleration structure build input flag.");
 #endif
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+	}
+	if (p_creation_bits.has_flag(BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT)) {
+#ifdef DEBUG_ENABLED
+		ERR_FAIL_COND_V_MSG(!has_feature(SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE), RID(),
+				"The GPU doesn't support cluster acceleration structures.");
+#endif
+		buffer.usage.set_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT);
 	}
 
 	buffer.driver_id = driver->buffer_create(buffer.size, buffer.usage, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
@@ -7853,7 +8031,9 @@ void RenderingDevice::_free_internal(RID p_id) {
 		} else if (acceleration_structure->type == ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL) {
 			_tlas_remove_blas_dependencies(acceleration_structure, p_id);
 		}
-		RDG::resource_tracker_free(acceleration_structure->draw_tracker);
+		if (!acceleration_structure->shared_draw_tracker) {
+			RDG::resource_tracker_free(acceleration_structure->draw_tracker);
+		}
 		frames[frame].acceleration_structures_to_dispose_of.push_back(*acceleration_structure);
 		acceleration_structure_owner.free(p_id);
 	} else if (raytracing_pipeline_owner.owns(p_id)) {
@@ -9727,6 +9907,7 @@ void RenderingDevice::_bind_methods() {
 	// Not exposed on purpose. This flag is too dangerous to be exposed to regular GD users.
 	//BIND_BITFIELD_FLAG(BUFFER_CREATION_DYNAMIC_PERSISTENT_BIT);
 	BIND_BITFIELD_FLAG(BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+	BIND_BITFIELD_FLAG(BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT);
 
 	BIND_BITFIELD_FLAG(ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
 	BIND_BITFIELD_FLAG(ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT);
@@ -9905,6 +10086,7 @@ void RenderingDevice::_bind_methods() {
 	BIND_ENUM_CONSTANT(SUPPORTS_RAY_QUERY);
 	BIND_ENUM_CONSTANT(SUPPORTS_RAYTRACING_PIPELINE);
 	BIND_ENUM_CONSTANT(SUPPORTS_HDR_OUTPUT);
+	BIND_ENUM_CONSTANT(SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE);
 
 	BIND_ENUM_CONSTANT(LIMIT_MAX_BOUND_UNIFORM_SETS);
 	BIND_ENUM_CONSTANT(LIMIT_MAX_FRAMEBUFFER_COLOR_ATTACHMENTS);

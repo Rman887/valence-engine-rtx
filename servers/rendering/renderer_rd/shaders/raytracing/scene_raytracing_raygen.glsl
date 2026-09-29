@@ -21,6 +21,9 @@
 #ifdef USE_SER
 #extension GL_EXT_shader_invocation_reorder : enable
 #endif
+#ifdef USE_CLUSTER_AS
+#extension GL_NV_cluster_acceleration_structure : require
+#endif
 
 #define GLSL 1
 #define RT_STAGE_RAYGEN 1
@@ -392,6 +395,9 @@ void main() {
 
 #pragma shader_stage(miss)
 #extension GL_EXT_ray_tracing : enable
+#ifdef USE_CLUSTER_AS
+#extension GL_NV_cluster_acceleration_structure : require
+#endif
 
 #define GLSL 1
 #define RT_STAGE_MISS 1
@@ -571,6 +577,10 @@ void main() {
 #extension GL_EXT_nonuniform_qualifier : require
 #ifdef USE_SER
 #extension GL_EXT_shader_invocation_reorder : enable
+#endif
+
+#ifdef USE_CLUSTER_AS
+#extension GL_NV_cluster_acceleration_structure : require
 #endif
 
 #define GLSL 1
@@ -790,6 +800,10 @@ void main() {
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_ARB_gpu_shader_int64 : require
 #extension GL_EXT_nonuniform_qualifier : require
+
+#ifdef USE_CLUSTER_AS
+#extension GL_NV_cluster_acceleration_structure : require
+#endif
 
 #define GLSL 1
 #define RT_STAGE_ANY_HIT 1

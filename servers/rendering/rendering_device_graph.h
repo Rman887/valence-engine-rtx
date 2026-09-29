@@ -121,6 +121,7 @@ public:
 			TYPE_CAPTURE_TIMESTAMP,
 			TYPE_DRIVER_CALLBACK,
 			TYPE_BOTTOM_LEVEL_ACCELERATION_STRUCTURE_UPDATE,
+			TYPE_CLUSTER_ACCELERATION_STRUCTURE_BUILD,
 			TYPE_MAX
 		};
 
@@ -354,6 +355,12 @@ private:
 		RDD::BufferID instance_buffer;
 		uint32_t instance_offset = 0;
 		uint32_t instance_count = 0;
+	};
+
+	// One indirect build of CLAS or cluster BLAS; the buffers it reads and writes are tracked
+	// by the caller, since which ones are written depends on the op mode.
+	struct RecordedClusterAccelerationStructureBuildCommand : RecordedCommand {
+		RDD::ClusterAccelerationStructureBuild build;
 	};
 
 	struct RecordedBufferClearCommand : RecordedCommand {
@@ -894,6 +901,7 @@ public:
 	void add_blas_build(RDD::AccelerationStructureID p_blas, RDD::BufferID p_scratch_buffer, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);
 	void add_blas_update(RDD::AccelerationStructureID p_blas, RDD::BufferID p_scratch_buffer, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);
 	void add_tlas_build(RDD::AccelerationStructureID p_tlas, RDD::BufferID p_scratch_buffer, RDD::BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);
+	void add_cluster_acceleration_structure_build(const RDD::ClusterAccelerationStructureBuild &p_build, VectorView<ResourceTracker *> p_trackers, VectorView<ResourceUsage> p_usages);
 	void add_buffer_clear(RDD::BufferID p_dst, ResourceTracker *p_dst_tracker, uint32_t p_offset, uint32_t p_size);
 	void add_buffer_copy(RDD::BufferID p_src, ResourceTracker *p_src_tracker, RDD::BufferID p_dst, ResourceTracker *p_dst_tracker, RDD::BufferCopyRegion p_region);
 	void add_buffer_get_data(RDD::BufferID p_src, ResourceTracker *p_src_tracker, RDD::BufferID p_dst, RDD::BufferCopyRegion p_region);

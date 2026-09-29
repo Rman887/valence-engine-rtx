@@ -749,6 +749,11 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_e
 		flags |= RT_FLAG_FOG_ENABLED;
 	}
 
+	// The setting alone asks the driver for the extension; the feature says whether it came.
+	if (RD::get_singleton()->has_feature(RD::SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE)) {
+		flags |= RT_FLAG_CLUSTER_AS;
+	}
+
 	if (GLOBAL_GET("rendering/pathtracing/use_shader_execution_reordering")) {
 		flags |= RT_FLAG_SER_ENABLED;
 		// The hint's form rides in the flags (D75), so a change rebuilds the ray-tracing pipelines
@@ -803,6 +808,12 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 
 	if (p_rt_flags & RT_FLAG_DEBUG_VIS_ENABLED) {
 		inject_define(sources, "#define RT_DEBUG_ENABLED\n");
+	}
+
+	// A define, not a variant: the SPIR-V capability the cluster ID needs is only legal on a
+	// device with the extension, and a variant would double the raygen set compiled at start.
+	if (p_rt_flags & RT_FLAG_CLUSTER_AS) {
+		inject_define(sources, "#define USE_CLUSTER_AS\n");
 	}
 
 	// Procedural templates come from intersection stage; strip from base HG0 path.

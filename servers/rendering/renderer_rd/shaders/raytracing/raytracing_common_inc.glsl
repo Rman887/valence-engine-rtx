@@ -2,7 +2,7 @@
 // Include AFTER raytracing_inc.glsl and scene_data_inc.glsl.
 // The includer must set exactly one of RT_STAGE_{RAYGEN,MISS,CLOSEST_HIT,ANY_HIT,INTERSECTION}.
 
-// Specialization constant (bits 0-20: flags, 21-28: samples, 29-31: bounces).
+// Specialization constant (bits 0-10: flags, 11-12: the SER hint, 13-20: free, 21-28: samples, 29-31: bounces).
 layout(constant_id = 0) const uint RT_FLAGS = 0u;
 
 #define RT_FLAG_DLSS_RR_ENABLED (1u << 1)
@@ -13,6 +13,16 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 #define RT_FLAG_LIGHT_TREE_POWER_PICK (1u << 8)
 #define RT_FLAG_SKY_LIGHT_VARIANCE_SHARE (1u << 9)
 #define RT_FLAG_RUSSIAN_ROULETTE (1u << 10)
+
+// The SER coherence hint's mode (D75), bits 11-12; the values of
+// rendering/pathtracing/shader_execution_reordering_hint.
+#define RT_SER_HINT_SHIFT 11u
+#define RT_SER_HINT_MASK 0x3u
+#define RT_GET_SER_HINT() ((RT_FLAGS >> RT_SER_HINT_SHIFT) & RT_SER_HINT_MASK)
+#define RT_SER_HINT_NONE 0u
+#define RT_SER_HINT_INSTANCE 1u
+#define RT_SER_HINT_TERMINATION 2u
+#define RT_SER_HINT_TERMINATION_DISTANCE 3u
 
 #define RT_SAMPLE_COUNT_SHIFT 21u
 #define RT_SAMPLE_COUNT_MASK 0xFFu
@@ -57,6 +67,14 @@ layout(set = 0, binding = 6, std140) uniform RaytracingParams {
 
 float get_rt_param(uint idx) {
 	return rt_params[idx >> 2u][idx & 3u];
+}
+
+/// Whether a path whose packed counts are p_packed has reached a bounce limit, the whole-path
+/// limit (RT_GET_MAX_BOUNCES(), a specialization constant) or the diffuse limit (D74, a uniform):
+/// the vertex it arrives at adds its emission and ends. The one test for shade_and_bounce and for
+/// the SER termination hint (D75), so the two cannot drift apart.
+bool rt_bounce_limit_reached(uint p_packed) {
+	return get_total_bounces(p_packed) >= RT_GET_MAX_BOUNCES() || get_diffuse_bounces(p_packed) >= uint(get_rt_param(RT_PARAM_MAX_DIFFUSE_BOUNCES));
 }
 
 /// One path contribution under a luminance clamp (D53): above the limit it is scaled down to the

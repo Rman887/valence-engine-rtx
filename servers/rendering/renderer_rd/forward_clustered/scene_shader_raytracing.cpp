@@ -751,6 +751,10 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_e
 
 	if (GLOBAL_GET("rendering/pathtracing/use_shader_execution_reordering")) {
 		flags |= RT_FLAG_SER_ENABLED;
+		// The hint's form rides in the flags (D75), so a change rebuilds the ray-tracing pipelines
+		// with the other forms folded away; without the reorder there is no hint, so no rebuild.
+		uint32_t hint = CLAMP(GLOBAL_GET_CACHED(int, "rendering/pathtracing/shader_execution_reordering_hint"), 0, (int)RT_SER_HINT_TERMINATION_DISTANCE);
+		flags |= hint << RT_SER_HINT_SHIFT;
 	}
 
 	return rt_flags_pack(flags, sample_count, max_bounces);

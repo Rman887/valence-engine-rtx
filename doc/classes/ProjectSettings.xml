@@ -3280,6 +3280,9 @@
 			Size in meters of the grid the path tracer's world-space anchor snaps to. The trace runs in world space relative to that anchor (the camera's grid cell on the X and Z axes), so 32-bit positions on the GPU stay precise kilometers from the origin; the anchor moves only when the camera leaves its cell. Set to [code]0.0[/code] to trace in absolute world space.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracing/shader_execution_reordering_hint" type="int" setter="" getter="" default="2">
+			The coherence hint the path tracer hands Shader Execution Reordering beside each hit's shader, which the reorder always sorts on. [code]0[/code] (None) adds nothing. [code]1[/code] (Instance) adds the hit's instance index in 8 bits, which the shader sort already separates by material. [code]2[/code] (Termination) adds one bit, whether the path ends at this hit because a bounce limit is reached there, so the threads that go on to trace again sit apart from those that only shade. [code]3[/code] (Termination and Distance) adds a 3-bit bin of the hit distance in factors of 4 under that bit. The image is the same under every value; only the frame's cost changes. Changing it rebuilds the ray-tracing pipelines. Has no effect with [member rendering/pathtracing/use_shader_execution_reordering] off or on hardware without SER.
+		</member>
 		<member name="rendering/pathtracing/use_shader_execution_reordering" type="bool" setter="" getter="" default="true">
 			If [code]true[/code], enables NVIDIA Shader Execution Reordering in the path tracer. SET reorders ray tracing shader invocations at runtime to improve GPU occupancy and reduce divergence between threads executing different materials. This can significantly improve path tracing performance on NVIDIA Ada Lovelace and later GPUs. Has no effect on hardware that does not support SET.
 		</member>

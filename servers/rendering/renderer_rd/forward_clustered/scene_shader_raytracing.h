@@ -69,7 +69,9 @@ public:
 	};
 
 	// Raytracing specialization constant flags (must match shader RT_FLAG_* defines).
-	// Bits 0-20:  Feature flags
+	// Bits 0-10:  Feature flags
+	// Bits 11-12: The SER coherence hint (RT_SER_HINT_*)
+	// Bits 13-20: Free
 	// Bits 21-28: Sample count
 	// Bits 29-31: Max bounce count (offset by 1: 0=1 bounce, 7=8 bounces)
 	enum RaytracingFlags {
@@ -86,6 +88,17 @@ public:
 		RT_FLAG_SKY_LIGHT_VARIANCE_SHARE = (1 << 9), // The sky's share by the variance it removes (D62); clear, by its concentrated light (D54). Set only with RT_FLAG_SKY_LIGHT.
 		RT_FLAG_RUSSIAN_ROULETTE = (1 << 10), // Paths end by Russian roulette on their throughput once a vertex has scattered (D73); clear, only at the bounce limits.
 	};
+
+	// The coherence hint the raygen hands reorderThreadEXT beside the hit's shader (D75), the
+	// values of rendering/pathtracing/shader_execution_reordering_hint. Set only with RT_FLAG_SER_ENABLED.
+	enum RaytracingSerHint {
+		RT_SER_HINT_NONE = 0, // No hint: the reorder sorts on the hit's shader alone.
+		RT_SER_HINT_INSTANCE = 1, // NVIDIA's, the value before D75: the hit's instance index in 8 bits.
+		RT_SER_HINT_TERMINATION = 2, // The default: one bit, the path ends at this hit, a bounce limit being reached there.
+		RT_SER_HINT_TERMINATION_DISTANCE = 3, // The termination bit above a 3-bit bin of the hit distance in factors of 4.
+	};
+	constexpr static uint32_t RT_SER_HINT_SHIFT = 11;
+	constexpr static uint32_t RT_SER_HINT_MASK = 0x3;
 
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 21;
 	constexpr static uint32_t RT_SAMPLE_COUNT_MASK = 0xFF;

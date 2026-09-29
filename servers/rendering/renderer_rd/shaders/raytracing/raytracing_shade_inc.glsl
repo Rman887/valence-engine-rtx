@@ -397,7 +397,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	ps.radiance += emitted;
 
 	// Bounce limit check.
-	if (total_bounces >= RT_GET_MAX_BOUNCES() || diffuse_bounces >= uint(get_rt_param(RT_PARAM_MAX_DIFFUSE_BOUNCES))) {
+	if (rt_bounce_limit_reached(ps.packed_bounces_flags)) {
 		ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
 		path_pack(payload, ps);
 		return;

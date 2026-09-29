@@ -105,13 +105,37 @@ void trace_path_ray(vec3 ray_origin, vec3 ray_dir, uint mask, float max_distance
 	hitObjectEXT hitObject;
 	hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS, mask, 0, 0, 0, ray_origin, 0.001, ray_dir, max_distance, 0);
 
-	// Reorder with a coherence hint that has 8 bits.
-	uint hint = 0;
-	if (hitObjectIsHitEXT(hitObject)) {
-		// TODO: This hint barely does anything. There is a lot of untapped potential here.
-		hint = hitObjectGetInstanceIdEXT(hitObject);
+	// The reorder sorts the threads on the hit's shader by itself (the hit group, or the miss);
+	// the hint refines that order. Its form is the pipeline's (D75, RT_GET_SER_HINT(), the
+	// rendering/pathtracing/shader_execution_reordering_hint setting), so the other forms fold away.
+	const uint hint_mode = RT_GET_SER_HINT();
+	if (hint_mode == RT_SER_HINT_INSTANCE) {
+		// NVIDIA's: the instance index in 8 bits, which the shader sort already separates by material.
+		uint hint = 0u;
+		if (hitObjectIsHitEXT(hitObject)) {
+			hint = hitObjectGetInstanceIdEXT(hitObject);
+		}
+		reorderThreadEXT(hitObject, hint, 8);
+	} else if (hint_mode == RT_SER_HINT_NONE) {
+		reorderThreadEXT(hitObject);
+	} else {
+		// Whether the path ends at this hit (RTXPT's one hint bit): the counts packed before the
+		// trace are the ones shade_and_bounce tests on arrival, so a set bit is a thread that only
+		// adds the hit's emission, kept apart from one that samples the lights and a direction and
+		// traces again. A miss ends the path too, and the sort keys it by the miss shader already.
+		uint hint = rt_bounce_limit_reached(payload.packed_bounces_flags) ? 1u : 0u;
+		if (hint_mode == RT_SER_HINT_TERMINATION_DISTANCE) {
+			// Under the termination bit, a 3-bit bin of the hit distance in factors of 4 (under 4 m,
+			// 4 to 16 m, ... 4096 m and beyond; a miss sits in the last).
+			uint bin = 7u;
+			if (hitObjectIsHitEXT(hitObject)) {
+				bin = uint(clamp(log2(max(hitObjectGetRayTMaxEXT(hitObject), 1.0)) * 0.5, 0.0, 7.0));
+			}
+			reorderThreadEXT(hitObject, (hint << 3u) | bin, 4);
+		} else {
+			reorderThreadEXT(hitObject, hint, 1);
+		}
 	}
-	reorderThreadEXT(hitObject, hint, 8);
 
 	hitObjectExecuteShaderEXT(hitObject, 0);
 #else

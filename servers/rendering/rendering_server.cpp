@@ -1311,7 +1311,22 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 
 	Vector4 uv_scale = Vector4(0.0, 0.0, 0.0, 0.0);
 
-	Error err = _surface_set_data(p_arrays, format, offsets, vertex_element_size, normal_element_size, attrib_element_size, skin_element_size, vertex_array, attrib_array, skin_array, array_len, index_array, index_array_len, aabb, bone_aabb, uv_scale);
+	// Triangle clusters (D80): the index buffer of a 3D triangle list is reordered so each
+	// cluster's triangles are contiguous, and the cluster table travels with the surface. The
+	// caller's arrays are left as they were.
+	Array arrays = p_arrays;
+	Vector<uint8_t> cluster_data;
+	// Skinned and blend-shape surfaces are left alone until stage 4 rebuilds deformed meshes per cluster.
+	if (p_primitive == RSE::PRIMITIVE_TRIANGLES && index_array_len > 0 && p_arrays[RSE::ARRAY_VERTEX].get_type() == Variant::PACKED_VECTOR3_ARRAY && p_arrays[RSE::ARRAY_INDEX].get_type() == Variant::PACKED_INT32_ARRAY && !(format & RSE::ARRAY_FORMAT_BONES) && p_blend_shapes.is_empty() && GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
+		Vector<int> indices = p_arrays[RSE::ARRAY_INDEX];
+		cluster_data = mesh_surface_build_clusters(p_arrays[RSE::ARRAY_VERTEX], indices);
+		if (cluster_data.size()) {
+			arrays = p_arrays.duplicate();
+			arrays[RSE::ARRAY_INDEX] = indices;
+		}
+	}
+
+	Error err = _surface_set_data(arrays, format, offsets, vertex_element_size, normal_element_size, attrib_element_size, skin_element_size, vertex_array, attrib_array, skin_array, array_len, index_array, index_array_len, aabb, bone_aabb, uv_scale);
 	ERR_FAIL_COND_V_MSG(err != OK, ERR_INVALID_DATA, "Invalid array format for surface.");
 
 	Vector<uint8_t> blend_shape_data;
@@ -1388,8 +1403,81 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 	surface_data.bone_aabbs = bone_aabb;
 	surface_data.lods = lods;
 	surface_data.uv_scale = uv_scale;
+	surface_data.cluster_data = cluster_data;
 
 	return OK;
+}
+
+RenderingServer::BuildClustersBoundFunc RenderingServer::build_clusters_bound_func = nullptr;
+RenderingServer::BuildClustersFunc RenderingServer::build_clusters_func = nullptr;
+
+Vector<uint8_t> RenderingServer::mesh_surface_build_clusters(const Vector<Vector3> &p_positions, Vector<int> &r_indices) {
+	Vector<uint8_t> cluster_data;
+	if (build_clusters_func == nullptr || build_clusters_bound_func == nullptr) {
+		return cluster_data;
+	}
+	const uint32_t index_count = r_indices.size();
+	const uint32_t vertex_count = p_positions.size();
+	if (index_count == 0 || index_count % 3 != 0 || vertex_count == 0) {
+		return cluster_data;
+	}
+	const uint64_t begin_us = OS::get_singleton()->get_ticks_usec();
+
+	// meshopt reads float3 positions and unsigned indices; Vector3 is double in a double build.
+	LocalVector<float> positions;
+	positions.resize(vertex_count * 3);
+	const Vector3 *pos = p_positions.ptr();
+	for (uint32_t i = 0; i < vertex_count; i++) {
+		positions[i * 3 + 0] = float(pos[i].x);
+		positions[i * 3 + 1] = float(pos[i].y);
+		positions[i * 3 + 2] = float(pos[i].z);
+	}
+	LocalVector<unsigned int> indices;
+	indices.resize(index_count);
+	const int *idx = r_indices.ptr();
+	for (uint32_t i = 0; i < index_count; i++) {
+		ERR_FAIL_COND_V_MSG(idx[i] < 0 || uint32_t(idx[i]) >= vertex_count, Vector<uint8_t>(), "Index out of range while clustering a surface.");
+		indices[i] = uint32_t(idx[i]);
+	}
+
+	const size_t cluster_bound = build_clusters_bound_func(index_count, RenderingServerTypes::MESH_CLUSTER_MAX_VERTICES, RenderingServerTypes::MESH_CLUSTER_MIN_TRIANGLES);
+	LocalVector<MeshCluster> clusters;
+	clusters.resize(cluster_bound);
+	LocalVector<unsigned int> cluster_vertices;
+	cluster_vertices.resize(index_count);
+	LocalVector<unsigned char> cluster_triangles;
+	cluster_triangles.resize(index_count);
+	const size_t cluster_count = build_clusters_func(clusters.ptr(), cluster_vertices.ptr(), cluster_triangles.ptr(), indices.ptr(), index_count, positions.ptr(), vertex_count, sizeof(float) * 3,
+			RenderingServerTypes::MESH_CLUSTER_MAX_VERTICES, RenderingServerTypes::MESH_CLUSTER_MIN_TRIANGLES, RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES, 0.5f);
+	ERR_FAIL_COND_V_MSG(cluster_count == 0 || cluster_count > cluster_bound, Vector<uint8_t>(), "The cluster builder returned an impossible cluster count.");
+
+	// Rewrite the index buffer cluster by cluster from the clusters' local indices, and the
+	// table beside it; r_indices takes the result only once every cluster has checked out.
+	cluster_data.resize(sizeof(uint32_t) * (1 + cluster_count));
+	uint32_t *table = reinterpret_cast<uint32_t *>(cluster_data.ptrw());
+	table[0] = RenderingServerTypes::MESH_CLUSTER_DATA_VERSION;
+	Vector<int> reordered;
+	reordered.resize(index_count);
+	int *out = reordered.ptrw();
+	uint32_t written = 0;
+	for (size_t c = 0; c < cluster_count; c++) {
+		const MeshCluster &cluster = clusters[c];
+		ERR_FAIL_COND_V_MSG(cluster.triangle_count == 0 || cluster.triangle_count > RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES || cluster.vertex_count == 0 || cluster.vertex_count > RenderingServerTypes::MESH_CLUSTER_MAX_VERTICES || written + cluster.triangle_count * 3 > index_count, Vector<uint8_t>(), "The cluster builder returned a cluster outside its limits.");
+		ERR_FAIL_COND_V_MSG(uint64_t(cluster.vertex_offset) + cluster.vertex_count > index_count || uint64_t(cluster.triangle_offset) + cluster.triangle_count * 3 > index_count, Vector<uint8_t>(), "The cluster builder returned a cluster outside its buffers.");
+		const unsigned int *verts = cluster_vertices.ptr() + cluster.vertex_offset;
+		const unsigned char *tris = cluster_triangles.ptr() + cluster.triangle_offset;
+		for (uint32_t t = 0; t < cluster.triangle_count * 3; t++) {
+			ERR_FAIL_COND_V_MSG(tris[t] >= cluster.vertex_count, Vector<uint8_t>(), "The cluster builder returned a local index outside its cluster.");
+			out[written + t] = int(verts[tris[t]]);
+		}
+		written += cluster.triangle_count * 3;
+		table[1 + c] = cluster.triangle_count | (cluster.vertex_count << 16);
+	}
+	ERR_FAIL_COND_V_MSG(written != index_count, Vector<uint8_t>(), "The cluster builder lost triangles.");
+	r_indices = reordered;
+
+	print_verbose(vformat("RS: %d triangles in %d clusters of at most %d (%d us).", index_count / 3, cluster_count, RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES, OS::get_singleton()->get_ticks_usec() - begin_us));
+	return cluster_data;
 }
 
 void RenderingServer::mesh_add_surface_from_arrays(RID p_mesh, RSE::PrimitiveType p_primitive, const Array &p_arrays, const Array &p_blend_shapes, const Dictionary &p_lods, BitField<RSE::ArrayFormat> p_compress_format) {
@@ -1987,6 +2075,10 @@ static RenderingServerTypes::SurfaceData _dict_to_surf(const Dictionary &p_dicti
 		sd.blend_shape_data = p_dictionary["blend_shape_data"];
 	}
 
+	if (p_dictionary.has("cluster_data")) {
+		sd.cluster_data = p_dictionary["cluster_data"];
+	}
+
 	if (p_dictionary.has("material")) {
 		sd.material = p_dictionary["material"];
 	}
@@ -2045,6 +2137,9 @@ Dictionary RenderingServer::_mesh_get_surface(RID p_mesh, int p_idx) {
 
 	if (sd.blend_shape_data.size()) {
 		d["blend_shape_data"] = sd.blend_shape_data;
+	}
+	if (sd.cluster_data.size()) {
+		d["cluster_data"] = sd.cluster_data;
 	}
 
 	if (sd.material.is_valid()) {

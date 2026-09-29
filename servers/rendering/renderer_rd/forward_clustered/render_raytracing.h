@@ -648,10 +648,11 @@ class RenderRaytracing {
 			uint32_t p_cache_key,
 			RTSurfaceData *r_surf_data,
 			LocalVector<RID> &r_dirty_blas_list);
-	// The cluster path of _populate_surface_blas (D79): the surface's triangles in runs of at most
-	// the device's cluster size, each a CLAS, one cluster BLAS over them, both built this frame into
-	// the surface's own storage. Returns false, with nothing created, if the surface does not fit.
-	bool _populate_surface_cluster_blas(RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data);
+	// The cluster path of _populate_surface_blas (D79): the surface's triangles as the clusters its
+	// cluster table names (D80) or, without one, in runs of at most the device's cluster size; each a
+	// CLAS, one cluster BLAS over them, both built this frame into the surface's own storage. Returns
+	// false, with nothing created, if the surface does not fit.
+	bool _populate_surface_cluster_blas(void *p_mesh_surface, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data);
 	// Frees the surface's BLAS and, on the cluster path, the buffers it lives in.
 	void _release_surface_data(RTSurfaceData *p_surf_data);
 	RTMaterialData *process_material(RID p_material_rid, uint16_t p_material_invalidation_counter);

@@ -1546,6 +1546,9 @@ Array ArrayMesh::_get_surfaces() const {
 		if (lods.size()) {
 			data["lods"] = lods;
 		}
+		if (surface.cluster_data.size()) {
+			data["cluster_data"] = surface.cluster_data;
+		}
 
 		Array bone_aabbs;
 		for (int j = 0; j < surface.bone_aabbs.size(); j++) {
@@ -1631,6 +1634,10 @@ void ArrayMesh::_set_surfaces(const Array &p_surfaces) {
 				lod.index_data = lods[j + 1];
 				surface.lods.push_back(lod);
 			}
+		}
+
+		if (d.has("cluster_data")) {
+			surface.cluster_data = d["cluster_data"];
 		}
 
 		if (d.has("bone_aabbs")) {
@@ -1782,7 +1789,7 @@ void ArrayMesh::_recompute_aabb() {
 }
 
 // TODO: Need to add binding to add_surface using future MeshSurfaceData object.
-void ArrayMesh::add_surface(BitField<ArrayFormat> p_format, PrimitiveType p_primitive, const Vector<uint8_t> &p_array, const Vector<uint8_t> &p_attribute_array, const Vector<uint8_t> &p_skin_array, int p_vertex_count, const Vector<uint8_t> &p_index_array, int p_index_count, const AABB &p_aabb, const Vector<uint8_t> &p_blend_shape_data, const Vector<AABB> &p_bone_aabbs, const Vector<RenderingServerTypes::SurfaceData::LOD> &p_lods, const Vector4 p_uv_scale) {
+void ArrayMesh::add_surface(BitField<ArrayFormat> p_format, PrimitiveType p_primitive, const Vector<uint8_t> &p_array, const Vector<uint8_t> &p_attribute_array, const Vector<uint8_t> &p_skin_array, int p_vertex_count, const Vector<uint8_t> &p_index_array, int p_index_count, const AABB &p_aabb, const Vector<uint8_t> &p_blend_shape_data, const Vector<AABB> &p_bone_aabbs, const Vector<RenderingServerTypes::SurfaceData::LOD> &p_lods, const Vector4 p_uv_scale, const Vector<uint8_t> &p_cluster_data) {
 	ERR_FAIL_COND(surfaces.size() == RSE::MAX_MESH_SURFACES);
 	_create_if_empty();
 
@@ -1811,6 +1818,7 @@ void ArrayMesh::add_surface(BitField<ArrayFormat> p_format, PrimitiveType p_prim
 	sd.bone_aabbs = p_bone_aabbs;
 	sd.lods = p_lods;
 	sd.uv_scale = p_uv_scale;
+	sd.cluster_data = p_cluster_data;
 
 	RenderingServer::get_singleton()->mesh_add_surface(mesh, sd);
 
@@ -1838,7 +1846,7 @@ void ArrayMesh::add_surface_from_arrays(PrimitiveType p_primitive, const Array &
 	print_line("primitive: " + itos(surface.primitive));
 	*/
 
-	add_surface(surface.format, PrimitiveType(surface.primitive), surface.vertex_data, surface.attribute_data, surface.skin_data, surface.vertex_count, surface.index_data, surface.index_count, surface.aabb, surface.blend_shape_data, surface.bone_aabbs, surface.lods, surface.uv_scale);
+	add_surface(surface.format, PrimitiveType(surface.primitive), surface.vertex_data, surface.attribute_data, surface.skin_data, surface.vertex_count, surface.index_data, surface.index_count, surface.aabb, surface.blend_shape_data, surface.bone_aabbs, surface.lods, surface.uv_scale, surface.cluster_data);
 }
 
 Array ArrayMesh::surface_get_arrays(int p_surface) const {

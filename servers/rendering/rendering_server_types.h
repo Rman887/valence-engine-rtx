@@ -107,7 +107,24 @@ struct SurfaceData {
 
 	Vector4 uv_scale;
 
+	// The surface's triangle clusters (D80), present when the surface was created with
+	// rendering/pathtracing/cluster_blas on: a uint32 version, then one uint32 per cluster
+	// holding its triangle count in the low 16 bits and the count of distinct vertices its
+	// indices reach in the high 16 bits. The clusters partition the index buffer in order,
+	// so a cluster's first triangle is the sum of the counts before it. Empty otherwise.
+	Vector<uint8_t> cluster_data;
+
 	RID material;
+};
+
+enum MeshClusterConstants : uint32_t {
+	MESH_CLUSTER_DATA_VERSION = 1,
+	// meshopt limits are 256 vertices and 512 triangles; every cluster acceleration structure
+	// device allows at least 256 of each. 128 is the size RTX Mega Geometry recommends for
+	// static geometry.
+	MESH_CLUSTER_MAX_TRIANGLES = 128,
+	MESH_CLUSTER_MIN_TRIANGLES = 32,
+	MESH_CLUSTER_MAX_VERTICES = 128,
 };
 
 struct MeshInfo {

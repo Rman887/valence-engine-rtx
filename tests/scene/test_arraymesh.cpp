@@ -34,6 +34,8 @@ TEST_FORCE_LINK(test_arraymesh)
 
 #ifndef _3D_DISABLED
 
+#include "core/config/project_settings.h"
+#include "core/templates/hash_set.h"
 #include "scene/resources/3d/primitive_meshes.h"
 #include "scene/resources/mesh.h"
 #include "servers/rendering/rendering_server.h"
@@ -444,6 +446,118 @@ TEST_CASE("[SceneTree][ArrayMesh] Get/Set mesh metadata and actions") {
 		ERR_PRINT_ON
 		CHECK(mesh->get_surface_count() == 2);
 	}
+}
+
+TEST_CASE("[SceneTree][ArrayMesh] Triangle clusters partition the index buffer (D80).") {
+	// A 40 by 40 grid: 1681 vertices, 3200 triangles, so the builder must split it into many
+	// clusters and no cluster can hold every vertex.
+	const int n = 40;
+	Vector<Vector3> positions;
+	for (int y = 0; y <= n; y++) {
+		for (int x = 0; x <= n; x++) {
+			positions.push_back(Vector3(x, Math::sin(x * 0.3) * Math::cos(y * 0.2), y));
+		}
+	}
+	Vector<int> indices;
+	for (int y = 0; y < n; y++) {
+		for (int x = 0; x < n; x++) {
+			const int i = y * (n + 1) + x;
+			indices.push_back(i);
+			indices.push_back(i + 1);
+			indices.push_back(i + n + 1);
+			indices.push_back(i + 1);
+			indices.push_back(i + n + 2);
+			indices.push_back(i + n + 1);
+		}
+	}
+	const Vector<int> original = indices;
+
+	Vector<uint8_t> table_bytes = RenderingServer::mesh_surface_build_clusters(positions, indices);
+	if (RenderingServer::build_clusters_func == nullptr) {
+		CHECK(table_bytes.is_empty());
+		CHECK(indices == original);
+		return;
+	}
+	REQUIRE(table_bytes.size() >= int(sizeof(uint32_t) * 2));
+	REQUIRE(table_bytes.size() % sizeof(uint32_t) == 0);
+	REQUIRE(indices.size() == original.size());
+	const uint32_t *table = reinterpret_cast<const uint32_t *>(table_bytes.ptr());
+	CHECK(table[0] == RenderingServerTypes::MESH_CLUSTER_DATA_VERSION);
+	const uint32_t cluster_count = table_bytes.size() / sizeof(uint32_t) - 1;
+	CHECK(cluster_count >= uint32_t(original.size() / 3 / RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES));
+
+	// Every cluster within its limits, with the distinct vertex count it declares, and the
+	// clusters partitioning the triangles in order.
+	uint32_t first_triangle = 0;
+	for (uint32_t c = 0; c < cluster_count; c++) {
+		const uint32_t triangles = table[1 + c] & 0xFFFFu;
+		const uint32_t vertices = table[1 + c] >> 16;
+		CHECK(triangles > 0);
+		CHECK(triangles <= RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES);
+		CHECK(vertices <= RenderingServerTypes::MESH_CLUSTER_MAX_VERTICES);
+		REQUIRE(int((first_triangle + triangles) * 3) <= indices.size());
+		HashSet<int> distinct;
+		for (uint32_t t = first_triangle * 3; t < (first_triangle + triangles) * 3; t++) {
+			distinct.insert(indices[t]);
+		}
+		CHECK(distinct.size() == vertices);
+		first_triangle += triangles;
+	}
+	CHECK(int(first_triangle * 3) == indices.size());
+
+	// The same triangles, as a set: each reordered triangle is one of the originals, with its
+	// winding kept (the vertices rotated at most).
+	HashSet<uint64_t> original_triangles;
+	auto triangle_key = [](int a, int b, int c) -> uint64_t {
+		// Rotate so the smallest index leads; the winding is then the order of the other two.
+		while (!(a <= b && a <= c)) {
+			const int t = a;
+			a = b;
+			b = c;
+			c = t;
+		}
+		return (uint64_t(a) << 42) | (uint64_t(b) << 21) | uint64_t(c);
+	};
+	for (int t = 0; t < original.size(); t += 3) {
+		original_triangles.insert(triangle_key(original[t], original[t + 1], original[t + 2]));
+	}
+	int matched = 0;
+	for (int t = 0; t < indices.size(); t += 3) {
+		matched += original_triangles.has(triangle_key(indices[t], indices[t + 1], indices[t + 2])) ? 1 : 0;
+	}
+	CHECK(matched == original.size() / 3);
+	CHECK(original_triangles.size() == uint32_t(original.size() / 3));
+
+	// A surface created from these arrays carries the table and the clustered index order with the
+	// setting on, and neither with it off; the caller's arrays are untouched either way.
+	Array arrays;
+	arrays.resize(RSE::ARRAY_MAX);
+	arrays[RSE::ARRAY_VERTEX] = positions;
+	arrays[RSE::ARRAY_INDEX] = original;
+	const Variant setting_before = GLOBAL_GET("rendering/pathtracing/cluster_blas");
+	{
+		ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", false);
+		RenderingServerTypes::SurfaceData surface;
+		REQUIRE(RS::get_singleton()->mesh_create_surface_data_from_arrays(&surface, RSE::PRIMITIVE_TRIANGLES, arrays) == OK);
+		CHECK(surface.cluster_data.is_empty());
+		CHECK(surface.index_count == uint32_t(original.size()));
+	}
+	{
+		ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", true);
+		RenderingServerTypes::SurfaceData surface;
+		REQUIRE(RS::get_singleton()->mesh_create_surface_data_from_arrays(&surface, RSE::PRIMITIVE_TRIANGLES, arrays) == OK);
+		CHECK(surface.cluster_data == table_bytes);
+		REQUIRE(surface.index_count == uint32_t(original.size()));
+		REQUIRE(surface.index_data.size() == int(sizeof(uint16_t)) * original.size()); // 1681 vertices: 16-bit indices.
+		const uint16_t *packed = reinterpret_cast<const uint16_t *>(surface.index_data.ptr());
+		int equal = 0;
+		for (int i = 0; i < indices.size(); i++) {
+			equal += int(packed[i]) == indices[i] ? 1 : 0;
+		}
+		CHECK(equal == indices.size());
+		CHECK(Vector<int>(arrays[RSE::ARRAY_INDEX]) == original);
+	}
+	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", setting_before);
 }
 
 } // namespace TestArrayMesh

@@ -1114,7 +1114,7 @@ void RenderRaytracing::_populate_surface_blas(
 	// triangle BLAS in place and keeps it, as do 2D and non-indexed surfaces.
 	if (cluster_blas_enabled) {
 		if (p_vertex_buffer_override.is_null() && !p_allow_update && !is_2d && index_buffer.is_valid() && index_count > 0) {
-			if (_populate_surface_cluster_blas(vertex_buffer, index_buffer, p_cache_key, r_surf_data)) {
+			if (_populate_surface_cluster_blas(p_mesh_surface, vertex_buffer, index_buffer, p_cache_key, r_surf_data)) {
 				return;
 			}
 		} else {
@@ -1163,22 +1163,78 @@ void RenderRaytracing::_populate_surface_blas(
 	}
 }
 
-bool RenderRaytracing::_populate_surface_cluster_blas(RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data) {
+bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data) {
 	RD *rd = RD::get_singleton();
 	const RT_GeometryData &geom = r_surf_data->geometry;
 	const RD::ClusterAccelerationStructureCapabilities &caps = rd->get_cluster_acceleration_structure_capabilities();
 
-	// Clusters are runs of the index buffer, so no index is read on the CPU: a run of T
-	// triangles reaches at most 3T distinct vertices, and T is chosen so that bound fits the
-	// device's vertex limit. The cluster's ID is its first triangle, which is what the hit
-	// shaders add to gl_PrimitiveID (rt_primitive_index).
-	const uint32_t triangles_per_cluster = MIN(caps.max_triangles_per_cluster, caps.max_vertices_per_cluster / 3u);
 	const uint32_t primitive_count = geom.primitive_count;
-	if (triangles_per_cluster == 0 || primitive_count == 0 || geom.vertex_buffer_address == 0 || geom.index_buffer_address == 0) {
-		print_verbose(vformat("RT: surface [%d] on the triangle BLAS path: %d triangles per cluster, %d triangles, addresses %d/%d.", p_cache_key, triangles_per_cluster, primitive_count, int(geom.vertex_buffer_address != 0), int(geom.index_buffer_address != 0)));
+	if (primitive_count == 0 || geom.vertex_buffer_address == 0 || geom.index_buffer_address == 0 || caps.max_triangles_per_cluster == 0 || caps.max_vertices_per_cluster < 3) {
+		print_verbose(vformat("RT: surface [%d] on the triangle BLAS path: %d triangles, addresses %d/%d, clusters of %d/%d.", p_cache_key, primitive_count, int(geom.vertex_buffer_address != 0), int(geom.index_buffer_address != 0), caps.max_triangles_per_cluster, caps.max_vertices_per_cluster));
 		return false;
 	}
-	const uint32_t cluster_count = (primitive_count + triangles_per_cluster - 1) / triangles_per_cluster;
+
+	// The clusters: each a contiguous range of the index buffer, its ID its first triangle,
+	// which is what the hit shaders add to gl_PrimitiveID (rt_primitive_index). A surface
+	// created with the setting on carries its table (D80): spatial clusters with the count of
+	// distinct vertices each reaches. Without one, or with one that does not describe this
+	// index buffer, the clusters are runs of T triangles (D79), which reach at most 3T distinct
+	// vertices, T chosen so that bound fits the device's vertex limit.
+	LocalVector<uint32_t> cluster_triangles;
+	LocalVector<uint32_t> cluster_vertices;
+	uint32_t max_cluster_triangles = 0;
+	uint32_t max_cluster_vertices = 0;
+	uint32_t total_cluster_vertices = 0;
+	bool from_table = false;
+	{
+		const Vector<uint8_t> &table_bytes = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_cluster_data(p_mesh_surface);
+		const uint32_t words = table_bytes.size() / sizeof(uint32_t);
+		if (words >= 2 && table_bytes.size() % sizeof(uint32_t) == 0) {
+			const uint32_t *table = reinterpret_cast<const uint32_t *>(table_bytes.ptr());
+			if (table[0] == RenderingServerTypes::MESH_CLUSTER_DATA_VERSION) {
+				cluster_triangles.reserve(words - 1);
+				cluster_vertices.reserve(words - 1);
+				uint32_t sum = 0;
+				bool valid = true;
+				for (uint32_t c = 1; c < words && valid; c++) {
+					const uint32_t triangles = table[c] & 0xFFFFu;
+					const uint32_t vertices = table[c] >> 16;
+					valid = triangles > 0 && triangles <= caps.max_triangles_per_cluster && vertices > 0 && vertices <= caps.max_vertices_per_cluster;
+					cluster_triangles.push_back(triangles);
+					cluster_vertices.push_back(vertices);
+					max_cluster_triangles = MAX(max_cluster_triangles, triangles);
+					max_cluster_vertices = MAX(max_cluster_vertices, vertices);
+					total_cluster_vertices += vertices;
+					sum += triangles;
+				}
+				from_table = valid && sum == primitive_count;
+			}
+			if (!from_table) {
+				WARN_PRINT_ONCE(vformat("RT: surface [%d] carries a cluster table that does not describe its index buffer; clustered as runs instead.", p_cache_key));
+			}
+		}
+	}
+	if (!from_table) {
+		const uint32_t triangles_per_cluster = MIN(caps.max_triangles_per_cluster, caps.max_vertices_per_cluster / 3u);
+		const uint32_t run_count = (primitive_count + triangles_per_cluster - 1) / triangles_per_cluster;
+		cluster_triangles.clear();
+		cluster_vertices.clear();
+		cluster_triangles.reserve(run_count);
+		cluster_vertices.reserve(run_count);
+		max_cluster_triangles = 0;
+		max_cluster_vertices = 0;
+		total_cluster_vertices = 0;
+		for (uint32_t c = 0; c < run_count; c++) {
+			const uint32_t triangles = MIN(triangles_per_cluster, primitive_count - c * triangles_per_cluster);
+			const uint32_t vertices = MIN(triangles * 3u, caps.max_vertices_per_cluster);
+			cluster_triangles.push_back(triangles);
+			cluster_vertices.push_back(vertices);
+			max_cluster_triangles = MAX(max_cluster_triangles, triangles);
+			max_cluster_vertices = MAX(max_cluster_vertices, vertices);
+			total_cluster_vertices += vertices;
+		}
+	}
+	const uint32_t cluster_count = cluster_triangles.size();
 	const uint32_t index_size = geom.index_format == RT_INDEX_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t);
 	const RD::DataFormat pos_format = r_surf_data->is_compressed ? RD::DATA_FORMAT_R16G16B16A16_UNORM : RD::DATA_FORMAT_R32G32B32_SFLOAT;
 
@@ -1190,10 +1246,10 @@ bool RenderRaytracing::_populate_surface_cluster_blas(RID p_vertex_buffer, RID p
 	clas_input.max_acceleration_structure_count = cluster_count;
 	clas_input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
 	clas_input.vertex_format = pos_format;
-	clas_input.max_cluster_triangle_count = triangles_per_cluster;
-	clas_input.max_cluster_vertex_count = MIN(triangles_per_cluster * 3u, caps.max_vertices_per_cluster);
+	clas_input.max_cluster_triangle_count = max_cluster_triangles;
+	clas_input.max_cluster_vertex_count = max_cluster_vertices;
 	clas_input.max_total_triangle_count = primitive_count;
-	clas_input.max_total_vertex_count = MIN(primitive_count * 3u, cluster_count * clas_input.max_cluster_vertex_count);
+	clas_input.max_total_vertex_count = total_cluster_vertices;
 
 	RD::ClusterAccelerationStructureInput blas_input;
 	blas_input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
@@ -1246,14 +1302,14 @@ bool RenderRaytracing::_populate_surface_cluster_blas(RID p_vertex_buffer, RID p
 	memset(args.ptr(), 0, args_size);
 
 	uint64_t *dst_addresses = reinterpret_cast<uint64_t *>(args.ptr() + dst_addresses_offset);
+	uint32_t first_triangle = 0;
 	for (uint32_t c = 0; c < cluster_count; c++) {
-		const uint32_t first_triangle = c * triangles_per_cluster;
-		const uint32_t triangle_count = MIN(triangles_per_cluster, primitive_count - first_triangle);
+		const uint32_t triangle_count = cluster_triangles[c];
 
 		RD::ClusterTriangleBuildInfo info;
 		info.cluster_id = first_triangle;
 		info.triangle_count = triangle_count;
-		info.vertex_count = MIN(triangle_count * 3u, caps.max_vertices_per_cluster);
+		info.vertex_count = cluster_vertices[c];
 		info.index_type = geom.index_format == RT_INDEX_FORMAT_UINT16 ? RD::ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT16 : RD::ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT32;
 		info.index_address = geom.index_buffer_address + uint64_t(first_triangle) * 3u * index_size;
 		info.index_stride = index_size;
@@ -1262,6 +1318,7 @@ bool RenderRaytracing::_populate_surface_cluster_blas(RID p_vertex_buffer, RID p
 		rd->cluster_triangle_build_info_write(args.ptr() + clas_infos_offset + uint64_t(c) * clas_info_stride, info);
 
 		dst_addresses[c] = storage_address + clas_region + clas_stride * c;
+		first_triangle += triangle_count;
 	}
 	dst_addresses[cluster_count] = storage_address;
 
@@ -1332,7 +1389,7 @@ bool RenderRaytracing::_populate_surface_cluster_blas(RID p_vertex_buffer, RID p
 	r_surf_data->blas_size = storage_size + args_size;
 	cluster_blas_builds++;
 	cluster_triangles_built += primitive_count;
-	print_verbose(vformat("RT: cluster BLAS [%d]: %d triangles in %d clusters of %d, %d KB storage, %d KB arguments.", p_cache_key, primitive_count, cluster_count, triangles_per_cluster, storage_size / 1024, args_size / 1024));
+	print_verbose(vformat("RT: cluster BLAS [%d]: %d triangles in %d %s of at most %d triangles and %d vertices, %d KB storage, %d KB arguments.", p_cache_key, primitive_count, cluster_count, from_table ? "clusters" : "runs", max_cluster_triangles, max_cluster_vertices, storage_size / 1024, args_size / 1024));
 	return true;
 }
 

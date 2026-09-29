@@ -206,6 +206,23 @@ public:
 	/// Returns stride
 	virtual void mesh_surface_make_offsets_from_format(uint64_t p_format, int p_vertex_len, int p_index_len, uint32_t *r_offsets, uint32_t &r_vertex_element_size, uint32_t &r_normal_element_size, uint32_t &r_attrib_element_size, uint32_t &r_skin_element_size) const;
 	virtual Error mesh_create_surface_data_from_arrays(RenderingServerTypes::SurfaceData *r_surface_data, RSE::PrimitiveType p_primitive, const Array &p_arrays, const Array &p_blend_shapes = Array(), const Dictionary &p_lods = Dictionary(), uint64_t p_compress_format = 0);
+
+	// Triangle clusters at surface creation (D80), set by the meshoptimizer module. The
+	// builder's signature is meshopt_buildMeshletsSpatial's, the bound's meshopt_buildMeshletsBound's.
+	struct MeshCluster {
+		unsigned int vertex_offset;
+		unsigned int triangle_offset;
+		unsigned int vertex_count;
+		unsigned int triangle_count;
+	};
+	typedef size_t (*BuildClustersBoundFunc)(size_t p_index_count, size_t p_max_vertices, size_t p_max_triangles);
+	typedef size_t (*BuildClustersFunc)(MeshCluster *r_clusters, unsigned int *r_cluster_vertices, unsigned char *r_cluster_triangles, const unsigned int *p_indices, size_t p_index_count, const float *p_vertex_positions, size_t p_vertex_count, size_t p_vertex_positions_stride, size_t p_max_vertices, size_t p_min_triangles, size_t p_max_triangles, float p_fill_weight);
+	static BuildClustersBoundFunc build_clusters_bound_func;
+	static BuildClustersFunc build_clusters_func;
+	// Reorders r_indices so each cluster's triangles are contiguous and returns the surface's
+	// cluster_data; empty, with r_indices untouched, when no builder is set or the input is not
+	// a triangle list. Public for the tests; surfaces get it through mesh_create_surface_data_from_arrays.
+	static Vector<uint8_t> mesh_surface_build_clusters(const Vector<Vector3> &p_positions, Vector<int> &r_indices);
 	Array mesh_create_arrays_from_surface_data(const RenderingServerTypes::SurfaceData &p_data) const;
 	Array mesh_surface_get_arrays(RID p_mesh, int p_surface) const;
 	TypedArray<Array> mesh_surface_get_blend_shape_arrays(RID p_mesh, int p_surface) const;

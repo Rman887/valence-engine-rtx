@@ -260,6 +260,75 @@ void MeshStorage::mesh_set_blend_shape_count(RID p_mesh, int p_blend_shape_count
 	mesh->blend_shape_count = p_blend_shape_count;
 }
 
+// Triangle clusters at load (D80): a 3D triangle-list surface arriving without its cluster table
+// (saved or imported before the setting was on, or handed over as packed data) is clustered here
+// from its packed positions and indices, so the cluster BLAS builds from spatial clusters and not
+// from runs. Positions are read as RenderingServer::_get_array_from_surface reads them. The table
+// is not written back to the resource; a mesh re-saved or re-imported with the setting on carries
+// it and skips this step.
+// Skinned and blend-shape surfaces are left alone until stage 4 rebuilds deformed meshes per cluster.
+static void _cluster_surface_at_load(RenderingServerTypes::SurfaceData &r_surface, uint32_t p_blend_shape_count) {
+	if (r_surface.cluster_data.size() || r_surface.index_count == 0 || r_surface.index_count % 3 != 0 || r_surface.vertex_count == 0 || r_surface.primitive != RSE::PRIMITIVE_TRIANGLES || !(r_surface.format & RSE::ARRAY_FORMAT_VERTEX) || (r_surface.format & RSE::ARRAY_FLAG_USE_2D_VERTICES) || (r_surface.format & RSE::ARRAY_FORMAT_BONES) || p_blend_shape_count > 0) {
+		return;
+	}
+	if (RenderingServer::build_clusters_func == nullptr || !GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
+		return;
+	}
+
+	uint32_t offsets[RSE::ARRAY_MAX];
+	uint32_t vertex_element_size = 0, normal_element_size = 0, attrib_element_size = 0, skin_element_size = 0;
+	RS::get_singleton()->mesh_surface_make_offsets_from_format(r_surface.format, r_surface.vertex_count, r_surface.index_count, offsets, vertex_element_size, normal_element_size, attrib_element_size, skin_element_size);
+	ERR_FAIL_COND(uint64_t(offsets[RSE::ARRAY_VERTEX]) + uint64_t(vertex_element_size) * r_surface.vertex_count > uint64_t(r_surface.vertex_data.size()));
+
+	Vector<Vector3> positions;
+	positions.resize(r_surface.vertex_count);
+	{
+		Vector3 *w = positions.ptrw();
+		const uint8_t *r = r_surface.vertex_data.ptr();
+		const bool compressed = r_surface.format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES;
+		for (uint32_t j = 0; j < r_surface.vertex_count; j++) {
+			const uint8_t *v = &r[j * vertex_element_size + offsets[RSE::ARRAY_VERTEX]];
+			if (compressed) {
+				const uint16_t *q = reinterpret_cast<const uint16_t *>(v);
+				w[j] = Vector3(float(q[0]) / 65535.0, float(q[1]) / 65535.0, float(q[2]) / 65535.0) * r_surface.aabb.size + r_surface.aabb.position;
+			} else {
+				const float *f = reinterpret_cast<const float *>(v);
+				w[j] = Vector3(f[0], f[1], f[2]);
+			}
+		}
+	}
+
+	const bool index_16 = r_surface.vertex_count <= 65536;
+	const uint32_t index_size = index_16 ? sizeof(uint16_t) : sizeof(uint32_t);
+	ERR_FAIL_COND(uint64_t(r_surface.index_count) * index_size != uint64_t(r_surface.index_data.size()));
+	Vector<int> indices;
+	indices.resize(r_surface.index_count);
+	{
+		int *w = indices.ptrw();
+		const uint8_t *r = r_surface.index_data.ptr();
+		for (uint32_t i = 0; i < r_surface.index_count; i++) {
+			w[i] = index_16 ? int(reinterpret_cast<const uint16_t *>(r)[i]) : int(reinterpret_cast<const uint32_t *>(r)[i]);
+		}
+	}
+
+	Vector<uint8_t> cluster_data = RenderingServer::mesh_surface_build_clusters(positions, indices);
+	if (cluster_data.is_empty()) {
+		return;
+	}
+	{
+		uint8_t *w = r_surface.index_data.ptrw();
+		const int *r = indices.ptr();
+		for (uint32_t i = 0; i < r_surface.index_count; i++) {
+			if (index_16) {
+				reinterpret_cast<uint16_t *>(w)[i] = uint16_t(r[i]);
+			} else {
+				reinterpret_cast<uint32_t *>(w)[i] = uint32_t(r[i]);
+			}
+		}
+	}
+	r_surface.cluster_data = cluster_data;
+}
+
 /// Returns stride
 void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::SurfaceData &p_surface) {
 	Mesh *mesh = mesh_owner.get_or_null(p_mesh);
@@ -370,6 +439,8 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	}
 #endif
 
+	_cluster_surface_at_load(new_surface, mesh->blend_shape_count);
+
 	static uint32_t s_next_rt_invalidation_counter = 1; // Monotonic counter is required so that new surfaces are also invalidated.
 	Mesh::Surface *s = memnew(Mesh::Surface);
 	s->rt_invalidation_counter = s_next_rt_invalidation_counter++;
@@ -456,6 +527,7 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	s->mesh_to_skeleton_xform = p_surface.mesh_to_skeleton_xform;
 
 	s->uv_scale = new_surface.uv_scale;
+	s->cluster_data = new_surface.cluster_data;
 
 	if (mesh->blend_shape_count > 0) {
 		s->blend_shape_buffer = RD::get_singleton()->storage_buffer_create(new_surface.blend_shape_data.size(), new_surface.blend_shape_data);
@@ -643,7 +715,9 @@ void RendererRD::MeshStorage::mesh_surface_update_index_region(RID p_mesh, int p
 
 	RD::get_singleton()->buffer_update(mesh->surfaces[p_surface]->index_buffer, p_offset, data_size, r);
 
-	// Invalidate RT cache for this surface.
+	// Invalidate RT cache for this surface. The cluster table described the previous indices;
+	// without it the rebuilt cluster BLAS falls back to runs, which hold for any index contents.
+	mesh->surfaces[p_surface]->cluster_data.clear();
 	mesh->surfaces[p_surface]->rt_invalidation_counter++;
 }
 
@@ -724,6 +798,7 @@ RenderingServerTypes::SurfaceData MeshStorage::mesh_get_surface(RID p_mesh, int 
 	}
 	sd.aabb = s.aabb;
 	sd.uv_scale = s.uv_scale;
+	sd.cluster_data = s.cluster_data;
 	for (uint32_t i = 0; i < s.lod_count; i++) {
 		RenderingServerTypes::SurfaceData::LOD lod;
 		lod.edge_length = s.lods[i].edge_length;

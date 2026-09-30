@@ -952,12 +952,21 @@ public:
 		uint32_t cluster_scratch_byte_alignment = 0; // Of a build's scratch address.
 		uint32_t triangle_build_info_size = 0; // Bytes per ClusterTriangleBuildInfo the driver writes.
 		uint32_t bottom_level_build_info_size = 0; // Bytes per ClusterBottomLevelBuildInfo the driver writes.
+		uint32_t move_info_size = 0; // Bytes per CLUSTER_OP_MOVE_OBJECTS info: one device address, the structure to move.
 	};
 
 	struct ClusterAccelerationStructureInput {
 		enum OpType {
 			CLUSTER_OP_BUILD_TRIANGLE_CLUSTER,
 			CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL,
+			// Copies built structures to new addresses (compaction); a cluster BLAS references its
+			// CLAS by address, so it is rebuilt after they move rather than moved.
+			CLUSTER_OP_MOVE_OBJECTS,
+		};
+
+		enum MoveType {
+			CLUSTER_MOVE_TRIANGLE_CLUSTER,
+			CLUSTER_MOVE_CLUSTERS_BOTTOM_LEVEL,
 		};
 
 		enum OpMode {
@@ -989,6 +998,12 @@ public:
 		// CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL.
 		uint32_t max_total_cluster_count = 0;
 		uint32_t max_cluster_count_per_acceleration_structure = 0;
+
+		// CLUSTER_OP_MOVE_OBJECTS: the kind of structure moved, whether no source overlaps a
+		// destination (a copy between buffers), and the bytes moved in all, an upper bound.
+		MoveType move_type = CLUSTER_MOVE_TRIANGLE_CLUSTER;
+		bool move_no_overlap = true;
+		uint64_t move_max_bytes = 0;
 	};
 
 	// One CLAS build's arguments: the triangles [0, triangle_count) of an index buffer over one

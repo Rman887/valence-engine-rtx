@@ -749,7 +749,7 @@ public:
 private:
 	void _acceleration_structure_create(VkAccelerationStructureTypeKHR p_type, VkAccelerationStructureBuildSizesInfoKHR p_size_info, AccelerationStructureInfo *r_accel_info);
 	// Fills the Vulkan input from ours; the op-type input structs must outlive the returned struct.
-	void _cluster_acceleration_structure_input(const ClusterAccelerationStructureInput &p_input, VkClusterAccelerationStructureTriangleClusterInputNV &r_triangles, VkClusterAccelerationStructureClustersBottomLevelInputNV &r_bottom_level, VkClusterAccelerationStructureInputInfoNV &r_vk_input);
+	void _cluster_acceleration_structure_input(const ClusterAccelerationStructureInput &p_input, VkClusterAccelerationStructureTriangleClusterInputNV &r_triangles, VkClusterAccelerationStructureClustersBottomLevelInputNV &r_bottom_level, VkClusterAccelerationStructureMoveObjectsInputNV &r_move, VkClusterAccelerationStructureInputInfoNV &r_vk_input);
 
 private:
 	VkStridedDeviceAddressRegionKHR _sbt_to_vk_strided_device_address_region(const ShaderBindingTable &p_sbt);

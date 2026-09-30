@@ -306,6 +306,8 @@ public:
 		CALLBACK_RESOURCE_USAGE_GENERAL,
 		CALLBACK_RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ,
 		CALLBACK_RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE,
+		CALLBACK_RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ,
+		CALLBACK_RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ_WRITE,
 		CALLBACK_RESOURCE_USAGE_MAX
 	};
 
@@ -1333,10 +1335,6 @@ private:
 		RDD::AccelerationStructureID driver_id;
 		RDD::AccelerationStructureType type = {};
 		RDG::ResourceTracker *draw_tracker = nullptr;
-		// A cluster BLAS shares the tracker of the storage buffer it was built into, so the
-		// build that wrote it and the TLAS that reads it order on the same resource.
-		bool shared_draw_tracker = false;
-
 		// BLAS/TLAS are weakly linked, as opposed to RD dependencies.
 		HashSet<RID> acceleration_structure_dependencies;
 		bool invalidated = true;
@@ -1458,6 +1456,12 @@ public:
 		// The buffers the build infos point at by device address (vertex and index buffers); the
 		// build is ordered after their uploads and reads them under the indirect access type.
 		Vector<RID> source_buffers;
+		// The buffers holding built structures the operation reads through its infos (a move's
+		// sources, the CLAS a cluster BLAS is built over).
+		Vector<RID> source_acceleration_structure_buffers;
+		// The cluster BLAS handles (cluster_blas_create) a bottom-level build writes: listing them
+		// makes each usable by a TLAS and gives the TLAS build's read the barrier it needs.
+		Vector<RID> dst_acceleration_structures;
 	};
 
 	const ClusterAccelerationStructureCapabilities &get_cluster_acceleration_structure_capabilities() const;
@@ -1465,8 +1469,10 @@ public:
 	void cluster_triangle_build_info_write(uint8_t *r_driver_info, const ClusterTriangleBuildInfo &p_info);
 	void cluster_bottom_level_build_info_write(uint8_t *r_driver_info, const ClusterBottomLevelBuildInfo &p_info);
 	Error cluster_acceleration_structure_build(const ClusterAccelerationStructureBuild &p_build);
-	// A BLAS over the cluster BLAS built at p_offset in p_storage_buffer, usable as an instance's blas
-	// once its build is recorded. Freed with the storage buffer.
+	// A BLAS over the cluster BLAS to be built at p_offset in p_storage_buffer, usable as an
+	// instance's blas once a build listing it in dst_acceleration_structures is recorded. Its
+	// address is fixed: a cluster BLAS rebuilt elsewhere needs a new handle. Freed with the
+	// storage buffer, or by free_rid on its own.
 	RID cluster_blas_create(RID p_storage_buffer, uint64_t p_offset);
 
 private:

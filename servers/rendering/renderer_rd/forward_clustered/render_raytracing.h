@@ -228,6 +228,8 @@ enum {
 	RT_CACHE_CHUNK_SIZE = 256,
 	RT_CACHE_CHUNK_SHIFT = 8,
 	RT_CACHE_CHUNK_MASK = 255,
+	// The static cluster arena's chunk size (D81): a constant to size on real geometry, not a setting.
+	RT_CLUSTER_ARENA_CHUNK_BYTES = 32u * 1024u * 1024u,
 };
 
 // Material flags for RT (matches GLSL mat_flags bit layout).
@@ -272,10 +274,54 @@ struct RTSurfaceData {
 	Transform3D aabb_transform;
 	bool is_compressed = false;
 	uint64_t blas_size = 0;
-	// A cluster BLAS (D79) lives in buffers this surface owns: the structures themselves and the
-	// build's arguments. `blas` is then a handle into `cluster_storage` and is freed with it.
+	// A cluster BLAS (D79) is first built into buffers this surface owns, the staging storage and
+	// the build's arguments, and `blas` is a handle into the staging. With
+	// rendering/pathtracing/cluster_blas_compaction on (D81), once its sizes are read back the CLAS
+	// move into the arena's region below, the BLAS is rebuilt there, `blas` becomes a handle into
+	// the chunk and the two buffers are freed; off, the staging is kept for life.
 	RID cluster_storage;
 	RID cluster_args;
+	uint32_t cluster_count = 0;
+	uint32_t cluster_cache_key = 0;
+	uint64_t cluster_blas_worst_size = 0; // The size query's worst case for the one BLAS, its slot in the region.
+	uint64_t cluster_clas_region_size = 0; // The implicit build's region for every CLAS, the move's byte budget.
+	uint64_t cluster_args_implicit_offset = 0; // The addresses the implicit build wrote, the move's sources.
+	uint64_t cluster_args_compact_offset = 0; // The addresses the move writes to, the rebuild's references.
+	uint64_t cluster_args_blas_info_offset = 0; // The BLAS build info over the compact addresses.
+	uint64_t compaction_ticket = 0; // The sizes readback in flight, 0 for none.
+	int32_t arena_chunk = -1;
+	uint64_t arena_offset = 0;
+	uint64_t arena_size = 0;
+};
+
+// One chunk of the static cluster arena (D81): a storage buffer sub-allocated first fit from a
+// free list kept sorted by offset and merged on free. A dead chunk keeps its slot with a null
+// buffer so the indices surfaces hold stay valid.
+struct RTClusterArenaChunk {
+	struct FreeRange {
+		uint64_t offset = 0;
+		uint64_t size = 0;
+	};
+	RID buffer;
+	uint64_t address = 0; // The aligned base inside the buffer.
+	uint64_t base_offset = 0; // Its offset from the buffer's start.
+	uint64_t size = 0; // Usable bytes from the base.
+	uint32_t live_regions = 0;
+	LocalVector<FreeRange> free_list;
+};
+
+struct RTClusterCompactionResult {
+	uint64_t ticket = 0;
+	PackedByteArray sizes;
+};
+
+// A region whose surface is gone but whose chunk the frames in flight may still trace: freed
+// once the frame queue has turned over, as RenderingDevice defers its own frees.
+struct RTClusterRetiredRegion {
+	uint32_t chunk = 0;
+	uint64_t offset = 0;
+	uint64_t size = 0;
+	uint64_t frame = 0;
 };
 
 /// Inputs for a surface backed by a per-frame-deformed vertex buffer.
@@ -446,11 +492,25 @@ class RenderRaytracing {
 	// Static indexed surfaces build their BLAS from triangle clusters (D79): the device has
 	// VK_NV_cluster_acceleration_structure and rendering/pathtracing/cluster_blas asked for it.
 	bool cluster_blas_enabled = false;
+	// The compaction of cluster BLAS into the arena (D81), rendering/pathtracing/cluster_blas_compaction; off, a
+	// surface keeps its build-time buffers for life.
+	bool cluster_compaction_enabled = false;
 	// Cluster builds recorded this frame, for the render-info counters (they never enter dirty_blas_list).
 	uint32_t cluster_blas_builds = 0;
 	uint32_t cluster_triangles_built = 0;
-	// For MeshStorage's surface-freed callback, a plain function that reaches the renderer.
+	// The static cluster arena (D81) and the compactions in flight: a surface's sizes readback
+	// is keyed by a ticket so a result whose surface went in the meantime is dropped.
 	static RenderRaytracing *singleton;
+	LocalVector<RTClusterArenaChunk> cluster_arena;
+	LocalVector<RTClusterRetiredRegion> cluster_arena_retired;
+	uint64_t cluster_arena_reserved_bytes = 0;
+	uint64_t cluster_arena_live_bytes = 0;
+	HashMap<uint64_t, RTSurfaceData *> cluster_compaction_pending;
+	LocalVector<RTClusterCompactionResult> cluster_compaction_results;
+	uint64_t cluster_compaction_next_ticket = 0;
+	uint32_t cluster_compactions_total = 0;
+	uint64_t cluster_bytes_staged_total = 0;
+	uint64_t cluster_bytes_compacted_total = 0;
 
 	// Merged MultiMesh BLAS cache and compute shader.
 	struct MergeShader {
@@ -655,9 +715,17 @@ class RenderRaytracing {
 	// CLAS, one cluster BLAS over them, both built this frame into the surface's own storage. Returns
 	// false, with nothing created, if the surface does not fit.
 	bool _populate_surface_cluster_blas(void *p_mesh_surface, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data);
-	// Frees the surface's BLAS and, on the cluster path, the buffers it lives in.
-	void _release_surface_data(RTSurfaceData *p_surf_data);
+	// The compaction (D81): RenderingDevice hands the built sizes to the static callback on the
+	// render thread as a later frame begins; the next RT frame moves those surfaces' CLAS into
+	// the arena, rebuilds the BLAS there and frees the staging.
+	static void _on_cluster_sizes_read(const PackedByteArray &p_sizes, uint64_t p_ticket);
+	void _process_cluster_compactions();
+	bool _cluster_arena_allocate(uint64_t p_size, uint32_t &r_chunk, uint64_t &r_offset);
+	void _cluster_arena_retire(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size);
+	void _cluster_arena_free(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size);
 	static void _mesh_surface_freed(RID p_mesh, uint32_t p_surface);
+	// Frees the surface's BLAS and, on the cluster path, the staging buffers or the arena region it lives in.
+	void _release_surface_data(RTSurfaceData *p_surf_data);
 	RTMaterialData *process_material(RID p_material_rid, uint16_t p_material_invalidation_counter);
 	bool _build_merged_mm_blas(
 			RID p_mm_rid,

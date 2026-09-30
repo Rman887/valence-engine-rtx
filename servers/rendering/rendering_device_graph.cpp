@@ -86,6 +86,10 @@ String RenderingDeviceGraph::_usage_to_string(ResourceUsage p_usage) {
 			return "Attachment Depth Stencil Read Write";
 		case RESOURCE_USAGE_GENERAL:
 			return "General";
+		case RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ:
+			return "Cluster Acceleration Structure Input Read";
+		case RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ_WRITE:
+			return "Cluster Acceleration Structure Input Read Write";
 		default:
 			ERR_FAIL_V_MSG("Invalid", vformat("Invalid resource usage %d.", p_usage));
 	}
@@ -107,6 +111,7 @@ bool RenderingDeviceGraph::_is_write_usage(ResourceUsage p_usage) {
 		case RESOURCE_USAGE_ATTACHMENT_FRAGMENT_SHADING_RATE_READ:
 		case RESOURCE_USAGE_ATTACHMENT_FRAGMENT_DENSITY_MAP_READ:
 		case RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ:
+		case RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ:
 			return false;
 		case RESOURCE_USAGE_COPY_TO:
 		case RESOURCE_USAGE_RESOLVE_TO:
@@ -117,6 +122,7 @@ bool RenderingDeviceGraph::_is_write_usage(ResourceUsage p_usage) {
 		case RESOURCE_USAGE_ATTACHMENT_DEPTH_STENCIL_READ_WRITE:
 		case RESOURCE_USAGE_GENERAL:
 		case RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE:
+		case RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ_WRITE:
 			return true;
 		default:
 			DEV_ASSERT(false && "Invalid resource tracker usage.");
@@ -203,6 +209,10 @@ RDD::BarrierAccessBits RenderingDeviceGraph::_usage_to_access_bits(ResourceUsage
 			return RDD::BarrierAccessBits(RDD::BARRIER_ACCESS_MEMORY_READ_BIT | RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT);
 		case RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE:
 			return RDD::BarrierAccessBits(RDD::BARRIER_ACCESS_ACCELERATION_STRUCTURE_READ_BIT | RDD::BARRIER_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT);
+		case RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ:
+			return RDD::BARRIER_ACCESS_INDIRECT_COMMAND_READ_BIT;
+		case RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ_WRITE:
+			return RDD::BarrierAccessBits(RDD::BARRIER_ACCESS_INDIRECT_COMMAND_READ_BIT | RDD::BARRIER_ACCESS_ACCELERATION_STRUCTURE_READ_BIT | RDD::BARRIER_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT);
 		default:
 			DEV_ASSERT(false && "Invalid usage.");
 			return RDD::BarrierAccessBits(0);

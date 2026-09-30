@@ -3946,6 +3946,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracing/shader_execution_reordering_hint", PROPERTY_HINT_ENUM, "None,Instance,Termination,Termination and Distance"), 2);
 	GLOBAL_DEF("rendering/pathtracing/async_shader_compilation", true);
 	GLOBAL_DEF_RST("rendering/pathtracing/multimesh_cache_cpu_transforms", false);
+	GLOBAL_DEF_RST("rendering/pathtracing/cluster_blas_compaction", false);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/deformed_mesh_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 60);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_blas_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,18000,1"), 3600);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_merged_blas_max_triangles", PROPERTY_HINT_RANGE, "256,1048576,1"), 65536);

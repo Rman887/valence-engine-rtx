@@ -178,6 +178,12 @@ public:
 		RESOURCE_USAGE_GENERAL,
 		RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ,
 		RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE,
+		// VK_NV_cluster_acceleration_structure reads every input reached through srcInfosArray
+		// (the infos, cluster references, a move's sources, vertex and index data) at the
+		// acceleration-structure build stage under INDIRECT_COMMAND_READ, and writes the implicit
+		// destination, the address and the size arrays there under ACCELERATION_STRUCTURE_WRITE.
+		RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ,
+		RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ_WRITE, // Read as input and written by one command.
 		RESOURCE_USAGE_MAX
 	};
 

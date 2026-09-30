@@ -1352,6 +1352,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			cluster_acceleration_structure_capabilities.cluster_bottom_level_byte_alignment = cluster_acceleration_structure_properties.clusterBottomLevelByteAlignment;
 			cluster_acceleration_structure_capabilities.triangle_build_info_size = sizeof(VkClusterAccelerationStructureBuildTriangleClusterInfoNV);
 			cluster_acceleration_structure_capabilities.bottom_level_build_info_size = sizeof(VkClusterAccelerationStructureBuildClustersBottomLevelInfoNV);
+			cluster_acceleration_structure_capabilities.move_info_size = sizeof(VkClusterAccelerationStructureMoveObjectsInfoNV);
 			cluster_acceleration_structure_capabilities.cluster_scratch_byte_alignment = cluster_acceleration_structure_properties.clusterScratchByteAlignment;
 
 			print_verbose("- Vulkan Cluster Acceleration Structure supported");
@@ -6731,7 +6732,7 @@ const RDD::ClusterAccelerationStructureCapabilities &RenderingDeviceDriverVulkan
 	return cluster_acceleration_structure_capabilities;
 }
 
-void RenderingDeviceDriverVulkan::_cluster_acceleration_structure_input(const ClusterAccelerationStructureInput &p_input, VkClusterAccelerationStructureTriangleClusterInputNV &r_triangles, VkClusterAccelerationStructureClustersBottomLevelInputNV &r_bottom_level, VkClusterAccelerationStructureInputInfoNV &r_vk_input) {
+void RenderingDeviceDriverVulkan::_cluster_acceleration_structure_input(const ClusterAccelerationStructureInput &p_input, VkClusterAccelerationStructureTriangleClusterInputNV &r_triangles, VkClusterAccelerationStructureClustersBottomLevelInputNV &r_bottom_level, VkClusterAccelerationStructureMoveObjectsInputNV &r_move, VkClusterAccelerationStructureInputInfoNV &r_vk_input) {
 	static_assert(ENUM_MEMBERS_EQUAL(ClusterAccelerationStructureInput::CLUSTER_OP_MODE_IMPLICIT_DESTINATIONS, VK_CLUSTER_ACCELERATION_STRUCTURE_OP_MODE_IMPLICIT_DESTINATIONS_NV));
 	static_assert(ENUM_MEMBERS_EQUAL(ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS, VK_CLUSTER_ACCELERATION_STRUCTURE_OP_MODE_EXPLICIT_DESTINATIONS_NV));
 	static_assert(ENUM_MEMBERS_EQUAL(ClusterAccelerationStructureInput::CLUSTER_OP_MODE_COMPUTE_SIZES, VK_CLUSTER_ACCELERATION_STRUCTURE_OP_MODE_COMPUTE_SIZES_NV));
@@ -6764,6 +6765,15 @@ void RenderingDeviceDriverVulkan::_cluster_acceleration_structure_input(const Cl
 			r_vk_input.opType = VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_BUILD_CLUSTERS_BOTTOM_LEVEL_NV;
 			r_vk_input.opInput.pClustersBottomLevel = &r_bottom_level;
 		} break;
+		case ClusterAccelerationStructureInput::CLUSTER_OP_MOVE_OBJECTS: {
+			r_move = {};
+			r_move.sType = VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_MOVE_OBJECTS_INPUT_NV;
+			r_move.type = p_input.move_type == ClusterAccelerationStructureInput::CLUSTER_MOVE_CLUSTERS_BOTTOM_LEVEL ? VK_CLUSTER_ACCELERATION_STRUCTURE_TYPE_CLUSTERS_BOTTOM_LEVEL_NV : VK_CLUSTER_ACCELERATION_STRUCTURE_TYPE_TRIANGLE_CLUSTER_NV;
+			r_move.noMoveOverlap = p_input.move_no_overlap;
+			r_move.maxMovedBytes = p_input.move_max_bytes;
+			r_vk_input.opType = VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_MOVE_OBJECTS_NV;
+			r_vk_input.opInput.pMoveObjects = &r_move;
+		} break;
 	}
 }
 
@@ -6775,14 +6785,16 @@ void RenderingDeviceDriverVulkan::cluster_acceleration_structure_get_build_sizes
 
 	VkClusterAccelerationStructureTriangleClusterInputNV triangles;
 	VkClusterAccelerationStructureClustersBottomLevelInputNV bottom_level;
+	VkClusterAccelerationStructureMoveObjectsInputNV move;
 	VkClusterAccelerationStructureInputInfoNV vk_input;
-	_cluster_acceleration_structure_input(p_input, triangles, bottom_level, vk_input);
+	_cluster_acceleration_structure_input(p_input, triangles, bottom_level, move, vk_input);
 
 	VkAccelerationStructureBuildSizesInfoKHR size_info = {};
 	size_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
 	device_functions.GetClusterAccelerationStructureBuildSizesNV(vk_device, &vk_input, &size_info);
 	r_acceleration_structure_size = size_info.accelerationStructureSize;
-	r_scratch_size = size_info.buildScratchSize;
+	// A move reports its scratch as the update size; one scratch covers either.
+	r_scratch_size = MAX(size_info.buildScratchSize, size_info.updateScratchSize);
 #endif
 }
 
@@ -6926,9 +6938,10 @@ void RenderingDeviceDriverVulkan::command_build_cluster_acceleration_structures(
 
 	VkClusterAccelerationStructureTriangleClusterInputNV triangles;
 	VkClusterAccelerationStructureClustersBottomLevelInputNV bottom_level;
+	VkClusterAccelerationStructureMoveObjectsInputNV move;
 	VkClusterAccelerationStructureCommandsInfoNV commands_info = {};
 	commands_info.sType = VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_COMMANDS_INFO_NV;
-	_cluster_acceleration_structure_input(p_build.input, triangles, bottom_level, commands_info.input);
+	_cluster_acceleration_structure_input(p_build.input, triangles, bottom_level, move, commands_info.input);
 
 	if (p_build.dst_implicit_buffer) {
 		commands_info.dstImplicitData = buffer_get_device_address(p_build.dst_implicit_buffer) + p_build.dst_implicit_offset;

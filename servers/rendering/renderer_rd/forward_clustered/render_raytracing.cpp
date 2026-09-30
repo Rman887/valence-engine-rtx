@@ -30,6 +30,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/math/math_funcs.h"
+#include "core/object/callable_mp.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/environment/sky.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
@@ -47,6 +48,10 @@ using namespace RendererSceneRenderImplementation;
 
 RenderRaytracing *RenderRaytracing::singleton = nullptr;
 
+static _FORCE_INLINE_ uint64_t _align_up(uint64_t p_value, uint64_t p_alignment) {
+	return p_alignment > 1 ? (p_value + p_alignment - 1) / p_alignment * p_alignment : p_value;
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -55,14 +60,15 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 	owner = p_owner;
 	singleton = this;
 	bindless_block = memnew(BindlessBlock);
-	// A surface its mesh drops releases its RT cache entry at once, not at the slot's reuse.
+	// A surface its mesh drops releases its RT cache entry at once (D81), not at the slot's reuse.
 	RendererRD::MeshStorage::get_singleton()->set_surface_freed_callback(&RenderRaytracing::_mesh_surface_freed);
 
 	cluster_blas_enabled = RD::get_singleton()->has_feature(RD::SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE);
 	if (cluster_blas_enabled) {
+		cluster_compaction_enabled = GLOBAL_GET("rendering/pathtracing/cluster_blas_compaction");
 		const RD::ClusterAccelerationStructureCapabilities &caps = RD::get_singleton()->get_cluster_acceleration_structure_capabilities();
 		// One line on the console (the setting is off by default): the harness reads it as proof the path is active.
-		print_line(vformat("RT: static BLAS built from clusters of up to %d triangles and %d vertices (D79).", caps.max_triangles_per_cluster, caps.max_vertices_per_cluster));
+		print_line(vformat("RT: static BLAS built from clusters of up to %d triangles and %d vertices (D79), compaction %s.", caps.max_triangles_per_cluster, caps.max_vertices_per_cluster, cluster_compaction_enabled ? "on" : "off"));
 	} else if (GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
 		WARN_PRINT("rendering/pathtracing/cluster_blas is on but the device has no VK_NV_cluster_acceleration_structure; static BLAS stay triangle BLAS.");
 	}
@@ -453,6 +459,26 @@ void RenderRaytracing::cleanup_caches() {
 
 	RD *rd = RD::get_singleton();
 
+	// The cluster arena (D81): every region went with its surface above; a result still in
+	// flight has no surface to land on.
+	cluster_compaction_pending.clear();
+	cluster_compaction_results.clear();
+	for (const RTClusterRetiredRegion &retired : cluster_arena_retired) {
+		_cluster_arena_free(retired.chunk, retired.offset, retired.size);
+	}
+	cluster_arena_retired.clear();
+	for (uint32_t i = 0; i < cluster_arena.size(); i++) {
+		if (cluster_arena[i].buffer.is_valid()) {
+			rd->free_rid(cluster_arena[i].buffer);
+		}
+	}
+	if (cluster_compactions_total > 0) {
+		print_verbose(vformat("RT: cluster arena released: %d compactions, %d KB staged -> %d KB compacted in all.", cluster_compactions_total, cluster_bytes_staged_total / 1024, cluster_bytes_compacted_total / 1024));
+	}
+	cluster_arena.clear();
+	cluster_arena_reserved_bytes = 0;
+	cluster_arena_live_bytes = 0;
+
 	// Free all cached deformed surface data.
 	{
 		LocalVector<RID> live = deformed_pool.get_owned_list();
@@ -644,6 +670,10 @@ RTMergedMMEntry *RenderRaytracing::_access_merged_mm_slot(RID &r_handle) {
 // ---------------------------------------------------------------------------
 
 void RenderRaytracing::prepare_frame() {
+	// Sizes read back since the last frame move their CLAS into the arena before the TLAS
+	// instances of this frame take each surface's handle (D81).
+	_process_cluster_compactions();
+
 	blass.clear();
 	blas_transforms.clear();
 	instance_flags.clear();
@@ -778,8 +808,8 @@ RTSurfaceData *RenderRaytracing::process_surface(
 		entry->ptr = memnew(RTSurfaceData);
 	} else {
 		// Surface data changed on a live mesh: the BLAS is still there, free it.
-		// A surface its mesh cleared or removed was released through MeshStorage's callback
-		// (release_mesh_surface); a triangle BLAS also cascades with the mesh's buffers.
+		// A deleted mesh or cleared surface cascade-freed a triangle BLAS through its buffers;
+		// a cluster BLAS and its storage wait here for the slot's reuse.
 		_release_surface_data(entry->ptr);
 	}
 
@@ -1247,11 +1277,17 @@ bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID 
 	const uint32_t index_size = geom.index_format == RT_INDEX_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t);
 	const RD::DataFormat pos_format = r_surf_data->is_compressed ? RD::DATA_FORMAT_R16G16B16A16_UNORM : RD::DATA_FORMAT_R32G32B32_SFLOAT;
 
-	// Sizes: explicit destinations, so the CLAS size is the worst case of one cluster and
-	// the BLAS size the worst case for this many clusters.
+	// Sizes (D81): the CLAS are built with implicit destinations into a staging buffer, so their
+	// size query returns one region for all of them and the build writes each one's size back;
+	// the BLAS is built at an explicit address, the staging base, so its handle exists this frame
+	// (explicit builds write no sizes, so the BLAS keeps its worst case). With
+	// rendering/pathtracing/cluster_blas_compaction on, once the CLAS sizes are read they move to
+	// the arena at their compacted size and the BLAS is rebuilt over them
+	// (_process_cluster_compactions); off, the staging is the surface's for life. The argument
+	// sections the move needs (the sizes, info B, the compact addresses) are laid out either way.
 	RD::ClusterAccelerationStructureInput clas_input;
 	clas_input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER;
-	clas_input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
+	clas_input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_IMPLICIT_DESTINATIONS;
 	clas_input.max_acceleration_structure_count = cluster_count;
 	clas_input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
 	clas_input.vertex_format = pos_format;
@@ -1268,53 +1304,56 @@ bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID 
 	blas_input.max_total_cluster_count = cluster_count;
 	blas_input.max_cluster_count_per_acceleration_structure = cluster_count;
 
-	uint64_t clas_size = 0, clas_scratch = 0, blas_size = 0, blas_scratch = 0;
-	rd->cluster_acceleration_structure_get_build_sizes(clas_input, clas_size, clas_scratch);
+	uint64_t clas_region_size = 0, clas_scratch = 0, blas_size = 0, blas_scratch = 0;
+	rd->cluster_acceleration_structure_get_build_sizes(clas_input, clas_region_size, clas_scratch);
 	rd->cluster_acceleration_structure_get_build_sizes(blas_input, blas_size, blas_scratch);
-	if (clas_size == 0 || blas_size == 0) {
-		print_verbose(vformat("RT: surface [%d] on the triangle BLAS path: the driver sized a CLAS at %d and the BLAS at %d bytes.", p_cache_key, clas_size, blas_size));
+	if (clas_region_size == 0 || blas_size == 0) {
+		print_verbose(vformat("RT: surface [%d] on the triangle BLAS path: the driver sized the CLAS region at %d and the BLAS at %d bytes.", p_cache_key, clas_region_size, blas_size));
 		return false;
 	}
 
-	// Storage: the BLAS first, then the CLAS at their alignment. The buffer's own address is
-	// aligned only as the allocator saw fit, so the base is aligned inside a padded buffer.
-	auto align_up = [](uint64_t p_value, uint64_t p_alignment) -> uint64_t {
-		return p_alignment > 1 ? (p_value + p_alignment - 1) / p_alignment * p_alignment : p_value;
-	};
+	// Staging: the BLAS first, then the implicit CLAS region at its alignment. The buffer's own
+	// address is aligned only as the allocator saw fit, so the base is aligned inside a padded buffer.
 	const uint64_t base_alignment = MAX(caps.cluster_byte_alignment, caps.cluster_bottom_level_byte_alignment);
-	const uint64_t clas_stride = align_up(clas_size, caps.cluster_byte_alignment);
-	const uint64_t clas_region = align_up(blas_size, base_alignment);
-	const uint64_t storage_size = base_alignment + clas_region + clas_stride * cluster_count;
-	ERR_FAIL_COND_V_MSG(storage_size > UINT32_MAX, false, "RT: a cluster BLAS's storage exceeds 4 GB.");
+	const uint64_t clas_region = _align_up(blas_size, base_alignment);
+	const uint64_t staging_size = base_alignment + clas_region + clas_region_size;
+	ERR_FAIL_COND_V_MSG(staging_size > UINT32_MAX, false, "RT: a cluster BLAS's staging exceeds 4 GB.");
 
-	RID storage = rd->storage_buffer_create(uint32_t(storage_size), {}, 0,
-			RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
-	if (storage.is_null()) {
+	RID staging = rd->storage_buffer_create(uint32_t(staging_size), {}, 0,
+			RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT);
+	if (staging.is_null()) {
 		return false;
 	}
-	const uint64_t buffer_address = rd->buffer_get_device_address(storage);
-	const uint64_t storage_address = align_up(buffer_address, base_alignment);
-	const uint64_t blas_offset = storage_address - buffer_address;
+	const uint64_t buffer_address = rd->buffer_get_device_address(staging);
+	const uint64_t staging_address = _align_up(buffer_address, base_alignment);
+	const uint64_t blas_offset = staging_address - buffer_address;
+	RID blas = rd->cluster_blas_create(staging, blas_offset);
+	if (blas.is_null()) {
+		rd->free_rid(staging);
+		return false;
+	}
 
-	// Arguments, read-only for the builds: the CLAS infos, the BLAS info and the destination
-	// addresses (cluster_count CLAS, then the BLAS), each section 16-byte aligned. Explicit
-	// destinations write no sizes, so none are asked for.
+	// Arguments, 16-byte sections: the CLAS infos; BLAS info A, over the implicit addresses (this
+	// frame's build); BLAS info B, over the compact addresses (the rebuild after the move); the
+	// implicit addresses (cluster_count CLAS the driver writes, then the BLAS's staging address);
+	// the CLAS sizes; the compact addresses, filled at the move.
 	const uint32_t clas_info_stride = caps.triangle_build_info_size;
 	const uint32_t blas_info_stride = caps.bottom_level_build_info_size;
 	const uint64_t clas_infos_offset = 0;
-	const uint64_t blas_info_offset = align_up(clas_infos_offset + uint64_t(clas_info_stride) * cluster_count, 16);
-	const uint64_t dst_addresses_offset = align_up(blas_info_offset + blas_info_stride, 16);
-	const uint64_t args_size = align_up(dst_addresses_offset + sizeof(uint64_t) * (cluster_count + 1), 16);
+	const uint64_t blas_info_a_offset = _align_up(clas_infos_offset + uint64_t(clas_info_stride) * cluster_count, 16);
+	const uint64_t blas_info_b_offset = _align_up(blas_info_a_offset + blas_info_stride, 16);
+	const uint64_t implicit_addresses_offset = _align_up(blas_info_b_offset + blas_info_stride, 16);
+	const uint64_t sizes_offset = _align_up(implicit_addresses_offset + sizeof(uint64_t) * (cluster_count + 1), 16);
+	const uint64_t compact_addresses_offset = _align_up(sizes_offset + sizeof(uint32_t) * cluster_count, 16);
+	const uint64_t args_size = _align_up(compact_addresses_offset + sizeof(uint64_t) * (cluster_count + 1), 16);
 
 	LocalVector<uint8_t> args;
 	args.resize(args_size);
 	memset(args.ptr(), 0, args_size);
 
-	uint64_t *dst_addresses = reinterpret_cast<uint64_t *>(args.ptr() + dst_addresses_offset);
 	uint32_t first_triangle = 0;
 	for (uint32_t c = 0; c < cluster_count; c++) {
 		const uint32_t triangle_count = cluster_triangles[c];
-
 		RD::ClusterTriangleBuildInfo info;
 		info.cluster_id = first_triangle;
 		info.triangle_count = triangle_count;
@@ -1325,16 +1364,15 @@ bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID 
 		info.vertex_address = geom.vertex_buffer_address;
 		info.vertex_stride = geom.position_stride;
 		rd->cluster_triangle_build_info_write(args.ptr() + clas_infos_offset + uint64_t(c) * clas_info_stride, info);
-
-		dst_addresses[c] = storage_address + clas_region + clas_stride * c;
 		first_triangle += triangle_count;
 	}
-	dst_addresses[cluster_count] = storage_address;
+	reinterpret_cast<uint64_t *>(args.ptr() + implicit_addresses_offset)[cluster_count] = staging_address;
 
 	RID args_buffer = rd->storage_buffer_create(uint32_t(args_size), {}, 0,
 			RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
 	if (args_buffer.is_null()) {
-		rd->free_rid(storage);
+		rd->free_rid(blas);
+		rd->free_rid(staging);
 		return false;
 	}
 	const uint64_t args_address = rd->buffer_get_device_address(args_buffer);
@@ -1342,69 +1380,378 @@ bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID 
 		RD::ClusterBottomLevelBuildInfo blas_info;
 		blas_info.cluster_references_count = cluster_count;
 		blas_info.cluster_references_stride = sizeof(uint64_t);
-		blas_info.cluster_references_address = args_address + dst_addresses_offset;
-		rd->cluster_bottom_level_build_info_write(args.ptr() + blas_info_offset, blas_info);
+		blas_info.cluster_references_address = args_address + implicit_addresses_offset;
+		rd->cluster_bottom_level_build_info_write(args.ptr() + blas_info_a_offset, blas_info);
+		blas_info.cluster_references_address = args_address + compact_addresses_offset;
+		rd->cluster_bottom_level_build_info_write(args.ptr() + blas_info_b_offset, blas_info);
 	}
 	rd->buffer_update(args_buffer, 0, uint32_t(args_size), args.ptr());
 
-	// The two builds this frame: every CLAS, then the BLAS over their addresses. The graph
-	// orders them on the storage and argument buffers, and the TLAS after both.
+	// The two builds this frame: every CLAS into the staging region, then the BLAS over the
+	// addresses the driver wrote.
 	{
 		RD::ClusterAccelerationStructureBuild build;
 		build.input = clas_input;
-		build.dst_storage_buffer = storage;
+		build.dst_implicit_buffer = staging;
+		build.dst_implicit_offset = blas_offset + clas_region;
 		build.dst_addresses_buffer = args_buffer;
-		build.dst_addresses_offset = dst_addresses_offset;
+		build.dst_addresses_offset = implicit_addresses_offset;
 		build.dst_addresses_stride = sizeof(uint64_t);
+		build.dst_sizes_buffer = args_buffer;
+		build.dst_sizes_offset = sizes_offset;
+		build.dst_sizes_stride = sizeof(uint32_t);
 		build.src_infos_buffer = args_buffer;
 		build.src_infos_offset = clas_infos_offset;
 		build.src_infos_stride = clas_info_stride;
 		build.source_buffers.push_back(p_vertex_buffer);
 		build.source_buffers.push_back(p_index_buffer);
 		if (rd->cluster_acceleration_structure_build(build) != OK) {
+			rd->free_rid(blas);
 			rd->free_rid(args_buffer);
-			rd->free_rid(storage);
+			rd->free_rid(staging);
 			return false;
 		}
 	}
 	{
 		RD::ClusterAccelerationStructureBuild build;
 		build.input = blas_input;
-		build.dst_storage_buffer = storage;
+		build.dst_storage_buffer = staging;
 		build.dst_addresses_buffer = args_buffer;
-		build.dst_addresses_offset = dst_addresses_offset + sizeof(uint64_t) * cluster_count;
+		build.dst_addresses_offset = implicit_addresses_offset + sizeof(uint64_t) * cluster_count;
 		build.dst_addresses_stride = sizeof(uint64_t);
 		build.src_infos_buffer = args_buffer;
-		build.src_infos_offset = blas_info_offset;
+		build.src_infos_offset = blas_info_a_offset;
 		build.src_infos_stride = blas_info_stride;
+		build.source_acceleration_structure_buffers.push_back(staging); // The CLAS it references, read through its info.
+		build.dst_acceleration_structures.push_back(blas);
 		if (rd->cluster_acceleration_structure_build(build) != OK) {
+			rd->free_rid(blas);
 			rd->free_rid(args_buffer);
-			rd->free_rid(storage);
+			rd->free_rid(staging);
 			return false;
 		}
 	}
 
-	r_surf_data->blas = rd->cluster_blas_create(storage, blas_offset);
-	if (r_surf_data->blas.is_null()) {
-		rd->free_rid(args_buffer);
-		rd->free_rid(storage);
-		return false;
-	}
+	r_surf_data->blas = blas;
 	rd->set_resource_name(r_surf_data->blas, "RT cluster BLAS [" + itos(p_cache_key) + "]");
-	rd->set_resource_name(storage, "RT cluster storage [" + itos(p_cache_key) + "]");
+	rd->set_resource_name(staging, "RT cluster staging [" + itos(p_cache_key) + "]");
 	rd->set_resource_name(args_buffer, "RT cluster args [" + itos(p_cache_key) + "]");
-	r_surf_data->cluster_storage = storage;
+	r_surf_data->cluster_storage = staging;
 	r_surf_data->cluster_args = args_buffer;
-	r_surf_data->blas_size = storage_size + args_size;
+	r_surf_data->blas_size = staging_size + args_size;
+	r_surf_data->cluster_count = cluster_count;
+	r_surf_data->cluster_cache_key = p_cache_key;
+	r_surf_data->cluster_blas_worst_size = blas_size;
+	r_surf_data->cluster_clas_region_size = clas_region_size;
+	r_surf_data->cluster_args_implicit_offset = implicit_addresses_offset;
+	r_surf_data->cluster_args_compact_offset = compact_addresses_offset;
+	r_surf_data->cluster_args_blas_info_offset = blas_info_b_offset;
+
+	// The sizes come back on the render thread a frame queue later; the compaction runs then.
+	// Without it (rendering/pathtracing/cluster_blas_compaction off) the surface keeps its staging
+	// buffers and BLAS for life, and nothing is read back.
+	if (cluster_compaction_enabled) {
+		const uint64_t ticket = ++cluster_compaction_next_ticket;
+		const Error readback = rd->buffer_get_data_async(args_buffer, callable_mp_static(&RenderRaytracing::_on_cluster_sizes_read).bind(ticket), uint32_t(sizes_offset), uint32_t(sizeof(uint32_t) * cluster_count));
+		if (readback == OK) {
+			r_surf_data->compaction_ticket = ticket;
+			cluster_compaction_pending.insert(ticket, r_surf_data);
+		} else {
+			WARN_PRINT_ONCE(vformat("RT: cluster BLAS [%d]: the sizes could not be read back; the surface stays in its staging buffer.", p_cache_key));
+		}
+	}
+
 	cluster_blas_builds++;
 	cluster_triangles_built += primitive_count;
-	print_verbose(vformat("RT: cluster BLAS [%d]: %d triangles in %d %s of at most %d triangles and %d vertices, %d KB storage, %d KB arguments.", p_cache_key, primitive_count, cluster_count, from_table ? "clusters" : "runs", max_cluster_triangles, max_cluster_vertices, storage_size / 1024, args_size / 1024));
+	print_verbose(vformat("RT: cluster BLAS [%d]: %d triangles in %d %s of at most %d triangles and %d vertices, %d KB staging, %d KB arguments.", p_cache_key, primitive_count, cluster_count, from_table ? "clusters" : "runs", max_cluster_triangles, max_cluster_vertices, staging_size / 1024, args_size / 1024));
 	return true;
 }
 
+void RenderRaytracing::_on_cluster_sizes_read(const PackedByteArray &p_sizes, uint64_t p_ticket) {
+	// Called by RenderingDevice on the render thread as it begins a later frame: only queue
+	// the result, the compaction records its commands from the next RT frame.
+	if (singleton == nullptr) {
+		return;
+	}
+	RTClusterCompactionResult result;
+	result.ticket = p_ticket;
+	result.sizes = p_sizes;
+	singleton->cluster_compaction_results.push_back(result);
+}
+
+void RenderRaytracing::_process_cluster_compactions() {
+	RD *rd = RD::get_singleton();
+
+	// Regions retired a frame queue ago are out of every frame in flight and go back to their chunk.
+	if (!cluster_arena_retired.is_empty()) {
+		const uint64_t frames_drawn = rd->get_frames_drawn();
+		const uint64_t frame_delay = rd->get_frame_delay();
+		for (uint32_t i = 0; i < cluster_arena_retired.size();) {
+			const RTClusterRetiredRegion &retired = cluster_arena_retired[i];
+			if (frames_drawn - retired.frame >= frame_delay) {
+				_cluster_arena_free(retired.chunk, retired.offset, retired.size);
+				cluster_arena_retired.remove_at_unordered(i);
+			} else {
+				i++;
+			}
+		}
+	}
+
+	if (cluster_compaction_results.is_empty()) {
+		return;
+	}
+	const RD::ClusterAccelerationStructureCapabilities &caps = rd->get_cluster_acceleration_structure_capabilities();
+	const uint64_t base_alignment = MAX(caps.cluster_byte_alignment, caps.cluster_bottom_level_byte_alignment);
+
+	// Taken off the member first: a buffer update below can stall on the frame queue, which
+	// delivers further readbacks into the member while these are processed.
+	LocalVector<RTClusterCompactionResult> results;
+	results = cluster_compaction_results;
+	cluster_compaction_results.clear();
+	for (const RTClusterCompactionResult &result : results) {
+		RTSurfaceData **found = cluster_compaction_pending.getptr(result.ticket);
+		if (found == nullptr) {
+			continue; // The surface was released while its sizes were in flight.
+		}
+		RTSurfaceData *surf = *found;
+		cluster_compaction_pending.erase(result.ticket);
+		surf->compaction_ticket = 0;
+
+		const uint32_t cluster_count = surf->cluster_count;
+		if (result.sizes.size() < int64_t(sizeof(uint32_t) * cluster_count)) {
+			WARN_PRINT_ONCE(vformat("RT: cluster BLAS [%d]: the sizes read back are short; the surface stays in its staging buffer.", surf->cluster_cache_key));
+			continue;
+		}
+		const uint32_t *sizes = reinterpret_cast<const uint32_t *>(result.sizes.ptr());
+		// The region: the BLAS at its base, sized as the query's worst case since an explicit
+		// build writes no size, then each CLAS at the cluster alignment.
+		const uint64_t clas_offset = _align_up(_align_up(surf->cluster_blas_worst_size, caps.cluster_bottom_level_byte_alignment), caps.cluster_byte_alignment);
+		uint64_t clas_total = 0;
+		bool sized = true;
+		for (uint32_t c = 0; c < cluster_count && sized; c++) {
+			sized = sizes[c] > 0;
+			clas_total += _align_up(sizes[c], caps.cluster_byte_alignment);
+		}
+		if (!sized) {
+			WARN_PRINT_ONCE(vformat("RT: cluster BLAS [%d]: a built size read back as zero; the surface stays in its staging buffer.", surf->cluster_cache_key));
+			continue;
+		}
+		const uint64_t region_size = _align_up(clas_offset + clas_total, base_alignment);
+
+		uint32_t chunk_index = 0;
+		uint64_t region_offset = 0;
+		if (!_cluster_arena_allocate(region_size, chunk_index, region_offset)) {
+			WARN_PRINT_ONCE(vformat("RT: cluster BLAS [%d]: no arena chunk could be created; the surface stays in its staging buffer.", surf->cluster_cache_key));
+			continue;
+		}
+		const RTClusterArenaChunk &chunk = cluster_arena[chunk_index];
+		const uint64_t region_address = chunk.address + region_offset;
+		RID blas = rd->cluster_blas_create(chunk.buffer, chunk.base_offset + region_offset);
+		if (blas.is_null()) {
+			_cluster_arena_retire(chunk_index, region_offset, region_size);
+			WARN_PRINT_ONCE(vformat("RT: cluster BLAS [%d]: no handle for the compacted BLAS; the surface stays in its staging buffer.", surf->cluster_cache_key));
+			continue;
+		}
+
+		LocalVector<uint64_t> compact_addresses;
+		compact_addresses.resize(cluster_count + 1);
+		uint64_t cursor = region_address + clas_offset;
+		for (uint32_t c = 0; c < cluster_count; c++) {
+			compact_addresses[c] = cursor;
+			cursor += _align_up(sizes[c], caps.cluster_byte_alignment);
+		}
+		compact_addresses[cluster_count] = region_address;
+		rd->buffer_update(surf->cluster_args, uint32_t(surf->cluster_args_compact_offset), uint32_t(sizeof(uint64_t) * (cluster_count + 1)), compact_addresses.ptr());
+
+		// The move: every CLAS from its implicit staging address (the address array the build
+		// wrote is, one address per entry, exactly the move's source info) to its compact one. The
+		// byte budget is the implicit build's whole region, as NVIDIA's sample passes it, not the
+		// sum of the read-back sizes: what the driver counts as moved is its own.
+		bool ok = true;
+		{
+			RD::ClusterAccelerationStructureBuild move;
+			move.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MOVE_OBJECTS;
+			move.input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
+			move.input.max_acceleration_structure_count = cluster_count;
+			move.input.move_type = RD::ClusterAccelerationStructureInput::CLUSTER_MOVE_TRIANGLE_CLUSTER;
+			move.input.move_no_overlap = true;
+			move.input.move_max_bytes = surf->cluster_clas_region_size;
+			move.dst_storage_buffer = chunk.buffer;
+			move.dst_addresses_buffer = surf->cluster_args;
+			move.dst_addresses_offset = surf->cluster_args_compact_offset;
+			move.dst_addresses_stride = sizeof(uint64_t);
+			move.src_infos_buffer = surf->cluster_args;
+			move.src_infos_offset = surf->cluster_args_implicit_offset;
+			move.src_infos_stride = sizeof(uint64_t);
+			move.source_acceleration_structure_buffers.push_back(surf->cluster_storage);
+			ok = rd->cluster_acceleration_structure_build(move) == OK;
+		}
+		// The BLAS again, over the compact addresses, at the region's base.
+		if (ok) {
+			RD::ClusterAccelerationStructureBuild build;
+			build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
+			build.input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
+			build.input.max_acceleration_structure_count = 1;
+			build.input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
+			build.input.max_total_cluster_count = cluster_count;
+			build.input.max_cluster_count_per_acceleration_structure = cluster_count;
+			build.dst_storage_buffer = chunk.buffer;
+			build.dst_addresses_buffer = surf->cluster_args;
+			build.dst_addresses_offset = surf->cluster_args_compact_offset + sizeof(uint64_t) * cluster_count;
+			build.dst_addresses_stride = sizeof(uint64_t);
+			build.src_infos_buffer = surf->cluster_args;
+			build.src_infos_offset = surf->cluster_args_blas_info_offset;
+			build.src_infos_stride = caps.bottom_level_build_info_size;
+			build.source_acceleration_structure_buffers.push_back(chunk.buffer); // The moved CLAS it references, read through its info.
+			build.dst_acceleration_structures.push_back(blas);
+			ok = rd->cluster_acceleration_structure_build(build) == OK;
+		}
+		if (!ok) {
+			// Nothing references the region, but a recorded move may still write it: retired, not freed.
+			rd->free_rid(blas);
+			_cluster_arena_retire(chunk_index, region_offset, region_size);
+			WARN_PRINT_ONCE(vformat("RT: cluster BLAS [%d]: the compaction could not be recorded; the surface stays in its staging buffer.", surf->cluster_cache_key));
+			continue;
+		}
+		rd->set_resource_name(blas, "RT cluster BLAS [" + itos(surf->cluster_cache_key) + "]");
+
+		// The swap: the TLAS is built from the surface's handle every frame, and the buffers the
+		// move reads are disposed of with this frame.
+		const uint64_t staged_bytes = surf->blas_size;
+		if (surf->blas.is_valid() && rd->acceleration_structure_is_valid(surf->blas)) {
+			rd->free_rid(surf->blas);
+		}
+		surf->blas = blas;
+		rd->free_rid(surf->cluster_storage);
+		surf->cluster_storage = RID();
+		rd->free_rid(surf->cluster_args);
+		surf->cluster_args = RID();
+		surf->arena_chunk = int32_t(chunk_index);
+		surf->arena_offset = region_offset;
+		surf->arena_size = region_size;
+		surf->blas_size = region_size;
+
+		cluster_compactions_total++;
+		cluster_bytes_staged_total += staged_bytes;
+		cluster_bytes_compacted_total += region_size;
+		print_verbose(vformat("RT: cluster BLAS [%d] compacted: %d clusters, %d KB staged -> %d KB (chunk %d at %d KB; arena %d chunks, %d / %d KB live).", surf->cluster_cache_key, cluster_count, staged_bytes / 1024, region_size / 1024, chunk_index, region_offset / 1024, cluster_arena.size(), cluster_arena_live_bytes / 1024, cluster_arena_reserved_bytes / 1024));
+	}
+}
+
+bool RenderRaytracing::_cluster_arena_allocate(uint64_t p_size, uint32_t &r_chunk, uint64_t &r_offset) {
+	// First fit over the live chunks. Every region size is a multiple of the base alignment and
+	// every chunk base is aligned to it, so every offset handed out is aligned.
+	for (uint32_t i = 0; i < cluster_arena.size(); i++) {
+		RTClusterArenaChunk &chunk = cluster_arena[i];
+		if (chunk.buffer.is_null()) {
+			continue;
+		}
+		for (uint32_t j = 0; j < chunk.free_list.size(); j++) {
+			RTClusterArenaChunk::FreeRange &range = chunk.free_list[j];
+			if (range.size < p_size) {
+				continue;
+			}
+			r_chunk = i;
+			r_offset = range.offset;
+			range.offset += p_size;
+			range.size -= p_size;
+			if (range.size == 0) {
+				chunk.free_list.remove_at(j);
+			}
+			chunk.live_regions++;
+			cluster_arena_live_bytes += p_size;
+			return true;
+		}
+	}
+
+	// A new chunk, of the standard size or, for a region larger than that, its own.
+	RD *rd = RD::get_singleton();
+	const RD::ClusterAccelerationStructureCapabilities &caps = rd->get_cluster_acceleration_structure_capabilities();
+	const uint64_t base_alignment = MAX(caps.cluster_byte_alignment, caps.cluster_bottom_level_byte_alignment);
+	const uint64_t chunk_size = MAX(uint64_t(RT_CLUSTER_ARENA_CHUNK_BYTES), p_size);
+	const uint64_t buffer_size = chunk_size + base_alignment;
+	ERR_FAIL_COND_V_MSG(buffer_size > UINT32_MAX, false, "RT: a cluster arena chunk exceeds 4 GB.");
+	RID buffer = rd->storage_buffer_create(uint32_t(buffer_size), {}, 0,
+			RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT);
+	if (buffer.is_null()) {
+		return false;
+	}
+	RTClusterArenaChunk chunk;
+	chunk.buffer = buffer;
+	const uint64_t buffer_address = rd->buffer_get_device_address(buffer);
+	chunk.address = _align_up(buffer_address, base_alignment);
+	chunk.base_offset = chunk.address - buffer_address;
+	chunk.size = chunk_size;
+	chunk.live_regions = 1;
+	if (chunk_size > p_size) {
+		chunk.free_list.push_back({ p_size, chunk_size - p_size });
+	}
+
+	// A dead slot is reused so the chunk indices surfaces hold stay valid.
+	uint32_t index = cluster_arena.size();
+	for (uint32_t i = 0; i < cluster_arena.size(); i++) {
+		if (cluster_arena[i].buffer.is_null()) {
+			index = i;
+			break;
+		}
+	}
+	if (index == cluster_arena.size()) {
+		cluster_arena.push_back(chunk);
+	} else {
+		cluster_arena[index] = chunk;
+	}
+	rd->set_resource_name(buffer, "RT cluster arena [" + itos(index) + "]");
+	cluster_arena_reserved_bytes += chunk_size;
+	cluster_arena_live_bytes += p_size;
+	r_chunk = index;
+	r_offset = 0;
+	return true;
+}
+
+void RenderRaytracing::_cluster_arena_retire(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size) {
+	// The chunk outlives the region and the trace's reads of it are not on the chunk's tracker,
+	// so the region is handed out again only once the frames that may read it have retired.
+	RTClusterRetiredRegion retired;
+	retired.chunk = p_chunk;
+	retired.offset = p_offset;
+	retired.size = p_size;
+	retired.frame = RD::get_singleton()->get_frames_drawn();
+	cluster_arena_retired.push_back(retired);
+}
+
+void RenderRaytracing::_cluster_arena_free(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size) {
+	ERR_FAIL_UNSIGNED_INDEX(p_chunk, cluster_arena.size());
+	RTClusterArenaChunk &chunk = cluster_arena[p_chunk];
+	ERR_FAIL_COND(chunk.buffer.is_null() || chunk.live_regions == 0);
+
+	// Insert in offset order, then merge with either neighbour it touches.
+	uint32_t at = 0;
+	while (at < chunk.free_list.size() && chunk.free_list[at].offset < p_offset) {
+		at++;
+	}
+	chunk.free_list.insert(at, { p_offset, p_size });
+	if (at + 1 < chunk.free_list.size() && chunk.free_list[at].offset + chunk.free_list[at].size == chunk.free_list[at + 1].offset) {
+		chunk.free_list[at].size += chunk.free_list[at + 1].size;
+		chunk.free_list.remove_at(at + 1);
+	}
+	if (at > 0 && chunk.free_list[at - 1].offset + chunk.free_list[at - 1].size == chunk.free_list[at].offset) {
+		chunk.free_list[at - 1].size += chunk.free_list[at].size;
+		chunk.free_list.remove_at(at);
+	}
+	chunk.live_regions--;
+	cluster_arena_live_bytes -= p_size;
+
+	// A chunk with nothing live in it goes, so the arena's memory follows its contents.
+	if (chunk.live_regions == 0) {
+		RD::get_singleton()->free_rid(chunk.buffer);
+		cluster_arena_reserved_bytes -= chunk.size;
+		chunk = RTClusterArenaChunk();
+	}
+}
+
 void RenderRaytracing::release_mesh_surface(RID p_mesh, uint32_t p_surface) {
-	// The RT cache entry of a surface its mesh is dropping: its BLAS and, on the cluster path,
-	// its buffers go now rather than when the cache slot is next reused.
+	// The RT cache entry of a surface its mesh is dropping: its BLAS, staging or arena region go
+	// now rather than when the cache slot is next reused.
 	const uint32_t cache_key = (p_mesh.get_local_index() << 8) | (p_surface & 0xFF);
 	const uint32_t chunk_idx = cache_key / RT_CACHE_CHUNK_SIZE;
 	if (chunk_idx >= (uint32_t)surface_chunks.size() || surface_chunks[chunk_idx] == nullptr) {
@@ -1424,12 +1771,16 @@ void RenderRaytracing::_mesh_surface_freed(RID p_mesh, uint32_t p_surface) {
 
 void RenderRaytracing::_release_surface_data(RTSurfaceData *p_surf_data) {
 	RD *rd = RD::get_singleton();
-	// A triangle BLAS may already be gone with its mesh's buffers; a cluster BLAS goes with its storage.
+	// A triangle BLAS may already be gone with its mesh's buffers; a cluster BLAS handle is freed here.
 	if (p_surf_data->blas.is_valid() && rd->acceleration_structure_is_valid(p_surf_data->blas)) {
 		rd->free_rid(p_surf_data->blas);
 	}
 	p_surf_data->blas = RID();
 	p_surf_data->blas_size = 0;
+	if (p_surf_data->compaction_ticket != 0) {
+		cluster_compaction_pending.erase(p_surf_data->compaction_ticket);
+		p_surf_data->compaction_ticket = 0;
+	}
 	if (p_surf_data->cluster_storage.is_valid()) {
 		rd->free_rid(p_surf_data->cluster_storage);
 		p_surf_data->cluster_storage = RID();
@@ -1437,6 +1788,12 @@ void RenderRaytracing::_release_surface_data(RTSurfaceData *p_surf_data) {
 	if (p_surf_data->cluster_args.is_valid()) {
 		rd->free_rid(p_surf_data->cluster_args);
 		p_surf_data->cluster_args = RID();
+	}
+	if (p_surf_data->arena_chunk >= 0) {
+		_cluster_arena_retire(uint32_t(p_surf_data->arena_chunk), p_surf_data->arena_offset, p_surf_data->arena_size);
+		p_surf_data->arena_chunk = -1;
+		p_surf_data->arena_offset = 0;
+		p_surf_data->arena_size = 0;
 	}
 }
 

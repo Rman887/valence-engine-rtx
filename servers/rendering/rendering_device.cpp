@@ -687,24 +687,30 @@ Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAcceler
 	RDD::ClusterAccelerationStructureBuild rdd_build;
 	rdd_build.input = p_build.input;
 
-	// The trackers the graph orders this build against, one entry per buffer: a buffer that
-	// is both read and written under this command keeps the write usage.
+	// The trackers the graph orders this build against, one entry per buffer. The spec reads
+	// every input reached through the infos (infos, references, a move's sources, vertex and
+	// index data) under INDIRECT_COMMAND_READ at the build stage and writes the destinations
+	// under ACCELERATION_STRUCTURE_WRITE there; a buffer used two ways by one command takes the
+	// usage that carries both (an argument buffer whose infos are read and addresses written).
 	LocalVector<RDG::ResourceTracker *> trackers;
 	LocalVector<RDG::ResourceUsage> usages;
-	auto track = [&](Buffer *p_buffer, RDG::ResourceUsage p_usage) {
-		if (p_buffer->draw_tracker == nullptr) {
+	auto track_tracker = [&](RDG::ResourceTracker *p_tracker, RDG::ResourceUsage p_usage) {
+		if (p_tracker == nullptr) {
 			return;
 		}
 		for (uint32_t i = 0; i < trackers.size(); i++) {
-			if (trackers[i] == p_buffer->draw_tracker) {
-				if (p_usage == RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE) {
-					usages[i] = p_usage;
+			if (trackers[i] == p_tracker) {
+				if (usages[i] != p_usage) {
+					usages[i] = RDG::RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ_WRITE;
 				}
 				return;
 			}
 		}
-		trackers.push_back(p_buffer->draw_tracker);
+		trackers.push_back(p_tracker);
 		usages.push_back(p_usage);
+	};
+	auto track = [&](Buffer *p_buffer, RDG::ResourceUsage p_usage) {
+		track_tracker(p_buffer->draw_tracker, p_usage);
 	};
 	auto resolve = [&](RID p_rid, const char *p_what, Buffer **r_buffer) -> bool {
 		*r_buffer = _get_buffer_from_owner(p_rid);
@@ -735,8 +741,9 @@ Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAcceler
 		rdd_build.dst_addresses_stride = p_build.dst_addresses_stride;
 		rdd_build.dst_addresses_size = uint64_t(p_build.dst_addresses_stride) * p_build.input.max_acceleration_structure_count;
 		ERR_FAIL_COND_V_MSG(p_build.dst_addresses_offset + rdd_build.dst_addresses_size > buffer->size, ERR_INVALID_PARAMETER, "The destination addresses run past their buffer.");
-		// Written by the build unless the caller placed the structures itself, then read as indirect input.
-		track(buffer, explicit_destinations ? RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ : RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE);
+		// The spec synchronises the address array as an acceleration-structure write in every mode,
+		// read as input as well when the caller placed the structures itself.
+		track(buffer, RDG::RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ_WRITE);
 	}
 	if (p_build.dst_sizes_buffer.is_valid()) {
 		ERR_FAIL_COND_V(!resolve(p_build.dst_sizes_buffer, "destination sizes", &buffer), ERR_INVALID_PARAMETER);
@@ -746,24 +753,46 @@ Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAcceler
 		rdd_build.dst_sizes_stride = p_build.dst_sizes_stride;
 		rdd_build.dst_sizes_size = uint64_t(p_build.dst_sizes_stride) * p_build.input.max_acceleration_structure_count;
 		ERR_FAIL_COND_V_MSG(p_build.dst_sizes_offset + rdd_build.dst_sizes_size > buffer->size, ERR_INVALID_PARAMETER, "The destination sizes run past their buffer.");
-		track(buffer, RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE);
+		track(buffer, RDG::RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ_WRITE);
 	}
 	{
 		ERR_FAIL_COND_V(!resolve(p_build.src_infos_buffer, "build infos", &buffer), ERR_INVALID_PARAMETER);
 		const ClusterAccelerationStructureCapabilities &caps = driver->get_cluster_acceleration_structure_capabilities();
-		uint32_t info_size = p_build.input.op_type == ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER ? caps.triangle_build_info_size : caps.bottom_level_build_info_size;
+		uint32_t info_size = 0;
+		switch (p_build.input.op_type) {
+			case ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER:
+				info_size = caps.triangle_build_info_size;
+				break;
+			case ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL:
+				info_size = caps.bottom_level_build_info_size;
+				break;
+			case ClusterAccelerationStructureInput::CLUSTER_OP_MOVE_OBJECTS:
+				info_size = caps.move_info_size;
+				break;
+		}
 		ERR_FAIL_COND_V_MSG(p_build.src_infos_stride < info_size, ERR_INVALID_PARAMETER, "The build info stride must hold one driver build info.");
 		rdd_build.src_infos_buffer = buffer->driver_id;
 		rdd_build.src_infos_offset = p_build.src_infos_offset;
 		rdd_build.src_infos_stride = p_build.src_infos_stride;
 		rdd_build.src_infos_size = uint64_t(p_build.src_infos_stride) * p_build.input.max_acceleration_structure_count;
 		ERR_FAIL_COND_V_MSG(p_build.src_infos_offset + rdd_build.src_infos_size > buffer->size, ERR_INVALID_PARAMETER, "The build infos run past their buffer.");
-		// The spec reads the infos and the data they point at under VK_ACCESS_INDIRECT_COMMAND_READ_BIT.
-		track(buffer, RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ);
+		track(buffer, RDG::RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ);
 	}
 	for (const RID &source : p_build.source_buffers) {
 		ERR_FAIL_COND_V(!resolve(source, "source buffer", &buffer), ERR_INVALID_PARAMETER);
-		track(buffer, RDG::RESOURCE_USAGE_INDIRECT_BUFFER_READ);
+		track(buffer, RDG::RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ);
+	}
+	for (const RID &source : p_build.source_acceleration_structure_buffers) {
+		ERR_FAIL_COND_V(!resolve(source, "source acceleration structure buffer", &buffer), ERR_INVALID_PARAMETER);
+		track(buffer, RDG::RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ);
+	}
+	LocalVector<AccelerationStructure *> destination_handles;
+	for (const RID &handle : p_build.dst_acceleration_structures) {
+		AccelerationStructure *acceleration_structure = acceleration_structure_owner.get_or_null(handle);
+		ERR_FAIL_NULL_V_MSG(acceleration_structure, ERR_INVALID_PARAMETER, "A destination acceleration structure is not a valid acceleration structure.");
+		ERR_FAIL_COND_V_MSG(acceleration_structure->type != RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL || acceleration_structure->draw_tracker == nullptr || acceleration_structure->draw_tracker->acceleration_structure_driver_id != acceleration_structure->driver_id, ERR_INVALID_PARAMETER, "A destination acceleration structure must be a bottom-level acceleration structure handle with its own tracker.");
+		track_tracker(acceleration_structure->draw_tracker, RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE);
+		destination_handles.push_back(acceleration_structure);
 	}
 
 	// The scratch lives for this frame's build alone.
@@ -787,6 +816,11 @@ Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAcceler
 
 	draw_graph.add_cluster_acceleration_structure_build(rdd_build, trackers, usages);
 
+	// Usable by a TLAS now that the build that writes them is recorded.
+	for (AccelerationStructure *acceleration_structure : destination_handles) {
+		acceleration_structure->invalidated = false;
+	}
+
 	return OK;
 }
 
@@ -804,10 +838,15 @@ RID RenderingDevice::cluster_blas_create(RID p_storage_buffer, uint64_t p_offset
 	acceleration_structure.type = RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
 	acceleration_structure.driver_id = driver->cluster_blas_create(storage->driver_id, p_offset);
 	ERR_FAIL_COND_V_MSG(!acceleration_structure.driver_id, RID(), "Failed to create the cluster BLAS.");
-	acceleration_structure.draw_tracker = storage->draw_tracker;
-	acceleration_structure.shared_draw_tracker = true;
-	// Built by cluster_acceleration_structure_build() before any TLAS reads it; the graph orders the two.
-	acceleration_structure.invalidated = false;
+	// Its own tracker, as a triangle BLAS has: the build that writes it lists the handle
+	// (ClusterAccelerationStructureBuild::dst_acceleration_structures) and a TLAS build's read
+	// then carries the acceleration-structure barrier over the storage that marks the BLAS
+	// complete, which the storage buffer's tracker alone (a memory barrier) does not.
+	acceleration_structure.draw_tracker = RDG::resource_tracker_create();
+	acceleration_structure.draw_tracker->acceleration_structure_driver_id = acceleration_structure.driver_id;
+	acceleration_structure.draw_tracker->usage = RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE;
+	// Not usable by a TLAS until a build lists it.
+	acceleration_structure.invalidated = true;
 
 	RID id = acceleration_structure_owner.make_rid(acceleration_structure);
 #ifdef DEV_ENABLED
@@ -8031,9 +8070,7 @@ void RenderingDevice::_free_internal(RID p_id) {
 		} else if (acceleration_structure->type == ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL) {
 			_tlas_remove_blas_dependencies(acceleration_structure, p_id);
 		}
-		if (!acceleration_structure->shared_draw_tracker) {
-			RDG::resource_tracker_free(acceleration_structure->draw_tracker);
-		}
+		RDG::resource_tracker_free(acceleration_structure->draw_tracker);
 		frames[frame].acceleration_structures_to_dispose_of.push_back(*acceleration_structure);
 		acceleration_structure_owner.free(p_id);
 	} else if (raytracing_pipeline_owner.owns(p_id)) {
@@ -10591,4 +10628,6 @@ static_assert(ENUM_MEMBERS_EQUAL(RD::CALLBACK_RESOURCE_USAGE_STORAGE_IMAGE_READ_
 static_assert(ENUM_MEMBERS_EQUAL(RD::CALLBACK_RESOURCE_USAGE_ATTACHMENT_COLOR_READ_WRITE, RDG::RESOURCE_USAGE_ATTACHMENT_COLOR_READ_WRITE));
 static_assert(ENUM_MEMBERS_EQUAL(RD::CALLBACK_RESOURCE_USAGE_ATTACHMENT_DEPTH_STENCIL_READ_WRITE, RDG::RESOURCE_USAGE_ATTACHMENT_DEPTH_STENCIL_READ_WRITE));
 static_assert(ENUM_MEMBERS_EQUAL(RD::CALLBACK_RESOURCE_USAGE_GENERAL, RDG::RESOURCE_USAGE_GENERAL));
+static_assert(ENUM_MEMBERS_EQUAL(RD::CALLBACK_RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ, RDG::RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ));
+static_assert(ENUM_MEMBERS_EQUAL(RD::CALLBACK_RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ_WRITE, RDG::RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ_WRITE));
 static_assert(ENUM_MEMBERS_EQUAL(RD::CALLBACK_RESOURCE_USAGE_MAX, RDG::RESOURCE_USAGE_MAX));

@@ -556,6 +556,20 @@ TEST_CASE("[SceneTree][ArrayMesh] Triangle clusters partition the index buffer (
 		}
 		CHECK(equal == indices.size());
 		CHECK(Vector<int>(arrays[RSE::ARRAY_INDEX]) == original);
+
+		// A pack that skips the clusterizer (D84) carries no table and the caller's index order,
+		// and its vertex stream is the clustered pack's, byte for byte.
+		RenderingServerTypes::SurfaceData skipped;
+		REQUIRE(RS::get_singleton()->mesh_create_surface_data_from_arrays(&skipped, RSE::PRIMITIVE_TRIANGLES, arrays, Array(), Dictionary(), 0, false) == OK);
+		CHECK(skipped.cluster_data.is_empty());
+		CHECK(skipped.vertex_data == surface.vertex_data);
+		REQUIRE(skipped.index_data.size() == surface.index_data.size());
+		const uint16_t *kept = reinterpret_cast<const uint16_t *>(skipped.index_data.ptr());
+		int same = 0;
+		for (int i = 0; i < original.size(); i++) {
+			same += int(kept[i]) == original[i] ? 1 : 0;
+		}
+		CHECK(same == original.size());
 	}
 	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", setting_before);
 }

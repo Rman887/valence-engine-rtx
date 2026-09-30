@@ -1176,7 +1176,7 @@ void RenderingServer::mesh_surface_make_offsets_from_format(uint64_t p_format, i
 	}
 }
 
-Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes::SurfaceData *r_surface_data, RSE::PrimitiveType p_primitive, const Array &p_arrays, const Array &p_blend_shapes, const Dictionary &p_lods, uint64_t p_compress_format) {
+Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes::SurfaceData *r_surface_data, RSE::PrimitiveType p_primitive, const Array &p_arrays, const Array &p_blend_shapes, const Dictionary &p_lods, uint64_t p_compress_format, bool p_build_clusters) {
 	ERR_FAIL_INDEX_V(p_primitive, RSE::PRIMITIVE_MAX, ERR_INVALID_PARAMETER);
 	ERR_FAIL_COND_V(p_arrays.size() != RSE::ARRAY_MAX, ERR_INVALID_PARAMETER);
 
@@ -1318,7 +1318,13 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 	Vector<uint8_t> cluster_data;
 	// Skinned and blend-shape surfaces are clustered too (D82): the reorder touches the index
 	// array alone, so the bone, weight and blend-shape arrays stay in vertex order.
-	if (p_primitive == RSE::PRIMITIVE_TRIANGLES && index_array_len > 0 && p_arrays[RSE::ARRAY_VERTEX].get_type() == Variant::PACKED_VECTOR3_ARRAY && p_arrays[RSE::ARRAY_INDEX].get_type() == Variant::PACKED_INT32_ARRAY && GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
+	// A caller that packs arrays only for their vertex stream, to write over a surface it
+	// already created (mesh_surface_update_vertex_region), passes p_build_clusters false (D84):
+	// the reorder never touches the vertex stream and the surface keeps the table it was
+	// created with, so the table and the reordered indices would be discarded. The result
+	// carries no table and the caller's index order; given to mesh_add_surface, it is
+	// clustered at load.
+	if (p_build_clusters && p_primitive == RSE::PRIMITIVE_TRIANGLES && index_array_len > 0 && p_arrays[RSE::ARRAY_VERTEX].get_type() == Variant::PACKED_VECTOR3_ARRAY && p_arrays[RSE::ARRAY_INDEX].get_type() == Variant::PACKED_INT32_ARRAY && GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
 		Vector<int> indices = p_arrays[RSE::ARRAY_INDEX];
 		cluster_data = mesh_surface_build_clusters(p_arrays[RSE::ARRAY_VERTEX], indices);
 		if (cluster_data.size()) {

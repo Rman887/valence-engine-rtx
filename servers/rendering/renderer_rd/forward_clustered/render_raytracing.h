@@ -320,21 +320,45 @@ struct RTLodInstanceEntry {
 	uint64_t arena_size = 0;
 };
 
+struct RTDeformedCacheEntry;
+
+// The selection's instance record, in words. Must match INSTANCE_WORDS in cluster_lod_select.glsl.
+static constexpr uint32_t RT_LOD_INSTANCE_WORDS = 24;
+
+// The frame's CLAS region for the deformed items (D87) stays under this many bytes: the argument
+// and region sizes are 32-bit, and a flush that cannot record turns the selection off for the
+// run, so past it the rest of the frame's deformed instances rebuild at LOD 0 through the
+// deformed batch. A VRAM budget (6d) replaces it.
+static constexpr uint64_t RT_LOD_CLAS_REGION_CEILING = uint64_t(1) << 30;
+
 // The cluster LOD selection of one frame (D86): every instance on the path appends itself; the
 // flush, in build_tlas after the MultiMesh merge's compute list, uploads one argument buffer (the
 // build infos with their counts at zero, the slot addresses, the instance records, room for the
-// reference lists), runs the selection compute over it and records one cluster BLAS build over
-// every instance's list. Every list is grow-only across frames.
+// reference lists and, for the deformed items, the CLAS count, destinations and build infos, D87),
+// runs the selection compute over it, records one CLAS build for the deformed items' selections
+// and then one cluster BLAS build over every instance's list. Every list is grow-only across frames.
 struct RTLodSelectBatch {
+	// Per item, a static instance's slot or a deformed entry (D87), the other null.
 	LocalVector<RTLodInstanceEntry *> entries;
+	LocalVector<RTDeformedCacheEntry *> deformed_entries;
 	LocalVector<uint32_t> slots; // Each entry's index in the per-frame instance arrays, for the fallback.
-	LocalVector<uint32_t> instance_words; // 16 words per entry, the shader's instance record; the list offset patched at the flush.
+	LocalVector<uint32_t> instance_words; // RT_LOD_INSTANCE_WORDS words per entry, the shader's instance record; the list offset and a deformed entry's destination base patched at the flush.
 	LocalVector<uint32_t> lod0_clusters; // Per entry, what LOD 0 would trace, for the report.
+	LocalVector<uint64_t> blas_addresses;
 	uint32_t cluster_total = 0;
 	uint32_t max_clusters = 0;
-	LocalVector<RID> storage_buffers; // The arena chunks the slots live in, each once.
+	LocalVector<RID> storage_buffers; // The arena chunks the slots live in, each once, and each deformed entry's storage.
 	LocalVector<RID> source_buffers; // The buffers the surfaces' CLAS live in, each once.
 	LocalVector<RID> blas_handles;
+	// The deformed items' CLAS, built this frame from their lists (D87): the count bound (their
+	// clusters over every level), the build's totals, the vertex and index buffers it reads.
+	uint32_t deformed_count = 0;
+	uint32_t deformed_routed = 0; // Deformed instances the ceiling sent to the deformed batch this frame.
+	uint32_t clas_bound = 0;
+	uint32_t clas_total_triangles = 0;
+	uint32_t clas_total_vertices = 0;
+	LocalVector<RID> clas_source_buffers;
+	LocalVector<RID> clas_index_buffers_seen;
 	RID args_buffer;
 	uint32_t args_capacity = 0; // Bytes.
 	LocalVector<uint8_t> args_host;
@@ -454,6 +478,22 @@ struct RTDeformedCacheEntry {
 	uint8_t cluster_frame_kind = CLUSTER_QUEUED_NONE; // Why it is in this frame's batch.
 	LocalVector<uint8_t> cluster_infos; // cluster_count driver build infos.
 	RID cluster_index_buffer; // The mesh's index buffer the infos read, listed as a source at each rebuild.
+	// The cluster LOD hierarchy on the GPU (D87): the entry's region of the shared LOD table
+	// (each cluster's group and the group it refines, the groups' bounds and errors, and every
+	// level's CLAS build info, since a deformed hierarchy has no CLAS until a frame builds the
+	// selected ones), the count over every level (a selection's bound, the BLAS storage's size)
+	// and the build's totals. While the region exists the selection, not the batch above,
+	// rebuilds the entry on every frame it is traced.
+	uint32_t cluster_lod_table_offset = UINT32_MAX; // Words; UINT32_MAX without a hierarchy.
+	uint32_t cluster_lod_table_words = 0;
+	uint32_t cluster_lod_infos_offset = 0; // Words, into the table.
+	uint32_t cluster_lod_count = 0; // Clusters over every level.
+	uint32_t cluster_lod_total_triangles = 0;
+	uint32_t cluster_lod_total_vertices = 0;
+	uint64_t cluster_lod_pushed_frame = 0; // frames_drawn when the selection last built it; a second viewport in the frame reuses that build.
+	uint8_t cluster_lod_pending_kind = CLUSTER_QUEUED_NONE; // What the batch above would have queued this frame, decided at the TLAS push.
+	bool cluster_lod_pending = false; // Set by process_deformed_surface on a selecting frame, taken at the TLAS push.
+	bool cluster_lod_last = false; // The last build was a selection: the batch above rebuilds it before tracing it again.
 };
 
 // One region of the deformed cluster batch (D82): the CLAS of one flush, sub-allocated by the
@@ -639,6 +679,13 @@ class RenderRaytracing {
 	// selection compute, the shared LOD table every hierarchy's region is sub-allocated from (in
 	// words, first fit, merged on free, grown by copy), the instance slots and the frame's batch.
 	bool cluster_lod_select_enabled = false;
+	// Deformed surfaces select too (D87), rendering/pathtracing/cluster_lod_deformed with the two
+	// above and cluster_blas_deformed; their selected CLAS are built each frame into explicit slots
+	// of this size (the worst case of one cluster under the D80 limits) in a region of the deformed
+	// batch's pool.
+	bool cluster_lod_deformed_enabled = false;
+	uint64_t cluster_lod_clas_slot_size = 0;
+	uint32_t cluster_lod_clas_ceiling_clusters = 0; // RT_LOD_CLAS_REGION_CEILING in slots, less the region's alignment.
 	float cluster_lod_pixel_error = 1.0f;
 	uint32_t cluster_lod_max_instances = 0; // The selection dispatch's instance axis, the device's workgroup count limit.
 	struct LodSelectShader {
@@ -659,6 +706,7 @@ class RenderRaytracing {
 	uint64_t lod_counts_ticket = 0;
 	uint32_t lod_counts_selected = 0;
 	uint32_t lod_counts_entries = 0;
+	uint32_t lod_counts_clas = 0; // The CLAS the deformed items built in that batch.
 
 	// Merged MultiMesh BLAS cache and compute shader.
 	struct MergeShader {
@@ -848,7 +896,8 @@ class RenderRaytracing {
 			void *p_mesh_surface,
 			const struct RTDeformedGeometrySource &p_source,
 			LocalVector<RID> &r_dirty_blas_list,
-			LocalVector<RID> &r_dirty_blas_update_list);
+			LocalVector<RID> &r_dirty_blas_update_list,
+			bool p_lod_select); // The frame selects (D87): an entry with a hierarchy defers its rebuild to the TLAS push.
 	void _populate_surface_blas(
 			void *p_mesh_surface,
 			RID p_vertex_buffer_override,
@@ -886,6 +935,10 @@ class RenderRaytracing {
 	bool _populate_deformed_cluster_layout(void *p_mesh_surface, uint32_t p_cache_key, RTDeformedCacheEntry &r_entry);
 	void _queue_deformed_cluster_rebuild(RTDeformedCacheEntry &p_entry, uint8_t p_kind);
 	bool _deformed_cluster_region_expired(const RTDeformedCacheEntry &p_entry, uint64_t p_frames_drawn) const;
+	// A region of the pool for this flush's CLAS: one whose last trace has been waited on, grown
+	// to p_alloc if too small, or a new one; -1 if none could be made. The batch and the
+	// selection (D87) share the pool.
+	int32_t _deformed_cluster_region_acquire(uint64_t p_alloc, uint64_t p_alignment);
 	bool _record_deformed_cluster_batch();
 	void _flush_deformed_cluster_batch();
 	void _release_deformed_cluster_storage(RTDeformedCacheEntry &p_entry);
@@ -904,9 +957,16 @@ class RenderRaytracing {
 	void _release_lod_entry(RTLodInstanceEntry &p_entry);
 	bool _prepare_lod_entry(RTLodInstanceEntry &p_entry, RTSurfaceData *p_surf_data);
 	void _queue_lod_instance(RTLodInstanceEntry &p_entry, const Transform3D &p_transform, uint32_t p_slot);
+	// The deformed entries on the selection (D87): the entry's region of the LOD table, made with
+	// its layout and released with its storage, and its record in the frame's batch.
+	bool _populate_deformed_cluster_lod(void *p_mesh_surface, const RTClusterLayout &p_layout, const LocalVector<uint8_t> &p_infos, uint32_t p_cache_key, RTDeformedCacheEntry &r_entry);
+	void _release_deformed_cluster_lod(RTDeformedCacheEntry &p_entry);
+	void _queue_lod_deformed_instance(RTDeformedCacheEntry &p_entry, const Transform3D &p_transform, uint32_t p_slot);
+	uint32_t *_lod_instance_record(const Transform3D &p_transform, uint32_t p_cluster_count, uint32_t p_table_offset);
 	bool _record_lod_batch(const RenderDataRD *p_render_data, const RTViewportState *p_state);
 	void _flush_lod_batch(const RenderDataRD *p_render_data, const RTViewportState *p_state);
 	static void _on_lod_counts_read(const PackedByteArray &p_counts, uint64_t p_ticket, uint32_t p_entry_count, uint32_t p_stride);
+	static void _on_lod_clas_count_read(const PackedByteArray &p_count, uint64_t p_ticket);
 	bool _cluster_arena_allocate(uint64_t p_size, uint32_t &r_chunk, uint64_t &r_offset);
 	void _cluster_arena_retire(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size);
 	void _cluster_arena_free(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size);

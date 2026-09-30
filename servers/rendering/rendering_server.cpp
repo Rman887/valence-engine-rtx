@@ -1327,13 +1327,16 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 	// With rendering/pathtracing/cluster_lod on as well, the surface gets a cluster LOD
 	// hierarchy instead (D85): the LOD 0 clusters take the index array as above, the coarse
 	// levels ride in the table. The flat clusterizer is the fallback when the hierarchy fails,
-	// and the layout for surfaces the hierarchy cannot serve at this stage: skinned and
-	// blend-shaped surfaces (the deformed path traces LOD 0 alone) and surfaces of one cluster
-	// (no coarse level to build; Label3D and Sprite3D recreate theirs constantly).
+	// and the layout for surfaces of one cluster (no coarse level to build; Label3D and
+	// Sprite3D recreate theirs constantly) and for blend-shaped surfaces (D87: the hierarchy's
+	// errors are the rest pose's, and a blend-shaped surface's shape is in its deformation, the
+	// ocean's waves on a flat grid; a per-group error floor from the blend-shape deltas' reach
+	// is the robust alternative). Skinned surfaces get the hierarchy (D87): both builders
+	// reorder the indices alone, so the bone and weight arrays stay in vertex order, and the
+	// coarse levels index the same vertices the skinning writes.
 	if (p_build_clusters && p_primitive == RSE::PRIMITIVE_TRIANGLES && index_array_len > 0 && p_arrays[RSE::ARRAY_VERTEX].get_type() == Variant::PACKED_VECTOR3_ARRAY && p_arrays[RSE::ARRAY_INDEX].get_type() == Variant::PACKED_INT32_ARRAY && GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
 		Vector<int> indices = p_arrays[RSE::ARRAY_INDEX];
-		const bool deformed = p_arrays[RSE::ARRAY_BONES].get_type() != Variant::NIL || p_blend_shapes.size() > 0;
-		if (!deformed && index_array_len > int(RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES) * 3 && GLOBAL_GET("rendering/pathtracing/cluster_lod")) {
+		if (p_blend_shapes.is_empty() && index_array_len > int(RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES) * 3 && GLOBAL_GET("rendering/pathtracing/cluster_lod")) {
 			Vector<Vector3> normals;
 			if (p_arrays[RSE::ARRAY_NORMAL].get_type() == Variant::PACKED_VECTOR3_ARRAY) {
 				normals = p_arrays[RSE::ARRAY_NORMAL];
@@ -4144,6 +4147,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_blas_deformed", true);
 	GLOBAL_DEF("rendering/pathtracing/cluster_lod", false);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_select", true);
+	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_deformed", true);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/cluster_lod_pixel_error", PROPERTY_HINT_RANGE, "0,16,0.05"), 1.0);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/deformed_mesh_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 60);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_blas_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,18000,1"), 3600);

@@ -15,12 +15,21 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // instance's reference list, and the count lands in the first word of its bottom-level build info,
 // which the cluster BLAS build that follows reads.
 //
+// A deformed instance (D87) has no CLAS until this frame builds them: its selected cluster takes
+// the next slot of the instance's destination range as its CLAS address (the reference list and
+// the CLAS build's destination array both get it) and its build info, written once on the CPU into
+// the instance's table region, is copied to the CLAS build's info array at the next free index,
+// whose count the build reads from the device.
+//
 // FrameBuf is the frame's argument buffer: the build infos (count, stride, address; count is the
-// atomic), then per instance 16 words (the object-to-trace transform as three rows of four, the
-// uniform scale, the cluster count, the surface's word offset in TableBuf, the reference list's word
-// offset in FrameBuf), then the reference lists. TableBuf holds every hierarchy's region: per cluster
-// its CLAS address (lo, hi), then per cluster its group and the group it refines (-1 at LOD 0), then
-// per group eight words (center, radius, error, depth, first cluster, cluster count).
+// atomic), then per instance INSTANCE_WORDS words (the object-to-trace transform as three rows of
+// four, the uniform scale, the cluster count, the surface's word offset in TableBuf, the reference
+// list's word offset in FrameBuf, the flags, the word offset of the instance's build infos in
+// TableBuf, the destination base address as lo and hi), the CLAS count, then the reference lists,
+// the CLAS destinations and the CLAS build infos. TableBuf holds every hierarchy's region: per
+// cluster its CLAS address (lo, hi; zero for a deformed hierarchy), then per cluster its group and
+// the group it refines (-1 at LOD 0), then per group eight words (center, radius, error, depth,
+// first cluster, cluster count), then, for a deformed hierarchy, per cluster its build info.
 
 layout(set = 0, binding = 0) restrict buffer FrameBuf {
 	uint v[];
@@ -39,13 +48,18 @@ layout(push_constant, std430) uniform PC {
 	uint blas_infos_offset; // Words into FrameBuf.
 	uint blas_info_stride; // Words.
 	uint flags;
+	uint clas_count_offset; // Words into FrameBuf: the CLAS build's count.
+	uint clas_dst_offset; // Words into FrameBuf: the CLAS destinations (lo, hi).
+	uint clas_infos_offset; // Words into FrameBuf: the CLAS build infos.
+	uint clas_info_words; // The driver's build info, in words.
+	uint clas_slot_size; // Bytes between destinations.
 	uint pad0;
-	uint pad1;
 }
 pc;
 
 #define FLAG_ORTHOGONAL 1u
-#define INSTANCE_WORDS 16u
+#define INSTANCE_WORDS 24u
+#define INSTANCE_FLAG_DEFORMED 1u
 #define GROUP_WORDS 8u
 
 // The group's sphere in trace space against the camera: its simplification shows when
@@ -80,6 +94,7 @@ void main() {
 	float scale = uintBitsToFloat(frame.v[inst + 12u]);
 	uint table_offset = frame.v[inst + 14u];
 	uint list_offset = frame.v[inst + 15u];
+	uint instance_flags = frame.v[inst + 16u];
 
 	uint record = table_offset + cluster_count * 2u + cluster * 2u;
 	uint group = table.v[record];
@@ -94,6 +109,26 @@ void main() {
 		return;
 	}
 	uint slot = atomicAdd(frame.v[pc.blas_infos_offset + entry * pc.blas_info_stride], 1u);
-	frame.v[list_offset + slot * 2u] = table.v[table_offset + cluster * 2u];
-	frame.v[list_offset + slot * 2u + 1u] = table.v[table_offset + cluster * 2u + 1u];
+	if ((instance_flags & INSTANCE_FLAG_DEFORMED) == 0u) {
+		frame.v[list_offset + slot * 2u] = table.v[table_offset + cluster * 2u];
+		frame.v[list_offset + slot * 2u + 1u] = table.v[table_offset + cluster * 2u + 1u];
+		return;
+	}
+	// The CLAS the build makes for this cluster: the slot's address in the instance's range (a
+	// 64-bit add as lo with carry, the range being under 4 GB), for the BLAS's list and the
+	// build's destination; the build info copied from the table to the build's next index.
+	uint infos_offset = frame.v[inst + 17u];
+	uint carry = 0u;
+	uint dst_lo = uaddCarry(frame.v[inst + 18u], slot * pc.clas_slot_size, carry);
+	uint dst_hi = frame.v[inst + 19u] + carry;
+	frame.v[list_offset + slot * 2u] = dst_lo;
+	frame.v[list_offset + slot * 2u + 1u] = dst_hi;
+	uint k = atomicAdd(frame.v[pc.clas_count_offset], 1u);
+	frame.v[pc.clas_dst_offset + k * 2u] = dst_lo;
+	frame.v[pc.clas_dst_offset + k * 2u + 1u] = dst_hi;
+	uint src = infos_offset + cluster * pc.clas_info_words;
+	uint dst = pc.clas_infos_offset + k * pc.clas_info_words;
+	for (uint w = 0u; w < pc.clas_info_words; w++) {
+		frame.v[dst + w] = table.v[src + w];
+	}
 }

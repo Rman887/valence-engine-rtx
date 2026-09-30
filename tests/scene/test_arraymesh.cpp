@@ -640,7 +640,56 @@ TEST_CASE("[SceneTree][ArrayMesh] A skinned surface is clustered with its skin i
 	REQUIRE(RS::get_singleton()->mesh_create_surface_data_from_arrays(&plain, RSE::PRIMITIVE_TRIANGLES, arrays, blend_shapes) == OK);
 	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", true);
 	REQUIRE(RS::get_singleton()->mesh_create_surface_data_from_arrays(&clustered, RSE::PRIMITIVE_TRIANGLES, arrays, blend_shapes) == OK);
+	// With the hierarchy on as well (D87): the skinned surface without its blend shape gets a
+	// cluster LOD table whose coarse levels ride in the table, the skin and vertex data untouched
+	// and the index data the drawn range alone, so the skinning output the coarse levels index is
+	// the same buffer; with the blend shape it keeps the flat table (the hierarchy's errors are the
+	// rest pose's, and a blend-shaped surface's shape is in its deformation).
+	const Variant lod_before = GLOBAL_GET("rendering/pathtracing/cluster_lod");
+	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_lod", true);
+	RenderingServerTypes::SurfaceData lod;
+	RenderingServerTypes::SurfaceData lod_blend;
+	REQUIRE(RS::get_singleton()->mesh_create_surface_data_from_arrays(&lod, RSE::PRIMITIVE_TRIANGLES, arrays) == OK);
+	REQUIRE(RS::get_singleton()->mesh_create_surface_data_from_arrays(&lod_blend, RSE::PRIMITIVE_TRIANGLES, arrays, blend_shapes) == OK);
+	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_lod", lod_before);
+	RenderingServerTypes::SurfaceData plain_skin;
+	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", false);
+	REQUIRE(RS::get_singleton()->mesh_create_surface_data_from_arrays(&plain_skin, RSE::PRIMITIVE_TRIANGLES, arrays) == OK);
 	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", setting_before);
+
+	CHECK(lod.vertex_count == plain_skin.vertex_count);
+	CHECK(lod.index_count == plain_skin.index_count);
+	CHECK(lod.index_data.size() == plain_skin.index_data.size());
+	CHECK(lod.format == plain_skin.format);
+	CHECK((lod.format & RSE::ARRAY_FORMAT_BONES) != 0);
+	CHECK(lod.vertex_data == plain_skin.vertex_data);
+	CHECK(lod.attribute_data == plain_skin.attribute_data);
+	CHECK(lod.skin_data == plain_skin.skin_data);
+	CHECK(lod_blend.blend_shape_data == plain.blend_shape_data);
+	CHECK(lod_blend.skin_data == plain.skin_data);
+	const bool lod_built = RenderingServer::build_cluster_lod_func != nullptr && RenderingServer::build_clusters_func != nullptr;
+	if (lod_built) {
+		// The blend-shaped surface's table is the flat one, whatever the setting.
+		REQUIRE(lod_blend.cluster_data.size() >= int(sizeof(uint32_t) * 2));
+		CHECK(reinterpret_cast<const uint32_t *>(lod_blend.cluster_data.ptr())[0] == RenderingServerTypes::MESH_CLUSTER_DATA_VERSION);
+		REQUIRE(lod.cluster_data.size() >= int(sizeof(uint32_t) * RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS));
+		const uint32_t *header = reinterpret_cast<const uint32_t *>(lod.cluster_data.ptr());
+		CHECK(header[0] == RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION);
+		CHECK(header[3] > 1); // Levels.
+		CHECK(header[5] == uint32_t(indices.size() / 3)); // LOD 0 triangles, the drawn range.
+		CHECK(header[6] > 0); // Coarse triangles, in the table.
+		// The tail's indices, the coarse levels' triangles, reach the surface's own vertices only.
+		const uint32_t cluster_count = header[1];
+		const uint32_t group_count = header[2];
+		const uint32_t coarse_triangles = header[6];
+		const uint32_t tail_offset = RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS + RenderingServerTypes::MESH_CLUSTER_LOD_CLUSTER_WORDS * cluster_count + RenderingServerTypes::MESH_CLUSTER_LOD_GROUP_WORDS * group_count;
+		REQUIRE(uint32_t(lod.cluster_data.size() / sizeof(uint32_t)) == tail_offset + coarse_triangles * 3);
+		uint32_t tail_in_range = 0;
+		for (uint32_t i = 0; i < coarse_triangles * 3; i++) {
+			tail_in_range += header[tail_offset + i] < uint32_t(positions.size()) ? 1 : 0;
+		}
+		CHECK(tail_in_range == coarse_triangles * 3);
+	}
 
 	CHECK(plain.cluster_data.is_empty());
 	CHECK((plain.format & RSE::ARRAY_FORMAT_BONES) != 0);
@@ -705,6 +754,26 @@ TEST_CASE("[SceneTree][ArrayMesh] A skinned surface is clustered with its skin i
 	CHECK(in_range == clustered_indices.size());
 	CHECK(original_triangles.size() == uint32_t(indices.size() / 3));
 	CHECK(clustered_triangles.size() == uint32_t(indices.size() / 3)); // A permutation: no triangle twice.
+
+	// The LOD pack's index data is LOD 0 alone, the same permutation property (D87).
+	if (lod_built) {
+		const Vector<int> lod_indices = decode(lod);
+		REQUIRE(lod_indices.size() == indices.size());
+		HashSet<uint64_t> lod_triangles;
+		int lod_matched = 0;
+		int lod_in_range = 0;
+		for (int t = 0; t < lod_indices.size(); t += 3) {
+			const uint64_t key = triangle_key(lod_indices[t], lod_indices[t + 1], lod_indices[t + 2]);
+			lod_triangles.insert(key);
+			lod_matched += original_triangles.has(key) ? 1 : 0;
+			for (int k = 0; k < 3; k++) {
+				lod_in_range += (lod_indices[t + k] >= 0 && lod_indices[t + k] < positions.size()) ? 1 : 0;
+			}
+		}
+		CHECK(lod_matched == indices.size() / 3);
+		CHECK(lod_in_range == lod_indices.size());
+		CHECK(lod_triangles.size() == uint32_t(indices.size() / 3));
+	}
 }
 
 TEST_CASE("[SceneTree][ArrayMesh] A cluster LOD hierarchy keeps LOD 0 as the index array and its levels in the table (D85).") {

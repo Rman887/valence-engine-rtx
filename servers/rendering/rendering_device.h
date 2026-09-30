@@ -1455,6 +1455,10 @@ public:
 		RID src_infos_buffer;
 		uint64_t src_infos_offset = 0;
 		uint32_t src_infos_stride = 0;
+		// Optional: the structure count read on the device at build time (one uint32 a compute
+		// pass wrote), at most input.max_acceleration_structure_count, which still sizes everything.
+		RID src_infos_count_buffer;
+		uint64_t src_infos_count_offset = 0;
 		// The buffers the build infos point at by device address (vertex and index buffers); the
 		// build is ordered after their uploads and reads them under the indirect access type.
 		Vector<RID> source_buffers;

@@ -784,6 +784,14 @@ Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAcceler
 		ERR_FAIL_COND_V_MSG(p_build.src_infos_offset + rdd_build.src_infos_size > buffer->size, ERR_INVALID_PARAMETER, "The build infos run past their buffer.");
 		track(buffer, RDG::RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ);
 	}
+	if (p_build.src_infos_count_buffer.is_valid()) {
+		ERR_FAIL_COND_V(!resolve(p_build.src_infos_count_buffer, "build count", &buffer), ERR_INVALID_PARAMETER);
+		ERR_FAIL_COND_V_MSG(p_build.src_infos_count_offset + sizeof(uint32_t) > buffer->size, ERR_INVALID_PARAMETER, "The build count runs past its buffer.");
+		ERR_FAIL_COND_V_MSG(p_build.src_infos_count_offset % sizeof(uint32_t) != 0, ERR_INVALID_PARAMETER, "The build count must sit at a 4-byte offset.");
+		rdd_build.src_infos_count_buffer = buffer->driver_id;
+		rdd_build.src_infos_count_offset = p_build.src_infos_count_offset;
+		track(buffer, RDG::RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ);
+	}
 	for (const RID &source : p_build.source_buffers) {
 		ERR_FAIL_COND_V(!resolve(source, "source buffer", &buffer), ERR_INVALID_PARAMETER);
 		track(buffer, RDG::RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ);

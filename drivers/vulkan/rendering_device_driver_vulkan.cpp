@@ -6960,7 +6960,10 @@ void RenderingDeviceDriverVulkan::command_build_cluster_acceleration_structures(
 	commands_info.srcInfosArray.deviceAddress = buffer_get_device_address(p_build.src_infos_buffer) + p_build.src_infos_offset;
 	commands_info.srcInfosArray.stride = p_build.src_infos_stride;
 	commands_info.srcInfosArray.size = p_build.src_infos_size;
-	// srcInfosCount 0: the count is maxAccelerationStructureCount.
+	// srcInfosCount 0: the count is maxAccelerationStructureCount; else the device reads it there (D87).
+	if (p_build.src_infos_count_buffer) {
+		commands_info.srcInfosCount = buffer_get_device_address(p_build.src_infos_count_buffer) + p_build.src_infos_count_offset;
+	}
 
 	device_functions.CmdBuildClusterAccelerationStructureIndirectNV(command_buffer->vk_command_buffer, &commands_info);
 #endif

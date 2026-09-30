@@ -830,6 +830,9 @@ public:
 		uint64_t src_infos_offset = 0;
 		uint32_t src_infos_stride = 0;
 		uint64_t src_infos_size = 0;
+		// Read when set: the structure count as one uint32 on the device, at most input.max_acceleration_structure_count.
+		BufferID src_infos_count_buffer;
+		uint64_t src_infos_count_offset = 0;
 	};
 
 	virtual const ClusterAccelerationStructureCapabilities &get_cluster_acceleration_structure_capabilities() = 0;

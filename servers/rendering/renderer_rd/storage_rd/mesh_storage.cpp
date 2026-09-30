@@ -1001,6 +1001,9 @@ void MeshStorage::mesh_clear(RID p_mesh) {
 	}
 
 	for (uint32_t i = 0; i < mesh->surface_count; i++) {
+		if (surface_freed_callback) {
+			surface_freed_callback(p_mesh, i);
+		}
 		_mesh_surface_clear(mesh, i);
 	}
 	if (mesh->surfaces) {
@@ -1031,6 +1034,13 @@ void MeshStorage::mesh_surface_remove(RID p_mesh, int p_surface) {
 		_mesh_instance_remove_surface(mi, p_surface);
 	}
 
+	// The surfaces above shift down a slot, so their cache keys change too; the old last key is
+	// released here since re-adding a surface reuses it.
+	if (surface_freed_callback) {
+		for (uint32_t i = p_surface; i < mesh->surface_count; i++) {
+			surface_freed_callback(p_mesh, i);
+		}
+	}
 	_mesh_surface_clear(mesh, p_surface);
 
 	if ((uint32_t)p_surface < mesh->surface_count - 1) {

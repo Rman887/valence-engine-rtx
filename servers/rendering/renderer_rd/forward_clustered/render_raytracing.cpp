@@ -45,13 +45,18 @@
 
 using namespace RendererSceneRenderImplementation;
 
+RenderRaytracing *RenderRaytracing::singleton = nullptr;
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
 void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 	owner = p_owner;
+	singleton = this;
 	bindless_block = memnew(BindlessBlock);
+	// A surface its mesh drops releases its RT cache entry at once, not at the slot's reuse.
+	RendererRD::MeshStorage::get_singleton()->set_surface_freed_callback(&RenderRaytracing::_mesh_surface_freed);
 
 	cluster_blas_enabled = RD::get_singleton()->has_feature(RD::SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE);
 	if (cluster_blas_enabled) {
@@ -91,12 +96,16 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 }
 
 RenderRaytracing::~RenderRaytracing() {
+	if (RendererRD::MeshStorage::get_singleton()) {
+		RendererRD::MeshStorage::get_singleton()->set_surface_freed_callback(nullptr);
+	}
 	for (KeyValue<RenderSceneBuffersRD *, RTViewportState *> &kv : viewport_states) {
 		_free_viewport_state_internal(kv.value);
 	}
 	viewport_states.clear();
 
 	cleanup_caches();
+	singleton = nullptr;
 
 	if (mat_ubo_pool_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(mat_ubo_pool_buffer);
@@ -769,8 +778,8 @@ RTSurfaceData *RenderRaytracing::process_surface(
 		entry->ptr = memnew(RTSurfaceData);
 	} else {
 		// Surface data changed on a live mesh: the BLAS is still there, free it.
-		// A deleted mesh or cleared surface cascade-freed a triangle BLAS through its buffers;
-		// a cluster BLAS and its storage wait here for the slot's reuse.
+		// A surface its mesh cleared or removed was released through MeshStorage's callback
+		// (release_mesh_surface); a triangle BLAS also cascades with the mesh's buffers.
 		_release_surface_data(entry->ptr);
 	}
 
@@ -1391,6 +1400,26 @@ bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID 
 	cluster_triangles_built += primitive_count;
 	print_verbose(vformat("RT: cluster BLAS [%d]: %d triangles in %d %s of at most %d triangles and %d vertices, %d KB storage, %d KB arguments.", p_cache_key, primitive_count, cluster_count, from_table ? "clusters" : "runs", max_cluster_triangles, max_cluster_vertices, storage_size / 1024, args_size / 1024));
 	return true;
+}
+
+void RenderRaytracing::release_mesh_surface(RID p_mesh, uint32_t p_surface) {
+	// The RT cache entry of a surface its mesh is dropping: its BLAS and, on the cluster path,
+	// its buffers go now rather than when the cache slot is next reused.
+	const uint32_t cache_key = (p_mesh.get_local_index() << 8) | (p_surface & 0xFF);
+	const uint32_t chunk_idx = cache_key / RT_CACHE_CHUNK_SIZE;
+	if (chunk_idx >= (uint32_t)surface_chunks.size() || surface_chunks[chunk_idx] == nullptr) {
+		return;
+	}
+	RTCacheEntry *entry = &surface_chunks[chunk_idx][cache_key % RT_CACHE_CHUNK_SIZE];
+	if (entry->ptr) {
+		_release_surface_data(entry->ptr);
+	}
+}
+
+void RenderRaytracing::_mesh_surface_freed(RID p_mesh, uint32_t p_surface) {
+	if (singleton) {
+		singleton->release_mesh_surface(p_mesh, p_surface);
+	}
 }
 
 void RenderRaytracing::_release_surface_data(RTSurfaceData *p_surf_data) {

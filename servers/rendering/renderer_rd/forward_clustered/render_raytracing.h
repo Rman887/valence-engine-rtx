@@ -449,6 +449,8 @@ class RenderRaytracing {
 	// Cluster builds recorded this frame, for the render-info counters (they never enter dirty_blas_list).
 	uint32_t cluster_blas_builds = 0;
 	uint32_t cluster_triangles_built = 0;
+	// For MeshStorage's surface-freed callback, a plain function that reaches the renderer.
+	static RenderRaytracing *singleton;
 
 	// Merged MultiMesh BLAS cache and compute shader.
 	struct MergeShader {
@@ -655,6 +657,7 @@ class RenderRaytracing {
 	bool _populate_surface_cluster_blas(void *p_mesh_surface, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data);
 	// Frees the surface's BLAS and, on the cluster path, the buffers it lives in.
 	void _release_surface_data(RTSurfaceData *p_surf_data);
+	static void _mesh_surface_freed(RID p_mesh, uint32_t p_surface);
 	RTMaterialData *process_material(RID p_material_rid, uint16_t p_material_invalidation_counter);
 	bool _build_merged_mm_blas(
 			RID p_mm_rid,
@@ -678,6 +681,8 @@ public:
 	void initialize(RenderForwardClustered *p_owner);
 
 	void cleanup_caches();
+	// Releases the RT cache entry of a surface its mesh is dropping (MeshStorage's surface-freed callback).
+	void release_mesh_surface(RID p_mesh, uint32_t p_surface);
 
 	RTViewportState *build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags);
 	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, const Vector3 &p_origin, float &r_score_sum, uint32_t &r_directional_count);

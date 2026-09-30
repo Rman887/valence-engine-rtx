@@ -43,6 +43,8 @@ namespace RendererRD {
 
 class MeshStorage : public RendererMeshStorage {
 public:
+	typedef void (*SurfaceFreedCallback)(RID p_mesh, uint32_t p_surface);
+
 	enum DefaultRDBuffer {
 		DEFAULT_RD_BUFFER_VERTEX,
 		DEFAULT_RD_BUFFER_NORMAL,
@@ -67,6 +69,10 @@ private:
 	static MeshStorage *singleton;
 
 	RID default_rd_storage_buffer;
+
+	// Told before a surface's buffers go (mesh_clear, mesh_surface_remove) so a renderer cache
+	// keyed by mesh and surface can release what it holds for it (the RT cluster arena, D81).
+	SurfaceFreedCallback surface_freed_callback = nullptr;
 
 	/* Mesh */
 
@@ -369,6 +375,8 @@ public:
 	bool free(RID p_rid);
 
 	RID get_default_rd_storage_buffer() const { return default_rd_storage_buffer; }
+
+	void set_surface_freed_callback(SurfaceFreedCallback p_callback) { surface_freed_callback = p_callback; }
 
 	/* MESH API */
 

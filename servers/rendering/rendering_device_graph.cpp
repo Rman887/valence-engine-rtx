@@ -183,7 +183,16 @@ RDD::BarrierAccessBits RenderingDeviceGraph::_usage_to_access_bits(ResourceUsage
 		case RESOURCE_USAGE_INDIRECT_BUFFER_READ:
 			return RDD::BARRIER_ACCESS_INDIRECT_COMMAND_READ_BIT;
 		case RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ:
-			return RDD::BARRIER_ACCESS_ACCELERATION_STRUCTURE_READ_BIT;
+			// With the memory read as well (D82). The Vulkan driver layer strips the
+			// acceleration-structure read bit from memory and buffer barriers
+			// (rendering_device_driver_vulkan.cpp, command_pipeline_barrier), so the global memory
+			// barrier ahead of every TLAS build and trace had no destination access, and memory
+			// reached indirectly (a CLAS through its BLAS, a BLAS through the TLAS in the trace)
+			// got no visibility operation on the KHR path either, where it never showed. It showed
+			// on driver 32.0.16.1714 under NVIDIA's ray-tracing validation layer, as a BLAS a
+			// cluster build (VK_NV_cluster_acceleration_structure) had just written read invalid
+			// by the TLAS build; the catch-all read, valid at every stage, survives the strip.
+			return RDD::BarrierAccessBits(RDD::BARRIER_ACCESS_ACCELERATION_STRUCTURE_READ_BIT | RDD::BARRIER_ACCESS_MEMORY_READ_BIT);
 		case RESOURCE_USAGE_STORAGE_BUFFER_READ:
 		case RESOURCE_USAGE_STORAGE_IMAGE_READ:
 		case RESOURCE_USAGE_TEXTURE_BUFFER_READ:

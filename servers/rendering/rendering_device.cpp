@@ -681,7 +681,7 @@ Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAcceler
 	const bool implicit = p_build.input.op_mode == ClusterAccelerationStructureInput::CLUSTER_OP_MODE_IMPLICIT_DESTINATIONS;
 	const bool explicit_destinations = p_build.input.op_mode == ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
 	ERR_FAIL_COND_V_MSG(implicit && p_build.dst_implicit_buffer.is_null(), ERR_INVALID_PARAMETER, "Implicit destinations need a destination region.");
-	ERR_FAIL_COND_V_MSG(explicit_destinations && (p_build.dst_storage_buffer.is_null() || p_build.dst_addresses_buffer.is_null()), ERR_INVALID_PARAMETER, "Explicit destinations need the storage buffer and the addresses written into it.");
+	ERR_FAIL_COND_V_MSG(explicit_destinations && ((p_build.dst_storage_buffer.is_null() && p_build.dst_storage_buffers.is_empty()) || p_build.dst_addresses_buffer.is_null()), ERR_INVALID_PARAMETER, "Explicit destinations need the storage buffer and the addresses written into it.");
 	ERR_FAIL_COND_V_MSG(p_build.src_infos_buffer.is_null(), ERR_INVALID_PARAMETER, "A cluster acceleration structure build needs its build infos.");
 
 	RDD::ClusterAccelerationStructureBuild rdd_build;
@@ -694,18 +694,19 @@ Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAcceler
 	// usage that carries both (an argument buffer whose infos are read and addresses written).
 	LocalVector<RDG::ResourceTracker *> trackers;
 	LocalVector<RDG::ResourceUsage> usages;
+	HashMap<RDG::ResourceTracker *, uint32_t> tracker_slots; // A batched build lists thousands of buffers (D82).
 	auto track_tracker = [&](RDG::ResourceTracker *p_tracker, RDG::ResourceUsage p_usage) {
 		if (p_tracker == nullptr) {
 			return;
 		}
-		for (uint32_t i = 0; i < trackers.size(); i++) {
-			if (trackers[i] == p_tracker) {
-				if (usages[i] != p_usage) {
-					usages[i] = RDG::RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ_WRITE;
-				}
-				return;
+		const uint32_t *slot = tracker_slots.getptr(p_tracker);
+		if (slot != nullptr) {
+			if (usages[*slot] != p_usage) {
+				usages[*slot] = RDG::RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ_WRITE;
 			}
+			return;
 		}
+		tracker_slots.insert(p_tracker, trackers.size());
 		trackers.push_back(p_tracker);
 		usages.push_back(p_usage);
 	};
@@ -731,6 +732,11 @@ Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAcceler
 	if (p_build.dst_storage_buffer.is_valid()) {
 		ERR_FAIL_COND_V(!resolve(p_build.dst_storage_buffer, "destination storage", &buffer), ERR_INVALID_PARAMETER);
 		ERR_FAIL_COND_V_MSG(!buffer->usage.has_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT), ERR_INVALID_PARAMETER, "The destination storage was not created with BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT.");
+		track(buffer, RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE);
+	}
+	for (const RID &storage : p_build.dst_storage_buffers) {
+		ERR_FAIL_COND_V(!resolve(storage, "destination storage", &buffer), ERR_INVALID_PARAMETER);
+		ERR_FAIL_COND_V_MSG(!buffer->usage.has_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT), ERR_INVALID_PARAMETER, "A destination storage was not created with BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT.");
 		track(buffer, RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE);
 	}
 	if (p_build.dst_addresses_buffer.is_valid()) {
@@ -786,13 +792,13 @@ Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAcceler
 		ERR_FAIL_COND_V(!resolve(source, "source acceleration structure buffer", &buffer), ERR_INVALID_PARAMETER);
 		track(buffer, RDG::RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ);
 	}
-	LocalVector<AccelerationStructure *> destination_handles;
+	LocalVector<Pair<AccelerationStructure *, RID>> destination_handles;
 	for (const RID &handle : p_build.dst_acceleration_structures) {
 		AccelerationStructure *acceleration_structure = acceleration_structure_owner.get_or_null(handle);
 		ERR_FAIL_NULL_V_MSG(acceleration_structure, ERR_INVALID_PARAMETER, "A destination acceleration structure is not a valid acceleration structure.");
 		ERR_FAIL_COND_V_MSG(acceleration_structure->type != RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL || acceleration_structure->draw_tracker == nullptr || acceleration_structure->draw_tracker->acceleration_structure_driver_id != acceleration_structure->driver_id, ERR_INVALID_PARAMETER, "A destination acceleration structure must be a bottom-level acceleration structure handle with its own tracker.");
 		track_tracker(acceleration_structure->draw_tracker, RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE);
-		destination_handles.push_back(acceleration_structure);
+		destination_handles.push_back(Pair<AccelerationStructure *, RID>(acceleration_structure, handle));
 	}
 
 	// The scratch lives for this frame's build alone.
@@ -816,9 +822,13 @@ Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAcceler
 
 	draw_graph.add_cluster_acceleration_structure_build(rdd_build, trackers, usages);
 
-	// Usable by a TLAS now that the build that writes them is recorded.
-	for (AccelerationStructure *acceleration_structure : destination_handles) {
-		acceleration_structure->invalidated = false;
+	// Usable by a TLAS now that the build that writes them is recorded, and, as blas_build and
+	// blas_update do, a TLAS that holds one is invalidated and drops the dependency, so its next
+	// build lists the BLAS's tracker again and is ordered after this build (a rebuild in place
+	// every frame, D82, would otherwise run unordered against it).
+	for (const Pair<AccelerationStructure *, RID> &destination : destination_handles) {
+		destination.first->invalidated = false;
+		_blas_remove_tlas_dependencies(destination.first, destination.second);
 	}
 
 	return OK;

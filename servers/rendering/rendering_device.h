@@ -1441,8 +1441,10 @@ public:
 		// CLUSTER_OP_MODE_IMPLICIT_DESTINATIONS: the region the structures are sub-allocated from.
 		RID dst_implicit_buffer;
 		uint64_t dst_implicit_offset = 0;
-		// CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS: the storage the written destination addresses point into.
+		// CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS: the storage the written destination addresses point into,
+		// or, for one build over structures in several buffers, every storage they point into.
 		RID dst_storage_buffer;
+		Vector<RID> dst_storage_buffers;
 		RID dst_addresses_buffer;
 		uint64_t dst_addresses_offset = 0;
 		uint32_t dst_addresses_stride = 0;

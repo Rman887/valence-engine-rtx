@@ -266,9 +266,10 @@ void MeshStorage::mesh_set_blend_shape_count(RID p_mesh, int p_blend_shape_count
 // from runs. Positions are read as RenderingServer::_get_array_from_surface reads them. The table
 // is not written back to the resource; a mesh re-saved or re-imported with the setting on carries
 // it and skips this step.
-// Skinned and blend-shape surfaces are left alone until stage 4 rebuilds deformed meshes per cluster.
-static void _cluster_surface_at_load(RenderingServerTypes::SurfaceData &r_surface, uint32_t p_blend_shape_count) {
-	if (r_surface.cluster_data.size() || r_surface.index_count == 0 || r_surface.index_count % 3 != 0 || r_surface.vertex_count == 0 || r_surface.primitive != RSE::PRIMITIVE_TRIANGLES || !(r_surface.format & RSE::ARRAY_FORMAT_VERTEX) || (r_surface.format & RSE::ARRAY_FLAG_USE_2D_VERTICES) || (r_surface.format & RSE::ARRAY_FORMAT_BONES) || p_blend_shape_count > 0) {
+// Skinned and blend-shape surfaces are clustered too (D82): only the index data is reordered, so
+// the skin and blend-shape data, both in vertex order, are untouched.
+static void _cluster_surface_at_load(RenderingServerTypes::SurfaceData &r_surface) {
+	if (r_surface.cluster_data.size() || r_surface.index_count == 0 || r_surface.index_count % 3 != 0 || r_surface.vertex_count == 0 || r_surface.primitive != RSE::PRIMITIVE_TRIANGLES || !(r_surface.format & RSE::ARRAY_FORMAT_VERTEX) || (r_surface.format & RSE::ARRAY_FLAG_USE_2D_VERTICES)) {
 		return;
 	}
 	if (RenderingServer::build_clusters_func == nullptr || !GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
@@ -439,7 +440,7 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	}
 #endif
 
-	_cluster_surface_at_load(new_surface, mesh->blend_shape_count);
+	_cluster_surface_at_load(new_surface);
 
 	static uint32_t s_next_rt_invalidation_counter = 1; // Monotonic counter is required so that new surfaces are also invalidated.
 	Mesh::Surface *s = memnew(Mesh::Surface);

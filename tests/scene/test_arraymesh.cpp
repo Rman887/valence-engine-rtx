@@ -560,6 +560,139 @@ TEST_CASE("[SceneTree][ArrayMesh] Triangle clusters partition the index buffer (
 	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", setting_before);
 }
 
+TEST_CASE("[SceneTree][ArrayMesh] A skinned surface is clustered with its skin in vertex order (D82).") {
+	// A 30 by 30 grid with four bones and weights per vertex and one blend shape, built into
+	// surface data with the setting off and on: the clustered surface's vertex, attribute, skin and
+	// blend-shape data are byte for byte the unclustered surface's, since the reorder touches the
+	// index data alone, and the clustered index data is a winding-preserving permutation of the
+	// triangles.
+	const int n = 30;
+	Vector<Vector3> positions;
+	Vector<Vector3> normals;
+	Vector<Vector2> uvs;
+	Vector<int> bones;
+	Vector<float> weights;
+	Vector<Vector3> shape_positions;
+	for (int y = 0; y <= n; y++) {
+		for (int x = 0; x <= n; x++) {
+			const Vector3 p(x, Math::cos(x * 0.25) * Math::sin(y * 0.35), y);
+			positions.push_back(p);
+			normals.push_back(Vector3(0, 1, 0));
+			uvs.push_back(Vector2(float(x) / n, float(y) / n));
+			const int bone = (x * 7 + y * 3) % 5;
+			bones.push_back(bone);
+			bones.push_back((bone + 1) % 5);
+			bones.push_back(0);
+			bones.push_back(0);
+			const float w = 0.25f + 0.5f * float(x % 3) / 2.0f;
+			weights.push_back(w);
+			weights.push_back(1.0f - w);
+			weights.push_back(0.0f);
+			weights.push_back(0.0f);
+			shape_positions.push_back(p + Vector3(0, 0.5 + 0.01 * x, 0));
+		}
+	}
+	Vector<int> indices;
+	for (int y = 0; y < n; y++) {
+		for (int x = 0; x < n; x++) {
+			const int i = y * (n + 1) + x;
+			indices.push_back(i);
+			indices.push_back(i + 1);
+			indices.push_back(i + n + 1);
+			indices.push_back(i + 1);
+			indices.push_back(i + n + 2);
+			indices.push_back(i + n + 1);
+		}
+	}
+	Array arrays;
+	arrays.resize(RSE::ARRAY_MAX);
+	arrays[RSE::ARRAY_VERTEX] = positions;
+	arrays[RSE::ARRAY_NORMAL] = normals;
+	arrays[RSE::ARRAY_TEX_UV] = uvs;
+	arrays[RSE::ARRAY_BONES] = bones;
+	arrays[RSE::ARRAY_WEIGHTS] = weights;
+	arrays[RSE::ARRAY_INDEX] = indices;
+	Array shape;
+	shape.resize(RSE::ARRAY_MAX);
+	shape[RSE::ARRAY_VERTEX] = shape_positions;
+	shape[RSE::ARRAY_NORMAL] = normals;
+	Array blend_shapes;
+	blend_shapes.push_back(shape);
+
+	const Variant setting_before = GLOBAL_GET("rendering/pathtracing/cluster_blas");
+	RenderingServerTypes::SurfaceData plain;
+	RenderingServerTypes::SurfaceData clustered;
+	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", false);
+	REQUIRE(RS::get_singleton()->mesh_create_surface_data_from_arrays(&plain, RSE::PRIMITIVE_TRIANGLES, arrays, blend_shapes) == OK);
+	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", true);
+	REQUIRE(RS::get_singleton()->mesh_create_surface_data_from_arrays(&clustered, RSE::PRIMITIVE_TRIANGLES, arrays, blend_shapes) == OK);
+	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", setting_before);
+
+	CHECK(plain.cluster_data.is_empty());
+	CHECK((plain.format & RSE::ARRAY_FORMAT_BONES) != 0);
+	CHECK(plain.blend_shape_data.size() > 0);
+	REQUIRE(clustered.vertex_count == plain.vertex_count);
+	REQUIRE(clustered.index_count == plain.index_count);
+	REQUIRE(clustered.index_data.size() == plain.index_data.size());
+	CHECK(clustered.format == plain.format);
+	CHECK(clustered.vertex_data == plain.vertex_data);
+	CHECK(clustered.attribute_data == plain.attribute_data);
+	CHECK(clustered.skin_data == plain.skin_data);
+	CHECK(clustered.blend_shape_data == plain.blend_shape_data);
+	if (RenderingServer::build_clusters_func == nullptr) {
+		CHECK(clustered.cluster_data.is_empty());
+		CHECK(clustered.index_data == plain.index_data);
+		return;
+	}
+	CHECK(clustered.cluster_data.size() >= int(sizeof(uint32_t) * 2));
+	CHECK(clustered.index_data != plain.index_data);
+
+	// The packed indices (16-bit here: 961 vertices), decoded and compared as triangle sets with
+	// the winding kept (the smallest index leads, the order of the other two is the winding).
+	auto decode = [](const RenderingServerTypes::SurfaceData &p_surface) -> Vector<int> {
+		Vector<int> out;
+		const bool wide = p_surface.vertex_count > 65536;
+		const int count = p_surface.index_data.size() / int(wide ? sizeof(uint32_t) : sizeof(uint16_t));
+		out.resize(count);
+		for (int i = 0; i < count; i++) {
+			out.write[i] = wide ? int(reinterpret_cast<const uint32_t *>(p_surface.index_data.ptr())[i]) : int(reinterpret_cast<const uint16_t *>(p_surface.index_data.ptr())[i]);
+		}
+		return out;
+	};
+	auto triangle_key = [](int a, int b, int c) -> uint64_t {
+		while (!(a <= b && a <= c)) {
+			const int t = a;
+			a = b;
+			b = c;
+			c = t;
+		}
+		return (uint64_t(a) << 42) | (uint64_t(b) << 21) | uint64_t(c);
+	};
+	const Vector<int> plain_indices = decode(plain);
+	const Vector<int> clustered_indices = decode(clustered);
+	REQUIRE(plain_indices == indices);
+	REQUIRE(clustered_indices.size() == indices.size());
+	HashSet<uint64_t> original_triangles;
+	for (int t = 0; t < indices.size(); t += 3) {
+		original_triangles.insert(triangle_key(indices[t], indices[t + 1], indices[t + 2]));
+	}
+	HashSet<uint64_t> clustered_triangles;
+	int matched = 0;
+	int in_range = 0;
+	for (int t = 0; t < clustered_indices.size(); t += 3) {
+		const uint64_t key = triangle_key(clustered_indices[t], clustered_indices[t + 1], clustered_indices[t + 2]);
+		clustered_triangles.insert(key);
+		matched += original_triangles.has(key) ? 1 : 0;
+		for (int k = 0; k < 3; k++) {
+			in_range += (clustered_indices[t + k] >= 0 && clustered_indices[t + k] < positions.size()) ? 1 : 0;
+		}
+	}
+	CHECK(matched == indices.size() / 3);
+	CHECK(in_range == clustered_indices.size());
+	CHECK(original_triangles.size() == uint32_t(indices.size() / 3));
+	CHECK(clustered_triangles.size() == uint32_t(indices.size() / 3)); // A permutation: no triangle twice.
+}
+
 } // namespace TestArrayMesh
 
 #endif // _3D_DISABLED

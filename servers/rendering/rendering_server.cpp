@@ -1316,8 +1316,9 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 	// caller's arrays are left as they were.
 	Array arrays = p_arrays;
 	Vector<uint8_t> cluster_data;
-	// Skinned and blend-shape surfaces are left alone until stage 4 rebuilds deformed meshes per cluster.
-	if (p_primitive == RSE::PRIMITIVE_TRIANGLES && index_array_len > 0 && p_arrays[RSE::ARRAY_VERTEX].get_type() == Variant::PACKED_VECTOR3_ARRAY && p_arrays[RSE::ARRAY_INDEX].get_type() == Variant::PACKED_INT32_ARRAY && !(format & RSE::ARRAY_FORMAT_BONES) && p_blend_shapes.is_empty() && GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
+	// Skinned and blend-shape surfaces are clustered too (D82): the reorder touches the index
+	// array alone, so the bone, weight and blend-shape arrays stay in vertex order.
+	if (p_primitive == RSE::PRIMITIVE_TRIANGLES && index_array_len > 0 && p_arrays[RSE::ARRAY_VERTEX].get_type() == Variant::PACKED_VECTOR3_ARRAY && p_arrays[RSE::ARRAY_INDEX].get_type() == Variant::PACKED_INT32_ARRAY && GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
 		Vector<int> indices = p_arrays[RSE::ARRAY_INDEX];
 		cluster_data = mesh_surface_build_clusters(p_arrays[RSE::ARRAY_VERTEX], indices);
 		if (cluster_data.size()) {
@@ -3947,6 +3948,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF("rendering/pathtracing/async_shader_compilation", true);
 	GLOBAL_DEF_RST("rendering/pathtracing/multimesh_cache_cpu_transforms", false);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_blas_compaction", false);
+	GLOBAL_DEF_RST("rendering/pathtracing/cluster_blas_deformed", true);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/deformed_mesh_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 60);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_blas_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,18000,1"), 3600);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_merged_blas_max_triangles", PROPERTY_HINT_RANGE, "256,1048576,1"), 65536);

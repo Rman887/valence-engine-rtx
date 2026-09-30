@@ -383,6 +383,73 @@ struct RTDeformedCacheEntry {
 	uint32_t cached_vertex_count = 0;
 	uint32_t cached_full_size = 0;
 	bool prev_pos_seeded = false; // False until the first owned->prev copy has run.
+
+	// The cluster path (D82): the entry owns the storage of its cluster BLAS alone (one worst-case
+	// slot at the aligned base); its CLAS are built on every frame the data changes, from
+	// owned_vb_full, with implicit destinations into the frame's region shared with every other
+	// deformed surface of the frame (RTDeformedClusterBatch), and the BLAS is rebuilt over them.
+	// The build infos are written once, when the layout is made, and appended to the batch each rebuild.
+	enum ClusterQueuedKind : uint8_t {
+		CLUSTER_QUEUED_NONE = 0,
+		CLUSTER_QUEUED_FIRST_BUILD, // The layout's first build, a build in the counters.
+		CLUSTER_QUEUED_CHANGED, // The data changed, the refit it replaces in the counters.
+		CLUSTER_QUEUED_EXPIRY, // Unchanged, rebuilt because its region is due for reuse; counted on its own.
+	};
+	RID cluster_storage;
+	uint64_t cluster_storage_capacity = 0; // Bytes; grow-only.
+	uint64_t cluster_blas_address = 0; // The BLAS slot, the handle's address.
+	uint32_t cluster_count = 0;
+	uint32_t cluster_max_triangles = 0; // The layout's largest cluster, for the batch's maxima.
+	uint32_t cluster_max_vertices = 0;
+	uint32_t cluster_total_vertices = 0;
+	uint64_t cluster_built_frame = 0; // RenderingDevice's frames_drawn at the flush whose region holds the CLAS; 0 for none.
+	uint64_t cluster_pushed_frame = 0; // frames_drawn when the surface last entered the TLAS instance list.
+	uint8_t cluster_frame_kind = CLUSTER_QUEUED_NONE; // Why it is in this frame's batch.
+	LocalVector<uint8_t> cluster_infos; // cluster_count driver build infos.
+	RID cluster_index_buffer; // The mesh's index buffer the infos read, listed as a source at each rebuild.
+};
+
+// One region of the deformed cluster batch (D82): the CLAS of one flush, sub-allocated by the
+// driver, reused once the last frame that could trace it has been waited on
+// (RenderRaytracing::_deformed_cluster_region_expired).
+struct RTDeformedClusterRegion {
+	RID buffer;
+	uint64_t capacity = 0; // Bytes; grow-only.
+	uint64_t base_offset = 0; // The aligned base's offset from the buffer's start.
+	uint64_t last_used_frame = 0; // RenderingDevice's frames_drawn at the flush that wrote it.
+};
+
+// The deformed cluster builds of one frame (D82): every deformed surface whose data changed
+// appends its cached CLAS infos and one bottom-level info over its slice of the address array
+// the CLAS build writes; the flush, in build_tlas after the MultiMesh merge's compute list and
+// before the counters are published, records two builds, every CLAS into the frame's region
+// then every cluster BLAS into its own storage, over one argument buffer uploaded once per
+// frame. Every list is grow-only across frames; the flush's allocations are the three Vectors
+// and the one-element source list the RenderingDevice build takes, and that build's own map,
+// lists and scratch.
+struct RTDeformedClusterBatch {
+	LocalVector<RTDeformedCacheEntry *> entries; // The queued entries, stamped once the builds record.
+	LocalVector<uint8_t> clas_infos;
+	LocalVector<uint64_t> blas_addresses;
+	uint32_t cluster_count = 0;
+	LocalVector<uint32_t> entry_cluster_counts;
+	LocalVector<RID> storage_buffers;
+	LocalVector<RID> source_buffers; // Each entry's owned vertex buffer, and each distinct index buffer once.
+	LocalVector<RID> index_buffers_seen;
+	LocalVector<RID> blas_handles;
+	uint32_t total_triangles = 0;
+	uint32_t total_vertices = 0;
+	uint32_t max_cluster_triangles = 0;
+	uint32_t max_cluster_vertices = 0;
+	uint32_t max_clusters_per_blas = 0;
+	// One argument buffer, grow-only: the graph orders each frame's upload after the previous
+	// frame's builds through the buffer's tracker.
+	RID args_buffer;
+	uint32_t args_capacity = 0; // Bytes.
+	LocalVector<uint8_t> args_host; // The upload's host copy; grow-only.
+	LocalVector<RTDeformedClusterRegion> regions;
+	LocalVector<RID> dropped_handles; // Handles a failed flush left without a build, to leave this frame's TLAS.
+	uint64_t frames_flushed = 0;
 };
 
 /// Cache entry for a per-(MultiMesh, surface) merged BLAS.
@@ -495,9 +562,19 @@ class RenderRaytracing {
 	// The compaction of cluster BLAS into the arena (D81), rendering/pathtracing/cluster_blas_compaction; off, a
 	// surface keeps its build-time buffers for life.
 	bool cluster_compaction_enabled = false;
+	// Deformed surfaces rebuilt from their clusters each frame (D82), rendering/pathtracing/cluster_blas_deformed.
+	bool cluster_deformed_enabled = false;
 	// Cluster builds recorded this frame, for the render-info counters (they never enter dirty_blas_list).
 	uint32_t cluster_blas_builds = 0;
 	uint32_t cluster_triangles_built = 0;
+	// The deformed cluster path's counters this frame: a layout's first build is a build, every
+	// later rebuild is counted as the refit it replaces.
+	uint32_t deformed_cluster_builds = 0;
+	uint32_t deformed_cluster_triangles_built = 0;
+	uint32_t deformed_cluster_refits = 0;
+	uint32_t deformed_cluster_triangles_refit = 0;
+	uint32_t deformed_cluster_expiry_rebuilds_total = 0; // Unchanged surfaces rebuilt for their region's reuse, over the run.
+	RTDeformedClusterBatch deformed_cluster_batch;
 	// The static cluster arena (D81) and the compactions in flight: a surface's sizes readback
 	// is keyed by a ticket so a result whose surface went in the meantime is dropped.
 	static RenderRaytracing *singleton;
@@ -715,6 +792,26 @@ class RenderRaytracing {
 	// CLAS, one cluster BLAS over them, both built this frame into the surface's own storage. Returns
 	// false, with nothing created, if the surface does not fit.
 	bool _populate_surface_cluster_blas(void *p_mesh_surface, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data);
+	// The clusters of a surface as the static and deformed paths both lay them out: from the
+	// surface's table (D80), or runs of at most p_max_vertices / 3 triangles without one.
+	struct RTClusterLayout {
+		LocalVector<uint32_t> triangles;
+		LocalVector<uint32_t> vertices;
+		uint32_t max_triangles = 0;
+		uint32_t max_vertices = 0;
+		uint32_t total_vertices = 0;
+		bool from_table = false;
+	};
+	static void _cluster_layout_for_surface(void *p_mesh_surface, uint32_t p_primitive_count, uint32_t p_max_triangles, uint32_t p_max_vertices, uint32_t p_cache_key, RTClusterLayout &r_layout);
+	// The deformed cluster path (D82): the entry's storage, handle, infos and slot addresses for
+	// the surface's current layout. Returns false, with the entry's cluster fields cleared, if the
+	// surface does not fit, and the caller builds a triangle BLAS instead.
+	bool _populate_deformed_cluster_layout(void *p_mesh_surface, uint32_t p_cache_key, RTDeformedCacheEntry &r_entry);
+	void _queue_deformed_cluster_rebuild(RTDeformedCacheEntry &p_entry, uint8_t p_kind);
+	bool _deformed_cluster_region_expired(const RTDeformedCacheEntry &p_entry, uint64_t p_frames_drawn) const;
+	bool _record_deformed_cluster_batch();
+	void _flush_deformed_cluster_batch();
+	void _release_deformed_cluster_storage(RTDeformedCacheEntry &p_entry);
 	// The compaction (D81): RenderingDevice hands the built sizes to the static callback on the
 	// render thread as a later frame begins; the next RT frame moves those surfaces' CLAS into
 	// the arena, rebuilds the BLAS there and frees the staging.

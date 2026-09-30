@@ -37,6 +37,7 @@
 #include "core/templates/rid_owner.h"
 #include "core/templates/vector.h"
 #include "servers/rendering/renderer_rd/bindless_block.h"
+#include "servers/rendering/renderer_rd/shaders/raytracing/cluster_lod_select.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/sky_light_table.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
@@ -293,6 +294,51 @@ struct RTSurfaceData {
 	int32_t arena_chunk = -1;
 	uint64_t arena_offset = 0;
 	uint64_t arena_size = 0;
+	// The cluster LOD hierarchy on the GPU (D86): the surface's region of the shared LOD table
+	// (its CLAS addresses over every level, kept current across the compaction; each cluster's
+	// group and the group it refines; the groups' bounds and errors), which the selection reads,
+	// and the worst case of a BLAS over any selection, the size of an instance's slot.
+	uint32_t cluster_lod_table_offset = UINT32_MAX; // Words; UINT32_MAX without a hierarchy.
+	uint32_t cluster_lod_table_words = 0;
+	uint64_t cluster_lod_blas_worst_size = 0;
+	uint32_t cluster_lod_generation = 0; // Unique per population; an instance's slot follows it.
+};
+
+// An instance's cluster BLAS over the clusters the LOD selection picks for it (D86): its own
+// worst-case slot in the arena, rebuilt on every frame the instance enters the TLAS from the
+// surface's current CLAS. Reached through the surface cache's rt_lod_handle and TTL-evicted with
+// the deformed entries; re-sized when the surface it was made for is populated again.
+struct RTLodInstanceEntry {
+	RTSurfaceData *ptr = nullptr;
+	uint32_t generation = 0;
+	uint32_t last_used_frame = 0;
+	uint64_t pushed_frame = 0; // frames_drawn when it last entered the TLAS; a second viewport in the frame reuses that build.
+	RID blas;
+	uint64_t blas_address = 0;
+	int32_t arena_chunk = -1;
+	uint64_t arena_offset = 0;
+	uint64_t arena_size = 0;
+};
+
+// The cluster LOD selection of one frame (D86): every instance on the path appends itself; the
+// flush, in build_tlas after the MultiMesh merge's compute list, uploads one argument buffer (the
+// build infos with their counts at zero, the slot addresses, the instance records, room for the
+// reference lists), runs the selection compute over it and records one cluster BLAS build over
+// every instance's list. Every list is grow-only across frames.
+struct RTLodSelectBatch {
+	LocalVector<RTLodInstanceEntry *> entries;
+	LocalVector<uint32_t> slots; // Each entry's index in the per-frame instance arrays, for the fallback.
+	LocalVector<uint32_t> instance_words; // 16 words per entry, the shader's instance record; the list offset patched at the flush.
+	LocalVector<uint32_t> lod0_clusters; // Per entry, what LOD 0 would trace, for the report.
+	uint32_t cluster_total = 0;
+	uint32_t max_clusters = 0;
+	LocalVector<RID> storage_buffers; // The arena chunks the slots live in, each once.
+	LocalVector<RID> source_buffers; // The buffers the surfaces' CLAS live in, each once.
+	LocalVector<RID> blas_handles;
+	RID args_buffer;
+	uint32_t args_capacity = 0; // Bytes.
+	LocalVector<uint8_t> args_host;
+	uint64_t frames_flushed = 0;
 };
 
 // One chunk of the static cluster arena (D81): a storage buffer sub-allocated first fit from a
@@ -589,6 +635,30 @@ class RenderRaytracing {
 	uint32_t cluster_compactions_total = 0;
 	uint64_t cluster_bytes_staged_total = 0;
 	uint64_t cluster_bytes_compacted_total = 0;
+	// Cluster LOD selection (D86), rendering/pathtracing/cluster_lod_select with cluster_lod: the
+	// selection compute, the shared LOD table every hierarchy's region is sub-allocated from (in
+	// words, first fit, merged on free, grown by copy), the instance slots and the frame's batch.
+	bool cluster_lod_select_enabled = false;
+	float cluster_lod_pixel_error = 1.0f;
+	uint32_t cluster_lod_max_instances = 0; // The selection dispatch's instance axis, the device's workgroup count limit.
+	struct LodSelectShader {
+		ClusterLodSelectShaderRD shader;
+		RID version;
+		RID version_shader;
+		RID pipeline;
+	} lod_select_shader;
+	RID cluster_lod_table;
+	uint32_t cluster_lod_table_capacity = 0; // Words.
+	uint32_t cluster_lod_table_live_words = 0;
+	LocalVector<RTClusterArenaChunk::FreeRange> cluster_lod_table_free; // Offsets and sizes in words.
+	uint32_t cluster_lod_generation_counter = 0;
+	RID_Owner<RTLodInstanceEntry> lod_pool;
+	RTLodSelectBatch lod_batch;
+	// The selected counts read back a frame queue later, the latest whole batch, for the report.
+	uint64_t lod_counts_next_ticket = 0;
+	uint64_t lod_counts_ticket = 0;
+	uint32_t lod_counts_selected = 0;
+	uint32_t lod_counts_entries = 0;
 
 	// Merged MultiMesh BLAS cache and compute shader.
 	struct MergeShader {
@@ -824,6 +894,19 @@ class RenderRaytracing {
 	// the arena, rebuilds the BLAS there and frees the staging.
 	static void _on_cluster_sizes_read(const PackedByteArray &p_sizes, uint64_t p_ticket);
 	void _process_cluster_compactions();
+	// The cluster LOD selection (D86): the surface's region of the LOD table, an instance's slot,
+	// the frame's batch, and the flush that runs the selection and builds every instance's BLAS.
+	bool _cluster_lod_table_allocate(uint32_t p_words, uint32_t &r_offset);
+	void _cluster_lod_table_free(uint32_t p_offset, uint32_t p_words);
+	void _populate_surface_cluster_lod(void *p_mesh_surface, const RTClusterLayout &p_layout, RID p_args_buffer, uint64_t p_implicit_addresses_offset, uint32_t p_cache_key, RTSurfaceData *r_surf_data);
+	void _release_surface_cluster_lod(RTSurfaceData *p_surf_data);
+	RTLodInstanceEntry *_access_lod_slot(RID &r_handle);
+	void _release_lod_entry(RTLodInstanceEntry &p_entry);
+	bool _prepare_lod_entry(RTLodInstanceEntry &p_entry, RTSurfaceData *p_surf_data);
+	void _queue_lod_instance(RTLodInstanceEntry &p_entry, const Transform3D &p_transform, uint32_t p_slot);
+	bool _record_lod_batch(const RenderDataRD *p_render_data, const RTViewportState *p_state);
+	void _flush_lod_batch(const RenderDataRD *p_render_data, const RTViewportState *p_state);
+	static void _on_lod_counts_read(const PackedByteArray &p_counts, uint64_t p_ticket, uint32_t p_entry_count, uint32_t p_stride);
 	bool _cluster_arena_allocate(uint64_t p_size, uint32_t &r_chunk, uint64_t &r_offset);
 	void _cluster_arena_retire(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size);
 	void _cluster_arena_free(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size);
@@ -856,7 +939,8 @@ public:
 	// Releases the RT cache entry of a surface its mesh is dropping (MeshStorage's surface-freed callback).
 	void release_mesh_surface(RID p_mesh, uint32_t p_surface);
 
-	RTViewportState *build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags);
+	// p_primary_from_gbuffer: the frame's visible surface is the raster's, so the cluster LOD selection stands down (D86).
+	RTViewportState *build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_primary_from_gbuffer = false);
 	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, const Vector3 &p_origin, float &r_score_sum, uint32_t &r_directional_count);
 	uint32_t gather_emissive(const RenderDataRD *p_render_data, const RTViewportState *p_state, RT_EmissiveInstance *r_emissive_data, uint32_t p_max_emissive, float &r_score_sum);
 	uint32_t build_light_tree(const RT_LightData *p_lights, uint32_t p_light_count, uint32_t p_directional_count, const RT_EmissiveInstance *p_emissive, uint32_t p_emissive_count, float p_exposure, uint32_t p_cut_size, uint32_t p_cut_indirect_size, bool p_power_pick);

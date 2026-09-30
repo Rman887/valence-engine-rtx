@@ -217,7 +217,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 			raytracing->rt_free_gbuffer_textures(rb.ptr());
 		}
 
-		rt_state = raytracing->build_tlas(p_render_data, rt_flags);
+		rt_state = raytracing->build_tlas(p_render_data, rt_flags, use_gbuffer);
 		if (rt_state) {
 			// The froxel volumetric fog (D37): the frame renders no shadow map, so the froxel's lights are
 			// shadowed by ray queries against the TLAS just built, and the raygen composes the result over

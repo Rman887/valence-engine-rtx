@@ -573,6 +573,7 @@ protected:
 		mutable bool cached_final_transform_valid = false;
 
 		mutable RID rt_deformed_handle;
+		mutable RID rt_lod_handle; // The instance's cluster LOD slot (D86).
 
 		GeometryInstanceSurfaceDataCache *next = nullptr;
 		GeometryInstanceForwardClustered *owner = nullptr;

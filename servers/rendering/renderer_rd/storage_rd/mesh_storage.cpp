@@ -350,6 +350,9 @@ static void _cluster_lod_index_tail(const RenderingServerTypes::SurfaceData &p_s
 	if (!GLOBAL_GET("rendering/pathtracing/cluster_blas") || !GLOBAL_GET("rendering/pathtracing/cluster_lod")) {
 		return;
 	}
+	if (table[7] & RenderingServerTypes::MESH_CLUSTER_LOD_FLAG_STALE) {
+		return; // The coarse levels are traced no more (D86); the tail would sit unused.
+	}
 	const uint32_t cluster_count = table[1];
 	const uint32_t group_count = table[2];
 	const uint32_t lod0_triangle_count = table[5];
@@ -730,6 +733,18 @@ void MeshStorage::mesh_surface_update_vertex_region(RID p_mesh, int p_surface, i
 	const uint8_t *r = p_data.ptr();
 
 	RD::get_singleton()->buffer_update(mesh->surfaces[p_surface]->vertex_buffer, p_offset, data_size, r);
+
+	// A cluster LOD hierarchy (D85) was simplified from the previous positions: its coarse
+	// levels, bounds and errors no longer describe the surface, so the rebuilt cluster BLAS traces
+	// LOD 0 alone until a re-creation builds a new one (D86). The clusters themselves are
+	// index-only and stand.
+	Vector<uint8_t> &table = mesh->surfaces[p_surface]->cluster_data;
+	if (table.size() >= int64_t(RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS * sizeof(uint32_t))) {
+		uint32_t *words = reinterpret_cast<uint32_t *>(table.ptrw());
+		if (words[0] == RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION) {
+			words[7] |= RenderingServerTypes::MESH_CLUSTER_LOD_FLAG_STALE;
+		}
+	}
 
 	// Invalidate RT cache for this surface.
 	mesh->surfaces[p_surface]->rt_invalidation_counter++;

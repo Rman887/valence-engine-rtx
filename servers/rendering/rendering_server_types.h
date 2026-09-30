@@ -115,7 +115,8 @@ struct SurfaceData {
 	// Version 2 (D85, created with rendering/pathtracing/cluster_lod on as well) is a cluster
 	// LOD hierarchy, all words uint32 or float: an 8-word header (version, cluster count over
 	// every level, group count, level count, LOD 0 cluster count, LOD 0 triangle count, coarse
-	// triangle count, reserved); per cluster 8 words (triangles | vertices << 16 as in version
+	// triangle count, flags: MESH_CLUSTER_LOD_FLAG_STALE once the positions were updated in
+	// place, D86); per cluster 8 words (triangles | vertices << 16 as in version
 	// 1, group, refined group as int32 or -1, bounds center x y z, radius, error); per group 8
 	// words (depth, first cluster, cluster count, simplified bounds center x y z, radius, error,
 	// FLT_MAX for a terminal group); then the coarse clusters' triangles as uint32 vertex
@@ -145,6 +146,9 @@ enum MeshClusterConstants : uint32_t {
 	MESH_CLUSTER_LOD_CLUSTER_WORDS = 8,
 	MESH_CLUSTER_LOD_GROUP_WORDS = 8,
 	MESH_CLUSTER_LOD_PARTITION_SIZE = 24,
+	// The header's flags word (word 7): the hierarchy was simplified from positions since
+	// updated in place, so its coarse levels are traced no more (D86).
+	MESH_CLUSTER_LOD_FLAG_STALE = 1,
 };
 // The clusterizer's fill weight (D80) and the hierarchy's error merge across levels (D85):
 // a level's error is max(previous * merge, own), 1.5 being the NVIDIA sample's choice.

@@ -4143,6 +4143,8 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_blas_compaction", true);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_blas_deformed", true);
 	GLOBAL_DEF("rendering/pathtracing/cluster_lod", false);
+	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_select", true);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/cluster_lod_pixel_error", PROPERTY_HINT_RANGE, "0,16,0.05"), 1.0);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/deformed_mesh_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 60);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_blas_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,18000,1"), 3600);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_merged_blas_max_triangles", PROPERTY_HINT_RANGE, "256,1048576,1"), 65536);

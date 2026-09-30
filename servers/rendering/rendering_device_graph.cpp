@@ -93,6 +93,7 @@ String RenderingDeviceGraph::_usage_to_string(ResourceUsage p_usage) {
 
 bool RenderingDeviceGraph::_is_write_usage(ResourceUsage p_usage) {
 	switch (p_usage) {
+		case RESOURCE_USAGE_NONE: // A fresh tracker's usage, asked when its first use follows a read-only one.
 		case RESOURCE_USAGE_COPY_FROM:
 		case RESOURCE_USAGE_RESOLVE_FROM:
 		case RESOURCE_USAGE_UNIFORM_BUFFER_READ:
@@ -574,16 +575,24 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 
 				_add_texture_barrier_to_command(resource_tracker->texture_driver_id, resource_tracker->usage_access, new_usage_access, resource_tracker->usage, new_resource_usage, resource_tracker->texture_subresources, command_transition_barriers, r_command->transition_barrier_index, r_command->transition_barrier_count);
 			} else if (resource_tracker->buffer_driver_id.id != 0) {
+				// A read-only previous usage contributes no source access: a read leaves nothing to make
+				// available, and the execution dependency on the readers' stages already reaches this
+				// command through the write-after-read adjacency; its access bits would otherwise land in
+				// a barrier whose source stages never include the reader's
+				// (VUID-vkCmdPipelineBarrier-srcAccessMask-02815, VUID-vkCmdPipelineBarrier-pBufferMemoryBarriers-02817).
+				const BitField<RDD::BarrierAccessBits> previous_write_access = _is_write_usage(resource_tracker->usage) ? resource_tracker->usage_access : BitField<RDD::BarrierAccessBits>();
 #if USE_BUFFER_BARRIERS
-				_add_buffer_barrier_to_command(resource_tracker->buffer_driver_id, resource_tracker->usage_access, new_usage_access, r_command->buffer_barrier_index, r_command->buffer_barrier_count);
+				_add_buffer_barrier_to_command(resource_tracker->buffer_driver_id, previous_write_access, new_usage_access, r_command->buffer_barrier_index, r_command->buffer_barrier_count);
 #endif
 				// Memory barriers are pushed regardless of buffer barriers being used or not.
-				r_command->memory_barrier.src_access = r_command->memory_barrier.src_access | resource_tracker->usage_access;
+				r_command->memory_barrier.src_access = r_command->memory_barrier.src_access | previous_write_access;
 				r_command->memory_barrier.dst_access = r_command->memory_barrier.dst_access | new_usage_access;
 			} else if (resource_tracker->acceleration_structure_driver_id.id != 0) {
 				// Make sure the acceleration structure has been built before accessing it from raytracing shaders.
-				_add_acceleration_structure_barrier_to_command(resource_tracker->acceleration_structure_driver_id, resource_tracker->usage_access, new_usage_access, command_acceleration_structure_barriers, r_command->acceleration_structure_barrier_index, r_command->acceleration_structure_barrier_count);
-				r_command->memory_barrier.src_access = r_command->memory_barrier.src_access | resource_tracker->usage_access;
+				// As above: a read-only previous usage contributes no source access.
+				const BitField<RDD::BarrierAccessBits> previous_write_access = _is_write_usage(resource_tracker->usage) ? resource_tracker->usage_access : BitField<RDD::BarrierAccessBits>();
+				_add_acceleration_structure_barrier_to_command(resource_tracker->acceleration_structure_driver_id, previous_write_access, new_usage_access, command_acceleration_structure_barriers, r_command->acceleration_structure_barrier_index, r_command->acceleration_structure_barrier_count);
+				r_command->memory_barrier.src_access = r_command->memory_barrier.src_access | previous_write_access;
 				r_command->memory_barrier.dst_access = r_command->memory_barrier.dst_access | new_usage_access;
 			} else {
 				DEV_ASSERT(false && "Resource tracker does not contain a valid buffer or texture ID.");

@@ -31,6 +31,7 @@
 #pragma once
 
 #include "core/io/image.h"
+#include "core/templates/local_vector.h"
 #include "core/templates/rid.h"
 #include "core/variant/typed_array.h"
 #include "core/variant/variant.h"
@@ -223,6 +224,36 @@ public:
 	// cluster_data; empty, with r_indices untouched, when no builder is set or the input is not
 	// a triangle list. Public for the tests; surfaces get it through mesh_create_surface_data_from_arrays.
 	static Vector<uint8_t> mesh_surface_build_clusters(const Vector<Vector3> &p_positions, Vector<int> &r_indices);
+	// Cluster LOD hierarchies at surface creation (D85), set by the meshoptimizer module
+	// (clusterlod.h). The builder fills every level's clusters in its output order (the LOD 0
+	// clusters first), the groups, and the clusters' triangles concatenated as global vertex
+	// indices; clod's own types stay in the module.
+	struct MeshClusterLodCluster {
+		uint32_t triangle_count;
+		uint32_t vertex_count;
+		int32_t group;
+		int32_t refined; // The finer group this cluster was simplified from, -1 for LOD 0.
+		float center[3];
+		float radius;
+		float error;
+		uint32_t first_index; // Into the concatenated indices.
+	};
+	struct MeshClusterLodGroup {
+		int32_t depth;
+		uint32_t first_cluster;
+		uint32_t cluster_count;
+		float center[3]; // The group's simplified bounds and error (FLT_MAX for a terminal group).
+		float radius;
+		float error;
+	};
+	typedef bool (*BuildClusterLodFunc)(const float *p_vertex_positions, size_t p_vertex_count, size_t p_vertex_positions_stride, const float *p_vertex_attributes, size_t p_vertex_attributes_stride, const float *p_attribute_weights, size_t p_attribute_count, unsigned int p_attribute_protect_mask, const unsigned int *p_indices, size_t p_index_count, LocalVector<MeshClusterLodCluster> &r_clusters, LocalVector<MeshClusterLodGroup> &r_groups, LocalVector<unsigned int> &r_indices);
+	static BuildClusterLodFunc build_cluster_lod_func;
+	// Builds the hierarchy over the surface's triangles: r_indices becomes the LOD 0 clusters'
+	// triangles in cluster order and the result is the version-2 cluster_data (the coarse
+	// levels inside it). Empty, with r_indices untouched, when no builder is set or the build
+	// fails; the caller then falls back to mesh_surface_build_clusters. Normals and UVs, when
+	// their arrays match the positions, steer the simplification.
+	static Vector<uint8_t> mesh_surface_build_cluster_lod(const Vector<Vector3> &p_positions, const Vector<Vector3> &p_normals, const Vector<Vector2> &p_uvs, Vector<int> &r_indices);
 	Array mesh_create_arrays_from_surface_data(const RenderingServerTypes::SurfaceData &p_data) const;
 	Array mesh_surface_get_arrays(RID p_mesh, int p_surface) const;
 	TypedArray<Array> mesh_surface_get_blend_shape_arrays(RID p_mesh, int p_surface) const;

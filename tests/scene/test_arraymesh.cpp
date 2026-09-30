@@ -707,6 +707,186 @@ TEST_CASE("[SceneTree][ArrayMesh] A skinned surface is clustered with its skin i
 	CHECK(clustered_triangles.size() == uint32_t(indices.size() / 3)); // A permutation: no triangle twice.
 }
 
+TEST_CASE("[SceneTree][ArrayMesh] A cluster LOD hierarchy keeps LOD 0 as the index array and its levels in the table (D85).") {
+	// A 60 by 60 grid: 3721 vertices, 7200 triangles, enough clusters for several levels.
+	const int n = 60;
+	Vector<Vector3> positions;
+	Vector<Vector3> normals;
+	Vector<Vector2> uvs;
+	for (int y = 0; y <= n; y++) {
+		for (int x = 0; x <= n; x++) {
+			positions.push_back(Vector3(x, Math::sin(x * 0.3) * Math::cos(y * 0.2), y));
+			normals.push_back(Vector3(0, 1, 0));
+			uvs.push_back(Vector2(x / float(n), y / float(n)));
+		}
+	}
+	Vector<int> indices;
+	for (int y = 0; y < n; y++) {
+		for (int x = 0; x < n; x++) {
+			const int i = y * (n + 1) + x;
+			indices.push_back(i);
+			indices.push_back(i + 1);
+			indices.push_back(i + n + 1);
+			indices.push_back(i + 1);
+			indices.push_back(i + n + 2);
+			indices.push_back(i + n + 1);
+		}
+	}
+	const Vector<int> original = indices;
+
+	Vector<uint8_t> table_bytes = RenderingServer::mesh_surface_build_cluster_lod(positions, normals, uvs, indices);
+	if (RenderingServer::build_cluster_lod_func == nullptr) {
+		CHECK(table_bytes.is_empty());
+		CHECK(indices == original);
+		return;
+	}
+	REQUIRE(table_bytes.size() >= int(sizeof(uint32_t) * RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS));
+	REQUIRE(table_bytes.size() % sizeof(uint32_t) == 0);
+	const uint32_t *table = reinterpret_cast<const uint32_t *>(table_bytes.ptr());
+	const uint32_t words = table_bytes.size() / sizeof(uint32_t);
+	CHECK(table[0] == RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION);
+	const uint32_t cluster_count = table[1];
+	const uint32_t group_count = table[2];
+	const uint32_t level_count = table[3];
+	const uint32_t lod0_cluster_count = table[4];
+	const uint32_t lod0_triangle_count = table[5];
+	const uint32_t coarse_triangle_count = table[6];
+	CHECK(table[7] == 0);
+	CHECK(level_count > 1);
+	CHECK(group_count > 1);
+	CHECK(lod0_cluster_count > 1);
+	CHECK(lod0_cluster_count < cluster_count);
+	CHECK(lod0_triangle_count == uint32_t(original.size() / 3));
+	CHECK(coarse_triangle_count > 0);
+	CHECK(coarse_triangle_count < lod0_triangle_count * 2);
+	REQUIRE(words == RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS + RenderingServerTypes::MESH_CLUSTER_LOD_CLUSTER_WORDS * cluster_count + RenderingServerTypes::MESH_CLUSTER_LOD_GROUP_WORDS * group_count + coarse_triangle_count * 3);
+	const uint32_t *cluster_words = table + RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS;
+	const uint32_t *group_words = cluster_words + RenderingServerTypes::MESH_CLUSTER_LOD_CLUSTER_WORDS * cluster_count;
+	const uint32_t *coarse = group_words + RenderingServerTypes::MESH_CLUSTER_LOD_GROUP_WORDS * group_count;
+
+	// The clusters: within the limits, LOD 0 first as original geometry, the rest refined from
+	// an earlier group, the triangle sums those of the header.
+	uint32_t lod0_sum = 0;
+	uint32_t coarse_sum = 0;
+	uint32_t in_limits = 0;
+	uint32_t lod0_original = 0;
+	uint32_t coarse_refined = 0;
+	for (uint32_t c = 0; c < cluster_count; c++) {
+		const uint32_t *w = cluster_words + c * RenderingServerTypes::MESH_CLUSTER_LOD_CLUSTER_WORDS;
+		const uint32_t triangles = w[0] & 0xFFFFu;
+		const uint32_t vertices = w[0] >> 16;
+		const int32_t refined = int32_t(w[2]);
+		in_limits += (triangles > 0 && triangles <= RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES && vertices > 0 && vertices <= RenderingServerTypes::MESH_CLUSTER_MAX_VERTICES && w[1] < group_count) ? 1 : 0;
+		if (c < lod0_cluster_count) {
+			lod0_sum += triangles;
+			lod0_original += refined == -1 ? 1 : 0;
+		} else {
+			coarse_sum += triangles;
+			coarse_refined += (refined >= 0 && uint32_t(refined) < w[1]) ? 1 : 0;
+		}
+	}
+	CHECK(in_limits == cluster_count);
+	CHECK(lod0_sum == lod0_triangle_count);
+	CHECK(coarse_sum == coarse_triangle_count);
+	CHECK(lod0_original == lod0_cluster_count);
+	CHECK(coarse_refined == cluster_count - lod0_cluster_count);
+
+	// The groups: contiguous over the clusters in nondecreasing depth, the depth-0 groups
+	// covering exactly the LOD 0 clusters.
+	uint32_t next_cluster = 0;
+	uint32_t depth0_clusters = 0;
+	uint32_t max_depth = 0;
+	bool ordered = true;
+	int32_t last_depth = 0;
+	for (uint32_t g = 0; g < group_count; g++) {
+		const uint32_t *w = group_words + g * RenderingServerTypes::MESH_CLUSTER_LOD_GROUP_WORDS;
+		const int32_t depth = int32_t(w[0]);
+		ordered = ordered && depth >= last_depth && w[1] == next_cluster && w[2] > 0;
+		if (depth == 0) {
+			depth0_clusters += w[2];
+		}
+		next_cluster += w[2];
+		max_depth = MAX(max_depth, uint32_t(depth));
+		last_depth = depth;
+	}
+	CHECK(ordered);
+	CHECK(next_cluster == cluster_count);
+	CHECK(depth0_clusters == lod0_cluster_count);
+	CHECK(max_depth + 1 == level_count);
+
+	// Every coarse index inside the surface; the LOD 0 index array a permutation of the input.
+	uint32_t coarse_in_range = 0;
+	for (uint32_t i = 0; i < coarse_triangle_count * 3; i++) {
+		coarse_in_range += coarse[i] < uint32_t(positions.size()) ? 1 : 0;
+	}
+	CHECK(coarse_in_range == coarse_triangle_count * 3);
+	REQUIRE(indices.size() == original.size());
+	auto triangle_key = [](int a, int b, int c) -> uint64_t {
+		return (uint64_t(a) << 42) | (uint64_t(b) << 21) | uint64_t(c);
+	};
+	HashSet<uint64_t> original_triangles;
+	HashSet<uint64_t> lod0_triangles;
+	for (int t = 0; t < original.size(); t += 3) {
+		original_triangles.insert(triangle_key(original[t], original[t + 1], original[t + 2]));
+	}
+	uint32_t lod0_found = 0;
+	for (int t = 0; t < indices.size(); t += 3) {
+		const uint64_t key = triangle_key(indices[t], indices[t + 1], indices[t + 2]);
+		const uint64_t key_b = triangle_key(indices[t + 1], indices[t + 2], indices[t]);
+		const uint64_t key_c = triangle_key(indices[t + 2], indices[t], indices[t + 1]);
+		lod0_found += (original_triangles.has(key) || original_triangles.has(key_b) || original_triangles.has(key_c)) ? 1 : 0;
+		lod0_triangles.insert(key);
+	}
+	CHECK(lod0_found == uint32_t(indices.size() / 3));
+	CHECK(lod0_triangles.size() == uint32_t(original.size() / 3));
+
+	// An ArrayMesh built from these arrays with both settings on carries the table, and a
+	// duplicate() round trip (_get_surfaces then _set_surfaces) keeps the index data at the
+	// drawn range and the table whole.
+	const Variant blas_before = GLOBAL_GET("rendering/pathtracing/cluster_blas");
+	const Variant lod_before = GLOBAL_GET("rendering/pathtracing/cluster_lod");
+	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", true);
+	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_lod", true);
+	Array arrays;
+	arrays.resize(RSE::ARRAY_MAX);
+	arrays[RSE::ARRAY_VERTEX] = positions;
+	arrays[RSE::ARRAY_NORMAL] = normals;
+	arrays[RSE::ARRAY_TEX_UV] = uvs;
+	arrays[RSE::ARRAY_INDEX] = original;
+	Ref<ArrayMesh> mesh;
+	mesh.instantiate();
+	mesh->add_surface_from_arrays(Mesh::PRIMITIVE_TRIANGLES, arrays);
+	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", blas_before);
+	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_lod", lod_before);
+	REQUIRE(mesh->get_surface_count() == 1);
+	Ref<ArrayMesh> copy = mesh->duplicate();
+	REQUIRE(copy.is_valid());
+	REQUIRE(copy->get_surface_count() == 1);
+	auto check_surfaces = [&](const Ref<ArrayMesh> &p_mesh) {
+		Array surfaces = p_mesh->get("_surfaces");
+		CHECK(surfaces.size() == 1);
+		if (surfaces.size() != 1) {
+			return;
+		}
+		Dictionary d = surfaces[0];
+		CHECK(d.has("index_count"));
+		CHECK(d.has("index_data"));
+		CHECK(d.has("cluster_data"));
+		const int index_count = d.has("index_count") ? int(d["index_count"]) : 0;
+		const Vector<uint8_t> index_data = d.has("index_data") ? Vector<uint8_t>(d["index_data"]) : Vector<uint8_t>();
+		const Vector<uint8_t> cluster_data = d.has("cluster_data") ? Vector<uint8_t>(d["cluster_data"]) : Vector<uint8_t>();
+		CHECK(index_count == original.size());
+		CHECK(index_data.size() == index_count * int(sizeof(uint16_t))); // 3721 vertices: 16-bit indices, the drawn range alone.
+		CHECK(cluster_data.size() == table_bytes.size());
+		if (cluster_data.size() >= int(sizeof(uint32_t) * RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS)) {
+			CHECK(reinterpret_cast<const uint32_t *>(cluster_data.ptr())[0] == RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION);
+			CHECK(reinterpret_cast<const uint32_t *>(cluster_data.ptr())[6] == coarse_triangle_count);
+		}
+	};
+	check_surfaces(mesh);
+	check_surfaces(copy);
+}
+
 } // namespace TestArrayMesh
 
 #endif // _3D_DISABLED

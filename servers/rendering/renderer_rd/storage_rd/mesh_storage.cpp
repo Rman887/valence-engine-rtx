@@ -330,6 +330,61 @@ static void _cluster_surface_at_load(RenderingServerTypes::SurfaceData &r_surfac
 	r_surface.cluster_data = cluster_data;
 }
 
+// The coarse levels of a cluster LOD hierarchy (D85): while rendering/pathtracing/cluster_blas
+// and cluster_lod are both on, and the surface's table is version 2 and describes its index
+// data, the coarse clusters' triangles are packed to the surface's index format and appended to
+// r_index_data, so the index buffer holds every level. Otherwise the buffer stays the drawn
+// range and the RT cache, which reads the buffer's length (Surface::index_total), traces LOD 0
+// from the table's first clusters. A coarse index outside the surface leaves the buffer at the
+// drawn range too.
+static void _cluster_lod_index_tail(const RenderingServerTypes::SurfaceData &p_surface, bool p_is_index_16, Vector<uint8_t> &r_index_data, uint32_t &r_index_total) {
+	const Vector<uint8_t> &table_bytes = p_surface.cluster_data;
+	const uint64_t words = table_bytes.size() / sizeof(uint32_t);
+	if (words < RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS || table_bytes.size() % sizeof(uint32_t) != 0) {
+		return;
+	}
+	const uint32_t *table = reinterpret_cast<const uint32_t *>(table_bytes.ptr());
+	if (table[0] != RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION) {
+		return;
+	}
+	if (!GLOBAL_GET("rendering/pathtracing/cluster_blas") || !GLOBAL_GET("rendering/pathtracing/cluster_lod")) {
+		return;
+	}
+	const uint32_t cluster_count = table[1];
+	const uint32_t group_count = table[2];
+	const uint32_t lod0_triangle_count = table[5];
+	const uint32_t coarse_triangle_count = table[6];
+	const uint64_t expected_words = RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS + uint64_t(RenderingServerTypes::MESH_CLUSTER_LOD_CLUSTER_WORDS) * cluster_count + uint64_t(RenderingServerTypes::MESH_CLUSTER_LOD_GROUP_WORDS) * group_count + uint64_t(coarse_triangle_count) * 3;
+	if (words != expected_words || coarse_triangle_count == 0 || uint64_t(lod0_triangle_count) * 3 != p_surface.index_count) {
+		return;
+	}
+	const uint32_t index_size = p_is_index_16 ? 2 : 4;
+	if (uint64_t(p_surface.index_count) * index_size != uint64_t(p_surface.index_data.size())) {
+		return;
+	}
+	const uint32_t *coarse = table + (expected_words - uint64_t(coarse_triangle_count) * 3);
+	const uint32_t coarse_index_count = coarse_triangle_count * 3;
+	const uint64_t tail_bytes = uint64_t(coarse_index_count) * index_size;
+	const uint64_t old_bytes = r_index_data.size();
+	r_index_data.resize(old_bytes + tail_bytes);
+	uint8_t *tail = r_index_data.ptrw() + old_bytes;
+	const uint32_t vertex_count = p_surface.vertex_count;
+	for (uint32_t i = 0; i < coarse_index_count; i++) {
+		const uint32_t index = coarse[i];
+		if (index >= vertex_count) {
+			WARN_PRINT_ONCE("A surface's cluster LOD table indexes outside the surface; its coarse levels are left out.");
+			r_index_data.resize(old_bytes);
+			return;
+		}
+		if (p_is_index_16) {
+			reinterpret_cast<uint16_t *>(tail)[i] = uint16_t(index);
+		} else {
+			reinterpret_cast<uint32_t *>(tail)[i] = index;
+		}
+	}
+	r_index_total = p_surface.index_count + coarse_index_count;
+}
+
 /// Returns stride
 void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::SurfaceData &p_surface) {
 	Mesh *mesh = mesh_owner.get_or_null(p_mesh);
@@ -502,9 +557,17 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	if (new_surface.index_count) {
 		bool is_index_16 = new_surface.vertex_count <= 65536 && new_surface.vertex_count > 0;
 
-		s->index_buffer = RD::get_singleton()->index_buffer_create(new_surface.index_count, is_index_16 ? RD::INDEX_BUFFER_FORMAT_UINT16 : RD::INDEX_BUFFER_FORMAT_UINT32, new_surface.index_data, false, requested_storage_flag);
-		s->index_buffer_size = new_surface.index_data.size();
+		// A cluster LOD hierarchy (D85) appends its coarse levels' triangles to the index buffer
+		// past the drawn range: the raster's index array covers index_count as before, the trace
+		// addresses every cluster through the one buffer.
+		Vector<uint8_t> index_data = new_surface.index_data;
+		uint32_t index_total = new_surface.index_count;
+		_cluster_lod_index_tail(new_surface, is_index_16, index_data, index_total);
+
+		s->index_buffer = RD::get_singleton()->index_buffer_create(index_total, is_index_16 ? RD::INDEX_BUFFER_FORMAT_UINT16 : RD::INDEX_BUFFER_FORMAT_UINT32, index_data, false, requested_storage_flag);
+		s->index_buffer_size = index_data.size();
 		s->index_count = new_surface.index_count;
+		s->index_total = index_total;
 		s->index_array = RD::get_singleton()->index_array_create(s->index_buffer, 0, s->index_count);
 		if (new_surface.lods.size()) {
 			s->lods = memnew_arr(Mesh::Surface::LOD, new_surface.lods.size());
@@ -795,7 +858,9 @@ RenderingServerTypes::SurfaceData MeshStorage::mesh_get_surface(RID p_mesh, int 
 	sd.primitive = s.primitive;
 
 	if (sd.index_count) {
-		sd.index_data = RD::get_singleton()->buffer_get_data(s.index_buffer);
+		// The drawn range alone: a cluster LOD tail (D85) is the table's, re-appended at upload.
+		const uint32_t index_size = (s.vertex_count <= 65536 && s.vertex_count > 0) ? sizeof(uint16_t) : sizeof(uint32_t);
+		sd.index_data = RD::get_singleton()->buffer_get_data(s.index_buffer, 0, s.index_count * index_size);
 	}
 	sd.aabb = s.aabb;
 	sd.uv_scale = s.uv_scale;

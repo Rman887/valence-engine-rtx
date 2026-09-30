@@ -282,6 +282,7 @@ struct RTSurfaceData {
 	RID cluster_storage;
 	RID cluster_args;
 	uint32_t cluster_count = 0;
+	uint32_t cluster_lod0_count = 0; // The clusters the BLAS is built over (D85), all of them without a hierarchy.
 	uint32_t cluster_cache_key = 0;
 	uint64_t cluster_blas_worst_size = 0; // The size query's worst case for the one BLAS, its slot in the region.
 	uint64_t cluster_clas_region_size = 0; // The implicit build's region for every CLAS, the move's byte budget.
@@ -794,12 +795,18 @@ class RenderRaytracing {
 	bool _populate_surface_cluster_blas(void *p_mesh_surface, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data);
 	// The clusters of a surface as the static and deformed paths both lay them out: from the
 	// surface's table (D80), or runs of at most p_max_vertices / 3 triangles without one.
+	// A cluster LOD table (D85) lists every level's clusters, the LOD 0 clusters first: the
+	// BLAS is built over those, the CLAS over all; the totals count every level.
 	struct RTClusterLayout {
 		LocalVector<uint32_t> triangles;
 		LocalVector<uint32_t> vertices;
 		uint32_t max_triangles = 0;
 		uint32_t max_vertices = 0;
 		uint32_t total_vertices = 0;
+		uint32_t total_triangles = 0;
+		uint32_t lod0_clusters = 0;
+		uint32_t lod0_vertices = 0;
+		uint32_t levels = 1;
 		bool from_table = false;
 	};
 	static void _cluster_layout_for_surface(void *p_mesh_surface, uint32_t p_primitive_count, uint32_t p_max_triangles, uint32_t p_max_vertices, uint32_t p_cache_key, RTClusterLayout &r_layout);

@@ -112,6 +112,18 @@ struct SurfaceData {
 	// holding its triangle count in the low 16 bits and the count of distinct vertices its
 	// indices reach in the high 16 bits. The clusters partition the index buffer in order,
 	// so a cluster's first triangle is the sum of the counts before it. Empty otherwise.
+	// Version 2 (D85, created with rendering/pathtracing/cluster_lod on as well) is a cluster
+	// LOD hierarchy, all words uint32 or float: an 8-word header (version, cluster count over
+	// every level, group count, level count, LOD 0 cluster count, LOD 0 triangle count, coarse
+	// triangle count, reserved); per cluster 8 words (triangles | vertices << 16 as in version
+	// 1, group, refined group as int32 or -1, bounds center x y z, radius, error); per group 8
+	// words (depth, first cluster, cluster count, simplified bounds center x y z, radius, error,
+	// FLT_MAX for a terminal group); then the coarse clusters' triangles as uint32 vertex
+	// indices, 3 per triangle. Clusters and groups are in the builder's output order, the LOD 0
+	// clusters first (their triangles are index_data, in that order), so a cluster's first
+	// triangle in the concatenation [index_data | coarse triangles] is again the sum of the
+	// counts before it. The RD mesh storage appends the coarse triangles to the surface's index
+	// buffer past index_count; the raster draws index_count, the trace reaches every cluster.
 	Vector<uint8_t> cluster_data;
 
 	RID material;
@@ -125,7 +137,19 @@ enum MeshClusterConstants : uint32_t {
 	MESH_CLUSTER_MAX_TRIANGLES = 128,
 	MESH_CLUSTER_MIN_TRIANGLES = 32,
 	MESH_CLUSTER_MAX_VERTICES = 128,
+	// The cluster LOD hierarchy (D85): its table version and word counts, and the partition
+	// target (meshopt_partitionClusters may exceed its target by a third, so 24 holds a group to
+	// at most 32 clusters, the NVIDIA sample's group size).
+	MESH_CLUSTER_LOD_DATA_VERSION = 2,
+	MESH_CLUSTER_LOD_HEADER_WORDS = 8,
+	MESH_CLUSTER_LOD_CLUSTER_WORDS = 8,
+	MESH_CLUSTER_LOD_GROUP_WORDS = 8,
+	MESH_CLUSTER_LOD_PARTITION_SIZE = 24,
 };
+// The clusterizer's fill weight (D80) and the hierarchy's error merge across levels (D85):
+// a level's error is max(previous * merge, own), 1.5 being the NVIDIA sample's choice.
+constexpr float MESH_CLUSTER_FILL_WEIGHT = 0.5f;
+constexpr float MESH_CLUSTER_LOD_ERROR_MERGE_PREVIOUS = 1.5f;
 
 struct MeshInfo {
 	RID mesh;

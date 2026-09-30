@@ -120,6 +120,9 @@ private:
 			uint32_t index_buffer_size = 0;
 			RID index_array;
 			uint32_t index_count = 0;
+			// The indices the buffer holds: index_count, plus a cluster LOD hierarchy's coarse
+			// levels when they were appended at upload (D85).
+			uint32_t index_total = 0;
 
 			struct LOD {
 				float edge_length = 0.0;
@@ -494,6 +497,11 @@ public:
 	_FORCE_INLINE_ Vector4 mesh_surface_get_uv_scale(void *p_surface) {
 		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
 		return s->uv_scale;
+	}
+
+	_FORCE_INLINE_ uint32_t mesh_surface_get_index_total(void *p_surface) {
+		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
+		return s->index_total;
 	}
 
 	_FORCE_INLINE_ const Vector<uint8_t> &mesh_surface_get_cluster_data(void *p_surface) {

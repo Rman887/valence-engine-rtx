@@ -1261,6 +1261,9 @@ bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID 
 	const uint32_t total_cluster_vertices = layout.total_vertices;
 	const bool from_table = layout.from_table;
 	const uint32_t cluster_count = cluster_triangles.size();
+	// With a cluster LOD hierarchy (D85) the CLAS cover every level and the BLAS the LOD 0
+	// clusters, the first lod0_cluster_count of them, so the image is the flat clustering's.
+	const uint32_t lod0_cluster_count = layout.lod0_clusters;
 	const uint32_t index_size = geom.index_format == RT_INDEX_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t);
 	const RD::DataFormat pos_format = r_surf_data->is_compressed ? RD::DATA_FORMAT_R16G16B16A16_UNORM : RD::DATA_FORMAT_R32G32B32_SFLOAT;
 
@@ -1280,7 +1283,7 @@ bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID 
 	clas_input.vertex_format = pos_format;
 	clas_input.max_cluster_triangle_count = max_cluster_triangles;
 	clas_input.max_cluster_vertex_count = max_cluster_vertices;
-	clas_input.max_total_triangle_count = primitive_count;
+	clas_input.max_total_triangle_count = layout.total_triangles;
 	clas_input.max_total_vertex_count = total_cluster_vertices;
 
 	RD::ClusterAccelerationStructureInput blas_input;
@@ -1288,8 +1291,8 @@ bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID 
 	blas_input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
 	blas_input.max_acceleration_structure_count = 1;
 	blas_input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
-	blas_input.max_total_cluster_count = cluster_count;
-	blas_input.max_cluster_count_per_acceleration_structure = cluster_count;
+	blas_input.max_total_cluster_count = lod0_cluster_count;
+	blas_input.max_cluster_count_per_acceleration_structure = lod0_cluster_count;
 
 	uint64_t clas_region_size = 0, clas_scratch = 0, blas_size = 0, blas_scratch = 0;
 	rd->cluster_acceleration_structure_get_build_sizes(clas_input, clas_region_size, clas_scratch);
@@ -1365,7 +1368,7 @@ bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID 
 	const uint64_t args_address = rd->buffer_get_device_address(args_buffer);
 	{
 		RD::ClusterBottomLevelBuildInfo blas_info;
-		blas_info.cluster_references_count = cluster_count;
+		blas_info.cluster_references_count = lod0_cluster_count;
 		blas_info.cluster_references_stride = sizeof(uint64_t);
 		blas_info.cluster_references_address = args_address + implicit_addresses_offset;
 		rd->cluster_bottom_level_build_info_write(args.ptr() + blas_info_a_offset, blas_info);
@@ -1427,6 +1430,7 @@ bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID 
 	r_surf_data->cluster_args = args_buffer;
 	r_surf_data->blas_size = staging_size + args_size;
 	r_surf_data->cluster_count = cluster_count;
+	r_surf_data->cluster_lod0_count = lod0_cluster_count;
 	r_surf_data->cluster_cache_key = p_cache_key;
 	r_surf_data->cluster_blas_worst_size = blas_size;
 	r_surf_data->cluster_clas_region_size = clas_region_size;
@@ -1449,8 +1453,12 @@ bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID 
 	}
 
 	cluster_blas_builds++;
-	cluster_triangles_built += primitive_count;
-	print_verbose(vformat("RT: cluster BLAS [%d]: %d triangles in %d %s of at most %d triangles and %d vertices, %d KB staging, %d KB arguments.", p_cache_key, primitive_count, cluster_count, from_table ? "clusters" : "runs", max_cluster_triangles, max_cluster_vertices, staging_size / 1024, args_size / 1024));
+	cluster_triangles_built += layout.total_triangles;
+	if (layout.levels > 1) {
+		print_verbose(vformat("RT: cluster BLAS [%d]: %d triangles in %d clusters over %d LOD levels (%d clusters, %d triangles at LOD 0) of at most %d triangles and %d vertices, %d KB staging, %d KB arguments.", p_cache_key, layout.total_triangles, cluster_count, layout.levels, lod0_cluster_count, primitive_count, max_cluster_triangles, max_cluster_vertices, staging_size / 1024, args_size / 1024));
+	} else {
+		print_verbose(vformat("RT: cluster BLAS [%d]: %d triangles in %d %s of at most %d triangles and %d vertices, %d KB staging, %d KB arguments.", p_cache_key, primitive_count, cluster_count, from_table ? "clusters" : "runs", max_cluster_triangles, max_cluster_vertices, staging_size / 1024, args_size / 1024));
+	}
 	return true;
 }
 
@@ -1466,6 +1474,10 @@ void RenderRaytracing::_cluster_layout_for_surface(void *p_mesh_surface, uint32_
 	r_layout.max_triangles = 0;
 	r_layout.max_vertices = 0;
 	r_layout.total_vertices = 0;
+	r_layout.total_triangles = 0;
+	r_layout.lod0_clusters = 0;
+	r_layout.lod0_vertices = 0;
+	r_layout.levels = 1;
 	r_layout.from_table = false;
 	{
 		const Vector<uint8_t> &table_bytes = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_cluster_data(p_mesh_surface);
@@ -1489,6 +1501,52 @@ void RenderRaytracing::_cluster_layout_for_surface(void *p_mesh_surface, uint32_
 					sum += triangles;
 				}
 				r_layout.from_table = valid && sum == p_primitive_count;
+				r_layout.total_triangles = sum;
+				r_layout.lod0_clusters = r_layout.triangles.size();
+				r_layout.lod0_vertices = r_layout.total_vertices;
+			} else if (table[0] == RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION && words >= RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS) {
+				// A cluster LOD hierarchy (D85): the LOD 0 clusters first, summing to the drawn
+				// triangles, then the coarse levels, summing to the header's coarse count. The
+				// coarse levels are taken only when the mesh storage appended them to the index
+				// buffer (the buffer holds every level's indices); otherwise the LOD 0 clusters
+				// are the surface's flat clustering.
+				const uint32_t cluster_count = table[1];
+				const uint32_t group_count = table[2];
+				const uint32_t lod0_clusters = table[4];
+				const uint32_t coarse_triangles = table[6];
+				const uint64_t expected_words = RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS + uint64_t(RenderingServerTypes::MESH_CLUSTER_LOD_CLUSTER_WORDS) * cluster_count + uint64_t(RenderingServerTypes::MESH_CLUSTER_LOD_GROUP_WORDS) * group_count + uint64_t(coarse_triangles) * 3;
+				bool valid = words == expected_words && lod0_clusters > 0 && lod0_clusters <= cluster_count && table[5] == p_primitive_count;
+				const bool tailed = valid && coarse_triangles > 0 && uint64_t(RendererRD::MeshStorage::get_singleton()->mesh_surface_get_index_total(p_mesh_surface)) >= (uint64_t(table[5]) + coarse_triangles) * 3;
+				const uint32_t taken = tailed ? cluster_count : lod0_clusters;
+				if (valid) {
+					r_layout.triangles.reserve(taken);
+					r_layout.vertices.reserve(taken);
+					const uint32_t *cluster_words = table + RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS;
+					uint32_t lod0_sum = 0;
+					uint32_t coarse_sum = 0;
+					for (uint32_t c = 0; c < taken && valid; c++) {
+						const uint32_t packed = cluster_words[uint64_t(c) * RenderingServerTypes::MESH_CLUSTER_LOD_CLUSTER_WORDS];
+						const uint32_t triangles = packed & 0xFFFFu;
+						const uint32_t vertices = packed >> 16;
+						valid = triangles > 0 && triangles <= p_max_triangles && vertices > 0 && vertices <= p_max_vertices;
+						r_layout.triangles.push_back(triangles);
+						r_layout.vertices.push_back(vertices);
+						r_layout.max_triangles = MAX(r_layout.max_triangles, triangles);
+						r_layout.max_vertices = MAX(r_layout.max_vertices, vertices);
+						r_layout.total_vertices += vertices;
+						if (c < lod0_clusters) {
+							lod0_sum += triangles;
+							r_layout.lod0_vertices += vertices;
+						} else {
+							coarse_sum += triangles;
+						}
+					}
+					valid = valid && lod0_sum == p_primitive_count && (!tailed || coarse_sum == coarse_triangles);
+					r_layout.total_triangles = lod0_sum + coarse_sum;
+					r_layout.lod0_clusters = lod0_clusters;
+					r_layout.levels = tailed ? MAX(1u, table[3]) : 1u;
+				}
+				r_layout.from_table = valid;
 			}
 			if (!r_layout.from_table) {
 				WARN_PRINT_ONCE(vformat("RT: surface [%d] carries a cluster table that does not describe its index buffer; clustered as runs instead.", p_cache_key));
@@ -1514,6 +1572,10 @@ void RenderRaytracing::_cluster_layout_for_surface(void *p_mesh_surface, uint32_
 			r_layout.max_vertices = MAX(r_layout.max_vertices, vertices);
 			r_layout.total_vertices += vertices;
 		}
+		r_layout.total_triangles = p_primitive_count;
+		r_layout.lod0_clusters = run_count;
+		r_layout.lod0_vertices = r_layout.total_vertices;
+		r_layout.levels = 1;
 	}
 }
 
@@ -1565,7 +1627,9 @@ bool RenderRaytracing::_populate_deformed_cluster_layout(void *p_mesh_surface, u
 
 	RTClusterLayout layout;
 	_cluster_layout_for_surface(p_mesh_surface, primitive_count, max_triangles, max_vertices, p_cache_key, layout);
-	const uint32_t cluster_count = layout.triangles.size();
+	// The LOD 0 clusters alone (D85): a deformed surface's CLAS are rebuilt every frame its
+	// positions change, so its coarse levels wait for the selection that would use them.
+	const uint32_t cluster_count = layout.lod0_clusters;
 
 	// The entry's storage holds the BLAS alone, at an explicit address the size query bounds for
 	// this cluster count; its CLAS are built with implicit destinations into the frame's region
@@ -1638,10 +1702,14 @@ bool RenderRaytracing::_populate_deformed_cluster_layout(void *p_mesh_surface, u
 	r_entry.cluster_count = cluster_count;
 	r_entry.cluster_max_triangles = layout.max_triangles;
 	r_entry.cluster_max_vertices = layout.max_vertices;
-	r_entry.cluster_total_vertices = layout.total_vertices;
+	r_entry.cluster_total_vertices = layout.lod0_vertices;
 	r_entry.cluster_index_buffer = index_buffer;
 	r_entry.cluster_built_frame = 0;
-	print_verbose(vformat("RT: deformed cluster BLAS [%d]: %d triangles in %d %s of at most %d triangles and %d vertices, %d KB BLAS storage.", p_cache_key, primitive_count, cluster_count, layout.from_table ? "clusters" : "runs", layout.max_triangles, layout.max_vertices, storage_size / 1024));
+	if (layout.levels > 1) {
+		print_verbose(vformat("RT: deformed cluster BLAS [%d]: %d triangles in %d clusters at LOD 0 of %d over %d levels, of at most %d triangles and %d vertices, %d KB BLAS storage.", p_cache_key, primitive_count, cluster_count, layout.triangles.size(), layout.levels, layout.max_triangles, layout.max_vertices, storage_size / 1024));
+	} else {
+		print_verbose(vformat("RT: deformed cluster BLAS [%d]: %d triangles in %d %s of at most %d triangles and %d vertices, %d KB BLAS storage.", p_cache_key, primitive_count, cluster_count, layout.from_table ? "clusters" : "runs", layout.max_triangles, layout.max_vertices, storage_size / 1024));
+	}
 	return true;
 }
 
@@ -2058,8 +2126,8 @@ void RenderRaytracing::_process_cluster_compactions() {
 			build.input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
 			build.input.max_acceleration_structure_count = 1;
 			build.input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
-			build.input.max_total_cluster_count = cluster_count;
-			build.input.max_cluster_count_per_acceleration_structure = cluster_count;
+			build.input.max_total_cluster_count = surf->cluster_lod0_count; // The BLAS spans the LOD 0 clusters (D85); the move spanned them all.
+			build.input.max_cluster_count_per_acceleration_structure = surf->cluster_lod0_count;
 			build.dst_storage_buffer = chunk.buffer;
 			build.dst_addresses_buffer = surf->cluster_args;
 			build.dst_addresses_offset = surf->cluster_args_compact_offset + sizeof(uint64_t) * cluster_count;

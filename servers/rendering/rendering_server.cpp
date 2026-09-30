@@ -1324,9 +1324,29 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 	// created with, so the table and the reordered indices would be discarded. The result
 	// carries no table and the caller's index order; given to mesh_add_surface, it is
 	// clustered at load.
+	// With rendering/pathtracing/cluster_lod on as well, the surface gets a cluster LOD
+	// hierarchy instead (D85): the LOD 0 clusters take the index array as above, the coarse
+	// levels ride in the table. The flat clusterizer is the fallback when the hierarchy fails,
+	// and the layout for surfaces the hierarchy cannot serve at this stage: skinned and
+	// blend-shaped surfaces (the deformed path traces LOD 0 alone) and surfaces of one cluster
+	// (no coarse level to build; Label3D and Sprite3D recreate theirs constantly).
 	if (p_build_clusters && p_primitive == RSE::PRIMITIVE_TRIANGLES && index_array_len > 0 && p_arrays[RSE::ARRAY_VERTEX].get_type() == Variant::PACKED_VECTOR3_ARRAY && p_arrays[RSE::ARRAY_INDEX].get_type() == Variant::PACKED_INT32_ARRAY && GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
 		Vector<int> indices = p_arrays[RSE::ARRAY_INDEX];
-		cluster_data = mesh_surface_build_clusters(p_arrays[RSE::ARRAY_VERTEX], indices);
+		const bool deformed = p_arrays[RSE::ARRAY_BONES].get_type() != Variant::NIL || p_blend_shapes.size() > 0;
+		if (!deformed && index_array_len > int(RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES) * 3 && GLOBAL_GET("rendering/pathtracing/cluster_lod")) {
+			Vector<Vector3> normals;
+			if (p_arrays[RSE::ARRAY_NORMAL].get_type() == Variant::PACKED_VECTOR3_ARRAY) {
+				normals = p_arrays[RSE::ARRAY_NORMAL];
+			}
+			Vector<Vector2> uvs;
+			if (p_arrays[RSE::ARRAY_TEX_UV].get_type() == Variant::PACKED_VECTOR2_ARRAY) {
+				uvs = p_arrays[RSE::ARRAY_TEX_UV];
+			}
+			cluster_data = mesh_surface_build_cluster_lod(p_arrays[RSE::ARRAY_VERTEX], normals, uvs, indices);
+		}
+		if (cluster_data.is_empty()) {
+			cluster_data = mesh_surface_build_clusters(p_arrays[RSE::ARRAY_VERTEX], indices);
+		}
 		if (cluster_data.size()) {
 			arrays = p_arrays.duplicate();
 			arrays[RSE::ARRAY_INDEX] = indices;
@@ -1417,6 +1437,7 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 
 RenderingServer::BuildClustersBoundFunc RenderingServer::build_clusters_bound_func = nullptr;
 RenderingServer::BuildClustersFunc RenderingServer::build_clusters_func = nullptr;
+RenderingServer::BuildClusterLodFunc RenderingServer::build_cluster_lod_func = nullptr;
 
 Vector<uint8_t> RenderingServer::mesh_surface_build_clusters(const Vector<Vector3> &p_positions, Vector<int> &r_indices) {
 	Vector<uint8_t> cluster_data;
@@ -1455,7 +1476,7 @@ Vector<uint8_t> RenderingServer::mesh_surface_build_clusters(const Vector<Vector
 	LocalVector<unsigned char> cluster_triangles;
 	cluster_triangles.resize(index_count);
 	const size_t cluster_count = build_clusters_func(clusters.ptr(), cluster_vertices.ptr(), cluster_triangles.ptr(), indices.ptr(), index_count, positions.ptr(), vertex_count, sizeof(float) * 3,
-			RenderingServerTypes::MESH_CLUSTER_MAX_VERTICES, RenderingServerTypes::MESH_CLUSTER_MIN_TRIANGLES, RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES, 0.5f);
+			RenderingServerTypes::MESH_CLUSTER_MAX_VERTICES, RenderingServerTypes::MESH_CLUSTER_MIN_TRIANGLES, RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES, RenderingServerTypes::MESH_CLUSTER_FILL_WEIGHT);
 	ERR_FAIL_COND_V_MSG(cluster_count == 0 || cluster_count > cluster_bound, Vector<uint8_t>(), "The cluster builder returned an impossible cluster count.");
 
 	// Rewrite the index buffer cluster by cluster from the clusters' local indices, and the
@@ -1484,6 +1505,172 @@ Vector<uint8_t> RenderingServer::mesh_surface_build_clusters(const Vector<Vector
 	r_indices = reordered;
 
 	print_verbose(vformat("RS: %d triangles in %d clusters of at most %d (%d us).", index_count / 3, cluster_count, RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES, OS::get_singleton()->get_ticks_usec() - begin_us));
+	return cluster_data;
+}
+
+Vector<uint8_t> RenderingServer::mesh_surface_build_cluster_lod(const Vector<Vector3> &p_positions, const Vector<Vector3> &p_normals, const Vector<Vector2> &p_uvs, Vector<int> &r_indices) {
+	Vector<uint8_t> cluster_data;
+	if (build_cluster_lod_func == nullptr) {
+		return cluster_data;
+	}
+	const uint32_t index_count = r_indices.size();
+	const uint32_t vertex_count = p_positions.size();
+	if (index_count == 0 || index_count % 3 != 0 || vertex_count == 0) {
+		return cluster_data;
+	}
+	const uint64_t begin_us = OS::get_singleton()->get_ticks_usec();
+
+	LocalVector<float> positions;
+	positions.resize(vertex_count * 3);
+	const Vector3 *pos = p_positions.ptr();
+	for (uint32_t i = 0; i < vertex_count; i++) {
+		positions[i * 3 + 0] = float(pos[i].x);
+		positions[i * 3 + 1] = float(pos[i].y);
+		positions[i * 3 + 2] = float(pos[i].z);
+	}
+	LocalVector<unsigned int> indices;
+	indices.resize(index_count);
+	const int *idx = r_indices.ptr();
+	for (uint32_t i = 0; i < index_count; i++) {
+		ERR_FAIL_COND_V_MSG(idx[i] < 0 || uint32_t(idx[i]) >= vertex_count, Vector<uint8_t>(), "Index out of range while building a surface's cluster LOD.");
+		indices[i] = uint32_t(idx[i]);
+	}
+
+	// The attributes the simplifier weighs, interleaved per vertex: the normal (3) and the UV
+	// (2), each when its array matches the positions, at half weight; the UV also marks its
+	// seams for permissive simplification. No tangents, no vertex locks.
+	const bool has_normals = uint32_t(p_normals.size()) == vertex_count;
+	const bool has_uvs = uint32_t(p_uvs.size()) == vertex_count;
+	const uint32_t attribute_count = (has_normals ? 3 : 0) + (has_uvs ? 2 : 0);
+	LocalVector<float> attributes;
+	float weights[5] = { 0.5f, 0.5f, 0.5f, 0.5f, 0.5f };
+	unsigned int protect_mask = 0;
+	if (attribute_count > 0) {
+		attributes.resize(vertex_count * attribute_count);
+		const Vector3 *nrm = p_normals.ptr();
+		const Vector2 *uv = p_uvs.ptr();
+		for (uint32_t i = 0; i < vertex_count; i++) {
+			float *a = attributes.ptr() + i * attribute_count;
+			if (has_normals) {
+				*a++ = float(nrm[i].x);
+				*a++ = float(nrm[i].y);
+				*a++ = float(nrm[i].z);
+			}
+			if (has_uvs) {
+				*a++ = float(uv[i].x);
+				*a++ = float(uv[i].y);
+			}
+		}
+		if (has_uvs) {
+			const uint32_t uv_offset = has_normals ? 3 : 0;
+			protect_mask = (1u << uv_offset) | (1u << (uv_offset + 1));
+		}
+	}
+
+	LocalVector<MeshClusterLodCluster> clusters;
+	LocalVector<MeshClusterLodGroup> groups;
+	LocalVector<unsigned int> cluster_indices;
+	if (!build_cluster_lod_func(positions.ptr(), vertex_count, sizeof(float) * 3, attribute_count ? attributes.ptr() : nullptr, sizeof(float) * attribute_count, attribute_count ? weights : nullptr, attribute_count, protect_mask, indices.ptr(), index_count, clusters, groups, cluster_indices)) {
+		WARN_PRINT_ONCE("The cluster LOD builder failed on a surface; it is clustered flat instead.");
+		return cluster_data;
+	}
+	ERR_FAIL_COND_V_MSG(clusters.is_empty() || groups.is_empty(), Vector<uint8_t>(), "The cluster LOD builder returned no clusters.");
+
+	// Check the hierarchy before anything takes it: every cluster within the limits and its
+	// buffers, groups contiguous over the clusters in nondecreasing depth, the depth-0 groups
+	// first and holding exactly the input triangles as original geometry.
+	const uint32_t cluster_count = clusters.size();
+	const uint32_t group_count = groups.size();
+	uint32_t lod0_cluster_count = 0;
+	uint32_t lod0_triangle_count = 0;
+	uint32_t total_triangle_count = 0;
+	uint32_t level_count = 0;
+	{
+		uint32_t next_cluster = 0;
+		int32_t last_depth = 0;
+		for (uint32_t g = 0; g < group_count; g++) {
+			const MeshClusterLodGroup &group = groups[g];
+			ERR_FAIL_COND_V_MSG(group.depth < last_depth || group.first_cluster != next_cluster || group.cluster_count == 0 || uint64_t(group.first_cluster) + group.cluster_count > cluster_count, Vector<uint8_t>(), "The cluster LOD builder returned groups out of order.");
+			ERR_FAIL_COND_V_MSG(group.depth == 0 && lod0_cluster_count != group.first_cluster, Vector<uint8_t>(), "The cluster LOD builder returned a depth-0 group after a coarser one.");
+			for (uint32_t c = group.first_cluster; c < group.first_cluster + group.cluster_count; c++) {
+				const MeshClusterLodCluster &cluster = clusters[c];
+				ERR_FAIL_COND_V_MSG(cluster.triangle_count == 0 || cluster.triangle_count > RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES || cluster.vertex_count == 0 || cluster.vertex_count > RenderingServerTypes::MESH_CLUSTER_MAX_VERTICES, Vector<uint8_t>(), "The cluster LOD builder returned a cluster outside its limits.");
+				ERR_FAIL_COND_V_MSG(cluster.group != int32_t(g) || uint64_t(cluster.first_index) + cluster.triangle_count * 3 > cluster_indices.size() || cluster.refined >= int32_t(g) || (group.depth == 0) != (cluster.refined < 0), Vector<uint8_t>(), "The cluster LOD builder returned a cluster outside its group or hierarchy.");
+				for (uint32_t t = 0; t < cluster.triangle_count * 3; t++) {
+					ERR_FAIL_COND_V_MSG(cluster_indices[cluster.first_index + t] >= vertex_count, Vector<uint8_t>(), "The cluster LOD builder returned an index outside the surface.");
+				}
+				total_triangle_count += cluster.triangle_count;
+				if (group.depth == 0) {
+					lod0_triangle_count += cluster.triangle_count;
+				}
+			}
+			if (group.depth == 0) {
+				lod0_cluster_count += group.cluster_count;
+			}
+			next_cluster += group.cluster_count;
+			last_depth = group.depth;
+			level_count = MAX(level_count, uint32_t(group.depth) + 1);
+		}
+		ERR_FAIL_COND_V_MSG(next_cluster != cluster_count || lod0_triangle_count * 3 != index_count, Vector<uint8_t>(), "The cluster LOD builder lost triangles.");
+	}
+	const uint32_t coarse_triangle_count = total_triangle_count - lod0_triangle_count;
+
+	// The LOD 0 clusters' triangles become the index array, cluster by cluster; the table takes
+	// the header, the clusters, the groups, then the coarse clusters' triangles in the same order.
+	Vector<int> reordered;
+	reordered.resize(index_count);
+	int *out = reordered.ptrw();
+	uint32_t written = 0;
+	const uint64_t table_words = RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS + uint64_t(RenderingServerTypes::MESH_CLUSTER_LOD_CLUSTER_WORDS) * cluster_count + uint64_t(RenderingServerTypes::MESH_CLUSTER_LOD_GROUP_WORDS) * group_count + uint64_t(coarse_triangle_count) * 3;
+	ERR_FAIL_COND_V_MSG(table_words * sizeof(uint32_t) > uint64_t(INT32_MAX), Vector<uint8_t>(), "A surface's cluster LOD table exceeds 2 GB.");
+	cluster_data.resize(table_words * sizeof(uint32_t));
+	uint32_t *table = reinterpret_cast<uint32_t *>(cluster_data.ptrw());
+	table[0] = RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION;
+	table[1] = cluster_count;
+	table[2] = group_count;
+	table[3] = level_count;
+	table[4] = lod0_cluster_count;
+	table[5] = lod0_triangle_count;
+	table[6] = coarse_triangle_count;
+	table[7] = 0;
+	uint32_t *cluster_words = table + RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS;
+	uint32_t *group_words = cluster_words + uint64_t(RenderingServerTypes::MESH_CLUSTER_LOD_CLUSTER_WORDS) * cluster_count;
+	uint32_t *coarse_words = group_words + uint64_t(RenderingServerTypes::MESH_CLUSTER_LOD_GROUP_WORDS) * group_count;
+	uint32_t coarse_written = 0;
+	for (uint32_t c = 0; c < cluster_count; c++) {
+		const MeshClusterLodCluster &cluster = clusters[c];
+		uint32_t *w = cluster_words + uint64_t(c) * RenderingServerTypes::MESH_CLUSTER_LOD_CLUSTER_WORDS;
+		w[0] = cluster.triangle_count | (cluster.vertex_count << 16);
+		w[1] = uint32_t(cluster.group);
+		w[2] = uint32_t(cluster.refined);
+		memcpy(w + 3, cluster.center, sizeof(float) * 3);
+		memcpy(w + 6, &cluster.radius, sizeof(float));
+		memcpy(w + 7, &cluster.error, sizeof(float));
+		const unsigned int *src = cluster_indices.ptr() + cluster.first_index;
+		if (c < lod0_cluster_count) {
+			for (uint32_t t = 0; t < cluster.triangle_count * 3; t++) {
+				out[written + t] = int(src[t]);
+			}
+			written += cluster.triangle_count * 3;
+		} else {
+			memcpy(coarse_words + coarse_written, src, sizeof(uint32_t) * cluster.triangle_count * 3);
+			coarse_written += cluster.triangle_count * 3;
+		}
+	}
+	for (uint32_t g = 0; g < group_count; g++) {
+		const MeshClusterLodGroup &group = groups[g];
+		uint32_t *w = group_words + uint64_t(g) * RenderingServerTypes::MESH_CLUSTER_LOD_GROUP_WORDS;
+		w[0] = uint32_t(group.depth);
+		w[1] = group.first_cluster;
+		w[2] = group.cluster_count;
+		memcpy(w + 3, group.center, sizeof(float) * 3);
+		memcpy(w + 6, &group.radius, sizeof(float));
+		memcpy(w + 7, &group.error, sizeof(float));
+	}
+	ERR_FAIL_COND_V_MSG(written != index_count || coarse_written != coarse_triangle_count * 3, Vector<uint8_t>(), "The cluster LOD table lost triangles.");
+	r_indices = reordered;
+
+	print_verbose(vformat("RS: cluster LOD: %d triangles in %d levels, %d groups, %d clusters (%d at LOD 0), %d coarse triangles, %d KB table (%d us).", index_count / 3, level_count, group_count, cluster_count, lod0_cluster_count, coarse_triangle_count, cluster_data.size() / 1024, OS::get_singleton()->get_ticks_usec() - begin_us));
 	return cluster_data;
 }
 
@@ -3955,6 +4142,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST("rendering/pathtracing/multimesh_cache_cpu_transforms", false);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_blas_compaction", true);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_blas_deformed", true);
+	GLOBAL_DEF("rendering/pathtracing/cluster_lod", false);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/deformed_mesh_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 60);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_blas_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,18000,1"), 3600);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_merged_blas_max_triangles", PROPERTY_HINT_RANGE, "256,1048576,1"), 65536);

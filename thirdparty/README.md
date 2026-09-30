@@ -726,6 +726,7 @@ Update instructions:
 Files extracted from upstream repository:
 
 - All files in `src/`
+- `demo/clusterlod.h`, placed at the library root as `clusterlod.h` (the cluster LOD hierarchy builder, D85; the same version and commit)
 - `LICENSE.md`
 
 

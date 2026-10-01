@@ -71,7 +71,9 @@ public:
 	// Raytracing specialization constant flags (must match shader RT_FLAG_* defines).
 	// Bits 0-10:  Feature flags
 	// Bits 11-12: The SER coherence hint (RT_SER_HINT_*)
-	// Bits 13-20: Free
+	// Bit 13:    Cluster BLAS (RT_FLAG_CLUSTER_AS)
+	// Bits 14-15: Position fetch and its verbose check (D93)
+	// Bits 16-20: Free
 	// Bits 21-28: Sample count
 	// Bits 29-31: Max bounce count (offset by 1: 0=1 bounce, 7=8 bounces)
 	enum RaytracingFlags {
@@ -88,6 +90,8 @@ public:
 		RT_FLAG_SKY_LIGHT_VARIANCE_SHARE = (1 << 9), // The sky's share by the variance it removes (D62); clear, by its concentrated light (D54). Set only with RT_FLAG_SKY_LIGHT.
 		RT_FLAG_RUSSIAN_ROULETTE = (1 << 10), // Paths end by Russian roulette on their throughput once a vertex has scattered (D73); clear, only at the bounce limits.
 		RT_FLAG_CLUSTER_AS = (1 << 13), // Static BLAS built from triangle clusters (D79): hit shaders add gl_ClusterIDNV to gl_PrimitiveID. Set when rendering/pathtracing/cluster_blas is on and the device has the extension.
+		RT_FLAG_POSITION_FETCH = (1 << 14), // Cluster builds allow data access and the hit stages enable position fetch (D93). Set while geometry residency is on.
+		RT_FLAG_POSITION_FETCH_CHECK = (1 << 15), // A verbose run's closest hit compares fetched positions with the vertex buffer's (D93). Set only with RT_FLAG_POSITION_FETCH.
 	};
 
 	// The coherence hint the raygen hands reorderThreadEXT beside the hit's shader (D75), the

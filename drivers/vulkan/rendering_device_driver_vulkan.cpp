@@ -599,6 +599,10 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 	// pipeline opting into cluster traversal.
 	if (GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
 		_register_requested_device_extension(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME, false);
+		// Geometry residency (D93) takes a cluster hit's positions from its CLAS.
+		if (GLOBAL_GET("rendering/pathtracing/cluster_lod_stream_geometry")) {
+			_register_requested_device_extension(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME, false);
+		}
 	}
 	_register_requested_device_extension(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, false);
 
@@ -941,6 +945,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		VkPhysicalDeviceSynchronization2FeaturesKHR sync_2_features = {};
 		VkPhysicalDeviceRayTracingValidationFeaturesNV raytracing_validation_features = {};
 		VkPhysicalDeviceClusterAccelerationStructureFeaturesNV cluster_acceleration_structure_features = {};
+		VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR position_fetch_features = {};
 
 		const bool use_1_2_features = physical_device_properties.apiVersion >= VK_API_VERSION_1_2;
 		if (use_1_2_features) {
@@ -1041,6 +1046,12 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			cluster_acceleration_structure_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV;
 			cluster_acceleration_structure_features.pNext = next_features;
 			next_features = &cluster_acceleration_structure_features;
+		}
+
+		if (enabled_device_extension_names.has(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME)) {
+			position_fetch_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR;
+			position_fetch_features.pNext = next_features;
+			next_features = &position_fetch_features;
 		}
 
 		if (enabled_device_extension_names.has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME)) {
@@ -1149,6 +1160,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 
 		if (enabled_device_extension_names.has(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
 			cluster_acceleration_structure_capabilities.supported = acceleration_structure_features.accelerationStructure && cluster_acceleration_structure_features.clusterAccelerationStructure;
+			cluster_acceleration_structure_capabilities.position_fetch = cluster_acceleration_structure_capabilities.supported && enabled_device_extension_names.has(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME) && position_fetch_features.rayTracingPositionFetch;
 		}
 	}
 
@@ -1361,6 +1373,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			print_verbose("  cluster byte alignment: " + itos(cluster_acceleration_structure_capabilities.cluster_byte_alignment));
 			print_verbose("  cluster bottom level byte alignment: " + itos(cluster_acceleration_structure_capabilities.cluster_bottom_level_byte_alignment));
 			print_verbose("  cluster scratch byte alignment: " + itos(cluster_acceleration_structure_capabilities.cluster_scratch_byte_alignment));
+			print_verbose(String("  position fetch: ") + (cluster_acceleration_structure_capabilities.position_fetch ? "yes" : "no"));
 		}
 	}
 
@@ -1552,6 +1565,14 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		cluster_acceleration_structure_features.pNext = create_info_next;
 		cluster_acceleration_structure_features.clusterAccelerationStructure = VK_TRUE;
 		create_info_next = &cluster_acceleration_structure_features;
+	}
+
+	VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR position_fetch_features = {};
+	if (cluster_acceleration_structure_capabilities.position_fetch) {
+		position_fetch_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR;
+		position_fetch_features.pNext = create_info_next;
+		position_fetch_features.rayTracingPositionFetch = VK_TRUE;
+		create_info_next = &position_fetch_features;
 	}
 
 	VkPhysicalDeviceVulkan11Features vulkan_1_1_features = {};
@@ -6524,6 +6545,7 @@ static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BI
 static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT, VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR));
 static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT, VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR));
 static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_LOW_MEMORY_BIT, VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR));
+static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT, VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR));
 
 // RDD::AccelerationStructureGeometryFlagBits == VkGeometryFlagsKHR.
 static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT, VK_GEOMETRY_OPAQUE_BIT_KHR));

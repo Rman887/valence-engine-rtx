@@ -752,6 +752,12 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_e
 	// The setting alone asks the driver for the extension; the feature says whether it came.
 	if (RD::get_singleton()->has_feature(RD::SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE)) {
 		flags |= RT_FLAG_CLUSTER_AS;
+		if (RenderRaytracing::is_position_fetch_enabled()) {
+			flags |= RT_FLAG_POSITION_FETCH;
+			if (OS::get_singleton()->is_stdout_verbose()) {
+				flags |= RT_FLAG_POSITION_FETCH_CHECK;
+			}
+		}
 	}
 
 	if (GLOBAL_GET("rendering/pathtracing/use_shader_execution_reordering")) {
@@ -814,6 +820,13 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 	// device with the extension, and a variant would double the raygen set compiled at start.
 	if (p_rt_flags & RT_FLAG_CLUSTER_AS) {
 		inject_define(sources, "#define USE_CLUSTER_AS\n");
+	}
+	// Defines for the same reason: the position-fetch capability is legal only with the extension (D93).
+	if (p_rt_flags & RT_FLAG_POSITION_FETCH) {
+		inject_define(sources, "#define USE_POSITION_FETCH\n");
+		if (p_rt_flags & RT_FLAG_POSITION_FETCH_CHECK) {
+			inject_define(sources, "#define RT_POSITION_FETCH_CHECK\n");
+		}
 	}
 
 	// Procedural templates come from intersection stage; strip from base HG0 path.

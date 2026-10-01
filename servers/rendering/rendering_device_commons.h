@@ -921,6 +921,9 @@ public:
 		ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT = (1 << 2),
 		ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT = (1 << 3),
 		ACCELERATION_STRUCTURE_LOW_MEMORY_BIT = (1 << 4),
+		// VK_KHR_ray_tracing_position_fetch: hit shaders may read the hit triangle's positions
+		// from the structure (D93). Valid only where the device reports position fetch.
+		ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT = (1 << 11),
 	};
 
 	enum AccelerationStructureGeometryFlagBits {
@@ -953,6 +956,7 @@ public:
 		uint32_t triangle_build_info_size = 0; // Bytes per ClusterTriangleBuildInfo the driver writes.
 		uint32_t bottom_level_build_info_size = 0; // Bytes per ClusterBottomLevelBuildInfo the driver writes.
 		uint32_t move_info_size = 0; // Bytes per CLUSTER_OP_MOVE_OBJECTS info: one device address, the structure to move.
+		bool position_fetch = false; // VK_KHR_ray_tracing_position_fetch enabled: ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT is valid (D93).
 	};
 
 	struct ClusterAccelerationStructureInput {

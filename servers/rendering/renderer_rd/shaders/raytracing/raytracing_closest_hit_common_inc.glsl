@@ -18,6 +18,41 @@
 // clang-format on
 
 // ============================================================================
+// POSITION FETCH CHECK (D93a)
+// ============================================================================
+
+#if defined(RT_POSITION_FETCH_CHECK) && defined(USE_CLUSTER_AS)
+// A verbose run's comparison of the positions a cluster hit fetches from its CLAS with the ones
+// its vertex buffer holds, in the space the CLAS was built in (the compressed format's unorm
+// box, which is what emissive_fetch_position decodes). Words per kind (float, compressed,
+// deformed): hits compared, hits that differ, the largest absolute difference as float bits. One
+// pixel in 64 compares; the host clears the words after each read.
+layout(set = 0, binding = 46, std430) buffer PositionFetchCheck {
+	uint words[];
+}
+position_fetch_check;
+
+void position_fetch_check_hit(GeometryData geom, uint primitive_id) {
+	if (gl_ClusterIDNV == gl_ClusterIDNoneNV || ((gl_LaunchIDEXT.x | gl_LaunchIDEXT.y) & 7u) != 0u || geom.vertex_address == 0ul) {
+		return;
+	}
+	uint i0, i1, i2;
+	get_triangle_indices_ex(geom, primitive_id, i0, i1, i2);
+	vec3 d0 = abs(gl_HitTriangleVertexPositionsEXT[0] - emissive_fetch_position(geom, i0));
+	vec3 d1 = abs(gl_HitTriangleVertexPositionsEXT[1] - emissive_fetch_position(geom, i1));
+	vec3 d2 = abs(gl_HitTriangleVertexPositionsEXT[2] - emissive_fetch_position(geom, i2));
+	vec3 d = max(max(d0, d1), d2);
+	float difference = max(max(d.x, d.y), d.z);
+	uint base = (geom.flags & FLAG_DEFORMED) != 0u ? 6u : ((geom.flags & FLAG_COMPRESSED) != 0u ? 3u : 0u);
+	atomicAdd(position_fetch_check.words[base], 1u);
+	if (difference != 0.0 || isnan(difference)) {
+		atomicAdd(position_fetch_check.words[base + 1u], 1u);
+		atomicMax(position_fetch_check.words[base + 2u], floatBitsToUint(isnan(difference) ? uintBitsToFloat(0x7F800000u) : difference));
+	}
+}
+#endif
+
+// ============================================================================
 // HIT DATA
 // ============================================================================
 
@@ -28,6 +63,9 @@ HitData compute_hit_data() {
 	h.geometry_idx = gl_InstanceCustomIndexEXT;
 	h.primitive_id = rt_primitive_index();
 	GeometryData geom = geometries[h.geometry_idx];
+#if defined(RT_POSITION_FETCH_CHECK) && defined(USE_CLUSTER_AS)
+	position_fetch_check_hit(geom, h.primitive_id);
+#endif
 
 	// Custom hit groups may reference vertex color in their fragment code, so
 	// pull all attributes; default HGs can skip color for perf.

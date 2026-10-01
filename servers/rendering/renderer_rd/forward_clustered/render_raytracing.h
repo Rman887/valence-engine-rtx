@@ -457,6 +457,9 @@ static constexpr uint32_t RT_LOD_STREAM_TOUCH_PERIOD = 8;
 // flags the CPU writes once. Must match STATE_WORDS and STATE_FLAG_ROOT.
 static constexpr uint32_t RT_LOD_STREAM_STATE_WORDS = 3;
 static constexpr uint32_t RT_LOD_STREAM_STATE_FLAG_ROOT = 1;
+// The position-fetch check's words (D93a): hits compared, hits that differ and the largest absolute
+// difference (float bits), for float positions, compressed positions and deformed surfaces.
+static constexpr uint32_t RT_POSITION_FETCH_CHECK_WORDS = 9;
 
 // A load of streamed groups (D92), D81's two steps at group granularity: this frame the groups'
 // CLAS are built with implicit destinations into a staging buffer, their sizes read back; when they
@@ -964,6 +967,14 @@ class RenderRaytracing {
 	uint32_t cluster_lod_stream_builds_per_frame = 0; // Clusters.
 	uint32_t cluster_lod_stream_min_age = 0; // Frames.
 	uint64_t cluster_lod_stream_cluster_worst = 0; // One CLAS's worst-case bytes, a load's estimate.
+	// Geometry residency (D93), rendering/pathtracing/cluster_lod_stream_geometry on a device with
+	// position fetch: every cluster build allows data access, and hits read CLAS positions.
+	bool cluster_build_data_access = false;
+	bool cluster_lod_stream_geometry_enabled = false;
+	// A verbose run's position-fetch check (D93a): the closest hit's counts of cluster hits whose
+	// fetched positions it compared with the vertex buffer's, of those that differ and the largest
+	// difference, by kind (RT_POSITION_FETCH_CHECK_WORDS words, binding 46), cleared after each read.
+	RID position_fetch_check_buffer;
 	HashMap<uint32_t, RTSurfaceData *> cluster_lod_stream_surfaces;
 	LocalVector<RTLodStreamRead> cluster_lod_stream_reads;
 	LocalVector<RTLodStreamLoad> cluster_lod_stream_loads;
@@ -1306,6 +1317,15 @@ class RenderRaytracing {
 	bool _lod_stream_level_resident(const RTSurfaceData *p_surf_data, uint32_t p_depth) const;
 	RID _lod_stream_pinned_blas(RTSurfaceData *p_surf_data);
 	void _prepare_lod_stream_pins();
+	// Geometry residency (D93): a cluster build's flags, with data access while it is on.
+	_FORCE_INLINE_ BitField<RD::AccelerationStructureFlagBits> _cluster_build_flags(RD::AccelerationStructureFlagBits p_base) const {
+		BitField<RD::AccelerationStructureFlagBits> flags = p_base;
+		if (cluster_build_data_access) {
+			flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT);
+		}
+		return flags;
+	}
+	static void _on_position_fetch_check_read(const PackedByteArray &p_bytes);
 	static void _mesh_surface_freed(RID p_mesh, uint32_t p_surface);
 	// Frees the surface's BLAS and, on the cluster path, the staging buffers or the arena region it lives in.
 	void _release_surface_data(RTSurfaceData *p_surf_data);
@@ -1330,6 +1350,8 @@ class RenderRaytracing {
 
 public:
 	void initialize(RenderForwardClustered *p_owner);
+	// Geometry residency (D93) is on: the hit stages compile with position fetch.
+	static bool is_position_fetch_enabled() { return singleton != nullptr && singleton->cluster_lod_stream_geometry_enabled; }
 
 	void cleanup_caches();
 	// Releases the RT cache entry of a surface its mesh is dropping (MeshStorage's surface-freed callback).

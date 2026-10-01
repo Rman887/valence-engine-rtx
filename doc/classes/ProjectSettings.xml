@@ -3310,6 +3310,10 @@
 			The most clusters [member rendering/pathtracing/cluster_lod_stream] builds in one frame; further loads wait for the next frames.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracing/cluster_lod_stream_geometry" type="bool" setter="" getter="" default="false">
+			If [code]true[/code] while [member rendering/pathtracing/cluster_lod_stream] is on (which needs [member rendering/pathtracing/cluster_blas]) and the device supports [code]VK_KHR_ray_tracing_position_fetch[/code], cluster acceleration structures are built so that hit shaders can read a triangle's positions from them, the first step of streaming the geometry of the surfaces [member rendering/pathtracing/cluster_lod_stream] streams. Without the extension, this setting has no effect.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
 		<member name="rendering/pathtracing/cluster_lod_stream_min_age_frames" type="int" setter="" getter="" default="30">
 			How many frames a group of clusters loaded by [member rendering/pathtracing/cluster_lod_stream] must have gone unused before it may be unloaded to make room. At least three of the selection's 8-frame reporting periods plus the frame queue's latency is used (about 27 frames).
 			[b]Note:[/b] Requires a restart to take effect.

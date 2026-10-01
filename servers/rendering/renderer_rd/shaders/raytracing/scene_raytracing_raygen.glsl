@@ -582,6 +582,9 @@ void main() {
 #ifdef USE_CLUSTER_AS
 #extension GL_NV_cluster_acceleration_structure : require
 #endif
+#ifdef USE_POSITION_FETCH
+#extension GL_EXT_ray_tracing_position_fetch : require
+#endif
 
 #define GLSL 1
 #define RT_STAGE_CLOSEST_HIT 1
@@ -803,6 +806,10 @@ void main() {
 
 #ifdef USE_CLUSTER_AS
 #extension GL_NV_cluster_acceleration_structure : require
+#endif
+#ifdef USE_POSITION_FETCH
+// Unread until D93b, whose alpha test takes a streamed surface's positions here.
+#extension GL_EXT_ray_tracing_position_fetch : require
 #endif
 
 #define GLSL 1

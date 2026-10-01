@@ -1832,6 +1832,7 @@ ProjectSettings::ProjectSettings() {
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/rendering_device/vulkan/max_descriptors_per_pool", PROPERTY_HINT_RANGE, "1,256,1,or_greater"), 64);
 	// Read by the Vulkan driver when it requests device extensions, before RenderingServer defines the other pathtracing settings.
 	GLOBAL_DEF_RST(PropertyInfo(Variant::BOOL, "rendering/pathtracing/cluster_blas"), false);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::BOOL, "rendering/pathtracing/cluster_lod_stream_geometry"), false);
 
 	GLOBAL_DEF_RST("rendering/rendering_device/d3d12/max_resource_descriptors", 65536);
 	custom_prop_info["rendering/rendering_device/d3d12/max_resource_descriptors"] = PropertyInfo(Variant::INT, "rendering/rendering_device/d3d12/max_resource_descriptors", PROPERTY_HINT_RANGE, "512,1000000");

@@ -83,6 +83,20 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		cluster_lod_traversal_enabled = cluster_lod_select_enabled && GLOBAL_GET("rendering/pathtracing/cluster_lod_traversal");
 		cluster_lod_max_instances = uint32_t(MIN(RD::get_singleton()->limit_get(RD::LIMIT_MAX_COMPUTE_WORKGROUP_COUNT_Y), uint64_t(UINT32_MAX)));
 		const RD::ClusterAccelerationStructureCapabilities &caps = RD::get_singleton()->get_cluster_acceleration_structure_capabilities();
+		// CLAS residency (D92) needs the traversal (its requests), the cached levels (the finest
+		// level is one) and the compaction (a load is its two steps).
+		const bool stream_wanted = cluster_lod_traversal_enabled && cluster_lod_cache_enabled && cluster_compaction_enabled && GLOBAL_GET("rendering/pathtracing/cluster_lod_stream");
+		// Geometry residency (D93) takes a cluster hit's positions from its CLAS, so every cluster
+		// build carries the data access flag while it is on: one build operation batches surfaces,
+		// static and deformed alike, and the BLAS over the clusters carries it too, as the
+		// position-fetch rule names the structure of the intersection. Set before any size query.
+		if (GLOBAL_GET("rendering/pathtracing/cluster_lod_stream_geometry")) {
+			if (caps.position_fetch) {
+				cluster_build_data_access = stream_wanted;
+			} else {
+				WARN_PRINT("rendering/pathtracing/cluster_lod_stream_geometry is on but the device has no VK_KHR_ray_tracing_position_fetch; surfaces keep their geometry resident.");
+			}
+		}
 		// The deformed selection (D87) builds each selected CLAS into its own slot: the worst case
 		// of one cluster under the limits every cluster obeys, at the cluster alignment.
 		cluster_lod_deformed_enabled = cluster_lod_select_enabled && cluster_deformed_enabled && GLOBAL_GET("rendering/pathtracing/cluster_lod_deformed");
@@ -93,7 +107,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 			slot_input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER;
 			slot_input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
 			slot_input.max_acceleration_structure_count = 1;
-			slot_input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT;
+			slot_input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT);
 			slot_input.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
 			slot_input.max_cluster_triangle_count = max_triangles;
 			slot_input.max_cluster_vertex_count = max_vertices;
@@ -109,10 +123,9 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 				cluster_lod_deformed_enabled = false;
 			}
 		}
-		// CLAS residency (D92): it needs the traversal (its requests), the cached levels (the finest
-		// level is one) and the compaction (a load is its two steps). A load's budget estimate is the
-		// worst case of one CLAS under the limits every cluster obeys, in either position format.
-		cluster_lod_stream_enabled = cluster_lod_traversal_enabled && cluster_lod_cache_enabled && cluster_compaction_enabled && GLOBAL_GET("rendering/pathtracing/cluster_lod_stream");
+		// CLAS residency (D92). A load's budget estimate is the worst case of one CLAS under the
+		// limits every cluster obeys, in either position format.
+		cluster_lod_stream_enabled = stream_wanted;
 		if (cluster_lod_stream_enabled) {
 			cluster_lod_stream_budget = uint64_t(MAX(16, int(GLOBAL_GET("rendering/pathtracing/cluster_lod_stream_budget_mb")))) * 1024 * 1024;
 			cluster_lod_stream_builds_per_frame = uint32_t(MAX(64, int(GLOBAL_GET("rendering/pathtracing/cluster_lod_stream_builds_per_frame"))));
@@ -127,7 +140,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 				input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER;
 				input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
 				input.max_acceleration_structure_count = 1;
-				input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
+				input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
 				input.vertex_format = format;
 				input.max_cluster_triangle_count = max_triangles;
 				input.max_cluster_vertex_count = max_vertices;
@@ -142,8 +155,18 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 				cluster_lod_stream_enabled = false;
 			}
 		}
+		cluster_lod_stream_geometry_enabled = cluster_lod_stream_enabled && cluster_build_data_access;
+		if (cluster_lod_stream_geometry_enabled && OS::get_singleton()->is_stdout_verbose()) {
+			Vector<uint8_t> zeros;
+			zeros.resize_initialized(sizeof(uint32_t) * RT_POSITION_FETCH_CHECK_WORDS);
+			position_fetch_check_buffer = RD::get_singleton()->storage_buffer_create(zeros.size(), zeros);
+			RD::get_singleton()->set_resource_name(position_fetch_check_buffer, "RT position fetch check");
+		}
 		// One line on the console (the setting is off by default): the harness reads it as proof the path is active.
 		print_line(vformat("RT: static BLAS built from clusters of up to %d triangles and %d vertices (D79), compaction %s, deformed meshes %s, cluster LOD selection %s, deformed selection %s, CLAS streaming %s.", caps.max_triangles_per_cluster, caps.max_vertices_per_cluster, cluster_compaction_enabled ? "on" : "off", cluster_deformed_enabled ? "rebuilt from clusters (D82)" : "refit as triangle BLAS", cluster_lod_select_enabled ? vformat("on at %.2f px (D86), traversal %s (D91), BLAS sharing %s", cluster_lod_pixel_error, cluster_lod_traversal_enabled ? "on" : "off", cluster_lod_share_enabled ? vformat("on within %d levels (D89), cached levels %s (D90)", cluster_lod_share_tolerance, cluster_lod_cache_enabled ? "on" : "off") : String("off (D89)")) : "off", cluster_lod_deformed_enabled ? vformat("on, %d byte slots (D87)", cluster_lod_clas_slot_size) : "off", cluster_lod_stream_enabled ? vformat("on within %d MB, %d clusters a frame, unused %d frames before unloading, %d bytes a CLAS at worst (D92)", cluster_lod_stream_budget / (1024 * 1024), cluster_lod_stream_builds_per_frame, cluster_lod_stream_min_age, cluster_lod_stream_cluster_worst) : "off"));
+		if (cluster_lod_stream_geometry_enabled) {
+			print_line("RT: geometry residency on: cluster builds allow data access, hits fetch CLAS positions (D93).");
+		}
 	} else if (GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
 		WARN_PRINT("rendering/pathtracing/cluster_blas is on but the device has no VK_NV_cluster_acceleration_structure; static BLAS stay triangle BLAS.");
 	}
@@ -195,6 +218,11 @@ RenderRaytracing::~RenderRaytracing() {
 
 	cleanup_caches();
 	singleton = nullptr;
+
+	if (position_fetch_check_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(position_fetch_check_buffer);
+		position_fetch_check_buffer = RID();
+	}
 
 	if (mat_ubo_pool_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(mat_ubo_pool_buffer);
@@ -822,6 +850,12 @@ void RenderRaytracing::prepare_frame() {
 	// and uses read back since admit, evict and start loads, all before this frame's selection.
 	if (cluster_lod_stream_enabled) {
 		_process_lod_stream();
+	}
+	// The position-fetch check's counts (D93a), read and cleared on the verbose report's cadence,
+	// so each report covers the frames since the last and no counter wraps.
+	if (position_fetch_check_buffer.is_valid() && RD::get_singleton()->get_frames_drawn() % 300 == 0) {
+		RD::get_singleton()->buffer_get_data_async(position_fetch_check_buffer, callable_mp_static(&RenderRaytracing::_on_position_fetch_check_read));
+		RD::get_singleton()->buffer_clear(position_fetch_check_buffer, 0, sizeof(uint32_t) * RT_POSITION_FETCH_CHECK_WORDS);
 	}
 
 	blass.clear();
@@ -1486,7 +1520,7 @@ bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID 
 	clas_input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER;
 	clas_input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_IMPLICIT_DESTINATIONS;
 	clas_input.max_acceleration_structure_count = build_count;
-	clas_input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
+	clas_input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
 	clas_input.vertex_format = pos_format;
 	clas_input.max_cluster_triangle_count = max_cluster_triangles;
 	clas_input.max_cluster_vertex_count = max_cluster_vertices;
@@ -1497,7 +1531,7 @@ bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID 
 	blas_input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
 	blas_input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
 	blas_input.max_acceleration_structure_count = 1;
-	blas_input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
+	blas_input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
 	blas_input.max_total_cluster_count = blas_count;
 	blas_input.max_cluster_count_per_acceleration_structure = blas_count;
 
@@ -1898,7 +1932,7 @@ bool RenderRaytracing::_populate_deformed_cluster_layout(void *p_mesh_surface, u
 	blas_input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
 	blas_input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
 	blas_input.max_acceleration_structure_count = 1;
-	blas_input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT;
+	blas_input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT);
 	blas_input.max_total_cluster_count = infos_count;
 	blas_input.max_cluster_count_per_acceleration_structure = infos_count;
 	uint64_t blas_size = 0, blas_scratch = 0;
@@ -2196,7 +2230,7 @@ bool RenderRaytracing::_record_deformed_cluster_batch() {
 	clas_input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER;
 	clas_input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_IMPLICIT_DESTINATIONS;
 	clas_input.max_acceleration_structure_count = cluster_count;
-	clas_input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT;
+	clas_input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT);
 	clas_input.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
 	clas_input.max_cluster_triangle_count = batch.max_cluster_triangles;
 	clas_input.max_cluster_vertex_count = batch.max_cluster_vertices;
@@ -2296,7 +2330,7 @@ bool RenderRaytracing::_record_deformed_cluster_batch() {
 		build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
 		build.input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
 		build.input.max_acceleration_structure_count = entry_count;
-		build.input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT;
+		build.input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT);
 		build.input.max_total_cluster_count = cluster_count;
 		build.input.max_cluster_count_per_acceleration_structure = batch.max_clusters_per_blas;
 		build.dst_storage_buffers = storage_buffers;
@@ -2528,7 +2562,7 @@ void RenderRaytracing::_process_cluster_compactions() {
 			build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
 			build.input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
 			build.input.max_acceleration_structure_count = 1;
-			build.input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
+			build.input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
 			build.input.max_total_cluster_count = surf->cluster_blas_count; // The BLAS spans the LOD 0 clusters (D85), or a streamed surface's coarsest cut (D92); the move spanned every CLAS built.
 			build.input.max_cluster_count_per_acceleration_structure = surf->cluster_blas_count;
 			build.dst_storage_buffer = chunk.buffer;
@@ -3178,7 +3212,7 @@ void RenderRaytracing::_populate_surface_cluster_lod(void *p_mesh_surface, const
 	blas_input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
 	blas_input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
 	blas_input.max_acceleration_structure_count = 1;
-	blas_input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT; // As the per-frame builds are flagged.
+	blas_input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT); // As the per-frame builds are flagged.
 	blas_input.max_total_cluster_count = cluster_count;
 	blas_input.max_cluster_count_per_acceleration_structure = cluster_count;
 	uint64_t blas_size = 0, blas_scratch = 0;
@@ -3712,7 +3746,7 @@ bool RenderRaytracing::_issue_lod_stream_load(const LocalVector<RTLodStreamLoad:
 	input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER;
 	input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_IMPLICIT_DESTINATIONS;
 	input.max_acceleration_structure_count = load.cluster_count;
-	input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT; // As the population builds them.
+	input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT); // As the population builds them.
 	input.vertex_format = p_compressed ? RD::DATA_FORMAT_R16G16B16A16_UNORM : RD::DATA_FORMAT_R32G32B32_SFLOAT;
 	input.max_cluster_triangle_count = max_triangles;
 	input.max_cluster_vertex_count = max_vertices;
@@ -4571,7 +4605,7 @@ bool RenderRaytracing::_prepare_lod_cached_level(RTSurfaceData *p_surf_data, uin
 	input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
 	input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
 	input.max_acceleration_structure_count = 1;
-	input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
+	input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
 	input.max_total_cluster_count = count;
 	input.max_cluster_count_per_acceleration_structure = count;
 	uint64_t size = 0, scratch = 0;
@@ -5216,7 +5250,7 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER;
 		build.input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
 		build.input.max_acceleration_structure_count = clas_bound;
-		build.input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT;
+		build.input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT);
 		build.input.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
 		build.input.max_cluster_triangle_count = max_triangles;
 		build.input.max_cluster_vertex_count = max_vertices;
@@ -5273,7 +5307,7 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 			build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
 			build.input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
 			build.input.max_acceleration_structure_count = count;
-			build.input.flags = pass == 0 ? RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT : RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
+			build.input.flags = _cluster_build_flags(pass == 0 ? RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT : RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
 			build.input.max_total_cluster_count = pass == 0 ? frame_total : batch.cache_total_clusters;
 			build.input.max_cluster_count_per_acceleration_structure = pass == 0 ? MIN(batch.max_clusters, frame_total) : batch.cache_max_clusters;
 			build.dst_storage_buffers = storage_buffers;
@@ -5483,6 +5517,19 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 	batch.clas_total_vertices = 0;
 	batch.clas_source_buffers.clear();
 	batch.clas_index_buffers_seen.clear();
+}
+
+void RenderRaytracing::_on_position_fetch_check_read(const PackedByteArray &p_bytes) {
+	if (p_bytes.size() < int64_t(sizeof(uint32_t) * RT_POSITION_FETCH_CHECK_WORDS)) {
+		return;
+	}
+	uint32_t words[RT_POSITION_FETCH_CHECK_WORDS];
+	memcpy(words, p_bytes.ptr(), sizeof(words));
+	float max_difference[3];
+	for (uint32_t i = 0; i < 3; i++) {
+		memcpy(&max_difference[i], &words[i * 3 + 2], sizeof(float));
+	}
+	print_line(vformat("RT: position fetch check (D93a), the last 300 frames: float %d hits, %d differ, max %s; compressed %d hits, %d differ, max %s; deformed %d hits, %d differ, max %s.", words[0], words[1], String::num_scientific(max_difference[0]), words[3], words[4], String::num_scientific(max_difference[1]), words[6], words[7], String::num_scientific(max_difference[2])));
 }
 
 void RenderRaytracing::_on_lod_counts_read(const PackedByteArray &p_counts, uint64_t p_ticket, uint32_t p_entry_count, uint32_t p_stride) {
@@ -8465,6 +8512,15 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		u.binding = 44;
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 		u.append_id(p_state->light_tree_buffer);
+		uniforms.push_back(u);
+	}
+
+	// Binding 46: the position-fetch check (D93a), declared only by a verbose run's shaders.
+	if (position_fetch_check_buffer.is_valid()) {
+		RD::Uniform u;
+		u.binding = 46;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.append_id(position_fetch_check_buffer);
 		uniforms.push_back(u);
 	}
 

@@ -186,6 +186,7 @@ private:
 		uint32_t size = 0;
 		BitField<RDD::BufferUsageBits> usage = {};
 		RDG::ResourceTracker *draw_tracker = nullptr;
+		BitField<RDD::PipelineStageBits> device_address_read_stages = {}; // Copied to the tracker, which may be created later.
 		int32_t transfer_worker_index = -1;
 		uint64_t transfer_worker_operation = 0;
 	};
@@ -268,6 +269,7 @@ public:
 	Vector<uint8_t> buffer_get_data(RID p_buffer, uint32_t p_offset = 0, uint32_t p_size = 0); // This causes stall, only use to retrieve large buffers for saving.
 	Error buffer_get_data_async(RID p_buffer, const Callable &p_callback, uint32_t p_offset = 0, uint32_t p_size = 0);
 	uint64_t buffer_get_device_address(RID p_buffer);
+	void buffer_add_device_address_read_stages(RID p_buffer, BitField<RDD::PipelineStageBits> p_stages); // Shaders that read the buffer through its address without binding it; writes wait for them.
 	uint8_t *buffer_persistent_map_advance(RID p_buffer);
 	void buffer_flush(RID p_buffer);
 

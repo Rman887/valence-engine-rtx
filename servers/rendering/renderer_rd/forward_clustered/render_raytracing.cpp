@@ -1307,14 +1307,21 @@ void RenderRaytracing::_populate_surface_blas(
 	RD *rd = RD::get_singleton();
 	RT_GeometryData &geom = r_surf_data->geometry;
 
+	// Hit shaders read these through their addresses; an in-place update must wait for an earlier frame's trace.
+	// An override is a per-frame copy, declared on the trace instead (register_raytracing_buffer_dependencies).
 	if (vertex_buffer.is_valid()) {
 		geom.vertex_buffer_address = rd->buffer_get_device_address(vertex_buffer);
+		if (p_vertex_buffer_override.is_null()) {
+			rd->buffer_add_device_address_read_stages(vertex_buffer, RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT);
+		}
 	}
 	if (attribute_buffer.is_valid()) {
 		geom.attribute_buffer_address = rd->buffer_get_device_address(attribute_buffer);
+		rd->buffer_add_device_address_read_stages(attribute_buffer, RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT);
 	}
 	if (index_buffer.is_valid() && geom.index_format != RT_INDEX_FORMAT_NONE) {
 		geom.index_buffer_address = rd->buffer_get_device_address(index_buffer);
+		rd->buffer_add_device_address_read_stages(index_buffer, RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT);
 	}
 
 	uint32_t vertex_count = geom.vertex_count;
@@ -1749,11 +1756,14 @@ bool RenderRaytracing::_populate_deformed_cluster_layout(void *p_mesh_surface, u
 	_fill_surface_geometry_data(p_mesh_surface, true, surf_data, &vertex_buffer, &attribute_buffer, &index_buffer);
 	RT_GeometryData &geom = surf_data->geometry;
 	geom.vertex_buffer_address = rd->buffer_get_device_address(r_entry.owned_vb_full);
+	// The mesh's own attribute and index buffers are read in place, as for a static surface.
 	if (attribute_buffer.is_valid()) {
 		geom.attribute_buffer_address = rd->buffer_get_device_address(attribute_buffer);
+		rd->buffer_add_device_address_read_stages(attribute_buffer, RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT);
 	}
 	if (index_buffer.is_valid() && geom.index_format != RT_INDEX_FORMAT_NONE) {
 		geom.index_buffer_address = rd->buffer_get_device_address(index_buffer);
+		rd->buffer_add_device_address_read_stages(index_buffer, RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT);
 	}
 
 	const bool is_2d = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_format(p_mesh_surface) & RSE::ARRAY_FLAG_USE_2D_VERTICES;
@@ -3955,6 +3965,8 @@ void RenderRaytracing::update_procedural_blas(RTProceduralState *p_state, LocalV
 	// BDA for shader access.
 	if (p_state->expose_bounds && p_state->gpu_buffer.is_valid()) {
 		p_state->gpu_buffer_address = RD::get_singleton()->buffer_get_device_address(p_state->gpu_buffer);
+		// Intersection shaders read the bounds through the address; the in-place update above must wait for them.
+		RD::get_singleton()->buffer_add_device_address_read_stages(p_state->gpu_buffer, RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT);
 	} else {
 		p_state->gpu_buffer_address = 0;
 	}
@@ -4641,6 +4653,8 @@ bool RenderRaytracing::_build_merged_mm_blas(
 	RID vtx_buf = mesh_storage->mesh_surface_get_vertex_buffer(p_mesh_surface);
 	ERR_FAIL_COND_V(!vtx_buf.is_valid(), false);
 	uint64_t vtx_bda = rd->buffer_get_device_address(vtx_buf);
+	// The merge reads the source mesh through addresses; an in-place update must wait for an earlier frame's merge.
+	rd->buffer_add_device_address_read_stages(vtx_buf, RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
 	const bool needs_rebake = first_touch_this_frame &&
 			(transforms_changed || !entry.blas_built_once);
@@ -4693,6 +4707,7 @@ bool RenderRaytracing::_build_merged_mm_blas(
 
 		if (indexed) {
 			uint64_t src_idx_bda = rd->buffer_get_device_address(index_buffer);
+			rd->buffer_add_device_address_read_stages(index_buffer, RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 			pc.src_idx_lo = uint32_t(src_idx_bda);
 			pc.src_idx_hi = uint32_t(src_idx_bda >> 32);
 			pc.index_count = index_count;
@@ -7068,8 +7083,8 @@ void RenderRaytracing::register_raytracing_buffer_dependencies(RD::RaytracingLis
 	// RT_GeometryData. The draw graph cannot infer those reads from the BDA, so
 	// every per-frame-written buffer that the trace will touch via BDA must be
 	// declared here -- otherwise the producing copy/dispatch may not be visible
-	// to the trace. (Static mesh VB/AB/IB are uploaded once via the transfer
-	// worker and don't need per-frame barriers.)
+	// to the trace. (Static mesh VB/AB/IB are not declared: an in-place update of
+	// one waits for earlier traces through buffer_add_device_address_read_stages.)
 
 	// Mat UBO pool buffer dependency.
 	if (mat_ubo_pool_buffer.is_valid()) {

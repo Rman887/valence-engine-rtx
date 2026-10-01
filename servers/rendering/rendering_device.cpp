@@ -1766,6 +1766,20 @@ uint64_t RenderingDevice::buffer_get_device_address(RID p_buffer) {
 	return driver->buffer_get_device_address(buffer->driver_id);
 }
 
+void RenderingDevice::buffer_add_device_address_read_stages(RID p_buffer, BitField<RDD::PipelineStageBits> p_stages) {
+	ERR_RENDER_THREAD_GUARD();
+
+	Buffer *buffer = _get_buffer_from_owner(p_buffer);
+	ERR_FAIL_NULL_MSG(buffer, "Buffer argument is not a valid buffer of any type.");
+	ERR_FAIL_COND_MSG(!buffer->usage.has_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT), "Buffer was not created with device address flag.");
+
+	// The graph orders frames only through declared usages, so a write would not wait for these reads in an earlier frame.
+	buffer->device_address_read_stages = buffer->device_address_read_stages | p_stages;
+	if (buffer->draw_tracker != nullptr) {
+		buffer->draw_tracker->device_address_read_stages = buffer->device_address_read_stages;
+	}
+}
+
 uint8_t *RenderingDevice::buffer_persistent_map_advance(RID p_buffer) {
 	ERR_RENDER_THREAD_GUARD_V(0);
 
@@ -7930,6 +7944,7 @@ bool RenderingDevice::_buffer_make_mutable(Buffer *p_buffer, RID p_buffer_id) {
 		// Create a tracker for the buffer and make all its dependencies mutable.
 		p_buffer->draw_tracker = RDG::resource_tracker_create();
 		p_buffer->draw_tracker->buffer_driver_id = p_buffer->driver_id;
+		p_buffer->draw_tracker->device_address_read_stages = p_buffer->device_address_read_stages;
 		if (p_buffer_id.is_valid()) {
 			_dependencies_make_mutable(p_buffer_id, p_buffer->draw_tracker);
 		}

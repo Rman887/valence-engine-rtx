@@ -192,6 +192,7 @@ public:
 		int64_t command_frame = -1;
 		BitField<RDD::PipelineStageBits> previous_frame_stages = {};
 		BitField<RDD::PipelineStageBits> current_frame_stages = {};
+		BitField<RDD::PipelineStageBits> device_address_read_stages = {}; // Stages that may read the buffer through its device address without declaring it.
 		int32_t read_full_command_list_index = -1;
 		int32_t read_slice_command_list_index = -1;
 		int32_t write_command_or_list_index = -1;

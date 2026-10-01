@@ -583,7 +583,9 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 		ResourceTracker *search_tracker = resource_has_parent ? resource_tracker->parent : resource_tracker;
 		bool different_usage = resource_tracker->usage != new_resource_usage;
 		bool write_usage_after_write = (write_usage && search_tracker->write_command_or_list_index >= 0);
-		if (different_usage || write_usage_after_write) {
+		// Reads through a device address are never declared, so a write must always wait for those stages in any earlier frame.
+		bool write_usage_after_device_address_read = (write_usage && !search_tracker->device_address_read_stages.is_empty());
+		if (different_usage || write_usage_after_write || write_usage_after_device_address_read) {
 			// A barrier must be pushed if the usage is different of it's a write usage and there was already a command that wrote to this resource previously.
 			if (resource_tracker->texture_driver_id.id != 0) {
 				if (resource_tracker->usage_access.is_empty()) {
@@ -628,6 +630,10 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 			// Add to the command the stages the tracker was used on in the previous frame.
 			r_command->previous_stages = r_command->previous_stages | search_tracker->previous_frame_stages;
 			search_tracker->previous_frame_stages.clear();
+		}
+
+		if (write_usage_after_device_address_read) {
+			r_command->previous_stages = r_command->previous_stages | search_tracker->device_address_read_stages;
 		}
 
 		if (different_usage) {

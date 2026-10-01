@@ -21,6 +21,12 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // the instance's table region, is copied to the CLAS build's info array at the next free index,
 // whose count the build reads from the device.
 //
+// A cached level (D90) is an item with no instance: it takes the clusters of one depth's discrete
+// level, depth standing for the error (a cluster is taken when its group is at that depth or
+// deeper, or terminal, and the group it was simplified from is above it), the whole surface at
+// that depth for any instance. The CPU counts the same clusters to size its slot and puts the
+// count in the record's word 18; the shader takes no more, so the two rules must stay one.
+//
 // FrameBuf is the frame's argument buffer: the build infos (count, stride, address; count is the
 // atomic), then per instance INSTANCE_WORDS words (the object-to-trace transform as three rows of
 // four, the uniform scale, the cluster count, the surface's word offset in TableBuf, the reference
@@ -60,6 +66,7 @@ pc;
 #define FLAG_ORTHOGONAL 1u
 #define INSTANCE_WORDS 24u
 #define INSTANCE_FLAG_DEFORMED 1u
+#define INSTANCE_FLAG_LEVEL 2u
 #define GROUP_WORDS 8u
 
 // The group's sphere in trace space against the camera: its simplification shows when
@@ -101,14 +108,31 @@ void main() {
 	int refined = int(table.v[record + 1u]);
 	uint groups = table_offset + cluster_count * 4u;
 
-	bool selected = group_error_visible(groups + group * GROUP_WORDS, row0, row1, row2, scale);
-	if (selected && refined >= 0) {
-		selected = !group_error_visible(groups + uint(refined) * GROUP_WORDS, row0, row1, row2, scale);
+	bool selected;
+	if ((instance_flags & INSTANCE_FLAG_LEVEL) != 0u) {
+		uint level = frame.v[inst + 17u];
+		uint group_record = groups + group * GROUP_WORDS;
+		// A terminal group's error is FLT_MAX; the CPU's count tests the same bound.
+		selected = table.v[group_record + 5u] >= level || uintBitsToFloat(table.v[group_record + 4u]) >= 3.0e38;
+		if (selected && refined >= 0) {
+			selected = table.v[groups + uint(refined) * GROUP_WORDS + 5u] < level;
+		}
+	} else {
+		selected = group_error_visible(groups + group * GROUP_WORDS, row0, row1, row2, scale);
+		if (selected && refined >= 0) {
+			selected = !group_error_visible(groups + uint(refined) * GROUP_WORDS, row0, row1, row2, scale);
+		}
 	}
 	if (!selected) {
 		return;
 	}
 	uint slot = atomicAdd(frame.v[pc.blas_infos_offset + entry * pc.blas_info_stride], 1u);
+	if ((instance_flags & INSTANCE_FLAG_LEVEL) != 0u && slot >= frame.v[inst + 18u]) {
+		// Past the slot's count: taken back so the build stays in its slot, and counted.
+		atomicAdd(frame.v[pc.blas_infos_offset + entry * pc.blas_info_stride], 0xFFFFFFFFu);
+		atomicAdd(frame.v[pc.clas_count_offset + 1u], 1u);
+		return;
+	}
 	if ((instance_flags & INSTANCE_FLAG_DEFORMED) == 0u) {
 		frame.v[list_offset + slot * 2u] = table.v[table_offset + cluster * 2u];
 		frame.v[list_offset + slot * 2u + 1u] = table.v[table_offset + cluster * 2u + 1u];

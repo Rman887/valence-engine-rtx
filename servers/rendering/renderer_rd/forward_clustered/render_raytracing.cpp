@@ -79,6 +79,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		cluster_lod_pixel_error = MAX(0.0f, float(GLOBAL_GET("rendering/pathtracing/cluster_lod_pixel_error")));
 		cluster_lod_share_enabled = cluster_lod_select_enabled && GLOBAL_GET("rendering/pathtracing/cluster_lod_share");
 		cluster_lod_share_tolerance = uint32_t(CLAMP(int(GLOBAL_GET("rendering/pathtracing/cluster_lod_share_tolerance")), 0, 16));
+		cluster_lod_cache_enabled = cluster_lod_share_enabled && GLOBAL_GET("rendering/pathtracing/cluster_lod_cache");
 		cluster_lod_max_instances = uint32_t(MIN(RD::get_singleton()->limit_get(RD::LIMIT_MAX_COMPUTE_WORKGROUP_COUNT_Y), uint64_t(UINT32_MAX)));
 		const RD::ClusterAccelerationStructureCapabilities &caps = RD::get_singleton()->get_cluster_acceleration_structure_capabilities();
 		// The deformed selection (D87) builds each selected CLAS into its own slot: the worst case
@@ -108,7 +109,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 			}
 		}
 		// One line on the console (the setting is off by default): the harness reads it as proof the path is active.
-		print_line(vformat("RT: static BLAS built from clusters of up to %d triangles and %d vertices (D79), compaction %s, deformed meshes %s, cluster LOD selection %s, deformed selection %s.", caps.max_triangles_per_cluster, caps.max_vertices_per_cluster, cluster_compaction_enabled ? "on" : "off", cluster_deformed_enabled ? "rebuilt from clusters (D82)" : "refit as triangle BLAS", cluster_lod_select_enabled ? vformat("on at %.2f px (D86), BLAS sharing %s (D89)", cluster_lod_pixel_error, cluster_lod_share_enabled ? vformat("on within %d levels", cluster_lod_share_tolerance) : String("off")) : "off", cluster_lod_deformed_enabled ? vformat("on, %d byte slots (D87)", cluster_lod_clas_slot_size) : "off"));
+		print_line(vformat("RT: static BLAS built from clusters of up to %d triangles and %d vertices (D79), compaction %s, deformed meshes %s, cluster LOD selection %s, deformed selection %s.", caps.max_triangles_per_cluster, caps.max_vertices_per_cluster, cluster_compaction_enabled ? "on" : "off", cluster_deformed_enabled ? "rebuilt from clusters (D82)" : "refit as triangle BLAS", cluster_lod_select_enabled ? vformat("on at %.2f px (D86), BLAS sharing %s", cluster_lod_pixel_error, cluster_lod_share_enabled ? vformat("on within %d levels (D89), cached levels %s (D90)", cluster_lod_share_tolerance, cluster_lod_cache_enabled ? "on" : "off") : String("off (D89)")) : "off", cluster_lod_deformed_enabled ? vformat("on, %d byte slots (D87)", cluster_lod_clas_slot_size) : "off"));
 	} else if (GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
 		WARN_PRINT("rendering/pathtracing/cluster_blas is on but the device has no VK_NV_cluster_acceleration_structure; static BLAS stay triangle BLAS.");
 	}
@@ -547,6 +548,8 @@ void RenderRaytracing::cleanup_caches() {
 			}
 			lod_pool.free(live[i]);
 		}
+		// The cached levels (D90) went with their surfaces' release above.
+		DEV_ASSERT(cluster_lod_cached_surfaces.is_empty());
 	}
 	if (lod_batch.args_buffer.is_valid()) {
 		rd->free_rid(lod_batch.args_buffer);
@@ -832,6 +835,24 @@ void RenderRaytracing::prepare_frame() {
 			}
 			_release_lod_entry(*e);
 			lod_pool.free(live[i]);
+		}
+		// The cached levels (D90) no instance has traced for as long.
+		LocalVector<RTSurfaceData *> emptied;
+		for (RTSurfaceData *surface : cluster_lod_cached_surfaces) {
+			bool any_left = false;
+			for (RTLodCachedLevel &level : surface->cluster_lod_cache) {
+				if (level.blas.is_valid() && current_frame - level.last_used_frame > LOD_SLOT_TTL) {
+					_release_lod_cached_level(level);
+				}
+				any_left = any_left || level.blas.is_valid();
+			}
+			if (!any_left) {
+				emptied.push_back(surface);
+			}
+		}
+		for (RTSurfaceData *surface : emptied) {
+			surface->cluster_lod_cache.clear();
+			cluster_lod_cached_surfaces.erase(surface);
 		}
 	}
 
@@ -2398,6 +2419,9 @@ void RenderRaytracing::_process_cluster_compactions() {
 		}
 		rd->set_resource_name(blas, "RT cluster BLAS [" + itos(surf->cluster_cache_key) + "]");
 		if (surf->cluster_lod_table_offset != UINT32_MAX) {
+			// A cached level (D90) would reference the staged CLAS, which go with this frame. None is
+			// placed while the compaction is pending, so this only guards that rule.
+			_release_lod_cached_levels(surf);
 			// The selection reads the CLAS addresses from the LOD table (D86): the compact ones from
 			// this frame on, the upload ordered ahead of the frame's selection by the table's tracker
 			// and the instances' BLAS builds behind the move by the chunk's.
@@ -2754,6 +2778,19 @@ void RenderRaytracing::_populate_surface_cluster_lod(void *p_mesh_surface, const
 		level.center_spread = MAX(level.center_spread, spread);
 		level.enclosing_radius = MAX(level.enclosing_radius, spread + _bits_float(w[6]));
 	}
+	// Each depth's discrete level (D90), counted by the selection shader's level rule: a cluster
+	// is in the levels from just under the group it was simplified from (0 at LOD 0) down to its
+	// own group's depth, or to the last depth when its group is terminal.
+	for (uint32_t c = 0; c < cluster_count && level_count > 0; c++) {
+		const uint32_t *w = cluster_words + uint64_t(c) * RenderingServerTypes::MESH_CLUSTER_LOD_CLUSTER_WORDS;
+		const uint32_t *group = group_words + uint64_t(w[1]) * GROUP_WORDS;
+		const int32_t refined = int32_t(w[2]);
+		const uint32_t first = refined < 0 ? 0 : group_words[uint64_t(refined) * GROUP_WORDS] + 1;
+		const uint32_t last = _bits_float(group[7]) >= 3.0e38f ? level_count - 1 : MIN(group[0], level_count - 1);
+		for (uint32_t l = first; l <= last; l++) {
+			levels[l].cut_clusters++;
+		}
+	}
 
 	RD::ClusterAccelerationStructureInput blas_input;
 	blas_input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
@@ -2814,6 +2851,7 @@ void RenderRaytracing::_populate_surface_cluster_lod(void *p_mesh_surface, const
 }
 
 void RenderRaytracing::_release_surface_cluster_lod(RTSurfaceData *p_surf_data) {
+	_release_lod_cached_levels(p_surf_data);
 	if (p_surf_data->cluster_lod_table_offset == UINT32_MAX) {
 		return;
 	}
@@ -3072,13 +3110,188 @@ void RenderRaytracing::_classify_lod_instance(const RTSurfaceData *p_surf_data, 
 // it. False with the slot left on the surface's LOD 0 BLAS, past the dispatch's instance limit or
 // with no room in the arena.
 bool RenderRaytracing::_queue_lod_candidate(const RTLodSelectBatch::Candidate &p_candidate) {
-	if (lod_batch.entries.size() >= cluster_lod_max_instances || !_prepare_lod_entry(*p_candidate.entry, p_candidate.surface)) {
+	if (lod_batch.entries.size() + lod_batch.cache_builds.size() >= cluster_lod_max_instances || !_prepare_lod_entry(*p_candidate.entry, p_candidate.surface)) {
 		return false;
 	}
 	_queue_lod_instance(*p_candidate.entry, p_candidate.transform, p_candidate.slot);
 	p_candidate.entry->last_built_frame = RSG::rasterizer->get_frame_number();
 	blass[p_candidate.slot] = p_candidate.entry->blas;
 	return true;
+}
+
+// Cached levels (D90), before the stand-ins. A candidate whose selection spans no more than the
+// tolerance (its coarsest depth at most that far below its finest) is covered by any one depth
+// from its finest down to the tolerance below its coarsest, and traces such a depth's cached
+// level: the coarsest one kept, else one it asks for. A surface's asks are settled together in
+// the order of their finest depths, each taking the depth last asked for when that is within its
+// range and else asking for its own finest, which gives the fewest levels for the set, each as
+// coarse as it can be. A candidate whose finest depth is LOD 0, whose range is wider than the
+// tolerance, whose surface's CLAS are about to move or whose level finds no slot is left to the
+// sharing.
+void RenderRaytracing::_place_lod_cached_levels() {
+	RTLodSelectBatch &batch = lod_batch;
+	const uint32_t candidate_count = batch.candidates.size();
+	const uint32_t frame = RSG::rasterizer->get_frame_number();
+	batch.cached_depths.resize(candidate_count);
+	batch.cache_requests.clear();
+	for (uint32_t i = 0; i < candidate_count; i++) {
+		const RTLodSelectBatch::Candidate &candidate = batch.candidates[i];
+		RTSurfaceData *surface = candidate.surface;
+		if (surface->cluster_lod_levels.is_empty() || candidate.level_min == 0 || candidate.level_max - candidate.level_min > cluster_lod_share_tolerance || surface->compaction_ticket != 0) {
+			continue;
+		}
+		const uint32_t highest = candidate.level_min;
+		const uint32_t lowest = MAX(candidate.level_max > cluster_lod_share_tolerance ? candidate.level_max - cluster_lod_share_tolerance : 0u, 1u);
+		uint32_t depth = 0;
+		for (uint32_t d = highest + 1; d-- > lowest;) {
+			if (d < surface->cluster_lod_cache.size() && surface->cluster_lod_cache[d].blas.is_valid()) {
+				depth = d;
+				break;
+			}
+		}
+		if (depth > 0) {
+			batch.targets[i] = RTLodSelectBatch::TARGET_CACHED;
+			batch.cached_depths[i] = depth;
+			surface->cluster_lod_cache[depth].last_used_frame = frame;
+			continue;
+		}
+		RTLodSelectBatch::CacheRequest request;
+		request.generation = surface->cluster_lod_generation;
+		request.highest = highest;
+		request.lowest = lowest;
+		request.candidate = i;
+		batch.cache_requests.push_back(request);
+	}
+	batch.cache_requests.sort();
+	RTSurfaceData *surface = nullptr;
+	uint32_t point = 0;
+	for (const RTLodSelectBatch::CacheRequest &request : batch.cache_requests) {
+		RTSurfaceData *candidate_surface = batch.candidates[request.candidate].surface;
+		if (candidate_surface != surface) {
+			surface = candidate_surface;
+			point = 0;
+		}
+		if (point == 0 || request.lowest > point) {
+			point = _prepare_lod_cached_level(surface, request.highest) ? request.highest : 0;
+		}
+		if (point != 0) {
+			batch.targets[request.candidate] = RTLodSelectBatch::TARGET_CACHED;
+			batch.cached_depths[request.candidate] = point;
+			surface->cluster_lod_cache[point].last_used_frame = frame;
+		}
+	}
+}
+
+// A cached level's slot (D90): the driver's size for one fast-trace BLAS over the level's exact
+// count, in the arena, and a handle at it; the level is built in this frame's batch, after every
+// other item. False past the dispatch's instance limit or with no room.
+bool RenderRaytracing::_prepare_lod_cached_level(RTSurfaceData *p_surf_data, uint32_t p_depth) {
+	RTLodSelectBatch &batch = lod_batch;
+	const uint32_t count = p_surf_data->cluster_lod_levels[p_depth].cut_clusters;
+	if (count == 0 || batch.entries.size() + batch.cache_builds.size() >= cluster_lod_max_instances) {
+		return false;
+	}
+	RD *rd = RD::get_singleton();
+	const RD::ClusterAccelerationStructureCapabilities &caps = rd->get_cluster_acceleration_structure_capabilities();
+	RD::ClusterAccelerationStructureInput input;
+	input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
+	input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
+	input.max_acceleration_structure_count = 1;
+	input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
+	input.max_total_cluster_count = count;
+	input.max_cluster_count_per_acceleration_structure = count;
+	uint64_t size = 0, scratch = 0;
+	rd->cluster_acceleration_structure_get_build_sizes(input, size, scratch);
+	const uint64_t base_alignment = MAX(caps.cluster_byte_alignment, caps.cluster_bottom_level_byte_alignment);
+	size = _align_up(size, base_alignment);
+	uint32_t chunk_index = 0;
+	uint64_t offset = 0;
+	if (size == 0 || !_cluster_arena_allocate(size, chunk_index, offset)) {
+		return false;
+	}
+	const RTClusterArenaChunk &chunk = cluster_arena[chunk_index];
+	const RID blas = rd->cluster_blas_create(chunk.buffer, chunk.base_offset + offset);
+	if (blas.is_null()) {
+		_cluster_arena_retire(chunk_index, offset, size);
+		return false;
+	}
+	if (p_surf_data->cluster_lod_cache.size() < p_surf_data->cluster_lod_levels.size()) {
+		p_surf_data->cluster_lod_cache.resize(p_surf_data->cluster_lod_levels.size());
+	}
+	RTLodCachedLevel &level = p_surf_data->cluster_lod_cache[p_depth];
+	level.blas = blas;
+	level.blas_address = chunk.address + offset;
+	level.arena_chunk = int32_t(chunk_index);
+	level.arena_offset = offset;
+	level.arena_size = size;
+	cluster_lod_cached_surfaces.insert(p_surf_data);
+	cluster_lod_cache_live++;
+	cluster_lod_cache_bytes += size;
+	RTLodSelectBatch::CacheBuild build;
+	build.surface = p_surf_data;
+	build.depth = p_depth;
+	batch.cache_builds.push_back(build);
+	return true;
+}
+
+// The level's item: no instance and no slot in the TLAS, the record's flag and depth in place of
+// a transform, the selection's list over every cluster as any item's, its exact count for the
+// build's bounds.
+void RenderRaytracing::_queue_lod_cached_level(RTSurfaceData *p_surf_data, uint32_t p_depth) {
+	RTLodSelectBatch &batch = lod_batch;
+	const RTLodCachedLevel &level = p_surf_data->cluster_lod_cache[p_depth];
+	const uint32_t count = p_surf_data->cluster_lod_levels[p_depth].cut_clusters;
+	if (batch.cache_max_clusters == 0) {
+		batch.cache_first = batch.entries.size();
+	}
+	batch.entries.push_back(nullptr);
+	batch.deformed_entries.push_back(nullptr);
+	batch.slots.push_back(UINT32_MAX);
+	batch.blas_handles.push_back(level.blas);
+	batch.blas_addresses.push_back(level.blas_address);
+	batch.lod0_clusters.push_back(0);
+
+	uint32_t *w = _lod_instance_record(Transform3D(), p_surf_data->cluster_count, p_surf_data->cluster_lod_table_offset);
+	w[16] = 2; // INSTANCE_FLAG_LEVEL.
+	w[17] = p_depth;
+	w[18] = count; // The slot's count: the shader takes no more, and counts any past it as overflow.
+
+	const RID storage = cluster_arena[level.arena_chunk].buffer;
+	if (!batch.storage_buffers.has(storage)) {
+		batch.storage_buffers.push_back(storage);
+	}
+	const RID source = p_surf_data->arena_chunk >= 0 ? cluster_arena[p_surf_data->arena_chunk].buffer : p_surf_data->cluster_storage;
+	if (source.is_valid() && !batch.source_buffers.has(source)) {
+		batch.source_buffers.push_back(source);
+	}
+	batch.cache_list_clusters += p_surf_data->cluster_count;
+	batch.cache_total_clusters += count;
+	batch.cache_max_clusters = MAX(batch.cache_max_clusters, count);
+	cluster_lod_cache_builds_total++;
+}
+
+void RenderRaytracing::_release_lod_cached_level(RTLodCachedLevel &p_level) {
+	if (p_level.blas.is_null()) {
+		return;
+	}
+	RD *rd = RD::get_singleton();
+	if (rd->acceleration_structure_is_valid(p_level.blas)) {
+		rd->free_rid(p_level.blas);
+	}
+	if (p_level.arena_chunk >= 0) {
+		_cluster_arena_retire(uint32_t(p_level.arena_chunk), p_level.arena_offset, p_level.arena_size);
+	}
+	cluster_lod_cache_live--;
+	cluster_lod_cache_bytes -= p_level.arena_size;
+	p_level = RTLodCachedLevel();
+}
+
+void RenderRaytracing::_release_lod_cached_levels(RTSurfaceData *p_surf_data) {
+	for (RTLodCachedLevel &level : p_surf_data->cluster_lod_cache) {
+		_release_lod_cached_level(level);
+	}
+	p_surf_data->cluster_lod_cache.clear();
+	cluster_lod_cached_surfaces.erase(p_surf_data);
 }
 
 // BLAS sharing (D89), after the walk and before the flush. Each static instance on the selection
@@ -3090,11 +3303,16 @@ bool RenderRaytracing::_queue_lod_candidate(const RTLodSelectBatch::Candidate &p
 // stands for the others, the one starting coarsest (ties to the walk's order), and builds when
 // anyone takes it; an instance takes the one starting coarsest among those it may trace, the LOD 0
 // BLAS unless a stand-in starts coarser, and builds its own when neither is within the tolerance.
+// With cached levels on (D90), the candidates a single depth covers are placed on one first, and
+// the stand-ins settle the rest.
 // With sharing off, every instance builds its own in the walk's order, D86's frame.
 void RenderRaytracing::_resolve_lod_candidates(const RenderDataRD *p_render_data, const RTViewportState *p_state) {
 	RTLodSelectBatch &batch = lod_batch;
 	batch.shared_count = 0;
 	batch.lod0_count = 0;
+	batch.cached_count = 0;
+	batch.shared_slots.clear(); // The flush clears them only when it records; a frame on cached levels alone does not (D90).
+	batch.shared_surfaces.clear();
 	const uint32_t candidate_count = batch.candidates.size();
 	if (candidate_count == 0) {
 		return;
@@ -3110,14 +3328,23 @@ void RenderRaytracing::_resolve_lod_candidates(const RenderDataRD *p_render_data
 	// Per surface and coarsest depth, the candidate standing for it.
 	const uint32_t NONE = UINT32_MAX;
 	const uint32_t LOD0 = UINT32_MAX - 1;
+	const uint32_t CACHED = RTLodSelectBatch::TARGET_CACHED;
 	const LodView view = _lod_view(p_render_data, p_state, cluster_lod_pixel_error);
-	batch.stand_in_bases.clear();
-	batch.stand_ins.clear();
+	batch.targets.resize(candidate_count);
 	for (uint32_t i = 0; i < candidate_count; i++) {
 		RTLodSelectBatch::Candidate &candidate = batch.candidates[i];
 		_classify_lod_instance(candidate.surface, candidate.transform, view, candidate.level_min, candidate.level_max);
+		batch.targets[i] = NONE;
+	}
+	if (cluster_lod_cache_enabled) {
+		_place_lod_cached_levels(); // The cached levels first (D90): what they cover builds nothing.
+	}
+	batch.stand_in_bases.clear();
+	batch.stand_ins.clear();
+	for (uint32_t i = 0; i < candidate_count; i++) {
+		const RTLodSelectBatch::Candidate &candidate = batch.candidates[i];
 		const uint32_t depths = candidate.surface->cluster_lod_levels.size();
-		if (depths == 0) {
+		if (depths == 0 || batch.targets[i] == CACHED) {
 			continue;
 		}
 		AHashMap<RTSurfaceData *, uint32_t>::Iterator it = batch.stand_in_bases.find(candidate.surface);
@@ -3134,11 +3361,13 @@ void RenderRaytracing::_resolve_lod_candidates(const RenderDataRD *p_render_data
 	}
 
 	// What each candidate would trace: the LOD 0 BLAS, a stand-in's build, or its own (NONE).
-	batch.targets.resize(candidate_count);
 	batch.builds.resize(candidate_count);
 	memset(batch.builds.ptr(), 0, candidate_count);
 	for (uint32_t i = 0; i < candidate_count; i++) {
 		const RTLodSelectBatch::Candidate &candidate = batch.candidates[i];
+		if (batch.targets[i] == CACHED) {
+			continue;
+		}
 		uint32_t pick = LOD0;
 		uint32_t pick_min = 0;
 		AHashMap<RTSurfaceData *, uint32_t>::Iterator it = batch.stand_in_bases.find(candidate.surface);
@@ -3172,7 +3401,7 @@ void RenderRaytracing::_resolve_lod_candidates(const RenderDataRD *p_render_data
 		const uint32_t target = batch.targets[i];
 		if (target == NONE) {
 			batch.builds[i] = 1;
-		} else if (target != LOD0) {
+		} else if (target != LOD0 && target != CACHED) {
 			batch.builds[target] = 1;
 		}
 	}
@@ -3197,10 +3426,23 @@ void RenderRaytracing::_resolve_lod_candidates(const RenderDataRD *p_render_data
 			batch.builds[i] = 0; // Not built this frame: it and the candidates taking it keep LOD 0.
 		}
 	}
+	for (const RTLodSelectBatch::CacheBuild &build : batch.cache_builds) {
+		_queue_lod_cached_level(build.surface, build.depth); // After every other item, a build of their own (D90).
+	}
 	const uint64_t frames_drawn = RD::get_singleton()->get_frames_drawn();
 	for (uint32_t i = 0; i < candidate_count; i++) {
 		const RTLodSelectBatch::Candidate &candidate = batch.candidates[i];
 		const uint32_t target = batch.targets[i];
+		if (target == CACHED) {
+			const RID blas = candidate.surface->cluster_lod_cache[batch.cached_depths[i]].blas;
+			blass[candidate.slot] = blas;
+			candidate.entry->pushed_frame = frames_drawn;
+			candidate.entry->frame_blas = blas;
+			batch.shared_slots.push_back(candidate.slot);
+			batch.shared_surfaces.push_back(candidate.surface);
+			batch.cached_count++;
+			continue;
+		}
 		if (target == NONE || batch.builds[i]) {
 			continue; // Its own build, queued above, or none and the LOD 0 BLAS it holds.
 		}
@@ -3301,7 +3543,7 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 			rd->cluster_bottom_level_build_info_write(args + blas_infos_offset + uint64_t(e) * blas_info_stride, blas_info);
 			dst[e] = batch.blas_addresses[e];
 			record[15] = uint32_t(lists_offset / sizeof(uint32_t)) + first_cluster * 2;
-			if (record[16] != 0) {
+			if ((record[16] & 1u) != 0) { // INSTANCE_FLAG_DEFORMED.
 				const uint64_t dst_base = region_base_address + uint64_t(record[18]) * cluster_lod_clas_slot_size;
 				record[18] = uint32_t(dst_base & 0xFFFFFFFFULL);
 				record[19] = uint32_t(dst_base >> 32);
@@ -3338,7 +3580,7 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 	pc.blas_infos_offset = uint32_t(blas_infos_offset / sizeof(uint32_t));
 	pc.blas_info_stride = blas_info_stride / sizeof(uint32_t);
 	pc.flags = view.orthogonal ? 1u : 0u;
-	pc.clas_count_offset = uint32_t(clas_count_offset / sizeof(uint32_t));
+	pc.clas_count_offset = uint32_t(clas_count_offset / sizeof(uint32_t)); // The word after it counts the cached levels' overflow (D90).
 	pc.clas_dst_offset = uint32_t(clas_dst_offset / sizeof(uint32_t));
 	pc.clas_infos_offset = uint32_t(clas_infos_offset / sizeof(uint32_t));
 	pc.clas_info_words = clas_info_stride / sizeof(uint32_t);
@@ -3408,38 +3650,62 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		}
 	}
 
-	// Every instance's cluster BLAS over its list, into its slot.
+	// Every instance's cluster BLAS over its list, into its slot, fast-build as it is rebuilt every
+	// frame; then the cached levels built this frame (D90), the items after them, fast-trace as
+	// they are traced from then on, each over its level's exact count.
+	const uint32_t cache_first = batch.cache_max_clusters > 0 ? batch.cache_first : entry_count;
 	{
-		Vector<RID> storage_buffers, source_buffers, blas_handles;
+		Vector<RID> storage_buffers, source_buffers;
 		storage_buffers.resize(batch.storage_buffers.size());
 		source_buffers.resize(batch.source_buffers.size() + (clas_bound > 0 ? 1 : 0));
-		blas_handles.resize(entry_count);
 		memcpy(storage_buffers.ptrw(), batch.storage_buffers.ptr(), sizeof(RID) * batch.storage_buffers.size());
 		memcpy(source_buffers.ptrw(), batch.source_buffers.ptr(), sizeof(RID) * batch.source_buffers.size());
 		if (clas_bound > 0) {
 			source_buffers.write[batch.source_buffers.size()] = deformed_cluster_batch.regions[region_index].buffer;
 		}
-		memcpy(blas_handles.ptrw(), batch.blas_handles.ptr(), sizeof(RID) * entry_count);
+		const uint32_t frame_total = cluster_total - batch.cache_list_clusters;
+		for (int pass = 0; pass < 2; pass++) {
+			const uint32_t first = pass == 0 ? 0 : cache_first;
+			const uint32_t count = pass == 0 ? cache_first : entry_count - cache_first;
+			if (count == 0) {
+				continue;
+			}
+			Vector<RID> blas_handles;
+			blas_handles.resize(count);
+			memcpy(blas_handles.ptrw(), batch.blas_handles.ptr() + first, sizeof(RID) * count);
 
-		RD::ClusterAccelerationStructureBuild build;
-		build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
-		build.input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
-		build.input.max_acceleration_structure_count = entry_count;
-		build.input.flags = RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT;
-		build.input.max_total_cluster_count = cluster_total;
-		build.input.max_cluster_count_per_acceleration_structure = batch.max_clusters;
-		build.dst_storage_buffers = storage_buffers;
-		build.dst_addresses_buffer = args_buffer;
-		build.dst_addresses_offset = blas_dst_offset;
-		build.dst_addresses_stride = sizeof(uint64_t);
-		build.src_infos_buffer = args_buffer;
-		build.src_infos_offset = blas_infos_offset;
-		build.src_infos_stride = blas_info_stride;
-		build.source_acceleration_structure_buffers = source_buffers; // The CLAS each BLAS references, read through its list.
-		build.dst_acceleration_structures = blas_handles;
-		if (rd->cluster_acceleration_structure_build(build) != OK) {
-			return false;
+			RD::ClusterAccelerationStructureBuild build;
+			build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
+			build.input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
+			build.input.max_acceleration_structure_count = count;
+			build.input.flags = pass == 0 ? RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT : RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
+			build.input.max_total_cluster_count = pass == 0 ? frame_total : batch.cache_total_clusters;
+			build.input.max_cluster_count_per_acceleration_structure = pass == 0 ? MIN(batch.max_clusters, frame_total) : batch.cache_max_clusters;
+			build.dst_storage_buffers = storage_buffers;
+			build.dst_addresses_buffer = args_buffer;
+			build.dst_addresses_offset = blas_dst_offset + sizeof(uint64_t) * first;
+			build.dst_addresses_stride = sizeof(uint64_t);
+			build.src_infos_buffer = args_buffer;
+			build.src_infos_offset = blas_infos_offset + uint64_t(blas_info_stride) * first;
+			build.src_infos_stride = blas_info_stride;
+			build.source_acceleration_structure_buffers = source_buffers; // The CLAS each BLAS references, read through its list.
+			build.dst_acceleration_structures = blas_handles;
+			if (rd->cluster_acceleration_structure_build(build) != OK) {
+				return false;
+			}
 		}
+	}
+
+	// A cached level's slot is sized for the count the CPU made of its level (D90), which the
+	// shader holds to; on a verbose run, what it counted and what it left out are read back.
+	if (cache_first < entry_count && OS::get_singleton()->is_stdout_verbose()) {
+		PackedInt32Array expected;
+		expected.resize(entry_count - cache_first);
+		for (uint32_t i = 0; i < batch.cache_builds.size() && i < uint32_t(expected.size()); i++) {
+			expected.write[i] = int32_t(batch.cache_builds[i].surface->cluster_lod_levels[batch.cache_builds[i].depth].cut_clusters);
+		}
+		rd->buffer_get_data_async(args_buffer, callable_mp_static(&RenderRaytracing::_on_lod_cache_counts_read).bind(blas_info_stride, expected), uint32_t(blas_infos_offset + uint64_t(blas_info_stride) * cache_first), uint32_t(blas_info_stride * (entry_count - cache_first)));
+		rd->buffer_get_data_async(args_buffer, callable_mp_static(&RenderRaytracing::_on_lod_cache_overflow_read), uint32_t(clas_count_offset + sizeof(uint32_t)), sizeof(uint32_t));
 	}
 
 	// The counts for the report, read back a frame queue later, so requested on the frames just
@@ -3447,7 +3713,9 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 	const uint64_t report_phase = batch.frames_flushed % 300;
 	if (report_phase >= 295 && OS::get_singleton()->is_stdout_verbose()) {
 		const uint64_t ticket = ++lod_counts_next_ticket;
-		rd->buffer_get_data_async(args_buffer, callable_mp_static(&RenderRaytracing::_on_lod_counts_read).bind(ticket, entry_count, blas_info_stride), uint32_t(blas_infos_offset), uint32_t(blas_info_stride * entry_count));
+		if (cache_first > 0) {
+			rd->buffer_get_data_async(args_buffer, callable_mp_static(&RenderRaytracing::_on_lod_counts_read).bind(ticket, cache_first, blas_info_stride), uint32_t(blas_infos_offset), uint32_t(blas_info_stride * cache_first));
+		}
 		rd->buffer_get_data_async(args_buffer, callable_mp_static(&RenderRaytracing::_on_lod_clas_count_read).bind(ticket), uint32_t(clas_count_offset), sizeof(uint32_t));
 	}
 
@@ -3457,7 +3725,7 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		for (uint32_t e = 0; e < entry_count; e++) {
 			lod0_total += batch.lod0_clusters[e];
 		}
-		print_verbose(vformat("RT: cluster LOD selection: %d instances (%d deformed, %d past the region ceiling; %d more tracing a shared build, %d the LOD 0 BLAS), %d clusters at LOD 0, %d over every level, %d selected a frame queue ago (%d instances then, %d CLAS built of %d), %.2f px, threshold %s, %d KB of arguments, %d KB of the LOD table live, %d KB CLAS region.", entry_count, batch.deformed_count, batch.deformed_routed, batch.shared_count, batch.lod0_count, lod0_total, cluster_total, lod_counts_selected, lod_counts_entries, lod_counts_clas, clas_bound, cluster_lod_pixel_error, String::num_scientific(threshold), args_size / 1024, uint64_t(cluster_lod_table_live_words) * sizeof(uint32_t) / 1024, uint64_t(clas_bound) * cluster_lod_clas_slot_size / 1024));
+		print_verbose(vformat("RT: cluster LOD selection: %d instances (%d deformed, %d past the region ceiling; %d more tracing a shared build, %d the LOD 0 BLAS, %d a cached level), %d cached levels built (%d live, %d KB, %d over the run), %d clusters at LOD 0, %d over every level, %d selected a frame queue ago (%d instances then, %d CLAS built of %d), %.2f px, threshold %s, %d KB of arguments, %d KB of the LOD table live, %d KB CLAS region.", cache_first, batch.deformed_count, batch.deformed_routed, batch.shared_count, batch.lod0_count, batch.cached_count, entry_count - cache_first, cluster_lod_cache_live, cluster_lod_cache_bytes / 1024, cluster_lod_cache_builds_total, lod0_total, cluster_total - batch.cache_list_clusters, lod_counts_selected, lod_counts_entries, lod_counts_clas, clas_bound, cluster_lod_pixel_error, String::num_scientific(threshold), args_size / 1024, uint64_t(cluster_lod_table_live_words) * sizeof(uint32_t) / 1024, uint64_t(clas_bound) * cluster_lod_clas_slot_size / 1024));
 	}
 	return true;
 }
@@ -3465,11 +3733,12 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const RTViewportState *p_state) {
 	RTLodSelectBatch &batch = lod_batch;
 	if (batch.entries.is_empty()) {
-		if (batch.lod0_count > 0) {
-			// Every instance on the LOD 0 BLAS (D89): nothing to record, but the report still says so.
+		if (batch.lod0_count + batch.cached_count > 0) {
+			// Every instance on the LOD 0 BLAS (D89) or a cached level (D90): nothing to record, but
+			// the report still says so.
 			batch.frames_flushed++;
 			if (batch.frames_flushed == 1 || batch.frames_flushed % 300 == 0) {
-				print_verbose(vformat("RT: cluster LOD selection: 0 instances (%d on the LOD 0 BLAS), nothing built.", batch.lod0_count));
+				print_verbose(vformat("RT: cluster LOD selection: 0 instances (%d on the LOD 0 BLAS, %d on a cached level; %d cached levels live, %d KB, %d built over the run), nothing built.", batch.lod0_count, batch.cached_count, cluster_lod_cache_live, cluster_lod_cache_bytes / 1024, cluster_lod_cache_builds_total));
 			}
 		}
 		return;
@@ -3526,7 +3795,12 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 		}
 		for (uint32_t i = 0; i < batch.shared_slots.size(); i++) {
 			if (batch.shared_slots[i] < blass.size()) {
-				blass[batch.shared_slots[i]] = batch.shared_surfaces[i]->blas; // The instances that shared a build (D89).
+				blass[batch.shared_slots[i]] = batch.shared_surfaces[i]->blas; // The instances that shared a build (D89) or a cached level (D90).
+			}
+		}
+		for (const RTLodSelectBatch::CacheBuild &build : batch.cache_builds) {
+			if (build.depth < build.surface->cluster_lod_cache.size()) {
+				_release_lod_cached_level(build.surface->cluster_lod_cache[build.depth]); // Never built.
 			}
 		}
 		if (batch.args_buffer.is_valid()) {
@@ -3542,6 +3816,12 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 	batch.shared_surfaces.clear();
 	batch.shared_count = 0;
 	batch.lod0_count = 0;
+	batch.cached_count = 0;
+	batch.cache_builds.clear();
+	batch.cache_first = 0;
+	batch.cache_list_clusters = 0;
+	batch.cache_total_clusters = 0;
+	batch.cache_max_clusters = 0;
 	batch.slots.clear();
 	batch.blas_handles.clear();
 	batch.blas_addresses.clear();
@@ -3576,6 +3856,34 @@ void RenderRaytracing::_on_lod_counts_read(const PackedByteArray &p_counts, uint
 	singleton->lod_counts_ticket = p_ticket;
 	singleton->lod_counts_selected = selected;
 	singleton->lod_counts_entries = p_entry_count;
+}
+
+void RenderRaytracing::_on_lod_cache_counts_read(const PackedByteArray &p_counts, uint32_t p_stride, const PackedInt32Array &p_expected) {
+	if (p_counts.size() < int64_t(uint64_t(p_stride) * p_expected.size())) {
+		return;
+	}
+	uint32_t mismatched = 0;
+	for (int i = 0; i < p_expected.size(); i++) {
+		uint32_t count;
+		memcpy(&count, p_counts.ptr() + uint64_t(i) * p_stride, sizeof(count));
+		mismatched += count != uint32_t(p_expected[i]) ? 1 : 0;
+	}
+	if (mismatched > 0) {
+		ERR_PRINT(vformat("RT: %d of %d cached levels selected a count other than their slot's (D90); the shader's level rule and the CPU's count differ.", mismatched, p_expected.size()));
+	} else {
+		print_verbose(vformat("RT: %d cached levels selected the counts their slots hold (D90).", p_expected.size()));
+	}
+}
+
+void RenderRaytracing::_on_lod_cache_overflow_read(const PackedByteArray &p_count) {
+	if (p_count.size() < int64_t(sizeof(uint32_t))) {
+		return;
+	}
+	uint32_t overflow;
+	memcpy(&overflow, p_count.ptr(), sizeof(overflow));
+	if (overflow > 0) {
+		ERR_PRINT(vformat("RT: the selection took %d clusters past the cached levels' slots (D90); the shader's level rule and the CPU's count differ, and those clusters were left out.", overflow));
+	}
 }
 
 void RenderRaytracing::_on_lod_clas_count_read(const PackedByteArray &p_count, uint64_t p_ticket) {

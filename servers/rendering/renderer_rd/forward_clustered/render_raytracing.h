@@ -34,6 +34,7 @@
 #include "core/string/string_name.h"
 #include "core/templates/a_hash_map.h"
 #include "core/templates/hash_map.h"
+#include "core/templates/hash_set.h"
 #include "core/templates/local_vector.h"
 #include "core/templates/rid_owner.h"
 #include "core/templates/vector.h"
@@ -282,6 +283,22 @@ struct RTLodLevelBound {
 	float max_error = 0.0f;
 	float min_error = 0.0f;
 	bool empty = true;
+	uint32_t cut_clusters = 0; // The clusters of the depth's discrete level, a cached build's exact count (D90).
+};
+
+// A discrete level's cluster BLAS (D90): every cluster of one depth's groups, with those of
+// terminal groups above it, the whole surface at that depth. It is built once, fast-trace, into
+// its own arena slot, and traced by any instance whose selection it covers within the tolerance;
+// never rebuilt, so no frame's build writes what an earlier frame's trace may still read. Released
+// on the slots' TTL unused or with the surface's hierarchy; none is made while the surface's
+// compaction is pending.
+struct RTLodCachedLevel {
+	RID blas;
+	uint64_t blas_address = 0;
+	int32_t arena_chunk = -1;
+	uint64_t arena_offset = 0;
+	uint64_t arena_size = 0;
+	uint32_t last_used_frame = 0;
 };
 
 struct RTSurfaceData {
@@ -318,6 +335,7 @@ struct RTSurfaceData {
 	uint64_t cluster_lod_blas_worst_size = 0;
 	uint32_t cluster_lod_generation = 0; // Unique per population; an instance's slot follows it.
 	LocalVector<RTLodLevelBound> cluster_lod_levels; // Per depth, the classification's bounds (D89); empty, never shared.
+	LocalVector<RTLodCachedLevel> cluster_lod_cache; // Per depth, its cached level if any (D90); empty until one is.
 };
 
 // An instance's cluster BLAS over the clusters the LOD selection picks for it (D86): its own
@@ -354,7 +372,8 @@ static constexpr uint64_t RT_LOD_CLAS_REGION_CEILING = uint64_t(1) << 30;
 // build infos with their counts at zero, the slot addresses, the instance records, room for the
 // reference lists and, for the deformed items, the CLAS count, destinations and build infos, D87),
 // runs the selection compute over it, records one CLAS build for the deformed items' selections
-// and then one cluster BLAS build over every instance's list. Every list is grow-only across frames.
+// and then one cluster BLAS build over every instance's list, and a second, fast-trace, over the
+// cached levels built this frame (D90). Every list is grow-only across frames.
 struct RTLodSelectBatch {
 	// The static instances of the frame before the sharing resolves them (D89): each one's slot,
 	// the surface its slot is for, its trace-space transform, and the depth range its selection
@@ -380,6 +399,37 @@ struct RTLodSelectBatch {
 	LocalVector<uint32_t> stand_ins;
 	LocalVector<uint32_t> targets;
 	LocalVector<uint8_t> builds;
+	// The cached levels (D90): per candidate the depth it traces, the frame's requests for a level
+	// not yet cached (sorted per surface by their coarsest admissible depth), and the levels this
+	// frame builds, appended after every other item so they form their own fast-trace build.
+	static constexpr uint32_t TARGET_CACHED = UINT32_MAX - 2; // In targets, beside the resolve's own two.
+	struct CacheRequest {
+		uint32_t generation = 0; // Its surface's population, the sort's first key.
+		uint32_t highest = 0; // Its finest depth, the coarsest it may trace.
+		uint32_t lowest = 0; // The finest depth within the tolerance of its coarsest.
+		uint32_t candidate = 0;
+		bool operator<(const CacheRequest &p_other) const {
+			if (generation != p_other.generation) {
+				return generation < p_other.generation;
+			}
+			if (highest != p_other.highest) {
+				return highest < p_other.highest;
+			}
+			return candidate < p_other.candidate;
+		}
+	};
+	struct CacheBuild {
+		RTSurfaceData *surface = nullptr;
+		uint32_t depth = 0;
+	};
+	LocalVector<uint32_t> cached_depths;
+	LocalVector<CacheRequest> cache_requests;
+	LocalVector<CacheBuild> cache_builds;
+	uint32_t cached_count = 0; // Instances tracing a cached level this frame.
+	uint32_t cache_first = 0; // The first cached build's item.
+	uint32_t cache_list_clusters = 0; // Their reference lists' clusters, outside the per-frame build.
+	uint32_t cache_total_clusters = 0; // Their exact counts, summed.
+	uint32_t cache_max_clusters = 0;
 	// Per item, a static instance's slot or a deformed entry (D87), the other null.
 	LocalVector<RTLodInstanceEntry *> entries;
 	LocalVector<RTDeformedCacheEntry *> deformed_entries;
@@ -735,6 +785,13 @@ class RenderRaytracing {
 	// surface's LOD 0 BLAS, when that adds no more than cluster_lod_share_tolerance levels of detail.
 	bool cluster_lod_share_enabled = false;
 	uint32_t cluster_lod_share_tolerance = 2;
+	// Cached levels (D90), rendering/pathtracing/cluster_lod_cache with the sharing: the surfaces
+	// holding one, for the TTL, and the totals for the report.
+	bool cluster_lod_cache_enabled = false;
+	HashSet<RTSurfaceData *> cluster_lod_cached_surfaces;
+	uint32_t cluster_lod_cache_live = 0;
+	uint64_t cluster_lod_cache_bytes = 0;
+	uint64_t cluster_lod_cache_builds_total = 0;
 	struct LodSelectShader {
 		ClusterLodSelectShaderRD shader;
 		RID version;
@@ -1016,6 +1073,15 @@ class RenderRaytracing {
 	static void _classify_lod_instance(const RTSurfaceData *p_surf_data, const Transform3D &p_transform, const LodView &p_view, uint32_t &r_level_min, uint32_t &r_level_max);
 	void _resolve_lod_candidates(const RenderDataRD *p_render_data, const RTViewportState *p_state);
 	bool _queue_lod_candidate(const RTLodSelectBatch::Candidate &p_candidate);
+	// Cached levels (D90): placing the candidates on them, a level's slot, its item in the batch
+	// after every other, and the release of one or of all a surface holds.
+	void _place_lod_cached_levels();
+	bool _prepare_lod_cached_level(RTSurfaceData *p_surf_data, uint32_t p_depth);
+	void _queue_lod_cached_level(RTSurfaceData *p_surf_data, uint32_t p_depth);
+	void _release_lod_cached_level(RTLodCachedLevel &p_level);
+	void _release_lod_cached_levels(RTSurfaceData *p_surf_data);
+	static void _on_lod_cache_counts_read(const PackedByteArray &p_counts, uint32_t p_stride, const PackedInt32Array &p_expected);
+	static void _on_lod_cache_overflow_read(const PackedByteArray &p_count);
 	// The deformed entries on the selection (D87): the entry's region of the LOD table, made with
 	// its layout and released with its storage, and its record in the frame's batch.
 	bool _populate_deformed_cluster_lod(void *p_mesh_surface, const RTClusterLayout &p_layout, const LocalVector<uint8_t> &p_infos, uint32_t p_cache_key, RTDeformedCacheEntry &r_entry);

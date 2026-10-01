@@ -4153,6 +4153,10 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_traversal", true);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_deformed", true);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/cluster_lod_pixel_error", PROPERTY_HINT_RANGE, "0,16,0.05"), 1.0);
+	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_stream", false);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/cluster_lod_stream_budget_mb", PROPERTY_HINT_RANGE, "16,65536,1"), 1024);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/cluster_lod_stream_builds_per_frame", PROPERTY_HINT_RANGE, "64,1048576,1"), 16384);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/cluster_lod_stream_min_age_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 30);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/deformed_mesh_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 60);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_blas_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,18000,1"), 3600);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_merged_blas_max_triangles", PROPERTY_HINT_RANGE, "256,1048576,1"), 65536);

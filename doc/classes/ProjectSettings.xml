@@ -3298,6 +3298,22 @@
 			How many hierarchy levels finer than its own coarsest an instance may trace through [member rendering/pathtracing/cluster_lod_share]: the shared structure's finest level is at most this many levels below the coarsest level the instance's own selection could reach. Higher shares more and builds fewer structures, at more detail far away; [code]0[/code] shares only between instances that need the same single level.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracing/cluster_lod_stream" type="bool" setter="" getter="" default="false">
+			If [code]true[/code] and [member rendering/pathtracing/cluster_lod_select], [member rendering/pathtracing/cluster_lod_traversal], [member rendering/pathtracing/cluster_lod_cache] and [member rendering/pathtracing/cluster_blas_compaction] are on, a static mesh surface with a hierarchy keeps only its coarsest cluster acceleration structures resident from the start, and the finer ones load group by group as the selection asks for them and unload, least recently used first, when [member rendering/pathtracing/cluster_lod_stream_budget_mb] is reached. Loads go coarse to fine and unloads fine to coarse, and the frame never waits for a load: until one completes, the finest resident level is traced in its place. A surface an emissive material or an expanded MultiMesh instance references is loaded whole, outside the budget. The surface's vertex and index buffers stay resident.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
+		<member name="rendering/pathtracing/cluster_lod_stream_budget_mb" type="int" setter="" getter="" default="1024">
+			The memory, in megabytes, the cluster acceleration structures loaded by [member rendering/pathtracing/cluster_lod_stream] may take. The coarsest structures every surface keeps and those of fully loaded surfaces are outside it.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
+		<member name="rendering/pathtracing/cluster_lod_stream_builds_per_frame" type="int" setter="" getter="" default="16384">
+			The most clusters [member rendering/pathtracing/cluster_lod_stream] builds in one frame; further loads wait for the next frames.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
+		<member name="rendering/pathtracing/cluster_lod_stream_min_age_frames" type="int" setter="" getter="" default="30">
+			How many frames a group of clusters loaded by [member rendering/pathtracing/cluster_lod_stream] must have gone unused before it may be unloaded to make room. At least three of the selection's 8-frame reporting periods plus the frame queue's latency is used (about 27 frames).
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
 		<member name="rendering/pathtracing/cluster_lod_traversal" type="bool" setter="" getter="" default="true">
 			If [code]true[/code] and [member rendering/pathtracing/cluster_lod_select] is on, the selection walks a tree of bounding spheres built over each hierarchy's cluster groups, one per level of detail, and tests only the clusters of groups whose simplification can show at the instance's distance. It selects exactly the clusters the exhaustive test of every cluster selects; [code]false[/code] runs that exhaustive test, for comparison.
 			[b]Note:[/b] Requires a restart to take effect.

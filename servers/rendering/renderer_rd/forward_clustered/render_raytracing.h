@@ -315,6 +315,73 @@ struct RTLodCachedLevel {
 	uint32_t last_used_frame = 0;
 };
 
+// CLAS residency (D92): a streamed surface's groups, the unit its CLAS are loaded and unloaded in.
+// A persistent group (a terminal one, the coarsest of its part of the surface) is built with the
+// surface and never leaves; any other is absent, loading (its CLAS built into a load's staging, its
+// sizes in flight) or resident at its own arena region. A group's parents are the groups holding a
+// cluster simplified from it, its children the groups its clusters were simplified from; a group
+// loads only with its parents resident or loading, and unloads only with no child resident or
+// loading (live_children), so residency stays monotone along the DAG.
+struct RTLodStreamGroup {
+	enum State : uint8_t {
+		ABSENT,
+		LOADING,
+		RESIDENT,
+		PERSISTENT,
+	};
+	uint32_t first_cluster = 0;
+	uint32_t cluster_count = 0;
+	uint32_t depth = 0;
+	uint32_t parents_first = 0; // Into RTLodStream::links.
+	uint32_t parents_count = 0;
+	uint32_t children_first = 0;
+	uint32_t children_count = 0;
+	uint32_t live_children = 0;
+	State state = ABSENT;
+	uint64_t last_used = 0; // frames_drawn of the last reported use, or of the load.
+	uint64_t requested = 0; // frames_drawn of the first request since it was absent, 0 for none.
+	uint64_t bytes = 0; // Its region's bytes once loaded; until then estimated at the worst case.
+	uint64_t loading_bytes = 0; // What its load holds against the budget while in flight.
+	int32_t arena_chunk = -1;
+	uint64_t arena_offset = 0;
+};
+
+// A streamed surface's residency (D92): what a load needs to build its groups' CLAS again (the
+// buffers, each cluster's first triangle and counts), the groups and their links, the persistent
+// clusters as runs in build order, and per depth the groups that stream and how many are resident,
+// which says when a cached level (D90) may be built; a placed level stamps its depth's use, which
+// keeps the groups it holds. A surface an emissive instance or an expanded MultiMesh references is
+// pinned: loaded whole, outside the budget, and traced at its cached level 0 once that is built.
+struct RTLodStream {
+	RID vertex_buffer;
+	RID index_buffer;
+	uint32_t state_offset = 0; // Words into the LOD table: RT_LOD_STREAM_STATE_WORDS per group, the selection's state.
+	uint32_t max_triangles = 0;
+	uint32_t max_vertices = 0;
+	LocalVector<uint32_t> cluster_first_triangle;
+	LocalVector<uint32_t> cluster_packed; // Triangles | vertices << 16.
+	LocalVector<RTLodStreamGroup> groups;
+	LocalVector<uint32_t> links;
+	LocalVector<uint32_t> persistent_runs; // (first cluster, count) pairs, the population's build order.
+	uint32_t persistent_clusters = 0;
+	uint32_t persistent_triangles = 0;
+	uint32_t persistent_vertices = 0;
+	LocalVector<uint32_t> depth_streamed;
+	LocalVector<uint32_t> depth_resident;
+	LocalVector<uint64_t> level_last_used; // frames_drawn a cached level of the depth was placed.
+	uint32_t absent_groups = 0;
+	uint32_t root_groups = 0; // Not persistent, refined into nothing: requested by their own test.
+	uint64_t resident_bytes = 0;
+	uint64_t loading_bytes = 0;
+	uint64_t persistent_bytes = 0;
+	uint64_t pinned_frame = 0; // frames_drawn it was last referenced as pinned.
+	// A cached level placement asked for and found not resident: its depth (the finest asked that
+	// frame) and the frame, which the next residency step turns into wants for every absent group
+	// of that depth and coarser.
+	uint32_t level_wanted = UINT32_MAX;
+	uint64_t level_wanted_frame = 0;
+};
+
 struct RTSurfaceData {
 	RID blas;
 	RT_GeometryData geometry = {};
@@ -351,6 +418,11 @@ struct RTSurfaceData {
 	LocalVector<RTLodLevelBound> cluster_lod_levels; // Per depth, the classification's bounds (D89); empty, never shared.
 	LocalVector<RTLodCachedLevel> cluster_lod_cache; // Per depth, its cached level if any (D90); empty until one is.
 	RTLodTree cluster_lod_tree; // The traversal's tree over the groups (D91), in the same region.
+	// Streamed (D92): the population built only the persistent groups' CLAS, `blas` is over them
+	// (the coarsest cut, the surface's fallback), and the rest load and unload with the camera.
+	RTLodStream *cluster_lod_stream = nullptr;
+	uint32_t cluster_built_count = 0; // The CLAS the population built and the compaction moves.
+	uint32_t cluster_blas_count = 0; // The clusters `blas` is over.
 };
 
 // An instance's cluster BLAS over the clusters the LOD selection picks for it (D86): its own
@@ -375,6 +447,42 @@ struct RTDeformedCacheEntry;
 
 // The selection's instance record, in words. Must match INSTANCE_WORDS in cluster_lod_select.glsl.
 static constexpr uint32_t RT_LOD_INSTANCE_WORDS = 24;
+
+// CLAS residency's lists (D92): the requests and the use reports one frame's selection may append,
+// and the frames between two reports of one group's use. Must match STREAM_* in cluster_lod_select.glsl.
+static constexpr uint32_t RT_LOD_STREAM_REQUEST_CAP = 8192;
+static constexpr uint32_t RT_LOD_STREAM_TOUCH_CAP = 16384;
+static constexpr uint32_t RT_LOD_STREAM_TOUCH_PERIOD = 8;
+// A group's state words in the table: requested frame, reported frame (the selection's atomics),
+// flags the CPU writes once. Must match STATE_WORDS and STATE_FLAG_ROOT.
+static constexpr uint32_t RT_LOD_STREAM_STATE_WORDS = 3;
+static constexpr uint32_t RT_LOD_STREAM_STATE_FLAG_ROOT = 1;
+
+// A load of streamed groups (D92), D81's two steps at group granularity: this frame the groups'
+// CLAS are built with implicit destinations into a staging buffer, their sizes read back; when they
+// are, each group gets its exact region of the arena, the CLAS move there and the group's addresses
+// go to the LOD table. Items whose surface went in the meantime have a null surface.
+struct RTLodStreamLoad {
+	struct Item {
+		RTSurfaceData *surface = nullptr;
+		uint32_t group = 0;
+		uint32_t first = 0; // Its first CLAS in the load.
+	};
+	uint64_t ticket = 0;
+	RID staging;
+	RID args;
+	uint64_t region_size = 0; // The implicit build's region, the move's byte budget.
+	uint64_t implicit_offset = 0;
+	uint64_t compact_offset = 0;
+	uint32_t cluster_count = 0;
+	LocalVector<Item> items;
+};
+
+struct RTLodStreamRead {
+	uint64_t frame = 0;
+	uint32_t part = 0; // 0: the requests, 1: the use reports; each its count, then records from word 4.
+	PackedByteArray bytes;
+};
 
 // The frame's CLAS region for the deformed items (D87) stays under this many bytes: the argument
 // and region sizes are 32-bit, and a flush that cannot record turns the selection off for the
@@ -461,6 +569,7 @@ struct RTLodSelectBatch {
 	uint32_t flat_max_clusters = 0;
 	LocalVector<uint32_t> tree_level_capacity;
 	uint32_t tree_group_capacity = 0; // The tree items' groups, the group queue's capacity.
+	uint32_t stream_items = 0; // Items of streamed surfaces (D92): the frame reads its requests back.
 	RID dispatch_buffer; // The cluster pass's indirect arguments, which the leaves write.
 	LocalVector<RID> storage_buffers; // The arena chunks the slots live in, each once, and each deformed entry's storage.
 	LocalVector<RID> source_buffers; // The buffers the surfaces' CLAS live in, each once.
@@ -842,6 +951,59 @@ class RenderRaytracing {
 	uint32_t lod_counts_selected = 0;
 	uint32_t lod_counts_entries = 0;
 	uint32_t lod_counts_clas = 0; // The CLAS the deformed items built in that batch.
+	// The frame's selection error in pixels: the setting's, or 0 under the G-buffer primary when
+	// streaming (D92), which traces the finest resident cut there.
+	float lod_frame_pixel_error = 1.0f;
+
+	// CLAS residency (D92), rendering/pathtracing/cluster_lod_stream with the selection, its
+	// traversal, the cached levels and the compaction: the streamed surfaces by their LOD table
+	// offset (which the selection's records carry), the readbacks and loads in flight, and the
+	// totals for the report.
+	bool cluster_lod_stream_enabled = false;
+	uint64_t cluster_lod_stream_budget = 0; // Bytes.
+	uint32_t cluster_lod_stream_builds_per_frame = 0; // Clusters.
+	uint32_t cluster_lod_stream_min_age = 0; // Frames.
+	uint64_t cluster_lod_stream_cluster_worst = 0; // One CLAS's worst-case bytes, a load's estimate.
+	HashMap<uint32_t, RTSurfaceData *> cluster_lod_stream_surfaces;
+	LocalVector<RTLodStreamRead> cluster_lod_stream_reads;
+	LocalVector<RTLodStreamLoad> cluster_lod_stream_loads;
+	LocalVector<RTClusterCompactionResult> cluster_lod_stream_load_results;
+	uint64_t cluster_lod_stream_next_ticket = 0;
+	uint64_t cluster_lod_stream_pressure_frame = 0; // The last frame the budget deferred one of the selection's requests.
+	uint64_t cluster_lod_stream_step_frame = 0; // Admission runs once a frame, whatever the viewports.
+	// The lists' decaying peaks, which size the next frames' readbacks (records past the read are
+	// asked for again the next frame).
+	uint32_t cluster_lod_stream_request_peak = 0;
+	uint32_t cluster_lod_stream_touch_peak = 0;
+	// The step's eviction candidates, gathered and sorted on its first need, consumed across its wants.
+	struct LodStreamCandidate {
+		RTSurfaceData *surface = nullptr;
+		uint32_t group = 0;
+		uint64_t last_used = 0;
+		bool operator<(const LodStreamCandidate &p_other) const {
+			return last_used < p_other.last_used;
+		}
+	};
+	LocalVector<LodStreamCandidate> lod_stream_candidates;
+	uint32_t lod_stream_candidate_next = 0;
+	bool lod_stream_candidates_built = false;
+	struct LodStreamStats {
+		uint64_t requests = 0;
+		uint64_t loads = 0;
+		uint64_t loaded_clusters = 0;
+		uint64_t deferred_cap = 0;
+		uint64_t deferred_budget = 0;
+		uint64_t deferred_soft = 0; // A cached level's asks that found no free room.
+		uint64_t root_requests = 0; // Requests for groups no cluster refines from, made by their own test.
+		uint64_t evictions = 0;
+		uint64_t request_overflow = 0;
+		uint64_t touch_overflow = 0;
+		uint64_t request_unread = 0; // Listed but past the frame's readback, asked for again later.
+		uint64_t touch_unread = 0;
+		uint64_t failed = 0;
+		uint64_t peak_bytes = 0;
+		LocalVector<uint32_t> latency; // Frames from request to resident, since the last report.
+	} lod_stream_stats;
 
 	// Merged MultiMesh BLAS cache and compute shader.
 	struct MergeShader {
@@ -1129,6 +1291,21 @@ class RenderRaytracing {
 	bool _cluster_arena_allocate(uint64_t p_size, uint32_t &r_chunk, uint64_t &r_offset);
 	void _cluster_arena_retire(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size);
 	void _cluster_arena_free(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size);
+	// CLAS residency (D92).
+	RTLodStream *_create_lod_stream(void *p_mesh_surface, const RTClusterLayout &p_layout, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key);
+	void _release_lod_stream(RTSurfaceData *p_surf_data);
+	static void _on_lod_stream_read(const PackedByteArray &p_bytes, uint64_t p_frame, uint32_t p_part);
+	static void _on_lod_stream_sizes_read(const PackedByteArray &p_sizes, uint64_t p_ticket);
+	void _process_lod_stream();
+	void _complete_lod_stream_loads();
+	bool _issue_lod_stream_load(const LocalVector<RTLodStreamLoad::Item> &p_items, bool p_compressed);
+	bool _evict_lod_stream_groups(uint64_t p_needed, uint64_t &r_used);
+	bool _lod_stream_evictable(const RTLodStream *p_stream, uint32_t p_group, uint64_t p_frames_drawn) const;
+	void _join_lod_stream_candidate(RTSurfaceData *p_surf_data, uint32_t p_group, uint64_t p_frames_drawn);
+	void _evict_lod_stream_group(RTSurfaceData *p_surf_data, uint32_t p_group);
+	bool _lod_stream_level_resident(const RTSurfaceData *p_surf_data, uint32_t p_depth) const;
+	RID _lod_stream_pinned_blas(RTSurfaceData *p_surf_data);
+	void _prepare_lod_stream_pins();
 	static void _mesh_surface_freed(RID p_mesh, uint32_t p_surface);
 	// Frees the surface's BLAS and, on the cluster path, the staging buffers or the arena region it lives in.
 	void _release_surface_data(RTSurfaceData *p_surf_data);

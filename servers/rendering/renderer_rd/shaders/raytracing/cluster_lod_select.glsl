@@ -50,13 +50,28 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // cluster its CLAS address (lo, hi; zero for a deformed hierarchy), then per cluster its group and
 // the group it refines (-1 at LOD 0), then per group eight words (center, radius, error, depth,
 // first cluster, cluster count), then, for a deformed hierarchy, per cluster its build info.
+//
+// CLAS residency (D92): an item whose record's word 23 is non-zero is a streamed surface's, and
+// word 23 the word offset of its per-group state in TableBuf (STATE_WORDS a group: the frame it
+// was last requested and the frame its use was last reported, both written here by atomics, then
+// flags the CPU writes once). Only the groups whose CLAS are resident have addresses (a group is
+// resident when its first cluster's address is non-zero), and the rule is clamped by residency: a
+// group is taken only if resident, and a cluster's refined group stands in for it only if resident
+// too, so what is traced is the finest resident cut (the CPU loads coarse to fine and unloads fine
+// to coarse, which keeps residency monotone along the DAG as the error is). A cluster whose refined
+// group would be taken but is not resident requests it, once a frame; a group no cluster refines
+// from (STATE_FLAG_ROOT: its simplification left nothing, as debris's does) has no such cluster,
+// and is requested by its own test instead. A resident group taken reports its use every
+// STREAM_TOUCH_PERIOD frames. Both go to capped lists, each after its count, which the CPU reads
+// back a frame queue later.
 
 // FrameBuf and DispatchBuf are not restrict: the cluster pass binds the frame's arguments to both.
 layout(set = 0, binding = 0) buffer FrameBuf {
 	uint v[];
 }
 frame;
-layout(set = 0, binding = 1) restrict readonly buffer TableBuf {
+// Written only in the streamed items' per-group state (D92), by atomics.
+layout(set = 0, binding = 1) restrict buffer TableBuf {
 	uint v[];
 }
 table;
@@ -88,7 +103,13 @@ layout(push_constant, std430) uniform PC {
 	uint group_queue; // Words into FrameBuf: the group queue (entry, group record).
 	uint group_count; // Word of FrameBuf: the group queue's length, an atomic.
 	uint entry_first; // The exhaustive test's first item; its dispatch covers its range along y.
+	uint frame_index; // The frame's number, for the streamed items' state (D92).
+	uint stream_requests; // Words into FrameBuf: the request count, an atomic, then from 4 on the requests (table offset, group), STREAM_REQUEST_CAP of them (D92).
+	uint stream_touches; // Words into FrameBuf: the use report count, then from 4 on the reports, STREAM_TOUCH_CAP of them.
 	uint pad0;
+	uint pad1;
+	uint pad2;
+	uint pad3;
 }
 pc;
 
@@ -102,6 +123,12 @@ pc;
 #define INSTANCE_FLAG_TREE 4u
 #define GROUP_WORDS 8u
 #define NODE_WORDS 8u
+// Must match RT_LOD_STREAM_* in render_raytracing.h (D92).
+#define STREAM_REQUEST_CAP 8192u
+#define STREAM_TOUCH_CAP 16384u
+#define STREAM_TOUCH_PERIOD 8u
+#define STATE_WORDS 3u
+#define STATE_FLAG_ROOT 1u
 
 // The group's sphere in trace space against the camera: its simplification shows when
 // error * scale / max(near, distance - radius * scale) >= threshold, written without the division
@@ -140,6 +167,51 @@ bool node_error_visible(uint p_node, vec4 p_row0, vec4 p_row1, vec4 p_row2, floa
 		distance = max(pc.near_distance, length(world - pc.camera_threshold.xyz) - radius * p_stretch - magnitude * (1.0 / 65536.0));
 	}
 	return error * p_scale >= pc.camera_threshold.w * distance;
+}
+
+// A streamed group's residency (D92): its first cluster's CLAS address, zero while it has none.
+bool group_resident(uint p_table_offset, uint p_group_record) {
+	uint first = table.v[p_group_record + 6u];
+	return (table.v[p_table_offset + first * 2u] | table.v[p_table_offset + first * 2u + 1u]) != 0u;
+}
+
+// A visible group that is not resident (D92): requested once a frame, whatever the number of
+// clusters and instances that want it, into the capped list (the count runs on past the cap).
+void stream_request(uint p_state, uint p_table_offset, uint p_group) {
+	if (atomicExchange(table.v[p_state + p_group * STATE_WORDS], pc.frame_index) == pc.frame_index) {
+		return;
+	}
+	uint k = atomicAdd(frame.v[pc.stream_requests], 1u);
+	if (k < STREAM_REQUEST_CAP) {
+		frame.v[pc.stream_requests + 4u + k * 2u] = p_table_offset;
+		frame.v[pc.stream_requests + 4u + k * 2u + 1u] = p_group;
+	}
+}
+
+// A visible group that is not resident and that no cluster refines from (D92): requested by its
+// own test, since no resident cluster stands in for it.
+void stream_request_root(uint p_state, uint p_table_offset, uint p_group) {
+	if ((table.v[p_state + p_group * STATE_WORDS + 2u] & STATE_FLAG_ROOT) != 0u) {
+		stream_request(p_state, p_table_offset, p_group);
+	}
+}
+
+// A taken resident group that is not persistent (D92): its use reported once in a period, which
+// the CPU's least-recently-used order reads.
+void stream_touch(uint p_state, uint p_table_offset, uint p_group, uint p_group_record) {
+	if (uintBitsToFloat(table.v[p_group_record + 4u]) >= 3.0e38) {
+		return; // Terminal: persistent, never evicted.
+	}
+	uint word = p_state + p_group * STATE_WORDS + 1u;
+	uint last = table.v[word];
+	if (pc.frame_index - last < STREAM_TOUCH_PERIOD || atomicCompSwap(table.v[word], last, pc.frame_index) != last) {
+		return;
+	}
+	uint k = atomicAdd(frame.v[pc.stream_touches], 1u);
+	if (k < STREAM_TOUCH_CAP) {
+		frame.v[pc.stream_touches + 4u + k * 2u] = p_table_offset;
+		frame.v[pc.stream_touches + 4u + k * 2u + 1u] = p_group;
+	}
 }
 
 // Appends a selected cluster to its item's list: its CLAS address, or for a deformed item the
@@ -216,9 +288,31 @@ void exhaustive_main() {
 			selected = table.v[groups + uint(refined) * GROUP_WORDS + 5u] < level;
 		}
 	} else {
-		selected = group_error_visible(groups + group * GROUP_WORDS, row0, row1, row2, scale);
+		// A streamed item's rule is clamped by residency (D92); the CLAS a frame on the exhaustive
+		// test needs are requested and reported here as the traversal does, the check only counts.
+		uint state = frame.v[inst + 23u];
+		uint group_record = groups + group * GROUP_WORDS;
+		selected = group_error_visible(group_record, row0, row1, row2, scale);
+		if (selected && state != 0u) {
+			selected = group_resident(table_offset, group_record);
+			if (!check) {
+				if (selected) {
+					stream_touch(state, table_offset, group, group_record);
+				} else {
+					stream_request_root(state, table_offset, group);
+				}
+			}
+		}
 		if (selected && refined >= 0) {
-			selected = !group_error_visible(groups + uint(refined) * GROUP_WORDS, row0, row1, row2, scale);
+			uint refined_record = groups + uint(refined) * GROUP_WORDS;
+			bool finer = group_error_visible(refined_record, row0, row1, row2, scale);
+			if (finer && state != 0u && !group_resident(table_offset, refined_record)) {
+				finer = false;
+				if (!check) {
+					stream_request(state, table_offset, uint(refined));
+				}
+			}
+			selected = !finer;
 		}
 	}
 	if (!selected) {
@@ -272,8 +366,19 @@ void traversal_main() {
 				value = child;
 			} else {
 				uint groups = frame.v[inst + 14u] + frame.v[inst + 13u] * 4u;
-				value = groups + table.v[frame.v[inst + 21u] + child] * GROUP_WORDS;
+				uint group = table.v[frame.v[inst + 21u] + child];
+				value = groups + group * GROUP_WORDS;
 				append_group = group_error_visible(value, row0, row1, row2, scale);
+				// A streamed item queues a group only once it is resident, and reports its use (D92).
+				uint state = frame.v[inst + 23u];
+				if (append_group && state != 0u) {
+					append_group = group_resident(frame.v[inst + 14u], value);
+					if (append_group) {
+						stream_touch(state, frame.v[inst + 14u], group, value);
+					} else {
+						stream_request_root(state, frame.v[inst + 14u], group);
+					}
+				}
 			}
 		}
 	}
@@ -329,13 +434,22 @@ void cluster_main() {
 	uint table_offset = frame.v[inst + 14u];
 	uint list_offset = frame.v[inst + 15u];
 	uint instance_flags = frame.v[inst + 16u];
+	uint state = frame.v[inst + 23u];
 	uint groups = table_offset + cluster_count * 4u;
 	// A group of more than 32 clusters takes a lane's further clusters in strides of 32.
 	for (uint i = lane; i < count; i += 32u) {
 		uint cluster = first + i;
 		int refined = int(table.v[table_offset + cluster_count * 2u + cluster * 2u + 1u]);
-		if (refined >= 0 && group_error_visible(groups + uint(refined) * GROUP_WORDS, row0, row1, row2, scale)) {
-			continue;
+		if (refined >= 0) {
+			uint refined_record = groups + uint(refined) * GROUP_WORDS;
+			if (group_error_visible(refined_record, row0, row1, row2, scale)) {
+				// The finer group stands in, if resident (D92); else this cluster does and it is
+				// requested: the frontier of the resident cut, its parents all resident.
+				if (state == 0u || group_resident(table_offset, refined_record)) {
+					continue;
+				}
+				stream_request(state, table_offset, uint(refined));
+			}
 		}
 		select_cluster(entry, inst, cluster, table_offset, list_offset, instance_flags);
 	}

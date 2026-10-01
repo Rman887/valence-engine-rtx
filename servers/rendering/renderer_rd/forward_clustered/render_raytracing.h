@@ -32,6 +32,7 @@
 
 #include "core/math/transform_3d.h"
 #include "core/string/string_name.h"
+#include "core/templates/a_hash_map.h"
 #include "core/templates/hash_map.h"
 #include "core/templates/local_vector.h"
 #include "core/templates/rid_owner.h"
@@ -269,6 +270,20 @@ struct RTProceduralState {
 	uint32_t aabb_count = 0;
 };
 
+// One depth of a cluster LOD hierarchy as the instance classification reads it (D89): over the
+// depth's groups, a sphere around them all (its center, the radius enclosing every group's
+// sphere, the farthest group center), the smallest group radius and the largest and smallest
+// group error, in mesh space. A depth with no group has no bound.
+struct RTLodLevelBound {
+	Vector3 center;
+	float enclosing_radius = 0.0f;
+	float center_spread = 0.0f;
+	float min_radius = 0.0f;
+	float max_error = 0.0f;
+	float min_error = 0.0f;
+	bool empty = true;
+};
+
 struct RTSurfaceData {
 	RID blas;
 	RT_GeometryData geometry = {};
@@ -302,6 +317,7 @@ struct RTSurfaceData {
 	uint32_t cluster_lod_table_words = 0;
 	uint64_t cluster_lod_blas_worst_size = 0;
 	uint32_t cluster_lod_generation = 0; // Unique per population; an instance's slot follows it.
+	LocalVector<RTLodLevelBound> cluster_lod_levels; // Per depth, the classification's bounds (D89); empty, never shared.
 };
 
 // An instance's cluster BLAS over the clusters the LOD selection picks for it (D86): its own
@@ -312,7 +328,9 @@ struct RTLodInstanceEntry {
 	RTSurfaceData *ptr = nullptr;
 	uint32_t generation = 0;
 	uint32_t last_used_frame = 0;
-	uint64_t pushed_frame = 0; // frames_drawn when it last entered the TLAS; a second viewport in the frame reuses that build.
+	uint64_t pushed_frame = 0; // frames_drawn when it last entered the TLAS; a second viewport in the frame traces frame_blas.
+	RID frame_blas; // What it traced at pushed_frame: its own BLAS, or the one it shares (D89).
+	uint32_t last_built_frame = 0; // An instance tracing another's build gives its slot back on the TTL (D89).
 	RID blas;
 	uint64_t blas_address = 0;
 	int32_t arena_chunk = -1;
@@ -338,6 +356,30 @@ static constexpr uint64_t RT_LOD_CLAS_REGION_CEILING = uint64_t(1) << 30;
 // runs the selection compute over it, records one CLAS build for the deformed items' selections
 // and then one cluster BLAS build over every instance's list. Every list is grow-only across frames.
 struct RTLodSelectBatch {
+	// The static instances of the frame before the sharing resolves them (D89): each one's slot,
+	// the surface its slot is for, its trace-space transform, and the depth range its selection
+	// could fall in, classified at the resolve.
+	struct Candidate {
+		RTLodInstanceEntry *entry = nullptr;
+		RTSurfaceData *surface = nullptr;
+		Transform3D transform;
+		uint32_t slot = 0;
+		uint32_t level_min = 0;
+		uint32_t level_max = 0;
+	};
+	LocalVector<Candidate> candidates;
+	// The instances that trace another's build this frame (D89): their slots and surfaces, for the
+	// fallback, and how many there were, for the report, with those on the surface's LOD 0 BLAS.
+	LocalVector<uint32_t> shared_slots;
+	LocalVector<RTSurfaceData *> shared_surfaces;
+	uint32_t shared_count = 0;
+	uint32_t lod0_count = 0;
+	// The resolve's scratch, grow-only: each surface's first slot in the stand-in table (one slot
+	// per depth), the table, and per candidate what it traces and whether it builds.
+	AHashMap<RTSurfaceData *, uint32_t> stand_in_bases;
+	LocalVector<uint32_t> stand_ins;
+	LocalVector<uint32_t> targets;
+	LocalVector<uint8_t> builds;
 	// Per item, a static instance's slot or a deformed entry (D87), the other null.
 	LocalVector<RTLodInstanceEntry *> entries;
 	LocalVector<RTDeformedCacheEntry *> deformed_entries;
@@ -688,6 +730,11 @@ class RenderRaytracing {
 	uint32_t cluster_lod_clas_ceiling_clusters = 0; // RT_LOD_CLAS_REGION_CEILING in slots, less the region's alignment.
 	float cluster_lod_pixel_error = 1.0f;
 	uint32_t cluster_lod_max_instances = 0; // The selection dispatch's instance axis, the device's workgroup count limit.
+	// BLAS sharing (D89), rendering/pathtracing/cluster_lod_share with the selection: instances of
+	// one surface whose selection can be no finer than another's trace that one's build, or the
+	// surface's LOD 0 BLAS, when that adds no more than cluster_lod_share_tolerance levels of detail.
+	bool cluster_lod_share_enabled = false;
+	uint32_t cluster_lod_share_tolerance = 2;
 	struct LodSelectShader {
 		ClusterLodSelectShaderRD shader;
 		RID version;
@@ -957,6 +1004,18 @@ class RenderRaytracing {
 	void _release_lod_entry(RTLodInstanceEntry &p_entry);
 	bool _prepare_lod_entry(RTLodInstanceEntry &p_entry, RTSurfaceData *p_surf_data);
 	void _queue_lod_instance(RTLodInstanceEntry &p_entry, const Transform3D &p_transform, uint32_t p_slot);
+	// BLAS sharing (D89): the view the selection's metric reads, the depth range an instance's
+	// selection could fall in, and the resolve that queues each surface's builds before the flush.
+	struct LodView {
+		Vector3 camera;
+		float threshold = 0.0f;
+		float near_distance = 1e-3f;
+		bool orthogonal = false;
+	};
+	static LodView _lod_view(const RenderDataRD *p_render_data, const RTViewportState *p_state, float p_pixel_error);
+	static void _classify_lod_instance(const RTSurfaceData *p_surf_data, const Transform3D &p_transform, const LodView &p_view, uint32_t &r_level_min, uint32_t &r_level_max);
+	void _resolve_lod_candidates(const RenderDataRD *p_render_data, const RTViewportState *p_state);
+	bool _queue_lod_candidate(const RTLodSelectBatch::Candidate &p_candidate);
 	// The deformed entries on the selection (D87): the entry's region of the LOD table, made with
 	// its layout and released with its storage, and its record in the frame's batch.
 	bool _populate_deformed_cluster_lod(void *p_mesh_surface, const RTClusterLayout &p_layout, const LocalVector<uint8_t> &p_infos, uint32_t p_cache_key, RTDeformedCacheEntry &r_entry);

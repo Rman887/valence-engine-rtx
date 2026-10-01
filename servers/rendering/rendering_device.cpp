@@ -281,11 +281,12 @@ Error RenderingDevice::_acceleration_structure_scratch_buffer_create(Acceleratio
 void RenderingDevice::_blas_remove_tlas_dependencies(AccelerationStructure *p_blas, RID p_blas_id) {
 	for (RID id : p_blas->acceleration_structure_dependencies) {
 		AccelerationStructure *tlas = acceleration_structure_owner.get_or_null(id);
-		ERR_FAIL_NULL(tlas);
-		ERR_FAIL_COND(tlas->type != ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
+		ERR_CONTINUE(tlas == nullptr);
+		ERR_CONTINUE(tlas->type != ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
 
 		tlas->invalidated = true;
 		tlas->acceleration_structure_dependencies.erase(p_blas_id);
+		tlas->blas_read_trackers_dirty = true;
 	}
 
 	p_blas->acceleration_structure_dependencies.clear();
@@ -301,6 +302,41 @@ void RenderingDevice::_tlas_remove_blas_dependencies(AccelerationStructure *p_tl
 	}
 
 	p_tlas->acceleration_structure_dependencies.clear();
+	p_tlas->blas_read_trackers.clear();
+	p_tlas->blas_read_usages.clear();
+	p_tlas->blas_read_trackers_dirty = false;
+}
+
+void RenderingDevice::_tlas_set_blas_reads(AccelerationStructure *p_tlas, const LocalVector<RDG::ResourceTracker *> &p_trackers) {
+	p_tlas->blas_read_trackers = p_trackers;
+	_tlas_fill_blas_read_usages(p_tlas);
+}
+
+void RenderingDevice::_tlas_fill_blas_read_usages(AccelerationStructure *p_tlas) {
+	p_tlas->blas_read_usages.resize(p_tlas->blas_read_trackers.size());
+	for (RDG::ResourceUsage &usage : p_tlas->blas_read_usages) {
+		usage = RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ;
+	}
+	p_tlas->blas_read_trackers_dirty = false;
+}
+
+const RenderingDevice::AccelerationStructure *RenderingDevice::_tlas_update_blas_reads(RID p_acceleration_structure) {
+	AccelerationStructure *tlas = acceleration_structure_owner.get_or_null(p_acceleration_structure);
+	if (tlas == nullptr || tlas->type != ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL) {
+		return nullptr;
+	}
+	if (tlas->blas_read_trackers_dirty) {
+		// A BLAS was built, updated or freed since the TLAS build; a freed one's tracker is gone.
+		tlas->blas_read_trackers.clear();
+		for (RID id : tlas->acceleration_structure_dependencies) {
+			AccelerationStructure *blas = acceleration_structure_owner.get_or_null(id);
+			if (blas != nullptr && blas->draw_tracker != nullptr) {
+				tlas->blas_read_trackers.push_back(blas->draw_tracker);
+			}
+		}
+		_tlas_fill_blas_read_usages(tlas);
+	}
+	return tlas;
 }
 
 RID RenderingDevice::blas_create(Span<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags) {
@@ -640,6 +676,7 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 	memcpy(instance_buffer.data_ptr + instance_buffer_offset, shadow_buffer.ptr(), instance_size * p_instances.size());
 
 	draw_graph.add_tlas_build(tlas->driver_id, tlas->scratch_buffer, instance_buffer.driver_id, instance_buffer_offset, p_instances.size(), tlas->draw_tracker, draw_trackers);
+	_tlas_set_blas_reads(tlas, draw_trackers);
 
 	tlas->invalidated = false;
 
@@ -6430,6 +6467,12 @@ void RenderingDevice::draw_list_draw(DrawListID p_list, bool p_use_indices, uint
 				_uniform_set_update_clears(uniform_set);
 
 				draw_graph.add_draw_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
+				for (RID accel_id : uniform_set->acceleration_structures) {
+					const AccelerationStructure *tlas = _tlas_update_blas_reads(accel_id);
+					if (tlas != nullptr) {
+						draw_graph.add_draw_list_usages(tlas->blas_read_trackers, tlas->blas_read_usages);
+					}
+				}
 				draw_list.state.sets[i].bound = true;
 
 				last_set_index = i;
@@ -6570,6 +6613,12 @@ void RenderingDevice::draw_list_draw_indirect(DrawListID p_list, bool p_use_indi
 			_uniform_set_update_clears(uniform_set);
 
 			draw_graph.add_draw_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
+			for (RID accel_id : uniform_set->acceleration_structures) {
+				const AccelerationStructure *tlas = _tlas_update_blas_reads(accel_id);
+				if (tlas != nullptr) {
+					draw_graph.add_draw_list_usages(tlas->blas_read_trackers, tlas->blas_read_usages);
+				}
+			}
 
 			draw_list.state.sets[i].bound = true;
 		}
@@ -6958,6 +7007,12 @@ void RenderingDevice::raytracing_list_trace_rays(RaytracingListID p_list, uint32
 			_uniform_set_update_shared(uniform_set);
 
 			draw_graph.add_raytracing_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
+			for (RID accel_id : uniform_set->acceleration_structures) {
+				const AccelerationStructure *tlas = _tlas_update_blas_reads(accel_id);
+				if (tlas != nullptr) {
+					draw_graph.add_raytracing_list_usages(tlas->blas_read_trackers, tlas->blas_read_usages);
+				}
+			}
 
 			raytracing_list.state.sets[i].bound = true;
 		}
@@ -7272,6 +7327,12 @@ void RenderingDevice::compute_list_dispatch(ComputeListID p_list, uint32_t p_x_g
 			_uniform_set_update_clears(uniform_set);
 
 			draw_graph.add_compute_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
+			for (RID accel_id : uniform_set->acceleration_structures) {
+				const AccelerationStructure *tlas = _tlas_update_blas_reads(accel_id);
+				if (tlas != nullptr) {
+					draw_graph.add_compute_list_usages(tlas->blas_read_trackers, tlas->blas_read_usages);
+				}
+			}
 			compute_list.state.sets[i].bound = true;
 		}
 	}
@@ -7409,6 +7470,12 @@ void RenderingDevice::compute_list_dispatch_indirect(ComputeListID p_list, RID p
 			_uniform_set_update_clears(uniform_set);
 
 			draw_graph.add_compute_list_usages(uniform_set->draw_trackers, uniform_set->draw_trackers_usage);
+			for (RID accel_id : uniform_set->acceleration_structures) {
+				const AccelerationStructure *tlas = _tlas_update_blas_reads(accel_id);
+				if (tlas != nullptr) {
+					draw_graph.add_compute_list_usages(tlas->blas_read_trackers, tlas->blas_read_usages);
+				}
+			}
 			compute_list.state.sets[i].bound = true;
 		}
 	}

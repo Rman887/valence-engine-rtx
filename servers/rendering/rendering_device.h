@@ -1170,7 +1170,7 @@ private:
 		HashMap<RID, RDG::ResourceUsage> untracked_usage;
 		LocalVector<SharedTexture> shared_textures_to_update;
 		LocalVector<RID> pending_clear_textures;
-		Vector<RID> acceleration_structures; // Used for validation.
+		Vector<RID> acceleration_structures; // Used for validation and for the BLAS reads of a bound TLAS (_tlas_update_blas_reads).
 		InvalidationCallback invalidated_callback = nullptr;
 		void *invalidated_callback_userdata = nullptr;
 	};
@@ -1348,6 +1348,12 @@ private:
 
 		// --- Top Level ---
 		uint32_t max_instance_count = 0;
+		// The trackers of the BLASes the last build referenced, read by every list that binds
+		// this TLAS: a trace reads them through it, and a BLAS rebuilt in place next frame must wait
+		// for that read. Gathered again from acceleration_structure_dependencies when a BLAS leaves it.
+		LocalVector<RDG::ResourceTracker *> blas_read_trackers;
+		LocalVector<RDG::ResourceUsage> blas_read_usages;
+		bool blas_read_trackers_dirty = false;
 
 		struct InstanceBuffer {
 			RDD::BufferID driver_id;
@@ -1362,6 +1368,9 @@ private:
 	Error _acceleration_structure_scratch_buffer_create(AccelerationStructure *p_acceleration_structure);
 	void _blas_remove_tlas_dependencies(AccelerationStructure *p_blas, RID p_blas_id);
 	void _tlas_remove_blas_dependencies(AccelerationStructure *p_tlas, RID p_tlas_id);
+	void _tlas_set_blas_reads(AccelerationStructure *p_tlas, const LocalVector<RDG::ResourceTracker *> &p_trackers);
+	void _tlas_fill_blas_read_usages(AccelerationStructure *p_tlas);
+	const AccelerationStructure *_tlas_update_blas_reads(RID p_acceleration_structure);
 
 	RID_Owner<AccelerationStructure, true> acceleration_structure_owner;
 

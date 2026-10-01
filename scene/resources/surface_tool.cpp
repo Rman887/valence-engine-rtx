@@ -137,10 +137,32 @@ uint32_t SurfaceTool::VertexHasher::hash(const Vertex &p_vtx) {
 	uint32_t h = hash_djb2_buffer((const uint8_t *)p_vtx.bones.ptr(), p_vtx.bones.size() * sizeof(int));
 	h = hash_djb2_buffer((const uint8_t *)p_vtx.weights.ptr(), p_vtx.weights.size() * sizeof(float), h);
 
-	const int64_t length = (int64_t)&p_vtx.vertex - (int64_t)&p_vtx.smooth_group + sizeof(p_vtx.vertex);
-	const void *key = &p_vtx.smooth_group;
-	h = hash_murmur3_buffer(key, length, h);
-	return h;
+	// Hash field by field, not over the struct's bytes: with real_t as double there is
+	// padding between `color` and `normal` whose bytes are indeterminate, and -0.0 and 0.0
+	// compare equal but differ in bits. Either way, equal vertices would hash differently.
+	h = hash_murmur3_one_32(p_vtx.smooth_group, h);
+	h = hash_murmur3_one_float(p_vtx.color.r, h);
+	h = hash_murmur3_one_float(p_vtx.color.g, h);
+	h = hash_murmur3_one_float(p_vtx.color.b, h);
+	h = hash_murmur3_one_float(p_vtx.color.a, h);
+	for (int i = 0; i < 3; i++) {
+		h = hash_murmur3_one_real(p_vtx.normal[i], h);
+		h = hash_murmur3_one_real(p_vtx.vertex[i], h);
+	}
+	for (int i = 0; i < 4; i++) {
+		h = hash_murmur3_one_real(p_vtx.tangent[i], h);
+	}
+	for (int i = 0; i < 2; i++) {
+		h = hash_murmur3_one_real(p_vtx.uv[i], h);
+		h = hash_murmur3_one_real(p_vtx.uv2[i], h);
+	}
+	for (int i = 0; i < RSE::ARRAY_CUSTOM_COUNT; i++) {
+		h = hash_murmur3_one_float(p_vtx.custom[i].r, h);
+		h = hash_murmur3_one_float(p_vtx.custom[i].g, h);
+		h = hash_murmur3_one_float(p_vtx.custom[i].b, h);
+		h = hash_murmur3_one_float(p_vtx.custom[i].a, h);
+	}
+	return hash_fmix32(h);
 }
 
 bool SurfaceTool::SmoothGroupVertex::operator==(const SmoothGroupVertex &p_vertex) const {

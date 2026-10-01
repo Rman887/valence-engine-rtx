@@ -271,6 +271,20 @@ struct RTProceduralState {
 	uint32_t aabb_count = 0;
 };
 
+// The selection's spatial hierarchy over a hierarchy's groups (D91), in its region of the LOD table:
+// a tree of bounding spheres per depth under one root, each node enclosing its children's spheres
+// and carrying their largest error, so a node whose test fails has no group under it that passes.
+// Nodes are eight words (center, radius, error, first child, child count with bit 31 set when the
+// children are groups, a reserved word) in breadth-first order, the root first, a node's children
+// contiguous; a group child is reached through the refs, one word per group. The node count of each
+// breadth-first level sizes the frame's queues.
+struct RTLodTree {
+	uint32_t nodes_offset = UINT32_MAX; // Words into the table; UINT32_MAX without a tree.
+	uint32_t refs_offset = 0; // Words into the table.
+	uint32_t group_count = 0; // The group queue's share of an item.
+	LocalVector<uint32_t> level_nodes; // Nodes per breadth-first level, the root's level first.
+};
+
 // One depth of a cluster LOD hierarchy as the instance classification reads it (D89): over the
 // depth's groups, a sphere around them all (its center, the radius enclosing every group's
 // sphere, the farthest group center), the smallest group radius and the largest and smallest
@@ -336,6 +350,7 @@ struct RTSurfaceData {
 	uint32_t cluster_lod_generation = 0; // Unique per population; an instance's slot follows it.
 	LocalVector<RTLodLevelBound> cluster_lod_levels; // Per depth, the classification's bounds (D89); empty, never shared.
 	LocalVector<RTLodCachedLevel> cluster_lod_cache; // Per depth, its cached level if any (D90); empty until one is.
+	RTLodTree cluster_lod_tree; // The traversal's tree over the groups (D91), in the same region.
 };
 
 // An instance's cluster BLAS over the clusters the LOD selection picks for it (D86): its own
@@ -439,6 +454,14 @@ struct RTLodSelectBatch {
 	LocalVector<uint64_t> blas_addresses;
 	uint32_t cluster_total = 0;
 	uint32_t max_clusters = 0;
+	// The traversal (D91): the items that walk their tree rather than test every cluster, the
+	// largest cluster count of the others (the exhaustive dispatch's width), and the frame's queue
+	// capacity per breadth-first level, the sum of the tree items' node counts there.
+	uint32_t tree_count = 0;
+	uint32_t flat_max_clusters = 0;
+	LocalVector<uint32_t> tree_level_capacity;
+	uint32_t tree_group_capacity = 0; // The tree items' groups, the group queue's capacity.
+	RID dispatch_buffer; // The cluster pass's indirect arguments, which the leaves write.
 	LocalVector<RID> storage_buffers; // The arena chunks the slots live in, each once, and each deformed entry's storage.
 	LocalVector<RID> source_buffers; // The buffers the surfaces' CLAS live in, each once.
 	LocalVector<RID> blas_handles;
@@ -579,6 +602,7 @@ struct RTDeformedCacheEntry {
 	uint32_t cluster_lod_table_offset = UINT32_MAX; // Words; UINT32_MAX without a hierarchy.
 	uint32_t cluster_lod_table_words = 0;
 	uint32_t cluster_lod_infos_offset = 0; // Words, into the table.
+	RTLodTree cluster_lod_tree; // The traversal's tree over the groups (D91), in the same region.
 	uint32_t cluster_lod_count = 0; // Clusters over every level.
 	uint32_t cluster_lod_total_triangles = 0;
 	uint32_t cluster_lod_total_vertices = 0;
@@ -792,6 +816,13 @@ class RenderRaytracing {
 	uint32_t cluster_lod_cache_live = 0;
 	uint64_t cluster_lod_cache_bytes = 0;
 	uint64_t cluster_lod_cache_builds_total = 0;
+	// The traversal (D91), rendering/pathtracing/cluster_lod_traversal with the selection; a verbose
+	// run checks it against the exhaustive test of the same frame, these its tallies.
+	bool cluster_lod_traversal_enabled = false;
+	uint64_t lod_tree_checks = 0;
+	uint64_t lod_tree_mismatches = 0;
+	uint64_t lod_select_timer_frame = 0; // The captured frame last read for the selection's timing.
+	LocalVector<float> lod_select_gpu_us; // The GPU span bracketing the selection per frame on a verbose run.
 	struct LodSelectShader {
 		ClusterLodSelectShaderRD shader;
 		RID version;
@@ -1082,12 +1113,15 @@ class RenderRaytracing {
 	void _release_lod_cached_levels(RTSurfaceData *p_surf_data);
 	static void _on_lod_cache_counts_read(const PackedByteArray &p_counts, uint32_t p_stride, const PackedInt32Array &p_expected);
 	static void _on_lod_cache_overflow_read(const PackedByteArray &p_count);
+	static void _on_lod_tree_check_read(const PackedByteArray &p_bytes, uint32_t p_entry_count, uint32_t p_blas_infos_offset, uint32_t p_stride, uint32_t p_instances_offset, uint32_t p_check_offset);
 	// The deformed entries on the selection (D87): the entry's region of the LOD table, made with
 	// its layout and released with its storage, and its record in the frame's batch.
 	bool _populate_deformed_cluster_lod(void *p_mesh_surface, const RTClusterLayout &p_layout, const LocalVector<uint8_t> &p_infos, uint32_t p_cache_key, RTDeformedCacheEntry &r_entry);
 	void _release_deformed_cluster_lod(RTDeformedCacheEntry &p_entry);
 	void _queue_lod_deformed_instance(RTDeformedCacheEntry &p_entry, const Transform3D &p_transform, uint32_t p_slot);
 	uint32_t *_lod_instance_record(const Transform3D &p_transform, uint32_t p_cluster_count, uint32_t p_table_offset);
+	void _lod_record_tree(const Transform3D &p_transform, const RTLodTree &p_tree);
+	static bool _build_cluster_lod_tree(const uint32_t *p_cluster_words, uint32_t p_cluster_count, const uint32_t *p_group_words, uint32_t p_group_count, LocalVector<uint32_t> &r_words, LocalVector<uint32_t> &r_level_nodes, uint32_t &r_node_count);
 	bool _record_lod_batch(const RenderDataRD *p_render_data, const RTViewportState *p_state);
 	void _flush_lod_batch(const RenderDataRD *p_render_data, const RTViewportState *p_state);
 	static void _on_lod_counts_read(const PackedByteArray &p_counts, uint64_t p_ticket, uint32_t p_entry_count, uint32_t p_stride);

@@ -27,6 +27,20 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // that depth for any instance. The CPU counts the same clusters to size its slot and puts the
 // count in the record's word 18; the shader takes no more, so the two rules must stay one.
 //
+// The traversal (D91): an item flagged INSTANCE_FLAG_TREE is not tested cluster by cluster but
+// walks its hierarchy's tree of spheres (words 20 and 21 of its record are the tree's nodes and
+// refs in TableBuf, word 22 the basis's Frobenius norm), one dispatch per breadth-first level with
+// FLAG_NODES set: each item of the level's queue is a node, half a workgroup tests its children (at
+// most 32), passing child nodes go to the next level's queue and passing groups to the group queue,
+// whose workgroup count DispatchBuf counts; then one indirect dispatch with FLAG_CLUSTERS gives each
+// queued group half a workgroup, a lane per cluster, testing it against the group it refines. The
+// group and the cluster tests are the exhaustive test's rule on the same words, so the selection is
+// the same; a lane per cluster rather than a loop per group keeps each thread's chain of dependent
+// loads and returning atomics short. A node's sphere encloses its children's and its error is
+// their largest, and its test takes the Frobenius norm for the scale and a slack for the float
+// arithmetic, so it passes whenever any child's does. With FLAG_CHECK the exhaustive test runs
+// over the tree items and only counts, for a verbose run's comparison.
+//
 // FrameBuf is the frame's argument buffer: the build infos (count, stride, address; count is the
 // atomic), then per instance INSTANCE_WORDS words (the object-to-trace transform as three rows of
 // four, the uniform scale, the cluster count, the surface's word offset in TableBuf, the reference
@@ -37,7 +51,8 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // the group it refines (-1 at LOD 0), then per group eight words (center, radius, error, depth,
 // first cluster, cluster count), then, for a deformed hierarchy, per cluster its build info.
 
-layout(set = 0, binding = 0) restrict buffer FrameBuf {
+// FrameBuf and DispatchBuf are not restrict: the cluster pass binds the frame's arguments to both.
+layout(set = 0, binding = 0) buffer FrameBuf {
 	uint v[];
 }
 frame;
@@ -45,6 +60,12 @@ layout(set = 0, binding = 1) restrict readonly buffer TableBuf {
 	uint v[];
 }
 table;
+// The cluster pass's indirect arguments (x, y, z), which the leaves' appends size; the cluster pass
+// itself, which reads them as its dispatch, has the frame's arguments bound here instead.
+layout(set = 0, binding = 2) buffer DispatchBuf {
+	uint v[];
+}
+dispatch;
 
 layout(push_constant, std430) uniform PC {
 	vec4 camera_threshold; // xyz: the camera in trace space; w: the error-over-distance threshold.
@@ -59,33 +80,106 @@ layout(push_constant, std430) uniform PC {
 	uint clas_infos_offset; // Words into FrameBuf: the CLAS build infos.
 	uint clas_info_words; // The driver's build info, in words.
 	uint clas_slot_size; // Bytes between destinations.
+	uint queue_in; // Words into FrameBuf: the level's queue (entry, node), with FLAG_NODES.
+	uint queue_out; // Words into FrameBuf: the next level's queue.
+	uint count_in; // Word of FrameBuf: the level's queue length.
+	uint count_out; // Word of FrameBuf: the next level's queue length, an atomic.
+	uint check_offset; // Words into FrameBuf: per item, the count FLAG_CHECK makes.
+	uint group_queue; // Words into FrameBuf: the group queue (entry, group record).
+	uint group_count; // Word of FrameBuf: the group queue's length, an atomic.
+	uint entry_first; // The exhaustive test's first item; its dispatch covers its range along y.
 	uint pad0;
 }
 pc;
 
 #define FLAG_ORTHOGONAL 1u
+#define FLAG_CHECK 2u
+#define FLAG_NODES 4u
+#define FLAG_CLUSTERS 8u
 #define INSTANCE_WORDS 24u
 #define INSTANCE_FLAG_DEFORMED 1u
 #define INSTANCE_FLAG_LEVEL 2u
+#define INSTANCE_FLAG_TREE 4u
 #define GROUP_WORDS 8u
+#define NODE_WORDS 8u
 
 // The group's sphere in trace space against the camera: its simplification shows when
 // error * scale / max(near, distance - radius * scale) >= threshold, written without the division
 // (the distance is positive). A terminal group's error is FLT_MAX, so it always shows.
+// The test is precise (D91): it is inlined into the exhaustive test, the traversal's leaves and its
+// cluster pass, and the traversal selects what the exhaustive test does only if every copy rounds
+// the same way, which contraction into fused operations could break.
 bool group_error_visible(uint p_group, vec4 p_row0, vec4 p_row1, vec4 p_row2, float p_scale) {
 	vec4 center = vec4(uintBitsToFloat(table.v[p_group + 0u]), uintBitsToFloat(table.v[p_group + 1u]), uintBitsToFloat(table.v[p_group + 2u]), 1.0);
 	float radius = uintBitsToFloat(table.v[p_group + 3u]);
 	float error = uintBitsToFloat(table.v[p_group + 4u]);
+	precise float distance = 1.0;
+	if ((pc.flags & FLAG_ORTHOGONAL) == 0u) {
+		precise vec3 world = vec3(dot(p_row0, center), dot(p_row1, center), dot(p_row2, center));
+		distance = max(pc.near_distance, length(world - pc.camera_threshold.xyz) - radius * p_scale);
+	}
+	precise float shown = error * p_scale;
+	precise float limit = pc.camera_threshold.w * distance;
+	return shown >= limit;
+}
+
+// A tree node against the camera (D91): the group test with the node's sphere and error, the
+// sphere scaled by the basis's Frobenius norm (a bound on how far the transform moves any point of
+// it, under shear too) and its distance lowered by a slack over every magnitude the arithmetic
+// meets, so it passes whenever a child's test does.
+bool node_error_visible(uint p_node, vec4 p_row0, vec4 p_row1, vec4 p_row2, float p_scale, float p_stretch) {
+	vec3 center = vec3(uintBitsToFloat(table.v[p_node + 0u]), uintBitsToFloat(table.v[p_node + 1u]), uintBitsToFloat(table.v[p_node + 2u]));
+	float radius = uintBitsToFloat(table.v[p_node + 3u]);
+	float error = uintBitsToFloat(table.v[p_node + 4u]);
 	float distance = 1.0;
 	if ((pc.flags & FLAG_ORTHOGONAL) == 0u) {
-		vec3 world = vec3(dot(p_row0, center), dot(p_row1, center), dot(p_row2, center));
-		distance = max(pc.near_distance, length(world - pc.camera_threshold.xyz) - radius * p_scale);
+		vec4 point = vec4(center, 1.0);
+		vec3 world = vec3(dot(p_row0, point), dot(p_row1, point), dot(p_row2, point));
+		vec3 origin = vec3(p_row0.w, p_row1.w, p_row2.w);
+		float magnitude = p_stretch * (length(center) + radius) + length(origin) + length(pc.camera_threshold.xyz);
+		distance = max(pc.near_distance, length(world - pc.camera_threshold.xyz) - radius * p_stretch - magnitude * (1.0 / 65536.0));
 	}
 	return error * p_scale >= pc.camera_threshold.w * distance;
 }
 
-void main() {
-	uint entry = gl_GlobalInvocationID.y;
+// Appends a selected cluster to its item's list: its CLAS address, or for a deformed item the
+// destination its build gets and the build info it is made from.
+void select_cluster(uint p_entry, uint p_inst, uint p_cluster, uint p_table_offset, uint p_list_offset, uint p_instance_flags) {
+	uint slot = atomicAdd(frame.v[pc.blas_infos_offset + p_entry * pc.blas_info_stride], 1u);
+	if ((p_instance_flags & INSTANCE_FLAG_LEVEL) != 0u && slot >= frame.v[p_inst + 18u]) {
+		// Past the slot's count: taken back so the build stays in its slot, and counted.
+		atomicAdd(frame.v[pc.blas_infos_offset + p_entry * pc.blas_info_stride], 0xFFFFFFFFu);
+		atomicAdd(frame.v[pc.clas_count_offset + 1u], 1u);
+		return;
+	}
+	if ((p_instance_flags & INSTANCE_FLAG_DEFORMED) == 0u) {
+		frame.v[p_list_offset + slot * 2u] = table.v[p_table_offset + p_cluster * 2u];
+		frame.v[p_list_offset + slot * 2u + 1u] = table.v[p_table_offset + p_cluster * 2u + 1u];
+		return;
+	}
+	// The CLAS the build makes for this cluster: the slot's address in the instance's range (a
+	// 64-bit add as lo with carry, the range being under 4 GB), for the BLAS's list and the
+	// build's destination; the build info copied from the table to the build's next index.
+	uint infos_offset = frame.v[p_inst + 17u];
+	uint carry = 0u;
+	uint dst_lo = uaddCarry(frame.v[p_inst + 18u], slot * pc.clas_slot_size, carry);
+	uint dst_hi = frame.v[p_inst + 19u] + carry;
+	frame.v[p_list_offset + slot * 2u] = dst_lo;
+	frame.v[p_list_offset + slot * 2u + 1u] = dst_hi;
+	uint k = atomicAdd(frame.v[pc.clas_count_offset], 1u);
+	frame.v[pc.clas_dst_offset + k * 2u] = dst_lo;
+	frame.v[pc.clas_dst_offset + k * 2u + 1u] = dst_hi;
+	uint src = infos_offset + p_cluster * pc.clas_info_words;
+	uint dst = pc.clas_infos_offset + k * pc.clas_info_words;
+	for (uint w = 0u; w < pc.clas_info_words; w++) {
+		frame.v[dst + w] = table.v[src + w];
+	}
+}
+
+// The exhaustive test: one thread per cluster of one item, the items along y. Tree items are
+// skipped, or with FLAG_CHECK are the only ones tested and are counted, not appended.
+void exhaustive_main() {
+	uint entry = pc.entry_first + gl_GlobalInvocationID.y;
 	uint cluster = gl_GlobalInvocationID.x;
 	if (entry >= pc.entry_count) {
 		return;
@@ -95,13 +189,17 @@ void main() {
 	if (cluster >= cluster_count) {
 		return;
 	}
+	uint instance_flags = frame.v[inst + 16u];
+	bool check = (pc.flags & FLAG_CHECK) != 0u;
+	if (((instance_flags & INSTANCE_FLAG_TREE) != 0u) != check) {
+		return;
+	}
 	vec4 row0 = vec4(uintBitsToFloat(frame.v[inst + 0u]), uintBitsToFloat(frame.v[inst + 1u]), uintBitsToFloat(frame.v[inst + 2u]), uintBitsToFloat(frame.v[inst + 3u]));
 	vec4 row1 = vec4(uintBitsToFloat(frame.v[inst + 4u]), uintBitsToFloat(frame.v[inst + 5u]), uintBitsToFloat(frame.v[inst + 6u]), uintBitsToFloat(frame.v[inst + 7u]));
 	vec4 row2 = vec4(uintBitsToFloat(frame.v[inst + 8u]), uintBitsToFloat(frame.v[inst + 9u]), uintBitsToFloat(frame.v[inst + 10u]), uintBitsToFloat(frame.v[inst + 11u]));
 	float scale = uintBitsToFloat(frame.v[inst + 12u]);
 	uint table_offset = frame.v[inst + 14u];
 	uint list_offset = frame.v[inst + 15u];
-	uint instance_flags = frame.v[inst + 16u];
 
 	uint record = table_offset + cluster_count * 2u + cluster * 2u;
 	uint group = table.v[record];
@@ -126,33 +224,129 @@ void main() {
 	if (!selected) {
 		return;
 	}
-	uint slot = atomicAdd(frame.v[pc.blas_infos_offset + entry * pc.blas_info_stride], 1u);
-	if ((instance_flags & INSTANCE_FLAG_LEVEL) != 0u && slot >= frame.v[inst + 18u]) {
-		// Past the slot's count: taken back so the build stays in its slot, and counted.
-		atomicAdd(frame.v[pc.blas_infos_offset + entry * pc.blas_info_stride], 0xFFFFFFFFu);
-		atomicAdd(frame.v[pc.clas_count_offset + 1u], 1u);
+	if (check) {
+		atomicAdd(frame.v[pc.check_offset + entry], 1u);
 		return;
 	}
-	if ((instance_flags & INSTANCE_FLAG_DEFORMED) == 0u) {
-		frame.v[list_offset + slot * 2u] = table.v[table_offset + cluster * 2u];
-		frame.v[list_offset + slot * 2u + 1u] = table.v[table_offset + cluster * 2u + 1u];
+	select_cluster(entry, inst, cluster, table_offset, list_offset, instance_flags);
+}
+
+// The workgroup's appends to the two queues (D91), gathered so each queue takes one global atomic
+// per workgroup rather than one per passing child: thousands of items append to the same two
+// counters, and same-address atomics serialize.
+shared uint shared_nodes;
+shared uint shared_groups;
+shared uint shared_node_base;
+shared uint shared_group_base;
+
+// One breadth-first level of the traversal (D91): two queue items per workgroup, one lane per child.
+// Every invocation reaches the barriers, so nothing returns before the appends.
+void traversal_main() {
+	uint item = gl_WorkGroupID.x * 2u + (gl_LocalInvocationID.x >> 5u);
+	uint lane = gl_LocalInvocationID.x & 31u;
+	if (gl_LocalInvocationIndex == 0u) {
+		shared_nodes = 0u;
+		shared_groups = 0u;
+	}
+	barrier();
+
+	bool append_node = false;
+	bool append_group = false;
+	uint entry = 0u;
+	uint value = 0u; // The child node, or the passing group's record.
+	if (item < frame.v[pc.count_in]) {
+		entry = frame.v[pc.queue_in + item * 2u];
+		uint node = frame.v[pc.queue_in + item * 2u + 1u];
+		uint inst = pc.instances_offset + entry * INSTANCE_WORDS;
+		uint nodes = frame.v[inst + 20u];
+		uint node_record = nodes + node * NODE_WORDS;
+		uint packed = table.v[node_record + 6u];
+		if (lane < (packed & 0x7FFFFFFFu)) {
+			vec4 row0 = vec4(uintBitsToFloat(frame.v[inst + 0u]), uintBitsToFloat(frame.v[inst + 1u]), uintBitsToFloat(frame.v[inst + 2u]), uintBitsToFloat(frame.v[inst + 3u]));
+			vec4 row1 = vec4(uintBitsToFloat(frame.v[inst + 4u]), uintBitsToFloat(frame.v[inst + 5u]), uintBitsToFloat(frame.v[inst + 6u]), uintBitsToFloat(frame.v[inst + 7u]));
+			vec4 row2 = vec4(uintBitsToFloat(frame.v[inst + 8u]), uintBitsToFloat(frame.v[inst + 9u]), uintBitsToFloat(frame.v[inst + 10u]), uintBitsToFloat(frame.v[inst + 11u]));
+			float scale = uintBitsToFloat(frame.v[inst + 12u]);
+			uint child = table.v[node_record + 5u] + lane;
+			if ((packed & 0x80000000u) == 0u) {
+				append_node = node_error_visible(nodes + child * NODE_WORDS, row0, row1, row2, scale, uintBitsToFloat(frame.v[inst + 22u]));
+				value = child;
+			} else {
+				uint groups = frame.v[inst + 14u] + frame.v[inst + 13u] * 4u;
+				value = groups + table.v[frame.v[inst + 21u] + child] * GROUP_WORDS;
+				append_group = group_error_visible(value, row0, row1, row2, scale);
+			}
+		}
+	}
+	uint local = 0u;
+	if (append_node) {
+		local = atomicAdd(shared_nodes, 1u);
+	} else if (append_group) {
+		local = atomicAdd(shared_groups, 1u);
+	}
+	barrier();
+	if (gl_LocalInvocationIndex == 0u) {
+		if (shared_nodes > 0u) {
+			shared_node_base = atomicAdd(frame.v[pc.count_out], shared_nodes);
+		}
+		if (shared_groups > 0u) {
+			shared_group_base = atomicAdd(frame.v[pc.group_count], shared_groups);
+			atomicMax(dispatch.v[0], (shared_group_base + shared_groups + 1u) / 2u);
+		}
+	}
+	barrier();
+	if (append_node) {
+		uint k = shared_node_base + local;
+		frame.v[pc.queue_out + k * 2u] = entry;
+		frame.v[pc.queue_out + k * 2u + 1u] = value;
+	} else if (append_group) {
+		uint k = shared_group_base + local;
+		frame.v[pc.group_queue + k * 2u] = entry;
+		frame.v[pc.group_queue + k * 2u + 1u] = value;
+	}
+}
+
+// The traversal's clusters (D91): two queued groups per workgroup, a lane per cluster of the group's
+// contiguous run (checked at population), each tested against the group it refines.
+void cluster_main() {
+	uint item = gl_WorkGroupID.x * 2u + (gl_LocalInvocationID.x >> 5u);
+	uint lane = gl_LocalInvocationID.x & 31u;
+	if (item >= frame.v[pc.group_count]) {
 		return;
 	}
-	// The CLAS the build makes for this cluster: the slot's address in the instance's range (a
-	// 64-bit add as lo with carry, the range being under 4 GB), for the BLAS's list and the
-	// build's destination; the build info copied from the table to the build's next index.
-	uint infos_offset = frame.v[inst + 17u];
-	uint carry = 0u;
-	uint dst_lo = uaddCarry(frame.v[inst + 18u], slot * pc.clas_slot_size, carry);
-	uint dst_hi = frame.v[inst + 19u] + carry;
-	frame.v[list_offset + slot * 2u] = dst_lo;
-	frame.v[list_offset + slot * 2u + 1u] = dst_hi;
-	uint k = atomicAdd(frame.v[pc.clas_count_offset], 1u);
-	frame.v[pc.clas_dst_offset + k * 2u] = dst_lo;
-	frame.v[pc.clas_dst_offset + k * 2u + 1u] = dst_hi;
-	uint src = infos_offset + cluster * pc.clas_info_words;
-	uint dst = pc.clas_infos_offset + k * pc.clas_info_words;
-	for (uint w = 0u; w < pc.clas_info_words; w++) {
-		frame.v[dst + w] = table.v[src + w];
+	uint entry = frame.v[pc.group_queue + item * 2u];
+	uint group_record = frame.v[pc.group_queue + item * 2u + 1u];
+	uint first = table.v[group_record + 6u];
+	uint count = table.v[group_record + 7u];
+	if (lane >= count) {
+		return;
+	}
+	uint inst = pc.instances_offset + entry * INSTANCE_WORDS;
+	vec4 row0 = vec4(uintBitsToFloat(frame.v[inst + 0u]), uintBitsToFloat(frame.v[inst + 1u]), uintBitsToFloat(frame.v[inst + 2u]), uintBitsToFloat(frame.v[inst + 3u]));
+	vec4 row1 = vec4(uintBitsToFloat(frame.v[inst + 4u]), uintBitsToFloat(frame.v[inst + 5u]), uintBitsToFloat(frame.v[inst + 6u]), uintBitsToFloat(frame.v[inst + 7u]));
+	vec4 row2 = vec4(uintBitsToFloat(frame.v[inst + 8u]), uintBitsToFloat(frame.v[inst + 9u]), uintBitsToFloat(frame.v[inst + 10u]), uintBitsToFloat(frame.v[inst + 11u]));
+	float scale = uintBitsToFloat(frame.v[inst + 12u]);
+	uint cluster_count = frame.v[inst + 13u];
+	uint table_offset = frame.v[inst + 14u];
+	uint list_offset = frame.v[inst + 15u];
+	uint instance_flags = frame.v[inst + 16u];
+	uint groups = table_offset + cluster_count * 4u;
+	// A group of more than 32 clusters takes a lane's further clusters in strides of 32.
+	for (uint i = lane; i < count; i += 32u) {
+		uint cluster = first + i;
+		int refined = int(table.v[table_offset + cluster_count * 2u + cluster * 2u + 1u]);
+		if (refined >= 0 && group_error_visible(groups + uint(refined) * GROUP_WORDS, row0, row1, row2, scale)) {
+			continue;
+		}
+		select_cluster(entry, inst, cluster, table_offset, list_offset, instance_flags);
+	}
+}
+
+void main() {
+	if ((pc.flags & FLAG_CLUSTERS) != 0u) {
+		cluster_main();
+	} else if ((pc.flags & FLAG_NODES) != 0u) {
+		traversal_main();
+	} else {
+		exhaustive_main();
 	}
 }

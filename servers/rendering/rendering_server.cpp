@@ -4150,6 +4150,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_share", true);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/cluster_lod_share_tolerance", PROPERTY_HINT_RANGE, "0,16,1"), 2);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_cache", true);
+	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_traversal", true);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_deformed", true);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/cluster_lod_pixel_error", PROPERTY_HINT_RANGE, "0,16,0.05"), 1.0);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/deformed_mesh_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 60);

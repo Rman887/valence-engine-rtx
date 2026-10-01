@@ -80,6 +80,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		cluster_lod_share_enabled = cluster_lod_select_enabled && GLOBAL_GET("rendering/pathtracing/cluster_lod_share");
 		cluster_lod_share_tolerance = uint32_t(CLAMP(int(GLOBAL_GET("rendering/pathtracing/cluster_lod_share_tolerance")), 0, 16));
 		cluster_lod_cache_enabled = cluster_lod_share_enabled && GLOBAL_GET("rendering/pathtracing/cluster_lod_cache");
+		cluster_lod_traversal_enabled = cluster_lod_select_enabled && GLOBAL_GET("rendering/pathtracing/cluster_lod_traversal");
 		cluster_lod_max_instances = uint32_t(MIN(RD::get_singleton()->limit_get(RD::LIMIT_MAX_COMPUTE_WORKGROUP_COUNT_Y), uint64_t(UINT32_MAX)));
 		const RD::ClusterAccelerationStructureCapabilities &caps = RD::get_singleton()->get_cluster_acceleration_structure_capabilities();
 		// The deformed selection (D87) builds each selected CLAS into its own slot: the worst case
@@ -109,7 +110,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 			}
 		}
 		// One line on the console (the setting is off by default): the harness reads it as proof the path is active.
-		print_line(vformat("RT: static BLAS built from clusters of up to %d triangles and %d vertices (D79), compaction %s, deformed meshes %s, cluster LOD selection %s, deformed selection %s.", caps.max_triangles_per_cluster, caps.max_vertices_per_cluster, cluster_compaction_enabled ? "on" : "off", cluster_deformed_enabled ? "rebuilt from clusters (D82)" : "refit as triangle BLAS", cluster_lod_select_enabled ? vformat("on at %.2f px (D86), BLAS sharing %s", cluster_lod_pixel_error, cluster_lod_share_enabled ? vformat("on within %d levels (D89), cached levels %s (D90)", cluster_lod_share_tolerance, cluster_lod_cache_enabled ? "on" : "off") : String("off (D89)")) : "off", cluster_lod_deformed_enabled ? vformat("on, %d byte slots (D87)", cluster_lod_clas_slot_size) : "off"));
+		print_line(vformat("RT: static BLAS built from clusters of up to %d triangles and %d vertices (D79), compaction %s, deformed meshes %s, cluster LOD selection %s, deformed selection %s.", caps.max_triangles_per_cluster, caps.max_vertices_per_cluster, cluster_compaction_enabled ? "on" : "off", cluster_deformed_enabled ? "rebuilt from clusters (D82)" : "refit as triangle BLAS", cluster_lod_select_enabled ? vformat("on at %.2f px (D86), traversal %s (D91), BLAS sharing %s", cluster_lod_pixel_error, cluster_lod_traversal_enabled ? "on" : "off", cluster_lod_share_enabled ? vformat("on within %d levels (D89), cached levels %s (D90)", cluster_lod_share_tolerance, cluster_lod_cache_enabled ? "on" : "off") : String("off (D89)")) : "off", cluster_lod_deformed_enabled ? vformat("on, %d byte slots (D87)", cluster_lod_clas_slot_size) : "off"));
 	} else if (GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
 		WARN_PRINT("rendering/pathtracing/cluster_blas is on but the device has no VK_NV_cluster_acceleration_structure; static BLAS stay triangle BLAS.");
 	}
@@ -550,6 +551,10 @@ void RenderRaytracing::cleanup_caches() {
 		}
 		// The cached levels (D90) went with their surfaces' release above.
 		DEV_ASSERT(cluster_lod_cached_surfaces.is_empty());
+	}
+	if (lod_batch.dispatch_buffer.is_valid()) {
+		rd->free_rid(lod_batch.dispatch_buffer);
+		lod_batch.dispatch_buffer = RID();
 	}
 	if (lod_batch.args_buffer.is_valid()) {
 		rd->free_rid(lod_batch.args_buffer);
@@ -1906,7 +1911,15 @@ bool RenderRaytracing::_populate_deformed_cluster_lod(void *p_mesh_surface, cons
 		}
 	}
 	const uint32_t GROUP_WORDS = RenderingServerTypes::MESH_CLUSTER_LOD_GROUP_WORDS;
-	const uint64_t words64 = uint64_t(cluster_count) * 4 + uint64_t(group_count) * GROUP_WORDS + uint64_t(cluster_count) * info_words;
+	// The traversal's tree (D91), after the build infos; without one the selection tests every cluster.
+	LocalVector<uint32_t> tree_words;
+	LocalVector<uint32_t> tree_levels;
+	uint32_t tree_nodes = 0;
+	if (cluster_lod_traversal_enabled && !_build_cluster_lod_tree(cluster_words, cluster_count, group_words, group_count, tree_words, tree_levels, tree_nodes)) {
+		tree_words.clear();
+		WARN_PRINT_ONCE(vformat("RT: deformed cluster BLAS [%d]: the hierarchy's groups do not own contiguous runs of its clusters; its selection tests every cluster.", p_cache_key));
+	}
+	const uint64_t words64 = uint64_t(cluster_count) * 4 + uint64_t(group_count) * GROUP_WORDS + uint64_t(cluster_count) * info_words + tree_words.size();
 	ERR_FAIL_COND_V_MSG(words64 > UINT32_MAX / 4, false, "RT: a deformed cluster LOD hierarchy's region exceeds the table's reach.");
 	const uint32_t words = uint32_t(words64);
 	uint32_t offset = 0;
@@ -1938,6 +1951,14 @@ bool RenderRaytracing::_populate_deformed_cluster_lod(void *p_mesh_surface, cons
 	}
 	const uint32_t infos_offset = cluster_count * 4 + group_count * GROUP_WORDS;
 	memcpy(host.ptr() + infos_offset, p_infos.ptr(), p_infos.size());
+	const uint32_t tree_offset = infos_offset + cluster_count * info_words;
+	if (!tree_words.is_empty()) {
+		memcpy(host.ptr() + tree_offset, tree_words.ptr(), tree_words.size() * sizeof(uint32_t));
+		r_entry.cluster_lod_tree.nodes_offset = offset + tree_offset;
+		r_entry.cluster_lod_tree.refs_offset = offset + tree_offset + tree_nodes * 8;
+		r_entry.cluster_lod_tree.group_count = group_count;
+		r_entry.cluster_lod_tree.level_nodes = tree_levels;
+	}
 	rd->buffer_update(cluster_lod_table, offset * sizeof(uint32_t), uint32_t(words * sizeof(uint32_t)), host.ptr());
 	r_entry.cluster_lod_table_offset = offset;
 	r_entry.cluster_lod_table_words = words;
@@ -1959,6 +1980,7 @@ void RenderRaytracing::_release_deformed_cluster_lod(RTDeformedCacheEntry &p_ent
 	p_entry.cluster_lod_table_offset = UINT32_MAX;
 	p_entry.cluster_lod_table_words = 0;
 	p_entry.cluster_lod_infos_offset = 0;
+	p_entry.cluster_lod_tree = RTLodTree();
 	p_entry.cluster_lod_count = 0;
 	p_entry.cluster_lod_total_triangles = 0;
 	p_entry.cluster_lod_total_vertices = 0;
@@ -2706,6 +2728,243 @@ void RenderRaytracing::_cluster_lod_table_free(uint32_t p_offset, uint32_t p_wor
 	}
 }
 
+// The traversal's tree over a hierarchy's groups (D91), after vk_lod_clusters' spatial hierarchy:
+// per depth, the groups sorted along a Morton curve over their centers and packed 32 to a node,
+// nodes packed 32 to a parent until one is left, the depths' roots under one root the same way;
+// then laid out breadth first, so a node's children are contiguous, the refs giving each leaf's
+// groups. A node's sphere encloses its children's stored spheres, rounded up, and its error is
+// their largest, the order the selection's node test needs to prune nothing the exhaustive test
+// would select. False when a group's clusters are not exactly the contiguous run its record names,
+// which the cluster pass assumes, or when a group's sphere or error is not a number, which the
+// node bounds' MIN and MAX would carry or drop by position; the caller then discards the outputs
+// and the surface keeps the exhaustive test.
+bool RenderRaytracing::_build_cluster_lod_tree(const uint32_t *p_cluster_words, uint32_t p_cluster_count, const uint32_t *p_group_words, uint32_t p_group_count, LocalVector<uint32_t> &r_words, LocalVector<uint32_t> &r_level_nodes, uint32_t &r_node_count) {
+	const uint32_t GROUP_WORDS = RenderingServerTypes::MESH_CLUSTER_LOD_GROUP_WORDS;
+	const uint32_t CLUSTER_WORDS = RenderingServerTypes::MESH_CLUSTER_LOD_CLUSTER_WORDS;
+	const uint32_t FANOUT = 32; // The lanes of half a workgroup, one per child.
+	r_words.clear();
+	r_level_nodes.clear();
+	r_node_count = 0;
+	uint32_t depth_count = 0;
+	for (uint32_t g = 0; g < p_group_count; g++) {
+		const uint32_t *w = p_group_words + uint64_t(g) * GROUP_WORDS;
+		if (uint64_t(w[1]) + w[2] > p_cluster_count || w[0] >= p_group_count) {
+			return false;
+		}
+		for (int k = 3; k < 8; k++) {
+			if (Math::is_nan(_bits_float(w[k]))) {
+				return false;
+			}
+		}
+		for (uint32_t c = w[1]; c < w[1] + w[2]; c++) {
+			if (p_cluster_words[uint64_t(c) * CLUSTER_WORDS + 1] != g) {
+				return false;
+			}
+		}
+		depth_count = MAX(depth_count, w[0] + 1);
+	}
+	for (uint32_t c = 0; c < p_cluster_count; c++) {
+		const uint32_t *w = p_group_words + uint64_t(p_cluster_words[uint64_t(c) * CLUSTER_WORDS + 1]) * GROUP_WORDS;
+		if (c < w[1] || c - w[1] >= w[2]) {
+			return false; // Its group's run does not hold it.
+		}
+	}
+
+	struct Node {
+		float center[3] = {};
+		float radius = 0.0f;
+		float error = 0.0f;
+		bool leaf = false; // Its children are groups.
+		uint32_t first = 0; // Into the children scratch.
+		uint32_t count = 0;
+	};
+	LocalVector<Node> nodes;
+	LocalVector<uint32_t> children; // Per node, its children (nodes, or groups for a leaf) contiguous.
+	// A node over children[p_first, p_first + p_count): the box of their spheres' centers, the
+	// radius in double from the stored float center, rounded up, the largest error.
+	auto make_node = [&](uint32_t p_first, uint32_t p_count, bool p_leaf) -> uint32_t {
+		double lo[3] = { 0.0, 0.0, 0.0 }, hi[3] = { 0.0, 0.0, 0.0 };
+		float error = 0.0f;
+		for (uint32_t i = 0; i < p_count; i++) {
+			const uint32_t child = children[p_first + i];
+			float center[3], radius, child_error;
+			if (p_leaf) {
+				const uint32_t *w = p_group_words + uint64_t(child) * GROUP_WORDS;
+				center[0] = _bits_float(w[3]);
+				center[1] = _bits_float(w[4]);
+				center[2] = _bits_float(w[5]);
+				radius = _bits_float(w[6]);
+				child_error = _bits_float(w[7]);
+			} else {
+				const Node &n = nodes[child];
+				center[0] = n.center[0];
+				center[1] = n.center[1];
+				center[2] = n.center[2];
+				radius = n.radius;
+				child_error = n.error;
+			}
+			for (int a = 0; a < 3; a++) {
+				const double l = double(center[a]) - double(radius);
+				const double h = double(center[a]) + double(radius);
+				lo[a] = i == 0 ? l : MIN(lo[a], l);
+				hi[a] = i == 0 ? h : MAX(hi[a], h);
+			}
+			error = i == 0 ? child_error : MAX(error, child_error);
+		}
+		Node node;
+		for (int a = 0; a < 3; a++) {
+			node.center[a] = float((lo[a] + hi[a]) * 0.5);
+		}
+		double radius = 0.0;
+		for (uint32_t i = 0; i < p_count; i++) {
+			const uint32_t child = children[p_first + i];
+			double d[3];
+			double child_radius;
+			if (p_leaf) {
+				const uint32_t *w = p_group_words + uint64_t(child) * GROUP_WORDS;
+				for (int a = 0; a < 3; a++) {
+					d[a] = double(_bits_float(w[3 + a])) - double(node.center[a]);
+				}
+				child_radius = double(_bits_float(w[6]));
+			} else {
+				for (int a = 0; a < 3; a++) {
+					d[a] = double(nodes[child].center[a]) - double(node.center[a]);
+				}
+				child_radius = double(nodes[child].radius);
+			}
+			radius = MAX(radius, Math::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) + child_radius);
+		}
+		node.radius = float(radius * (1.0 + 1.0 / 65536.0)); // Above the double value after rounding to float.
+		node.error = error;
+		node.leaf = p_leaf;
+		node.first = p_first;
+		node.count = p_count;
+		nodes.push_back(node);
+		return nodes.size() - 1;
+	};
+	// Packs a level of nodes (or groups, for the leaves) 32 at a time, in their order, into parents.
+	auto pack = [&](const LocalVector<uint32_t> &p_items, bool p_leaf) -> LocalVector<uint32_t> {
+		LocalVector<uint32_t> parents;
+		for (uint32_t i = 0; i < p_items.size(); i += FANOUT) {
+			const uint32_t count = MIN(FANOUT, p_items.size() - i);
+			const uint32_t first = children.size();
+			for (uint32_t k = 0; k < count; k++) {
+				children.push_back(p_items[i + k]);
+			}
+			parents.push_back(make_node(first, count, p_leaf));
+		}
+		return parents;
+	};
+
+	struct Keyed {
+		uint32_t key = 0;
+		uint32_t group = 0;
+		bool operator<(const Keyed &p_other) const {
+			return key != p_other.key ? key < p_other.key : group < p_other.group;
+		}
+	};
+	LocalVector<uint32_t> tops; // Each depth's root, depth order.
+	LocalVector<Keyed> keyed;
+	for (uint32_t depth = 0; depth < depth_count; depth++) {
+		keyed.clear();
+		double lo[3] = { 0.0, 0.0, 0.0 }, hi[3] = { 0.0, 0.0, 0.0 };
+		for (uint32_t g = 0; g < p_group_count; g++) {
+			const uint32_t *w = p_group_words + uint64_t(g) * GROUP_WORDS;
+			if (w[0] != depth) {
+				continue;
+			}
+			for (int a = 0; a < 3; a++) {
+				const double v = double(_bits_float(w[3 + a]));
+				lo[a] = keyed.is_empty() ? v : MIN(lo[a], v);
+				hi[a] = keyed.is_empty() ? v : MAX(hi[a], v);
+			}
+			Keyed k;
+			k.group = g;
+			keyed.push_back(k);
+		}
+		if (keyed.is_empty()) {
+			continue;
+		}
+		for (Keyed &k : keyed) {
+			const uint32_t *w = p_group_words + uint64_t(k.group) * GROUP_WORDS;
+			uint32_t key = 0;
+			for (int a = 0; a < 3; a++) {
+				const double extent = hi[a] - lo[a];
+				const double t = extent > 0.0 ? (double(_bits_float(w[3 + a])) - lo[a]) / extent : 0.0;
+				uint32_t q = uint32_t(CLAMP(t * 1023.0 + 0.5, 0.0, 1023.0));
+				// Spread ten bits three apart.
+				q = (q | (q << 16)) & 0x030000FF;
+				q = (q | (q << 8)) & 0x0300F00F;
+				q = (q | (q << 4)) & 0x030C30C3;
+				q = (q | (q << 2)) & 0x09249249;
+				key |= q << a;
+			}
+			k.key = key;
+		}
+		keyed.sort();
+		LocalVector<uint32_t> level;
+		for (const Keyed &k : keyed) {
+			level.push_back(k.group);
+		}
+		level = pack(level, true);
+		while (level.size() > 1) {
+			level = pack(level, false);
+		}
+		tops.push_back(level[0]);
+	}
+	while (tops.size() > 1) {
+		tops = pack(tops, false);
+	}
+	ERR_FAIL_COND_V(tops.is_empty(), false);
+
+	// Breadth first from the root: a node's children are enqueued together, so they are
+	// contiguous; a leaf's groups take the next run of the refs.
+	LocalVector<uint32_t> order;
+	LocalVector<uint32_t> depth_of;
+	order.push_back(tops[0]);
+	depth_of.push_back(0);
+	for (uint32_t i = 0; i < order.size(); i++) {
+		const Node &n = nodes[order[i]];
+		if (r_level_nodes.size() <= depth_of[i]) {
+			r_level_nodes.push_back(0);
+		}
+		r_level_nodes[depth_of[i]]++;
+		if (!n.leaf) {
+			for (uint32_t k = 0; k < n.count; k++) {
+				order.push_back(children[n.first + k]);
+				depth_of.push_back(depth_of[i] + 1);
+			}
+		}
+	}
+	const uint32_t node_count = order.size();
+	r_words.resize(uint64_t(node_count) * 8 + p_group_count);
+	uint32_t next_child = 1;
+	uint32_t next_ref = 0;
+	for (uint32_t i = 0; i < node_count; i++) {
+		const Node &n = nodes[order[i]];
+		uint32_t *w = r_words.ptr() + uint64_t(i) * 8;
+		w[0] = _float_bits(n.center[0]);
+		w[1] = _float_bits(n.center[1]);
+		w[2] = _float_bits(n.center[2]);
+		w[3] = _float_bits(n.radius);
+		w[4] = _float_bits(n.error);
+		w[6] = n.count | (n.leaf ? 0x80000000u : 0u);
+		w[7] = 0;
+		if (n.leaf) {
+			w[5] = next_ref;
+			for (uint32_t k = 0; k < n.count; k++) {
+				r_words[uint64_t(node_count) * 8 + next_ref++] = children[n.first + k];
+			}
+		} else {
+			w[5] = next_child; // Its children's breadth-first places, as enqueued above.
+			next_child += n.count;
+		}
+	}
+	ERR_FAIL_COND_V(next_ref != p_group_count || next_child != node_count, false);
+	r_node_count = node_count;
+	return true;
+}
+
 // The surface's hierarchy as the selection reads it: its region of the LOD table (the CLAS
 // addresses copied on the GPU from the argument buffer the implicit build writes them into, each
 // cluster's group and refined group, the groups' spheres and errors), and the worst case of a BLAS
@@ -2816,8 +3075,18 @@ void RenderRaytracing::_populate_surface_cluster_lod(void *p_mesh_surface, const
 		return;
 	}
 
-	// The region: the addresses (lo, hi), the cluster records, the group records as the shader reads them.
-	const uint64_t words64 = uint64_t(cluster_count) * 4 + uint64_t(group_count) * GROUP_WORDS;
+	// The traversal's tree (D91), after the group records; without one the selection tests every cluster.
+	LocalVector<uint32_t> tree_words;
+	LocalVector<uint32_t> tree_levels;
+	uint32_t tree_nodes = 0;
+	if (cluster_lod_traversal_enabled && !_build_cluster_lod_tree(cluster_words, cluster_count, group_words, group_count, tree_words, tree_levels, tree_nodes)) {
+		tree_words.clear();
+		WARN_PRINT_ONCE(vformat("RT: cluster BLAS [%d]: the hierarchy's groups do not own contiguous runs of its clusters; its selection tests every cluster.", p_cache_key));
+	}
+
+	// The region: the addresses (lo, hi), the cluster records, the group records as the shader
+	// reads them, then the tree's nodes and refs.
+	const uint64_t words64 = uint64_t(cluster_count) * 4 + uint64_t(group_count) * GROUP_WORDS + tree_words.size();
 	ERR_FAIL_COND_MSG(words64 > UINT32_MAX / 4, "RT: a cluster LOD hierarchy's region exceeds the table's reach.");
 	const uint32_t words = uint32_t(words64);
 	uint32_t offset = 0;
@@ -2831,6 +3100,10 @@ void RenderRaytracing::_populate_surface_cluster_lod(void *p_mesh_surface, const
 		const uint32_t *w = cluster_words + uint64_t(c) * RenderingServerTypes::MESH_CLUSTER_LOD_CLUSTER_WORDS;
 		host[c * 2] = w[1];
 		host[c * 2 + 1] = w[2];
+	}
+	const uint32_t tree_offset = cluster_count * 4 + group_count * GROUP_WORDS;
+	if (!tree_words.is_empty()) {
+		memcpy(host.ptr() + tree_offset - cluster_count * 2, tree_words.ptr(), tree_words.size() * sizeof(uint32_t));
 	}
 	for (uint32_t g = 0; g < group_count; g++) {
 		const uint32_t *w = group_words + uint64_t(g) * GROUP_WORDS;
@@ -2858,6 +3131,12 @@ void RenderRaytracing::_populate_surface_cluster_lod(void *p_mesh_surface, const
 	r_surf_data->cluster_lod_blas_worst_size = blas_size;
 	r_surf_data->cluster_lod_generation = ++cluster_lod_generation_counter;
 	r_surf_data->cluster_lod_levels = levels;
+	if (!tree_words.is_empty()) {
+		r_surf_data->cluster_lod_tree.nodes_offset = offset + tree_offset;
+		r_surf_data->cluster_lod_tree.refs_offset = offset + tree_offset + tree_nodes * 8;
+		r_surf_data->cluster_lod_tree.group_count = group_count;
+		r_surf_data->cluster_lod_tree.level_nodes = tree_levels;
+	}
 }
 
 void RenderRaytracing::_release_surface_cluster_lod(RTSurfaceData *p_surf_data) {
@@ -2873,6 +3152,7 @@ void RenderRaytracing::_release_surface_cluster_lod(RTSurfaceData *p_surf_data) 
 	p_surf_data->cluster_lod_table_words = 0;
 	p_surf_data->cluster_lod_blas_worst_size = 0;
 	p_surf_data->cluster_lod_levels.clear();
+	p_surf_data->cluster_lod_tree = RTLodTree();
 }
 
 RTLodInstanceEntry *RenderRaytracing::_access_lod_slot(RID &r_handle) {
@@ -2953,6 +3233,7 @@ void RenderRaytracing::_queue_lod_instance(RTLodInstanceEntry &p_entry, const Tr
 	w[17] = 0;
 	w[18] = 0;
 	w[19] = 0;
+	_lod_record_tree(p_transform, surf->cluster_lod_tree);
 
 	const RID storage = cluster_arena[p_entry.arena_chunk].buffer;
 	if (!batch.storage_buffers.has(storage)) {
@@ -2996,6 +3277,38 @@ uint32_t *RenderRaytracing::_lod_instance_record(const Transform3D &p_transform,
 	return w;
 }
 
+// The last queued item's traversal (D91): with a tree, its record flags it and names the tree's
+// nodes and refs and the basis's Frobenius norm (the node test's scale, a bound on the transform's
+// stretch under shear, rounded up), and the batch's queues grow by its node counts; without one it
+// widens the exhaustive dispatch.
+void RenderRaytracing::_lod_record_tree(const Transform3D &p_transform, const RTLodTree &p_tree) {
+	RTLodSelectBatch &batch = lod_batch;
+	uint32_t *w = batch.instance_words.ptr() + batch.instance_words.size() - RT_LOD_INSTANCE_WORDS;
+	if (!cluster_lod_traversal_enabled || p_tree.nodes_offset == UINT32_MAX) {
+		batch.flat_max_clusters = MAX(batch.flat_max_clusters, w[13]);
+		return;
+	}
+	const Basis &basis = p_transform.basis;
+	const double frobenius = Math::sqrt(double(basis.get_column(0).length_squared() + basis.get_column(1).length_squared() + basis.get_column(2).length_squared()));
+	const float stretch = MAX(float(frobenius * (1.0 + 1.0 / 65536.0)), _bits_float(w[12]));
+	w[16] |= 4u; // INSTANCE_FLAG_TREE.
+	w[20] = p_tree.nodes_offset;
+	w[21] = p_tree.refs_offset;
+	w[22] = _float_bits(stretch);
+	if (batch.tree_level_capacity.size() < p_tree.level_nodes.size()) {
+		const uint32_t from = batch.tree_level_capacity.size();
+		batch.tree_level_capacity.resize(p_tree.level_nodes.size());
+		for (uint32_t l = from; l < batch.tree_level_capacity.size(); l++) {
+			batch.tree_level_capacity[l] = 0;
+		}
+	}
+	for (uint32_t l = 0; l < p_tree.level_nodes.size(); l++) {
+		batch.tree_level_capacity[l] += p_tree.level_nodes[l];
+	}
+	batch.tree_group_capacity += p_tree.group_count;
+	batch.tree_count++;
+}
+
 // A deformed entry on the selection (D87): its record flags the CLAS build, names its build infos
 // in the table and its first slot of the frame's region (the flush turns that into the
 // destination base), and the build takes its storage, its owned vertex buffer and its index buffer.
@@ -3014,6 +3327,7 @@ void RenderRaytracing::_queue_lod_deformed_instance(RTDeformedCacheEntry &p_entr
 	w[17] = p_entry.cluster_lod_infos_offset;
 	w[18] = batch.clas_bound; // The first slot; the flush writes the destination base over 18 and 19.
 	w[19] = 0;
+	_lod_record_tree(p_transform, p_entry.cluster_lod_tree);
 
 	batch.storage_buffers.push_back(p_entry.cluster_storage); // Its own; nothing to dedupe.
 	batch.clas_source_buffers.push_back(p_entry.owned_vb_full);
@@ -3265,6 +3579,7 @@ void RenderRaytracing::_queue_lod_cached_level(RTSurfaceData *p_surf_data, uint3
 	w[16] = 2; // INSTANCE_FLAG_LEVEL.
 	w[17] = p_depth;
 	w[18] = count; // The slot's count: the shader takes no more, and counts any past it as overflow.
+	_lod_record_tree(Transform3D(), RTLodTree()); // A level's rule is by depth: tested exhaustively.
 
 	const RID storage = cluster_arena[level.arena_chunk].buffer;
 	if (!batch.storage_buffers.has(storage)) {
@@ -3499,10 +3814,39 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 	const uint64_t blas_dst_offset = _align_up(blas_infos_offset + uint64_t(blas_info_stride) * entry_count, 16);
 	const uint64_t instances_offset = _align_up(blas_dst_offset + sizeof(uint64_t) * entry_count, 16);
 	const uint64_t clas_count_offset = _align_up(instances_offset + uint64_t(RT_LOD_INSTANCE_WORDS) * sizeof(uint32_t) * entry_count, 16);
-	const uint64_t lists_offset = _align_up(clas_count_offset + 16, 16);
+	// The traversal (D91): a queue length per breadth-first level, one past the last and the group
+	// queue's, the verbose check's count per item, the first level's queue (each tree item at its
+	// root), all written here; the deeper levels' queues, each at its level's capacity, and the group
+	// queue, after everything else. A level or the group queue needing more workgroups than the
+	// device dispatches sends the frame's tree items to the exhaustive test.
+	uint32_t tree_levels = batch.tree_count > 0 ? batch.tree_level_capacity.size() : 0;
+	const uint64_t group_limit = rd->limit_get(RD::LIMIT_MAX_COMPUTE_WORKGROUP_COUNT_X);
+	uint64_t queue_rest_items = 0;
+	for (uint32_t l = 0; l < tree_levels; l++) {
+		if ((uint64_t(batch.tree_level_capacity[l]) + 1) / 2 > group_limit) {
+			tree_levels = 0;
+			break;
+		}
+		queue_rest_items += l > 0 ? batch.tree_level_capacity[l] : 0;
+	}
+	if ((uint64_t(batch.tree_group_capacity) + 1) / 2 > group_limit) {
+		tree_levels = 0;
+	}
+	if (tree_levels == 0) {
+		queue_rest_items = 0;
+	}
+	const uint32_t tree_items = tree_levels > 0 ? batch.tree_count : 0;
+	const uint32_t group_items = tree_levels > 0 ? batch.tree_group_capacity : 0;
+	const uint64_t tree_counts_offset = _align_up(clas_count_offset + 16, 16);
+	const uint64_t group_count_offset = tree_counts_offset + sizeof(uint32_t) * (tree_levels + 1);
+	const uint64_t check_offset = _align_up(group_count_offset + sizeof(uint32_t), 16);
+	const uint64_t queue_offset = _align_up(check_offset + sizeof(uint32_t) * entry_count, 16);
+	const uint64_t lists_offset = _align_up(queue_offset + sizeof(uint32_t) * 2 * tree_items, 16);
 	const uint64_t clas_dst_offset = _align_up(lists_offset + sizeof(uint64_t) * cluster_total, 16);
 	const uint64_t clas_infos_offset = _align_up(clas_dst_offset + sizeof(uint64_t) * clas_bound, 16);
-	const uint64_t args_size = _align_up(clas_infos_offset + uint64_t(clas_info_stride) * clas_bound, 16);
+	const uint64_t queue_rest_offset = _align_up(clas_infos_offset + uint64_t(clas_info_stride) * clas_bound, 16);
+	const uint64_t group_queue_offset = _align_up(queue_rest_offset + sizeof(uint32_t) * 2 * queue_rest_items, 16);
+	const uint64_t args_size = _align_up(group_queue_offset + sizeof(uint32_t) * 2 * group_items, 16);
 	ERR_FAIL_COND_V_MSG(args_size > UINT32_MAX, false, "RT: the cluster LOD batch's arguments exceed 4 GB.");
 	if (batch.args_capacity < args_size) {
 		if (batch.args_buffer.is_valid()) {
@@ -3519,6 +3863,11 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 	}
 	const RID args_buffer = batch.args_buffer;
 	const uint64_t args_address = rd->buffer_get_device_address(args_buffer);
+	if (batch.dispatch_buffer.is_null()) {
+		batch.dispatch_buffer = rd->storage_buffer_create(16, {}, RD::STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
+		ERR_FAIL_COND_V_MSG(batch.dispatch_buffer.is_null(), false, "RT: the cluster LOD traversal's dispatch buffer could not be created.");
+		rd->set_resource_name(batch.dispatch_buffer, "RT cluster LOD traversal dispatch");
+	}
 	// The deformed items' CLAS go to a region of the deformed batch's pool (D82's reuse rule),
 	// each item's clusters in a contiguous range of slots.
 	int32_t region_index = -1;
@@ -3539,12 +3888,39 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 	}
 	uint8_t *args = batch.args_host.ptr();
 	memset(args, 0, lists_offset);
+	uint32_t flat_max_clusters = batch.flat_max_clusters;
+	// The exhaustive dispatch's rows (D91): the items it tests, and the tree items the verbose check
+	// tests, each as the range from its first item to its last. With the traversal on, the flat
+	// items are the cached levels, contiguous from cache_first; off, or on a frame the tree items
+	// fall back, every item. Only a surface whose tree could not be built mixes the two kinds, and
+	// then the range takes the tree items between, which skip themselves.
+	uint32_t flat_first = entry_count, flat_end = 0;
+	uint32_t tree_first = entry_count, tree_end = 0;
 	{
 		uint64_t *dst = reinterpret_cast<uint64_t *>(args + blas_dst_offset);
 		uint32_t *instances = reinterpret_cast<uint32_t *>(args + instances_offset);
+		uint32_t *queue = reinterpret_cast<uint32_t *>(args + queue_offset);
+		uint32_t queued = 0;
 		memcpy(instances, batch.instance_words.ptr(), sizeof(uint32_t) * RT_LOD_INSTANCE_WORDS * entry_count);
 		for (uint32_t e = 0; e < entry_count; e++) {
 			uint32_t *record = instances + e * RT_LOD_INSTANCE_WORDS;
+			if ((record[16] & 4u) != 0) { // INSTANCE_FLAG_TREE.
+				if (tree_levels > 0) {
+					queue[queued * 2] = e;
+					queue[queued * 2 + 1] = 0; // The root.
+					queued++;
+				} else {
+					record[16] &= ~4u;
+					flat_max_clusters = MAX(flat_max_clusters, record[13]);
+				}
+			}
+			if ((record[16] & 4u) != 0) {
+				tree_first = MIN(tree_first, e);
+				tree_end = e + 1;
+			} else {
+				flat_first = MIN(flat_first, e);
+				flat_end = e + 1;
+			}
 			const uint32_t first_cluster = record[15];
 			RD::ClusterBottomLevelBuildInfo blas_info;
 			blas_info.cluster_references_count = 0;
@@ -3559,8 +3935,13 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 				record[19] = uint32_t(dst_base >> 32);
 			}
 		}
+		reinterpret_cast<uint32_t *>(args + tree_counts_offset)[0] = queued;
 	}
 	rd->buffer_update(args_buffer, 0, uint32_t(lists_offset), args);
+	if (tree_levels > 0) {
+		const uint32_t dispatch_init[4] = { 0, 1, 1, 0 };
+		rd->buffer_update(batch.dispatch_buffer, 0, sizeof(dispatch_init), dispatch_init);
+	}
 
 	const LodView view = _lod_view(p_render_data, p_state, cluster_lod_pixel_error);
 	const float threshold = view.threshold;
@@ -3578,6 +3959,14 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		uint32_t clas_infos_offset;
 		uint32_t clas_info_words;
 		uint32_t clas_slot_size;
+		uint32_t queue_in;
+		uint32_t queue_out;
+		uint32_t count_in;
+		uint32_t count_out;
+		uint32_t check_offset;
+		uint32_t group_queue;
+		uint32_t group_count;
+		uint32_t entry_first;
 		uint32_t pad0;
 	} pc;
 	pc.camera[0] = float(view.camera.x);
@@ -3595,11 +3984,50 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 	pc.clas_infos_offset = uint32_t(clas_infos_offset / sizeof(uint32_t));
 	pc.clas_info_words = clas_info_stride / sizeof(uint32_t);
 	pc.clas_slot_size = uint32_t(cluster_lod_clas_slot_size);
+	pc.queue_in = 0;
+	pc.queue_out = 0;
+	pc.count_in = 0;
+	pc.count_out = 0;
+	pc.check_offset = uint32_t(check_offset / sizeof(uint32_t));
+	pc.group_queue = uint32_t(group_queue_offset / sizeof(uint32_t));
+	pc.group_count = uint32_t(group_count_offset / sizeof(uint32_t));
+	pc.entry_first = 0;
 	pc.pad0 = 0;
+	// The verbose check (D91): the exhaustive test counts the tree items' clusters in the same frame,
+	// for the readback to compare with what the traversal appended; on the first flushes and every
+	// thirtieth.
+	const bool tree_check = tree_items > 0 && OS::get_singleton()->is_stdout_verbose() && (batch.frames_flushed < 8 || batch.frames_flushed % 30 == 0);
+	// A verbose run brackets the selection with two timestamps, which the graph keeps in order with
+	// every command around them, and reads the span a finished frame captured. The span is not the
+	// selection's cost: it includes any wait the traversal's barriers make on other work still in
+	// flight (about 0.2 ms on a 4000-rock field whatever the passes did, while the frame's GPU time
+	// stayed level), so it is read beside the frame's time.
+	const bool select_timer = OS::get_singleton()->is_stdout_verbose();
+	if (select_timer) {
+		const uint64_t timer_frame = rd->get_captured_timestamps_frame();
+		if (timer_frame != lod_select_timer_frame) {
+			lod_select_timer_frame = timer_frame;
+			uint64_t begin = 0;
+			bool open = false;
+			for (uint32_t i = 0; i < rd->get_captured_timestamps_count(); i++) {
+				const String name = rd->get_captured_timestamp_name(i);
+				if (name == "RT cluster LOD selection") {
+					begin = rd->get_captured_timestamp_gpu_time(i);
+					open = true;
+				} else if (open && name == "RT cluster LOD selection end" && lod_select_gpu_us.size() < 65536) {
+					lod_select_gpu_us.push_back(float(double(rd->get_captured_timestamp_gpu_time(i) - begin) / 1000.0));
+					open = false;
+				}
+			}
+		}
+		rd->capture_timestamp("RT cluster LOD selection");
+	}
 
 	// The selection, in a compute list of its own (RenderingDevice records no cluster build
 	// while one is open); the graph orders it after the upload and before the build through the
-	// argument buffer's tracker, and after every table upload through the table's.
+	// argument buffer's tracker, and after every table upload through the table's. The traversal's
+	// cluster pass reads the dispatch buffer as its indirect arguments, so it runs in a list of its
+	// own with the arguments bound in its place (the graph takes one usage of a buffer per list).
 	{
 		Vector<RD::Uniform> uniforms;
 		{
@@ -3616,15 +4044,75 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 			u.append_id(cluster_lod_table);
 			uniforms.push_back(u);
 		}
+		{
+			RD::Uniform u;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.binding = 2;
+			u.append_id(batch.dispatch_buffer);
+			uniforms.push_back(u);
+		}
 		RID uniform_set = rd->uniform_set_create(uniforms, lod_select_shader.version_shader, 0, /*p_linear_pool=*/true);
 		ERR_FAIL_COND_V(!uniform_set.is_valid(), false);
+		RID cluster_set;
+		if (tree_levels > 0) {
+			uniforms.write[2].set_id(0, args_buffer);
+			cluster_set = rd->uniform_set_create(uniforms, lod_select_shader.version_shader, 0, /*p_linear_pool=*/true);
+			if (!cluster_set.is_valid()) {
+				rd->free_rid(uniform_set);
+				ERR_FAIL_V(false);
+			}
+		}
 		RD::ComputeListID compute_list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(compute_list, lod_select_shader.pipeline);
 		rd->compute_list_bind_uniform_set(compute_list, uniform_set, 0);
-		rd->compute_list_set_push_constant(compute_list, &pc, sizeof(SelectPC));
-		rd->compute_list_dispatch_threads(compute_list, batch.max_clusters, entry_count, 1);
+		if (flat_max_clusters > 0 && flat_first < flat_end) {
+			SelectPC flat_pc = pc;
+			flat_pc.entry_first = flat_first;
+			rd->compute_list_set_push_constant(compute_list, &flat_pc, sizeof(SelectPC));
+			rd->compute_list_dispatch_threads(compute_list, flat_max_clusters, flat_end - flat_first, 1);
+		}
+		if (tree_check && tree_first < tree_end) {
+			SelectPC check_pc = pc;
+			check_pc.flags |= 2u; // FLAG_CHECK.
+			check_pc.entry_first = tree_first;
+			rd->compute_list_set_push_constant(compute_list, &check_pc, sizeof(SelectPC));
+			rd->compute_list_dispatch_threads(compute_list, batch.max_clusters, tree_end - tree_first, 1);
+		}
+		// The traversal (D91): a dispatch per breadth-first level at that level's capacity, two
+		// queue items per workgroup, each after a barrier on the previous level's queue.
+		uint64_t level_queue = queue_offset;
+		uint64_t next_queue = queue_rest_offset;
+		for (uint32_t l = 0; l < tree_levels; l++) {
+			if (l > 0) {
+				rd->compute_list_add_barrier(compute_list);
+			}
+			SelectPC node_pc = pc;
+			node_pc.flags |= 4u; // FLAG_NODES.
+			node_pc.queue_in = uint32_t(level_queue / sizeof(uint32_t));
+			node_pc.queue_out = uint32_t(next_queue / sizeof(uint32_t));
+			node_pc.count_in = uint32_t(tree_counts_offset / sizeof(uint32_t)) + l;
+			node_pc.count_out = node_pc.count_in + 1;
+			rd->compute_list_set_push_constant(compute_list, &node_pc, sizeof(SelectPC));
+			rd->compute_list_dispatch(compute_list, (batch.tree_level_capacity[l] + 1) / 2, 1, 1);
+			level_queue = next_queue;
+			next_queue += sizeof(uint32_t) * 2 * (l + 1 < tree_levels ? batch.tree_level_capacity[l + 1] : 0);
+		}
 		rd->compute_list_end();
+		if (tree_levels > 0) {
+			SelectPC cluster_pc = pc;
+			cluster_pc.flags |= 8u; // FLAG_CLUSTERS.
+			compute_list = rd->compute_list_begin();
+			rd->compute_list_bind_compute_pipeline(compute_list, lod_select_shader.pipeline);
+			rd->compute_list_bind_uniform_set(compute_list, cluster_set, 0);
+			rd->compute_list_set_push_constant(compute_list, &cluster_pc, sizeof(SelectPC));
+			rd->compute_list_dispatch_indirect(compute_list, batch.dispatch_buffer, 0);
+			rd->compute_list_end();
+			rd->free_rid(cluster_set);
+		}
 		rd->free_rid(uniform_set);
+	}
+	if (select_timer) {
+		rd->capture_timestamp("RT cluster LOD selection end");
 	}
 
 	// The deformed items' CLAS (D87): every cluster the selection picked for them, built into the
@@ -3718,6 +4206,12 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		rd->buffer_get_data_async(args_buffer, callable_mp_static(&RenderRaytracing::_on_lod_cache_overflow_read), uint32_t(clas_count_offset + sizeof(uint32_t)), sizeof(uint32_t));
 	}
 
+	// The traversal's check (D91): the items' records, their appended counts and the exhaustive
+	// counts, from the start of the arguments to the end of the counts, in one readback.
+	if (tree_check) {
+		rd->buffer_get_data_async(args_buffer, callable_mp_static(&RenderRaytracing::_on_lod_tree_check_read).bind(entry_count, uint32_t(blas_infos_offset / sizeof(uint32_t)), blas_info_stride, uint32_t(instances_offset / sizeof(uint32_t)), uint32_t(check_offset / sizeof(uint32_t))), 0, uint32_t(check_offset + sizeof(uint32_t) * entry_count));
+	}
+
 	// The counts for the report, read back a frame queue later, so requested on the frames just
 	// before it; only when the run is verbose.
 	const uint64_t report_phase = batch.frames_flushed % 300;
@@ -3736,8 +4230,45 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 			lod0_total += batch.lod0_clusters[e];
 		}
 		print_verbose(vformat("RT: cluster LOD selection: %d instances (%d deformed, %d past the region ceiling; %d more tracing a shared build, %d the LOD 0 BLAS, %d a cached level), %d cached levels built (%d live, %d KB, %d over the run), %d clusters at LOD 0, %d over every level, %d selected a frame queue ago (%d instances then, %d CLAS built of %d), %.2f px, threshold %s, %d KB of arguments, %d KB of the LOD table live, %d KB CLAS region.", cache_first, batch.deformed_count, batch.deformed_routed, batch.shared_count, batch.lod0_count, batch.cached_count, entry_count - cache_first, cluster_lod_cache_live, cluster_lod_cache_bytes / 1024, cluster_lod_cache_builds_total, lod0_total, cluster_total - batch.cache_list_clusters, lod_counts_selected, lod_counts_entries, lod_counts_clas, clas_bound, cluster_lod_pixel_error, String::num_scientific(threshold), args_size / 1024, uint64_t(cluster_lod_table_live_words) * sizeof(uint32_t) / 1024, uint64_t(clas_bound) * cluster_lod_clas_slot_size / 1024));
+		if (cluster_lod_traversal_enabled) {
+			uint64_t queue_capacity = 0;
+			for (uint32_t l = 0; l < tree_levels; l++) {
+				queue_capacity += batch.tree_level_capacity[l];
+			}
+			print_verbose(vformat("RT: cluster LOD traversal (D91): %d of %d items walked their tree in %d levels (queues for %d nodes), the others tested every cluster over %d threads each; %d frames checked against the exhaustive test, %d items mismatched.", tree_items, entry_count, tree_levels, queue_capacity, flat_max_clusters, lod_tree_checks, lod_tree_mismatches));
+		}
+		if (!lod_select_gpu_us.is_empty()) {
+			LocalVector<float> sorted(lod_select_gpu_us);
+			sorted.sort();
+			print_verbose(vformat("RT: cluster LOD selection, GPU span bracketing it (D91; includes waits on work in flight): p50 %.1f us, p90 %.1f us, max %.1f us over %d frames.", sorted[sorted.size() / 2], sorted[sorted.size() * 9 / 10], sorted[sorted.size() - 1], sorted.size()));
+		}
 	}
 	return true;
+}
+
+void RenderRaytracing::_on_lod_tree_check_read(const PackedByteArray &p_bytes, uint32_t p_entry_count, uint32_t p_blas_infos_offset, uint32_t p_stride, uint32_t p_instances_offset, uint32_t p_check_offset) {
+	// Called by RenderingDevice on the render thread as it begins a later frame. The first word of
+	// an item's build info is the count the traversal appended.
+	if (singleton == nullptr || p_bytes.size() < int64_t(sizeof(uint32_t)) * (p_check_offset + p_entry_count)) {
+		return;
+	}
+	const uint32_t *words = reinterpret_cast<const uint32_t *>(p_bytes.ptr());
+	uint32_t mismatched = 0;
+	for (uint32_t e = 0; e < p_entry_count; e++) {
+		if ((words[p_instances_offset + e * RT_LOD_INSTANCE_WORDS + 16] & 4u) == 0) {
+			continue;
+		}
+		const uint32_t walked = words[p_blas_infos_offset + e * (p_stride / sizeof(uint32_t))];
+		const uint32_t tested = words[p_check_offset + e];
+		if (walked != tested) {
+			if (mismatched < 4) {
+				ERR_PRINT(vformat("RT: cluster LOD traversal (D91): item %d selected %d clusters, the exhaustive test %d.", e, walked, tested));
+			}
+			mismatched++;
+		}
+	}
+	singleton->lod_tree_checks++;
+	singleton->lod_tree_mismatches += mismatched;
 }
 
 void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const RTViewportState *p_state) {
@@ -3841,6 +4372,10 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 	batch.source_buffers.clear();
 	batch.cluster_total = 0;
 	batch.max_clusters = 0;
+	batch.tree_count = 0;
+	batch.flat_max_clusters = 0;
+	batch.tree_level_capacity.clear();
+	batch.tree_group_capacity = 0;
 	batch.deformed_count = 0;
 	batch.deformed_routed = 0;
 	batch.clas_bound = 0;

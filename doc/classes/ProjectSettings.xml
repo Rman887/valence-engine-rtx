@@ -3298,6 +3298,10 @@
 			How many hierarchy levels finer than its own coarsest an instance may trace through [member rendering/pathtracing/cluster_lod_share]: the shared structure's finest level is at most this many levels below the coarsest level the instance's own selection could reach. Higher shares more and builds fewer structures, at more detail far away; [code]0[/code] shares only between instances that need the same single level.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracing/cluster_lod_traversal" type="bool" setter="" getter="" default="true">
+			If [code]true[/code] and [member rendering/pathtracing/cluster_lod_select] is on, the selection walks a tree of bounding spheres built over each hierarchy's cluster groups, one per level of detail, and tests only the clusters of groups whose simplification can show at the instance's distance. It selects exactly the clusters the exhaustive test of every cluster selects; [code]false[/code] runs that exhaustive test, for comparison.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
 		<member name="rendering/pathtracing/deformed_mesh_cache_ttl_frames" type="int" setter="" getter="" default="60">
 			Number of frames a skinned or vertex-displaced deformed-mesh BLAS is kept alive in the path tracer cache after its last visible frame. Once this threshold is exceeded the BLAS and its associated buffers are freed. Increase this value if deformed meshes flicker back into view after brief occlusion; decrease it to reclaim GPU memory sooner.
 			[b]Note:[/b] Requires a restart to take effect.

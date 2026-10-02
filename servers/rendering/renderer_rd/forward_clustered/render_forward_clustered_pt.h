@@ -51,6 +51,7 @@ protected:
 	virtual void _render_scene(RenderDataRD *p_render_data, const Color &p_default_bg_color) override;
 	virtual void _render_buffers_debug_draw(const RenderDataRD *p_render_data) override;
 	virtual void _free_rt_viewport_state(RenderSceneBuffersRD *p_render_buffers) override;
+	virtual void _geometry_instance_base_changed(GeometryInstanceForwardClustered *p_geometry_instance) override;
 
 public:
 	virtual void geometry_instance_free(RenderGeometryInstance *p_geometry_instance) override;

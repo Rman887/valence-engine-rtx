@@ -646,6 +646,14 @@ void RenderForwardClusteredPT::geometry_instance_free(RenderGeometryInstance *p_
 	RenderForwardClustered::geometry_instance_free(p_geometry_instance);
 }
 
+void RenderForwardClusteredPT::_geometry_instance_base_changed(GeometryInstanceForwardClustered *p_geometry_instance) {
+	// A mesh swapped in place (D95) keeps the slots of the surfaces both meshes have; those of the
+	// surfaces the new mesh lacks are released, as a free would.
+	if (raytracing && p_geometry_instance->data->base_type == RSE::INSTANCE_MESH) {
+		raytracing->release_slot_ranges_from(p_geometry_instance->rt_slots, uint32_t(RSG::mesh_storage->mesh_get_surface_count(p_geometry_instance->data->base)));
+	}
+}
+
 void RenderForwardClusteredPT::_render_buffers_debug_draw(const RenderDataRD *p_render_data) {
 	RenderForwardClustered::_render_buffers_debug_draw(p_render_data);
 

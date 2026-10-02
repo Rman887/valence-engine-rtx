@@ -5153,6 +5153,11 @@ void RenderForwardClustered::GeometryInstanceForwardClustered::set_transform(con
 	RenderGeometryInstanceBase::set_transform(p_transform, p_aabb, p_transformed_aabb);
 }
 
+void RenderForwardClustered::GeometryInstanceForwardClustered::set_base(RID p_base) {
+	RenderGeometryInstanceBase::set_base(p_base);
+	RenderForwardClustered::get_singleton()->_geometry_instance_base_changed(this);
+}
+
 void RenderForwardClustered::GeometryInstanceForwardClustered::reset_motion_vectors() {
 	prev_transform = transform;
 	transform_status = TransformStatus::TELEPORTED;

@@ -584,6 +584,39 @@ void RendererSceneCull::instance_set_base(RID p_instance, RID p_base) {
 
 	Scenario *scenario = instance->scenario;
 
+	if (instance->base_type == RSE::INSTANCE_MESH && p_base.is_valid() && RSG::utilities->get_base_type(p_base) == RSE::INSTANCE_MESH) {
+		InstanceGeometryData *geom = static_cast<InstanceGeometryData *>(instance->base_data);
+		// An empty new bounds would stop _update_instance before it moves the index and the pairs,
+		// so that swap takes the full path, which unindexes the instance.
+		if (geom && geom->geometry_instance && (instance->custom_aabb || RSG::mesh_storage->mesh_get_aabb(p_base, instance->skeleton).has_surface())) {
+			// A mesh swapped for a mesh keeps its geometry instance, its pairs and its place in the
+			// scenario. Recreating it lost the previous transform (a motion vector from the origin for
+			// a frame) and the instance's path-tracing slots (D95).
+			if (instance->mesh_instance.is_valid()) {
+				// A mesh instance is made for one mesh.
+				RSG::mesh_storage->mesh_instance_free(instance->mesh_instance);
+				instance->mesh_instance = RID();
+				geom->geometry_instance->set_mesh_instance(RID());
+				if (scenario && instance->array_index >= 0) {
+					scenario->instance_data[instance->array_index].flags &= ~InstanceData::FLAG_USES_MESH_INSTANCE;
+				}
+			}
+
+			instance->materials.clear();
+			geom->geometry_instance->set_surface_materials(instance->materials);
+			geom->geometry_instance->set_base(p_base);
+			instance->base = p_base;
+			if (scenario && instance->array_index >= 0) {
+				scenario->instance_data[instance->array_index].base_rid = p_base;
+			}
+
+			_instance_update_mesh_instance(instance);
+			RSG::utilities->base_update_dependency(p_base, &instance->dependency_tracker);
+			_instance_queue_update(instance, true, true);
+			return;
+		}
+	}
+
 	if (instance->base_type != RSE::INSTANCE_NONE) {
 		//free anything related to that base
 

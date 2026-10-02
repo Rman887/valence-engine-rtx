@@ -43,6 +43,7 @@ public:
 
 	virtual void _mark_dirty() = 0;
 
+	virtual void set_base(RID p_base) = 0;
 	virtual void set_skeleton(RID p_skeleton) = 0;
 	virtual void set_material_override(RID p_override) = 0;
 	virtual void set_material_overlay(RID p_overlay) = 0;
@@ -137,6 +138,7 @@ public:
 
 	Data *data = nullptr;
 
+	virtual void set_base(RID p_base) override;
 	virtual void set_skeleton(RID p_skeleton) override;
 	virtual void set_material_override(RID p_override) override;
 	virtual void set_material_overlay(RID p_overlay) override;

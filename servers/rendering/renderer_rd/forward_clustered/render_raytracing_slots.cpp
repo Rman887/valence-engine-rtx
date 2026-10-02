@@ -179,6 +179,18 @@ void RenderRaytracing::release_slot_ranges(RTSlotOwner &r_owner) {
 	r_owner.ranges.clear();
 }
 
+void RenderRaytracing::release_slot_ranges_from(RTSlotOwner &r_owner, uint32_t p_surface_count) {
+	for (uint32_t i = 0; i < r_owner.ranges.size();) {
+		const uint32_t key = uint32_t(r_owner.ranges[i] >> 32);
+		if (key >= p_surface_count && key != RT_SLOT_KEY_PROCEDURAL) {
+			_slot_range_release(uint32_t(r_owner.ranges[i] & 0xFFFFFFFFu));
+			r_owner.ranges.remove_at_unordered(i);
+		} else {
+			i++;
+		}
+	}
+}
+
 void RenderRaytracing::_release_viewport_slots(RTViewportState *p_state) {
 	for (uint32_t r = 0; r < p_state->slot_range_views.size() && r < slot_ranges.size(); r++) {
 		RTSlotRangeView &view = p_state->slot_range_views[r];

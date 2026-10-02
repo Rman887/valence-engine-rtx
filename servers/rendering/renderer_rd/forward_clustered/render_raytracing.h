@@ -1811,6 +1811,8 @@ public:
 	void cleanup_caches();
 	// Releases a geometry instance's PTLAS slot ranges (D94b) as it is freed.
 	void release_slot_ranges(RTSlotOwner &r_owner);
+	// Releases the ranges of surface indices from p_surface_count on, as a mesh swapped in place drops them (D95).
+	void release_slot_ranges_from(RTSlotOwner &r_owner, uint32_t p_surface_count);
 	// Releases the RT cache entry of a surface its mesh is dropping (MeshStorage's surface-freed callback).
 	void release_mesh_surface(RID p_mesh, uint32_t p_surface);
 

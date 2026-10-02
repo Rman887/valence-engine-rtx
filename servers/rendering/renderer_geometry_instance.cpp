@@ -30,6 +30,16 @@
 
 #include "servers/rendering/renderer_geometry_instance.h"
 
+#include "servers/rendering/rendering_server_globals.h"
+
+void RenderGeometryInstanceBase::set_base(RID p_base) {
+	data->base = p_base;
+	data->base_type = RSG::utilities->get_base_type(p_base);
+
+	_mark_dirty();
+	data->dirty_dependencies = true;
+}
+
 void RenderGeometryInstanceBase::set_skeleton(RID p_skeleton) {
 	data->skeleton = p_skeleton;
 

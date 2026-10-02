@@ -60,23 +60,89 @@ void get_triangle_indices_ex(in GeometryData geom, uint primitive_id, out uint i
 	}
 }
 
-#ifndef RT_STAGE_RAYGEN
-/// The hit triangle's index into the surface's index buffer (hit shaders only). In a cluster
-/// BLAS (D79) gl_PrimitiveID counts inside the cluster and the cluster's ID carries its first
-/// triangle; a hit on a triangle BLAS reports no cluster and keeps gl_PrimitiveID.
-uint rt_primitive_index() {
-#if defined(USE_CLUSTER_AS) && (defined(RT_STAGE_CLOSEST_HIT) || defined(RT_STAGE_ANY_HIT))
-	int cluster_id = gl_ClusterIDNV;
+// ============================================================================
+// TRIANGLE RESOLUTION (D93b)
+// ============================================================================
+
+// A triangle BLAS's hit, or a stage without cluster structures (gl_ClusterIDNoneNV's value).
+const int RT_CLUSTER_ID_NONE = -1;
+// A cluster geometry record's words and a blob section's alignment (RT_CLUSTER_GEOMETRY_RECORD_WORDS
+// and RT_CLUSTER_GEOMETRY_ALIGNMENT on the host).
+const uint CLUSTER_GEOMETRY_RECORD_WORDS = 4u;
+const uint CLUSTER_GEOMETRY_ALIGNMENT = 16u;
+
+#ifdef USE_CLUSTER_AS
+// The cluster geometry records (D93b), in the LOD table: for each cluster of a
+// FLAG_CLUSTER_GEOMETRY surface, from its cluster_record_base, the cluster's blob address (words 0
+// and 1), its vertex count | triangle count << 16, and its first triangle in [LOD 0 | coarse tail].
+layout(set = 0, binding = 45, std430) restrict readonly buffer ClusterGeometryRecords {
+	uint cluster_geometry_records[];
+};
+#endif
+
+/// A triangle of a hit or a ray-query candidate: its id in the surface's [LOD 0 | coarse tail],
+/// which emission weighting (D50) keys on, and its three vertex indices. In a cluster BLAS (D79)
+/// the primitive counts inside the cluster and the cluster's ID carries its first triangle, or on a
+/// FLAG_CLUSTER_GEOMETRY surface its index (D93b): there the indices are local to the cluster's
+/// blob, and geom is rewritten to read it (the normal block at its base, the attribute block after
+/// it), so the fetches below read the blob unchanged. Its vertex and index addresses then no longer
+/// name the surface's buffers, so a reader of positions keeps a copy of the record.
+uint rt_resolve_triangle(inout GeometryData geom, int cluster_id, uint primitive, out uint i0, out uint i1, out uint i2) {
+	uint triangle = primitive;
+#ifdef USE_CLUSTER_AS
 	if (cluster_id != gl_ClusterIDNoneNV) {
-		return uint(cluster_id) + uint(gl_PrimitiveID);
+		if ((geom.flags & FLAG_CLUSTER_GEOMETRY) != 0u) {
+			uint record = geom.cluster_record_base + uint(cluster_id) * CLUSTER_GEOMETRY_RECORD_WORDS;
+			uint64_t blob = packUint2x32(uvec2(cluster_geometry_records[record], cluster_geometry_records[record + 1u]));
+			uint vertex_count = cluster_geometry_records[record + 2u] & 0xFFFFu;
+			// The blob's strides, as the population derives them: the compressed format's normal entry
+			// widened to 8 bytes with the tangent angle's word, each section 16-byte aligned.
+			bool has_normal = geom.normal_byte_offset != OFFSET_NONE;
+			uint normal_stride = has_normal ? ((geom.flags & FLAG_COMPRESSED) != 0u ? 8u : geom.normal_stride) : 0u;
+			uint attribute_stride = geom.attribute_address != 0ul ? geom.attribute_stride : 0u;
+			const uint align_mask = CLUSTER_GEOMETRY_ALIGNMENT - 1u;
+			uint64_t attributes = blob + uint64_t((vertex_count * normal_stride + align_mask) & ~align_mask);
+			Uint32Buffer words = Uint32Buffer(attributes + uint64_t((vertex_count * attribute_stride + align_mask) & ~align_mask));
+			uint b = primitive * 3u;
+			i0 = (words.v[b >> 2u] >> ((b & 3u) << 3u)) & 0xFFu;
+			b++;
+			i1 = (words.v[b >> 2u] >> ((b & 3u) << 3u)) & 0xFFu;
+			b++;
+			i2 = (words.v[b >> 2u] >> ((b & 3u) << 3u)) & 0xFFu;
+			geom.vertex_address = blob;
+			geom.attribute_address = attribute_stride != 0u ? attributes : 0ul;
+			geom.index_address = 0ul;
+			geom.vertex_count = vertex_count;
+			if (has_normal) {
+				geom.normal_byte_offset = 0u;
+				geom.normal_stride = normal_stride;
+			}
+			if (geom.tangent_byte_offset != OFFSET_NONE) {
+				geom.tangent_byte_offset = 0u;
+				geom.tangent_stride = normal_stride;
+			}
+			return cluster_geometry_records[record + 3u] + primitive;
+		}
+		triangle = uint(cluster_id) + primitive;
 	}
 #endif
-	return uint(gl_PrimitiveID);
+	get_triangle_indices_ex(geom, triangle, i0, i1, i2);
+	return triangle;
 }
 
-/// Convenience wrapper over rt_primitive_index() (hit shaders only).
-void get_triangle_indices(in GeometryData geom, out uint i0, out uint i1, out uint i2) {
-	get_triangle_indices_ex(geom, rt_primitive_index(), i0, i1, i2);
+#ifndef RT_STAGE_RAYGEN
+/// The hit's cluster ID (hit shaders only).
+int rt_hit_cluster_id() {
+#if defined(USE_CLUSTER_AS) && (defined(RT_STAGE_CLOSEST_HIT) || defined(RT_STAGE_ANY_HIT))
+	return gl_ClusterIDNV;
+#else
+	return RT_CLUSTER_ID_NONE;
+#endif
+}
+
+/// rt_resolve_triangle for the hit (hit shaders only).
+uint rt_resolve_hit_triangle(inout GeometryData geom, out uint i0, out uint i1, out uint i2) {
+	return rt_resolve_triangle(geom, rt_hit_cluster_id(), uint(gl_PrimitiveID), i0, i1, i2);
 }
 #endif
 
@@ -249,7 +315,8 @@ TBNResult fetch_tbn(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) 
 #define FETCH_ALL (FETCH_UV | FETCH_TBN | FETCH_COLOR)
 
 #ifdef RT_HIT_ATTRIBS_DECLARED
-VertexAttributes fetch_vertex_attributes(in GeometryData geom, vec2 hit_attribs, uint fetch_flags) {
+/// geom and the indices as rt_resolve_hit_triangle returned them.
+VertexAttributes fetch_vertex_attributes(in GeometryData geom, uint i0, uint i1, uint i2, vec2 hit_attribs, uint fetch_flags) {
 	VertexAttributes attrs;
 	attrs.uv = vec2(0.0);
 	attrs.normal = vec3(0.0, 1.0, 0.0);
@@ -260,9 +327,6 @@ VertexAttributes fetch_vertex_attributes(in GeometryData geom, vec2 hit_attribs,
 	attrs.has_normal = false;
 	attrs.has_tangent = false;
 	attrs.has_color = false;
-
-	uint i0, i1, i2;
-	get_triangle_indices(geom, i0, i1, i2);
 
 	vec3 bary = vec3(1.0 - hit_attribs.x - hit_attribs.y, hit_attribs.x, hit_attribs.y);
 

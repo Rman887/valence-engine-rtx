@@ -64,6 +64,11 @@ static _FORCE_INLINE_ void _deformed_cluster_maxima(const RD::ClusterAcceleratio
 	r_max_vertices = MIN(uint32_t(RenderingServerTypes::MESH_CLUSTER_MAX_VERTICES), p_caps.max_vertices_per_cluster);
 }
 
+// The cluster arenas' allocator (D81, instanced twice since D93b), defined with the arena below.
+static bool _arena_allocate(LocalVector<RTClusterArenaChunk> &r_arena, uint64_t &r_reserved_bytes, uint64_t &r_live_bytes, uint64_t p_alignment, BitField<RD::BufferCreationBits> p_usage, BitField<RDD::PipelineStageBits> p_address_read_stages, const String &p_name, uint64_t p_size, uint32_t &r_chunk, uint64_t &r_offset);
+static void _arena_free(LocalVector<RTClusterArenaChunk> &r_arena, uint64_t &r_reserved_bytes, uint64_t &r_live_bytes, uint32_t p_chunk, uint64_t p_offset, uint64_t p_size);
+static void _arena_sweep(LocalVector<RTClusterArenaChunk> &r_arena, LocalVector<RTClusterRetiredRegion> &r_retired, uint64_t &r_reserved_bytes, uint64_t &r_live_bytes);
+
 void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 	owner = p_owner;
 	singleton = this;
@@ -92,7 +97,9 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		// position-fetch rule names the structure of the intersection. Set before any size query.
 		if (GLOBAL_GET("rendering/pathtracing/cluster_lod_stream_geometry")) {
 			if (caps.position_fetch) {
-				cluster_build_data_access = stream_wanted;
+				// The mesh storage's own test, which keeps the RAM copy the blobs come from (D93b): stream_wanted and support.
+				cluster_build_data_access = RendererRD::MeshStorage::is_cluster_geometry_streaming_wanted();
+				DEV_ASSERT(cluster_build_data_access == stream_wanted);
 			} else {
 				WARN_PRINT("rendering/pathtracing/cluster_lod_stream_geometry is on but the device has no VK_KHR_ray_tracing_position_fetch; surfaces keep their geometry resident.");
 			}
@@ -658,6 +665,19 @@ void RenderRaytracing::cleanup_caches() {
 	cluster_arena.clear();
 	cluster_arena_reserved_bytes = 0;
 	cluster_arena_live_bytes = 0;
+	// The cluster geometry arena (D93b): its surfaces retired their blobs above.
+	for (const RTClusterRetiredRegion &retired : cluster_geometry_arena_retired) {
+		_arena_free(cluster_geometry_arena, cluster_geometry_arena_reserved_bytes, cluster_geometry_arena_live_bytes, retired.chunk, retired.offset, retired.size);
+	}
+	cluster_geometry_arena_retired.clear();
+	for (uint32_t i = 0; i < cluster_geometry_arena.size(); i++) {
+		if (cluster_geometry_arena[i].buffer.is_valid()) {
+			rd->free_rid(cluster_geometry_arena[i].buffer);
+		}
+	}
+	cluster_geometry_arena.clear();
+	cluster_geometry_arena_reserved_bytes = 0;
+	cluster_geometry_arena_live_bytes = 0;
 
 	if (deformed_cluster_batch.args_buffer.is_valid()) {
 		rd->free_rid(deformed_cluster_batch.args_buffer);
@@ -1425,6 +1445,7 @@ void RenderRaytracing::_populate_surface_blas(
 			if (_populate_surface_cluster_blas(p_mesh_surface, vertex_buffer, index_buffer, p_cache_key, r_surf_data)) {
 				return;
 			}
+			_release_cluster_geometry(r_surf_data); // A triangle BLAS reads the surface's own buffers.
 		} else {
 			print_verbose(vformat("RT: surface [%d] on the triangle BLAS path (deformed %d, 2D %d, indexed %d).", p_cache_key, int(p_vertex_buffer_override.is_valid() || p_allow_update), int(is_2d), int(index_buffer.is_valid() && index_count > 0)));
 		}
@@ -1507,6 +1528,9 @@ bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID 
 	}
 	const uint32_t build_count = stream ? stream->persistent_clusters : cluster_count;
 	const uint32_t blas_count = stream ? stream->persistent_clusters : lod0_cluster_count;
+	// Geometry residency (D93b): a streamed surface whose records and blobs are in place gives every
+	// CLAS its cluster's index as its ID, here and in each load, and its hits read through them.
+	const bool cluster_geometry = stream && cluster_lod_stream_geometry_enabled && _populate_cluster_geometry(p_mesh_surface, layout, stream, p_cache_key, r_surf_data);
 
 	// Sizes (D81): the CLAS are built with implicit destinations into a staging buffer, so their
 	// size query returns one region for all of them and the build writes each one's size back;
@@ -1611,7 +1635,7 @@ bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID 
 			}
 		}
 		RD::ClusterTriangleBuildInfo info;
-		info.cluster_id = first_triangle;
+		info.cluster_id = cluster_geometry ? c : first_triangle;
 		info.triangle_count = triangle_count;
 		info.vertex_count = cluster_vertices[c];
 		info.index_type = geom.index_format == RT_INDEX_FORMAT_UINT16 ? RD::ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT16 : RD::ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT32;
@@ -1753,7 +1777,7 @@ bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID 
 }
 
 // The clusters of a surface: each a contiguous range of the index buffer, its ID its first
-// triangle, which is what the hit shaders add to gl_PrimitiveID (rt_primitive_index). A surface
+// triangle, which is what the hit shaders add to gl_PrimitiveID (rt_resolve_triangle). A surface
 // created with the setting on carries its table (D80): spatial clusters with the count of
 // distinct vertices each reaches. Without one, or with one that does not describe this index
 // buffer, the clusters are runs of T triangles (D79), which reach at most 3T distinct vertices,
@@ -2453,19 +2477,8 @@ void RenderRaytracing::_process_cluster_compactions() {
 	RD *rd = RD::get_singleton();
 
 	// Regions retired a frame queue ago are out of every frame in flight and go back to their chunk.
-	if (!cluster_arena_retired.is_empty()) {
-		const uint64_t frames_drawn = rd->get_frames_drawn();
-		const uint64_t frame_delay = rd->get_frame_delay();
-		for (uint32_t i = 0; i < cluster_arena_retired.size();) {
-			const RTClusterRetiredRegion &retired = cluster_arena_retired[i];
-			if (frames_drawn - retired.frame >= frame_delay) {
-				_cluster_arena_free(retired.chunk, retired.offset, retired.size);
-				cluster_arena_retired.remove_at_unordered(i);
-			} else {
-				i++;
-			}
-		}
-	}
+	_arena_sweep(cluster_arena, cluster_arena_retired, cluster_arena_reserved_bytes, cluster_arena_live_bytes);
+	_arena_sweep(cluster_geometry_arena, cluster_geometry_arena_retired, cluster_geometry_arena_reserved_bytes, cluster_geometry_arena_live_bytes);
 
 	if (cluster_compaction_results.is_empty()) {
 		return;
@@ -2628,11 +2641,13 @@ void RenderRaytracing::_process_cluster_compactions() {
 	}
 }
 
-bool RenderRaytracing::_cluster_arena_allocate(uint64_t p_size, uint32_t &r_chunk, uint64_t &r_offset) {
-	// First fit over the live chunks. Every region size is a multiple of the base alignment and
-	// every chunk base is aligned to it, so every offset handed out is aligned.
-	for (uint32_t i = 0; i < cluster_arena.size(); i++) {
-		RTClusterArenaChunk &chunk = cluster_arena[i];
+// A cluster arena (D81): chunks sub-allocated first fit, each region size a multiple of the
+// arena's alignment and each chunk base aligned to it, so every offset handed out is aligned. The
+// static CLAS arena and the cluster geometry arena (D93b) are two instances.
+static bool _arena_allocate(LocalVector<RTClusterArenaChunk> &r_arena, uint64_t &r_reserved_bytes, uint64_t &r_live_bytes, uint64_t p_alignment, BitField<RD::BufferCreationBits> p_usage, BitField<RDD::PipelineStageBits> p_address_read_stages, const String &p_name, uint64_t p_size, uint32_t &r_chunk, uint64_t &r_offset) {
+	// First fit over the live chunks.
+	for (uint32_t i = 0; i < r_arena.size(); i++) {
+		RTClusterArenaChunk &chunk = r_arena[i];
 		if (chunk.buffer.is_null()) {
 			continue;
 		}
@@ -2649,27 +2664,28 @@ bool RenderRaytracing::_cluster_arena_allocate(uint64_t p_size, uint32_t &r_chun
 				chunk.free_list.remove_at(j);
 			}
 			chunk.live_regions++;
-			cluster_arena_live_bytes += p_size;
+			r_live_bytes += p_size;
 			return true;
 		}
 	}
 
 	// A new chunk, of the standard size or, for a region larger than that, its own.
 	RD *rd = RD::get_singleton();
-	const RD::ClusterAccelerationStructureCapabilities &caps = rd->get_cluster_acceleration_structure_capabilities();
-	const uint64_t base_alignment = MAX(caps.cluster_byte_alignment, caps.cluster_bottom_level_byte_alignment);
 	const uint64_t chunk_size = MAX(uint64_t(RT_CLUSTER_ARENA_CHUNK_BYTES), p_size);
-	const uint64_t buffer_size = chunk_size + base_alignment;
+	const uint64_t buffer_size = chunk_size + p_alignment;
 	ERR_FAIL_COND_V_MSG(buffer_size > UINT32_MAX, false, "RT: a cluster arena chunk exceeds 4 GB.");
-	RID buffer = rd->storage_buffer_create(uint32_t(buffer_size), {}, 0,
-			RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT);
+	RID buffer = rd->storage_buffer_create(uint32_t(buffer_size), {}, 0, p_usage);
 	if (buffer.is_null()) {
 		return false;
+	}
+	if (p_address_read_stages != 0) {
+		// Read through device addresses: a write to a region reused after retirement waits for those reads.
+		rd->buffer_add_device_address_read_stages(buffer, p_address_read_stages);
 	}
 	RTClusterArenaChunk chunk;
 	chunk.buffer = buffer;
 	const uint64_t buffer_address = rd->buffer_get_device_address(buffer);
-	chunk.address = _align_up(buffer_address, base_alignment);
+	chunk.address = _align_up(buffer_address, p_alignment);
 	chunk.base_offset = chunk.address - buffer_address;
 	chunk.size = chunk_size;
 	chunk.live_regions = 1;
@@ -2678,40 +2694,29 @@ bool RenderRaytracing::_cluster_arena_allocate(uint64_t p_size, uint32_t &r_chun
 	}
 
 	// A dead slot is reused so the chunk indices surfaces hold stay valid.
-	uint32_t index = cluster_arena.size();
-	for (uint32_t i = 0; i < cluster_arena.size(); i++) {
-		if (cluster_arena[i].buffer.is_null()) {
+	uint32_t index = r_arena.size();
+	for (uint32_t i = 0; i < r_arena.size(); i++) {
+		if (r_arena[i].buffer.is_null()) {
 			index = i;
 			break;
 		}
 	}
-	if (index == cluster_arena.size()) {
-		cluster_arena.push_back(chunk);
+	if (index == r_arena.size()) {
+		r_arena.push_back(chunk);
 	} else {
-		cluster_arena[index] = chunk;
+		r_arena[index] = chunk;
 	}
-	rd->set_resource_name(buffer, "RT cluster arena [" + itos(index) + "]");
-	cluster_arena_reserved_bytes += chunk_size;
-	cluster_arena_live_bytes += p_size;
+	rd->set_resource_name(buffer, p_name + " [" + itos(index) + "]");
+	r_reserved_bytes += chunk_size;
+	r_live_bytes += p_size;
 	r_chunk = index;
 	r_offset = 0;
 	return true;
 }
 
-void RenderRaytracing::_cluster_arena_retire(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size) {
-	// The chunk outlives the region and the trace's reads of it are not on the chunk's tracker,
-	// so the region is handed out again only once the frames that may read it have retired.
-	RTClusterRetiredRegion retired;
-	retired.chunk = p_chunk;
-	retired.offset = p_offset;
-	retired.size = p_size;
-	retired.frame = RD::get_singleton()->get_frames_drawn();
-	cluster_arena_retired.push_back(retired);
-}
-
-void RenderRaytracing::_cluster_arena_free(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size) {
-	ERR_FAIL_UNSIGNED_INDEX(p_chunk, cluster_arena.size());
-	RTClusterArenaChunk &chunk = cluster_arena[p_chunk];
+static void _arena_free(LocalVector<RTClusterArenaChunk> &r_arena, uint64_t &r_reserved_bytes, uint64_t &r_live_bytes, uint32_t p_chunk, uint64_t p_offset, uint64_t p_size) {
+	ERR_FAIL_UNSIGNED_INDEX(p_chunk, r_arena.size());
+	RTClusterArenaChunk &chunk = r_arena[p_chunk];
 	ERR_FAIL_COND(chunk.buffer.is_null() || chunk.live_regions == 0);
 
 	// Insert in offset order, then merge with either neighbour it touches.
@@ -2729,14 +2734,55 @@ void RenderRaytracing::_cluster_arena_free(uint32_t p_chunk, uint64_t p_offset, 
 		chunk.free_list.remove_at(at);
 	}
 	chunk.live_regions--;
-	cluster_arena_live_bytes -= p_size;
+	r_live_bytes -= p_size;
 
 	// A chunk with nothing live in it goes, so the arena's memory follows its contents.
 	if (chunk.live_regions == 0) {
 		RD::get_singleton()->free_rid(chunk.buffer);
-		cluster_arena_reserved_bytes -= chunk.size;
+		r_reserved_bytes -= chunk.size;
 		chunk = RTClusterArenaChunk();
 	}
+}
+
+// Regions retired a frame queue ago are out of every frame in flight and go back to their chunk.
+static void _arena_sweep(LocalVector<RTClusterArenaChunk> &r_arena, LocalVector<RTClusterRetiredRegion> &r_retired, uint64_t &r_reserved_bytes, uint64_t &r_live_bytes) {
+	if (r_retired.is_empty()) {
+		return;
+	}
+	RD *rd = RD::get_singleton();
+	const uint64_t frames_drawn = rd->get_frames_drawn();
+	const uint64_t frame_delay = rd->get_frame_delay();
+	for (uint32_t i = 0; i < r_retired.size();) {
+		const RTClusterRetiredRegion &retired = r_retired[i];
+		if (frames_drawn - retired.frame >= frame_delay) {
+			_arena_free(r_arena, r_reserved_bytes, r_live_bytes, retired.chunk, retired.offset, retired.size);
+			r_retired.remove_at_unordered(i);
+		} else {
+			i++;
+		}
+	}
+}
+
+bool RenderRaytracing::_cluster_arena_allocate(uint64_t p_size, uint32_t &r_chunk, uint64_t &r_offset) {
+	const RD::ClusterAccelerationStructureCapabilities &caps = RD::get_singleton()->get_cluster_acceleration_structure_capabilities();
+	const uint64_t base_alignment = MAX(caps.cluster_byte_alignment, caps.cluster_bottom_level_byte_alignment);
+	return _arena_allocate(cluster_arena, cluster_arena_reserved_bytes, cluster_arena_live_bytes, base_alignment,
+			RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT, 0, "RT cluster arena", p_size, r_chunk, r_offset);
+}
+
+void RenderRaytracing::_cluster_arena_retire(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size) {
+	// The chunk outlives the region and the trace's reads of it are not on the chunk's tracker,
+	// so the region is handed out again only once the frames that may read it have retired.
+	RTClusterRetiredRegion retired;
+	retired.chunk = p_chunk;
+	retired.offset = p_offset;
+	retired.size = p_size;
+	retired.frame = RD::get_singleton()->get_frames_drawn();
+	cluster_arena_retired.push_back(retired);
+}
+
+void RenderRaytracing::_cluster_arena_free(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size) {
+	_arena_free(cluster_arena, cluster_arena_reserved_bytes, cluster_arena_live_bytes, p_chunk, p_offset, p_size);
 }
 
 void RenderRaytracing::release_mesh_surface(RID p_mesh, uint32_t p_surface) {
@@ -2786,6 +2832,209 @@ void RenderRaytracing::_release_surface_data(RTSurfaceData *p_surf_data) {
 		p_surf_data->arena_size = 0;
 	}
 	_release_surface_cluster_lod(p_surf_data);
+	_release_cluster_geometry(p_surf_data);
+}
+
+// ---------------------------------------------------------------------------
+// Geometry residency (D93b)
+// ---------------------------------------------------------------------------
+
+// A streamed surface's cluster geometry. Each group's blob holds its clusters in order, each one
+// self-contained: its distinct vertices' normal block (the surface's own encoding, the compressed
+// format's entries widened to 8 bytes, the oct16 normal and then the position word whose high half
+// carries the tangent angle), their attribute block (the surface's interleaved attributes, byte
+// for byte), then its triangles as 8-bit indices into those vertices, every section at
+// RT_CLUSTER_GEOMETRY_ALIGNMENT. Positions are absent: a hit takes them from the CLAS. A record per
+// cluster in the LOD table gives a hit its cluster's blob, counts and first triangle in
+// [LOD 0 | coarse tail]. Every group's blob is built here and stays (blob residency is D93c's). The
+// gather reads the surface's RAM copy, which MeshStorage keeps for a surface with a hierarchy while
+// geometry streaming is on: the bytes its buffers were made from.
+bool RenderRaytracing::_populate_cluster_geometry(void *p_mesh_surface, const RTClusterLayout &p_layout, const RTLodStream *p_stream, uint32_t p_cache_key, RTSurfaceData *r_surf_data) {
+	RD *rd = RD::get_singleton();
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	const Vector<uint8_t> &vertex_data = mesh_storage->mesh_surface_get_ram_vertex_data(p_mesh_surface);
+	const Vector<uint8_t> &attribute_data = mesh_storage->mesh_surface_get_ram_attribute_data(p_mesh_surface);
+	const Vector<uint8_t> &index_data = mesh_storage->mesh_surface_get_ram_index_data(p_mesh_surface);
+	RT_GeometryData &geom = r_surf_data->geometry;
+	const uint64_t gather_start = OS::get_singleton()->get_ticks_usec();
+	const uint32_t vertex_count = geom.vertex_count;
+	const uint32_t cluster_count = p_layout.triangles.size();
+	const bool compressed = (geom.flags & RT_GEOM_FLAG_COMPRESSED) != 0;
+	const bool has_normal = geom.normal_byte_offset != RT_OFFSET_NONE;
+	// As the shader derives them (rt_resolve_triangle).
+	const uint32_t normal_stride = has_normal ? (compressed ? 8u : geom.normal_stride) : 0u;
+	const uint32_t attribute_stride = geom.attribute_buffer_address != 0 ? geom.attribute_stride : 0u;
+	const bool index_16 = geom.index_format == RT_INDEX_FORMAT_UINT16;
+	const uint32_t index_size = index_16 ? sizeof(uint16_t) : sizeof(uint32_t);
+	const uint64_t index_count = uint64_t(p_layout.total_triangles) * 3;
+
+	// The RAM copy must hold what the buffers do: the normal block, every attribute, every level's indices.
+	const uint64_t vertex_bytes_needed = has_normal ? uint64_t(geom.normal_byte_offset) + uint64_t(vertex_count) * geom.normal_stride : uint64_t(vertex_count) * geom.position_stride;
+	if (vertex_data.is_empty() || index_data.is_empty() || geom.index_format == RT_INDEX_FORMAT_NONE || uint64_t(vertex_data.size()) < vertex_bytes_needed || uint64_t(attribute_data.size()) < uint64_t(vertex_count) * attribute_stride || uint64_t(index_data.size()) < index_count * index_size || p_stream->cluster_first_triangle.size() != cluster_count) {
+		print_verbose(vformat("RT: cluster BLAS [%d] streams its CLAS but reads its own buffers: no RAM copy of its arrays matches them (D93b).", p_cache_key));
+		return false;
+	}
+
+	// Each cluster's distinct vertices in first-use order and its triangles over them.
+	LocalVector<uint16_t> local;
+	local.resize(vertex_count);
+	memset(local.ptr(), 0xFF, sizeof(uint16_t) * vertex_count);
+	LocalVector<uint32_t> vertices; // Every cluster's, concatenated.
+	LocalVector<uint32_t> vertices_first; // Per cluster, and one past the last.
+	LocalVector<uint8_t> indices;
+	vertices_first.resize(cluster_count + 1);
+	indices.resize(index_count);
+	const uint8_t *index_bytes = index_data.ptr();
+	uint64_t cursor = 0;
+	for (uint32_t c = 0; c < cluster_count; c++) {
+		vertices_first[c] = vertices.size();
+		const uint64_t first = uint64_t(p_stream->cluster_first_triangle[c]) * 3;
+		const uint64_t end = first + uint64_t(p_layout.triangles[c]) * 3;
+		bool valid = cursor == first;
+		for (uint64_t i = first; i < end && valid; i++) {
+			const uint32_t index = index_16 ? reinterpret_cast<const uint16_t *>(index_bytes)[i] : reinterpret_cast<const uint32_t *>(index_bytes)[i];
+			valid = index < vertex_count;
+			if (!valid) {
+				break;
+			}
+			if (local[index] == 0xFFFF) {
+				valid = vertices.size() - vertices_first[c] < RT_CLUSTER_GEOMETRY_MAX_VERTICES;
+				local[index] = uint16_t(vertices.size() - vertices_first[c]);
+				vertices.push_back(index);
+			}
+			indices[i] = uint8_t(local[index]);
+		}
+		cursor = end;
+		for (uint32_t v = vertices_first[c]; v < vertices.size(); v++) {
+			local[vertices[v]] = 0xFFFF;
+		}
+		if (!valid) {
+			print_verbose(vformat("RT: cluster BLAS [%d] streams its CLAS but reads its own buffers: cluster %d indexes past the surface, out of order or past %d vertices (D93b).", p_cache_key, c, RT_CLUSTER_GEOMETRY_MAX_VERTICES));
+			return false;
+		}
+	}
+	vertices_first[cluster_count] = vertices.size();
+
+	// The records, in the LOD table.
+	const uint32_t record_words = cluster_count * RT_CLUSTER_GEOMETRY_RECORD_WORDS;
+	uint32_t record_offset = 0;
+	if (!_cluster_lod_table_allocate(record_words, record_offset)) {
+		return false;
+	}
+	r_surf_data->cluster_geometry_offset = record_offset;
+	r_surf_data->cluster_geometry_words = record_words;
+	LocalVector<uint32_t> records;
+	records.resize(record_words);
+
+	// The blobs, a region per group. Regions that follow each other in a chunk, as a fresh chunk
+	// hands them out, go up in one update: one transfer, not a barrier per group.
+	const uint64_t alignment = RT_CLUSTER_GEOMETRY_ALIGNMENT;
+	const uint8_t *vertex_bytes = vertex_data.ptr();
+	const uint8_t *attribute_bytes = attribute_data.ptr();
+	LocalVector<uint8_t> run;
+	int32_t run_chunk = -1;
+	uint64_t run_offset = 0;
+	uint32_t uploads = 0;
+	r_surf_data->cluster_geometry_blobs.resize(p_stream->groups.size());
+	uint64_t blob_bytes_total = 0;
+	for (uint32_t g = 0; g < p_stream->groups.size(); g++) {
+		const RTLodStreamGroup &group = p_stream->groups[g];
+		uint64_t size = 0;
+		for (uint32_t c = group.first_cluster; c < group.first_cluster + group.cluster_count; c++) {
+			const uint64_t v = vertices_first[c + 1] - vertices_first[c];
+			size += _align_up(v * normal_stride, alignment) + _align_up(v * attribute_stride, alignment) + _align_up(uint64_t(p_layout.triangles[c]) * 3, alignment);
+		}
+		uint32_t chunk_index = 0;
+		uint64_t offset = 0;
+		if (!_arena_allocate(cluster_geometry_arena, cluster_geometry_arena_reserved_bytes, cluster_geometry_arena_live_bytes, alignment,
+					RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT, RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT, "RT cluster geometry arena", size, chunk_index, offset)) {
+			_release_cluster_geometry(r_surf_data);
+			return false;
+		}
+		r_surf_data->cluster_geometry_blobs[g] = { int32_t(chunk_index), offset, size };
+		if (run_chunk != int32_t(chunk_index) || run_offset + run.size() != offset) {
+			if (run_chunk >= 0) {
+				const RTClusterArenaChunk &run_target = cluster_geometry_arena[run_chunk];
+				rd->buffer_update(run_target.buffer, run_target.base_offset + run_offset, run.size(), run.ptr());
+				uploads++;
+			}
+			run_chunk = int32_t(chunk_index);
+			run_offset = offset;
+			run.clear();
+		}
+		const RTClusterArenaChunk &chunk = cluster_geometry_arena[chunk_index];
+		const uint64_t base = run.size();
+		run.resize(base + size);
+		memset(run.ptr() + base, 0, size);
+		uint8_t *blob = run.ptr() + base;
+		uint64_t at = 0;
+		for (uint32_t c = group.first_cluster; c < group.first_cluster + group.cluster_count; c++) {
+			const uint32_t v_first = vertices_first[c];
+			const uint32_t v_count = vertices_first[c + 1] - v_first;
+			const uint64_t cluster_address = chunk.address + offset + at;
+			uint8_t *normals = blob + at;
+			uint8_t *attributes = normals + _align_up(uint64_t(v_count) * normal_stride, alignment);
+			uint8_t *local_indices = attributes + _align_up(uint64_t(v_count) * attribute_stride, alignment);
+			for (uint32_t k = 0; k < v_count; k++) {
+				const uint32_t vertex = vertices[v_first + k];
+				if (compressed && has_normal) {
+					memcpy(normals + k * 8, vertex_bytes + geom.normal_byte_offset + uint64_t(vertex) * geom.normal_stride, sizeof(uint32_t));
+					memcpy(normals + k * 8 + 4, vertex_bytes + uint64_t(vertex) * geom.position_stride + 4, sizeof(uint32_t));
+				} else if (has_normal) {
+					memcpy(normals + uint64_t(k) * normal_stride, vertex_bytes + geom.normal_byte_offset + uint64_t(vertex) * geom.normal_stride, normal_stride);
+				}
+				if (attribute_stride > 0) {
+					memcpy(attributes + uint64_t(k) * attribute_stride, attribute_bytes + uint64_t(vertex) * attribute_stride, attribute_stride);
+				}
+			}
+			const uint64_t first_index = uint64_t(p_stream->cluster_first_triangle[c]) * 3;
+			memcpy(local_indices, indices.ptr() + first_index, uint64_t(p_layout.triangles[c]) * 3);
+			uint32_t *record = records.ptr() + uint64_t(c) * RT_CLUSTER_GEOMETRY_RECORD_WORDS;
+			record[0] = uint32_t(cluster_address);
+			record[1] = uint32_t(cluster_address >> 32);
+			record[2] = v_count | (p_layout.triangles[c] << 16);
+			record[3] = p_stream->cluster_first_triangle[c];
+			at = uint64_t(local_indices - blob) + _align_up(uint64_t(p_layout.triangles[c]) * 3, alignment);
+		}
+		DEV_ASSERT(at == size);
+		blob_bytes_total += size;
+	}
+	if (run_chunk >= 0) {
+		const RTClusterArenaChunk &run_target = cluster_geometry_arena[run_chunk];
+		rd->buffer_update(run_target.buffer, run_target.base_offset + run_offset, run.size(), run.ptr());
+		uploads++;
+	}
+	rd->buffer_update(cluster_lod_table, record_offset * sizeof(uint32_t), record_words * sizeof(uint32_t), records.ptr());
+
+	geom.flags |= RT_GEOM_FLAG_CLUSTER_GEOMETRY;
+	geom.cluster_record_base = record_offset;
+	print_verbose(vformat("RT: cluster BLAS [%d] reads its geometry from blobs (D93b): %d clusters in %d groups, %d vertices, %d KB of blobs in %d uploads, %.1f bytes a triangle, gathered in %d us.", p_cache_key, cluster_count, p_stream->groups.size(), vertices.size(), blob_bytes_total / 1024, uploads, double(blob_bytes_total) / double(MAX(p_layout.total_triangles, 1u)), OS::get_singleton()->get_ticks_usec() - gather_start));
+	return true;
+}
+
+// The surface's records go back to the LOD table (a later write there is ordered behind the trace
+// that binds the table) and its blobs back to the arena past the frames that may trace them.
+void RenderRaytracing::_release_cluster_geometry(RTSurfaceData *p_surf_data) {
+	const uint64_t frames_drawn = RD::get_singleton()->get_frames_drawn();
+	for (const RTClusterArenaRegion &region : p_surf_data->cluster_geometry_blobs) {
+		if (region.chunk >= 0) {
+			RTClusterRetiredRegion retired;
+			retired.chunk = uint32_t(region.chunk);
+			retired.offset = region.offset;
+			retired.size = region.size;
+			retired.frame = frames_drawn;
+			cluster_geometry_arena_retired.push_back(retired);
+		}
+	}
+	p_surf_data->cluster_geometry_blobs.clear();
+	if (p_surf_data->cluster_geometry_offset != UINT32_MAX) {
+		cluster_lod_table_live_words -= p_surf_data->cluster_geometry_words;
+		_cluster_lod_table_free(p_surf_data->cluster_geometry_offset, p_surf_data->cluster_geometry_words);
+	}
+	p_surf_data->cluster_geometry_offset = UINT32_MAX;
+	p_surf_data->cluster_geometry_words = 0;
+	p_surf_data->geometry.flags &= ~uint32_t(RT_GEOM_FLAG_CLUSTER_GEOMETRY);
+	p_surf_data->geometry.cluster_record_base = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -3782,13 +4031,14 @@ bool RenderRaytracing::_issue_lod_stream_load(const LocalVector<RTLodStreamLoad:
 			const RTLodStreamGroup &group = stream->groups[item.group];
 			const RT_GeometryData &geom = surface->geometry;
 			const uint32_t index_size = geom.index_format == RT_INDEX_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t);
+			const bool cluster_geometry = (geom.flags & RT_GEOM_FLAG_CLUSTER_GEOMETRY) != 0; // As the population built the surface's CLAS (D93b).
 			for (uint32_t c = group.first_cluster; c < group.first_cluster + group.cluster_count; c++) {
 				RD::ClusterTriangleBuildInfo info;
-				info.cluster_id = stream->cluster_first_triangle[c];
+				info.cluster_id = cluster_geometry ? c : stream->cluster_first_triangle[c];
 				info.triangle_count = stream->cluster_packed[c] & 0xFFFFu;
 				info.vertex_count = stream->cluster_packed[c] >> 16;
 				info.index_type = geom.index_format == RT_INDEX_FORMAT_UINT16 ? RD::ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT16 : RD::ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT32;
-				info.index_address = geom.index_buffer_address + uint64_t(info.cluster_id) * 3u * index_size;
+				info.index_address = geom.index_buffer_address + uint64_t(stream->cluster_first_triangle[c]) * 3u * index_size;
 				info.index_stride = index_size;
 				info.vertex_address = geom.vertex_buffer_address;
 				info.vertex_stride = geom.position_stride;
@@ -4209,6 +4459,9 @@ void RenderRaytracing::_process_lod_stream() {
 		print_verbose(vformat("RT: CLAS streaming (D92): %d surfaces (%d pinned), %d of %d streamed groups resident (%d of %d roots, groups refined into nothing), %d KB resident (%d KB pinned, peak %d KB, budget %d KB), %d KB persistent, %d KB loading; over the run %d requests (%d for roots), %d loads (%d clusters), deferred %d for the build cap, %d for the budget and %d cached-level asks without room, %d evictions, %d failed, %d requests and %d use reports past their lists, %d and %d past the frame's read; request to resident p50 %d, max %d frames over %d loads since the last report; %d resident groups with a parent not resident.", cluster_lod_stream_surfaces.size(), pinned_surfaces, resident_groups, streamed_groups, resident_roots, root_groups, resident_total / 1024, pinned_bytes / 1024, lod_stream_stats.peak_bytes / 1024, cluster_lod_stream_budget / 1024, persistent_bytes / 1024, loading_bytes / 1024, lod_stream_stats.requests, lod_stream_stats.root_requests, lod_stream_stats.loads, lod_stream_stats.loaded_clusters, lod_stream_stats.deferred_cap, lod_stream_stats.deferred_budget, lod_stream_stats.deferred_soft, lod_stream_stats.evictions, lod_stream_stats.failed, lod_stream_stats.request_overflow, lod_stream_stats.touch_overflow, lod_stream_stats.request_unread, lod_stream_stats.touch_unread, p50, latency_max, lod_stream_stats.latency.size(), open));
 		if (open > 0) {
 			ERR_PRINT(vformat("RT: CLAS streaming (D92): %d resident groups have a parent that is not; the traced cut may have holes.", open));
+		}
+		if (cluster_lod_stream_geometry_enabled) {
+			print_verbose(vformat("RT: cluster geometry (D93b): %d KB of blobs in %d KB of arena chunks.", cluster_geometry_arena_live_bytes / 1024, cluster_geometry_arena_reserved_bytes / 1024));
 		}
 		lod_stream_stats.latency.clear();
 	}
@@ -5530,6 +5783,7 @@ void RenderRaytracing::_on_position_fetch_check_read(const PackedByteArray &p_by
 		memcpy(&max_difference[i], &words[i * 3 + 2], sizeof(float));
 	}
 	print_line(vformat("RT: position fetch check (D93a), the last 300 frames: float %d hits, %d differ, max %s; compressed %d hits, %d differ, max %s; deformed %d hits, %d differ, max %s.", words[0], words[1], String::num_scientific(max_difference[0]), words[3], words[4], String::num_scientific(max_difference[1]), words[6], words[7], String::num_scientific(max_difference[2])));
+	print_line(vformat("RT: cluster geometry check (D93b), the last 300 frames: %d hits read through a blob, %d with a normal or attribute word that differs from the surface's buffers.", words[9], words[10]));
 }
 
 void RenderRaytracing::_on_lod_counts_read(const PackedByteArray &p_counts, uint64_t p_ticket, uint32_t p_entry_count, uint32_t p_stride) {
@@ -8515,6 +8769,21 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		uniforms.push_back(u);
 	}
 
+	// Binding 45: the cluster geometry records (D93b), which sit in the LOD table; a table the
+	// population grows this frame is bound here as the new buffer, since the set is made after it.
+	// Bound only while geometry streams: a bound table is a declared read, which orders the
+	// selection's writes to it behind the trace.
+	{
+		RD::Uniform u;
+		u.binding = 45;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		if (cluster_lod_stream_geometry_enabled && cluster_lod_table.is_valid()) {
+			u.append_id(cluster_lod_table);
+		} else {
+			u.append_id(RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer());
+		}
+		uniforms.push_back(u);
+	}
 	// Binding 46: the position-fetch check (D93a), declared only by a verbose run's shaders.
 	if (position_fetch_check_buffer.is_valid()) {
 		RD::Uniform u;
@@ -8817,6 +9086,14 @@ void RenderRaytracing::register_raytracing_buffer_dependencies(RD::RaytracingLis
 		}
 		if (e->replicated_idx_buffer.is_valid()) {
 			rd->raytracing_list_add_buffer_dependency(p_list, e->replicated_idx_buffer, /*p_writable=*/false);
+		}
+	}
+
+	// The cluster geometry blobs (D93b), written by a population in this frame: the chunks, a few
+	// 32 MB buffers. Their in-place reuse past retirement is ordered by the read stages each declares.
+	for (const RTClusterArenaChunk &chunk : cluster_geometry_arena) {
+		if (chunk.buffer.is_valid()) {
+			rd->raytracing_list_add_buffer_dependency(p_list, chunk.buffer, /*p_writable=*/false);
 		}
 	}
 }

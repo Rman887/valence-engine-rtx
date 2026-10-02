@@ -25,8 +25,11 @@
 // A verbose run's comparison of the positions a cluster hit fetches from its CLAS with the ones
 // its vertex buffer holds, in the space the CLAS was built in (the compressed format's unorm
 // box, which is what emissive_fetch_position decodes). Words per kind (float, compressed,
-// deformed): hits compared, hits that differ, the largest absolute difference as float bits. One
-// pixel in 64 compares; the host clears the words after each read.
+// deformed): hits compared, hits that differ, the largest absolute difference as float bits. Then
+// (D93b) the cluster geometry hits whose blob words were compared with the surface's buffers at
+// the triangle's own vertices, and those with a word that differs; with the positions' check at
+// the same triangle id, this proves the records' first triangles too. One pixel in 64 compares;
+// the host clears the words after each read.
 layout(set = 0, binding = 46, std430) buffer PositionFetchCheck {
 	uint words[];
 }
@@ -50,6 +53,42 @@ void position_fetch_check_hit(GeometryData geom, uint primitive_id) {
 		atomicMax(position_fetch_check.words[base + 2u], floatBitsToUint(isnan(difference) ? uintBitsToFloat(0x7F800000u) : difference));
 	}
 }
+
+// p_surface is the record as bound, p_blob as rt_resolve_hit_triangle rewrote it, b0..b2 its indices.
+void cluster_geometry_check_hit(GeometryData p_surface, GeometryData p_blob, uint p_triangle, uint b0, uint b1, uint b2) {
+	if (gl_ClusterIDNV == gl_ClusterIDNoneNV || ((gl_LaunchIDEXT.x | gl_LaunchIDEXT.y) & 7u) != 0u || (p_surface.flags & FLAG_CLUSTER_GEOMETRY) == 0u || p_surface.vertex_address == 0ul) {
+		return;
+	}
+	uvec3 g;
+	get_triangle_indices_ex(p_surface, p_triangle, g.x, g.y, g.z);
+	uvec3 b = uvec3(b0, b1, b2);
+	Uint32Buffer surface_vertices = Uint32Buffer(p_surface.vertex_address);
+	Uint32Buffer blob_vertices = Uint32Buffer(p_blob.vertex_address);
+	Uint32Buffer surface_attributes = Uint32Buffer(p_surface.attribute_address);
+	Uint32Buffer blob_attributes = Uint32Buffer(p_blob.attribute_address);
+	uint attribute_words = p_surface.attribute_address != 0ul ? p_surface.attribute_stride >> 2u : 0u;
+	bool compressed = (p_surface.flags & FLAG_COMPRESSED) != 0u;
+	bool differs = false;
+	for (uint k = 0u; k < 3u; k++) {
+		if (p_surface.normal_byte_offset != OFFSET_NONE) {
+			uint surface_normal = (p_surface.normal_byte_offset >> 2u) + g[k] * (p_surface.normal_stride >> 2u);
+			uint blob_normal = b[k] * (p_blob.normal_stride >> 2u);
+			differs = differs || surface_vertices.v[surface_normal] != blob_vertices.v[blob_normal];
+			if (compressed) {
+				differs = differs || surface_vertices.v[g[k] * 2u + 1u] != blob_vertices.v[blob_normal + 1u]; // The tangent angle's word.
+			} else if (p_surface.normal_stride >= 8u) {
+				differs = differs || surface_vertices.v[surface_normal + 1u] != blob_vertices.v[blob_normal + 1u];
+			}
+		}
+		for (uint w = 0u; w < attribute_words; w++) {
+			differs = differs || surface_attributes.v[g[k] * attribute_words + w] != blob_attributes.v[b[k] * attribute_words + w];
+		}
+	}
+	atomicAdd(position_fetch_check.words[9], 1u);
+	if (differs) {
+		atomicAdd(position_fetch_check.words[10], 1u);
+	}
+}
 #endif
 
 // ============================================================================
@@ -61,18 +100,23 @@ void position_fetch_check_hit(GeometryData geom, uint primitive_id) {
 HitData compute_hit_data() {
 	HitData h;
 	h.geometry_idx = gl_InstanceCustomIndexEXT;
-	h.primitive_id = rt_primitive_index();
 	GeometryData geom = geometries[h.geometry_idx];
 #if defined(RT_POSITION_FETCH_CHECK) && defined(USE_CLUSTER_AS)
-	position_fetch_check_hit(geom, h.primitive_id);
+	GeometryData surface = geom;
+#endif
+	uint i0, i1, i2;
+	h.primitive_id = rt_resolve_hit_triangle(geom, i0, i1, i2);
+#if defined(RT_POSITION_FETCH_CHECK) && defined(USE_CLUSTER_AS)
+	position_fetch_check_hit(surface, h.primitive_id);
+	cluster_geometry_check_hit(surface, geom, h.primitive_id, i0, i1, i2);
 #endif
 
 	// Custom hit groups may reference vertex color in their fragment code, so
 	// pull all attributes; default HGs can skip color for perf.
 #ifdef RT_CUSTOM_HIT_GROUP
-	VertexAttributes attrs = fetch_vertex_attributes(geom, attribs, FETCH_ALL);
+	VertexAttributes attrs = fetch_vertex_attributes(geom, i0, i1, i2, attribs, FETCH_ALL);
 #else
-	VertexAttributes attrs = fetch_vertex_attributes(geom, attribs, FETCH_UV | FETCH_TBN);
+	VertexAttributes attrs = fetch_vertex_attributes(geom, i0, i1, i2, attribs, FETCH_UV | FETCH_TBN);
 #endif
 	h.uv = attrs.uv;
 	h.color = attrs.color;
@@ -215,7 +259,7 @@ void write_primary_hit_velocity(vec3 hit_pos) {
 		uint64_t prev_addr = packUint2x32(uvec2(geom.prev_vertex_address_lo, geom.prev_vertex_address_hi));
 		if (prev_addr != 0ul) {
 			uint i0, i1, i2;
-			get_triangle_indices(geom, i0, i1, i2);
+			rt_resolve_hit_triangle(geom, i0, i1, i2); // A deformed surface reads its own buffers.
 			vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
 			FloatBuffer prev_vb = FloatBuffer(prev_addr);
 			uint stride_floats = geom.position_stride >> 2;

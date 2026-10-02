@@ -148,6 +148,13 @@ private:
 			// The surface's triangle clusters (D80), as RenderingServerTypes::SurfaceData::cluster_data
 			// describes; the cluster BLAS builds from it. Kept so mesh_get_surface() returns it.
 			Vector<uint8_t> cluster_data;
+			// Geometry residency (D93): with rendering/pathtracing/cluster_lod_stream_geometry and
+			// cluster_lod_stream on, a surface whose index buffer carries a hierarchy's coarse levels
+			// keeps in RAM the bytes its vertex, attribute and index buffers were made from (the index
+			// data with its coarse tail), from which the trace's per-group blobs are gathered.
+			Vector<uint8_t> ram_vertex_data;
+			Vector<uint8_t> ram_attribute_data;
+			Vector<uint8_t> ram_index_data;
 
 			RID blend_shape_buffer;
 			uint32_t blend_shape_buffer_size = 0;
@@ -228,6 +235,12 @@ private:
 	RD::VertexFormatID _mesh_surface_generate_vertex_format(uint64_t p_surface_format, uint64_t p_input_mask, bool p_instanced_surface, bool p_input_motion_vectors, bool p_point_size_emulated, uint32_t &r_position_stride);
 	void _mesh_surface_generate_version_for_input_mask(Mesh::Surface::Version &v, Mesh::Surface *s, uint64_t p_input_mask, bool p_input_motion_vectors, bool p_point_size_emulated, MeshInstance::Surface *mis = nullptr, uint32_t p_current_buffer = 0, uint32_t p_previous_buffer = 0);
 	void _mesh_surface_clear(Mesh *p_mesh, int p_surface);
+	// Drops a surface's RAM copy (D93): its hierarchy is gone or no longer describes it.
+	static void _mesh_surface_clear_ram(Mesh::Surface &r_surface) {
+		r_surface.ram_vertex_data.clear();
+		r_surface.ram_attribute_data.clear();
+		r_surface.ram_index_data.clear();
+	}
 
 	void _mesh_instance_clear(MeshInstance *mi);
 	void _mesh_instance_add_surface(MeshInstance *mi, Mesh *mesh, uint32_t p_surface);
@@ -372,6 +385,11 @@ private:
 public:
 	static MeshStorage *get_singleton();
 
+	// Geometry residency (D93): rendering/pathtracing/cluster_lod_stream_geometry is effective, from
+	// the settings and the device: CLAS streaming with what it needs, and position fetch. The path
+	// tracer streams geometry by it and surfaces keep their RAM copy by it, so both decide alike.
+	static bool is_cluster_geometry_streaming_wanted();
+
 	MeshStorage();
 	virtual ~MeshStorage();
 
@@ -507,6 +525,22 @@ public:
 	_FORCE_INLINE_ const Vector<uint8_t> &mesh_surface_get_cluster_data(void *p_surface) {
 		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
 		return s->cluster_data;
+	}
+
+	// The surface's arrays in RAM (D93), empty unless it keeps them.
+	_FORCE_INLINE_ const Vector<uint8_t> &mesh_surface_get_ram_vertex_data(void *p_surface) {
+		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
+		return s->ram_vertex_data;
+	}
+
+	_FORCE_INLINE_ const Vector<uint8_t> &mesh_surface_get_ram_attribute_data(void *p_surface) {
+		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
+		return s->ram_attribute_data;
+	}
+
+	_FORCE_INLINE_ const Vector<uint8_t> &mesh_surface_get_ram_index_data(void *p_surface) {
+		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
+		return s->ram_index_data;
 	}
 
 	/// Get the vertex buffer RID for raytracing device address access.

@@ -43,6 +43,22 @@ MeshStorage *MeshStorage::get_singleton() {
 	return singleton;
 }
 
+bool MeshStorage::is_cluster_geometry_streaming_wanted() {
+	// Read once: every setting involved needs a restart.
+	static int wanted = -1;
+	if (wanted < 0) {
+		RD *rd = RD::get_singleton();
+		const bool supported = rd->has_feature(RD::SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE) && rd->get_cluster_acceleration_structure_capabilities().position_fetch;
+		// CLAS streaming (D92) needs the selection, its traversal, the cached levels (with the sharing
+		// they belong to) and the compaction.
+		const bool stream = GLOBAL_GET("rendering/pathtracing/cluster_lod") && GLOBAL_GET("rendering/pathtracing/cluster_lod_select") && GLOBAL_GET("rendering/pathtracing/cluster_lod_traversal") &&
+				GLOBAL_GET("rendering/pathtracing/cluster_lod_share") && GLOBAL_GET("rendering/pathtracing/cluster_lod_cache") && GLOBAL_GET("rendering/pathtracing/cluster_blas_compaction") &&
+				GLOBAL_GET("rendering/pathtracing/cluster_lod_stream");
+		wanted = supported && stream && GLOBAL_GET("rendering/pathtracing/cluster_lod_stream_geometry") ? 1 : 0;
+	}
+	return wanted == 1;
+}
+
 MeshStorage::MeshStorage() {
 	singleton = this;
 
@@ -571,6 +587,16 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 		s->index_buffer_size = index_data.size();
 		s->index_count = new_surface.index_count;
 		s->index_total = index_total;
+		// Geometry residency (D93): a surface with a hierarchy's coarse levels keeps its arrays in RAM,
+		// as its buffers hold them, for the trace's blobs. The vectors share the caller's data. A
+		// skinned or blend-shaped surface is deformed, and deformed surfaces do not stream. Whether
+		// its table passes the streamable test is the population's to say; the shared test is owed
+		// with D93d, when this copy becomes the only one.
+		if (index_total > new_surface.index_count && !(new_surface.format & RSE::ARRAY_FORMAT_BONES) && mesh->blend_shape_count == 0 && is_cluster_geometry_streaming_wanted()) {
+			s->ram_vertex_data = new_surface.vertex_data;
+			s->ram_attribute_data = new_surface.attribute_data;
+			s->ram_index_data = index_data;
+		}
 		s->index_array = RD::get_singleton()->index_array_create(s->index_buffer, 0, s->index_count);
 		if (new_surface.lods.size()) {
 			s->lods = memnew_arr(Mesh::Surface::LOD, new_surface.lods.size());
@@ -737,7 +763,8 @@ void MeshStorage::mesh_surface_update_vertex_region(RID p_mesh, int p_surface, i
 	// A cluster LOD hierarchy (D85) was simplified from the previous positions: its coarse
 	// levels, bounds and errors no longer describe the surface, so the rebuilt cluster BLAS traces
 	// LOD 0 alone until a re-creation builds a new one (D86). The clusters themselves are
-	// index-only and stand.
+	// index-only and stand. Without a hierarchy the surface no longer streams, so the RAM copy (D93)
+	// goes.
 	Vector<uint8_t> &table = mesh->surfaces[p_surface]->cluster_data;
 	if (table.size() >= int64_t(RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS * sizeof(uint32_t))) {
 		uint32_t *words = reinterpret_cast<uint32_t *>(table.ptrw());
@@ -745,6 +772,7 @@ void MeshStorage::mesh_surface_update_vertex_region(RID p_mesh, int p_surface, i
 			words[7] |= RenderingServerTypes::MESH_CLUSTER_LOD_FLAG_STALE;
 		}
 	}
+	_mesh_surface_clear_ram(*mesh->surfaces[p_surface]);
 
 	// Invalidate RT cache for this surface.
 	mesh->surfaces[p_surface]->rt_invalidation_counter++;
@@ -761,6 +789,16 @@ void MeshStorage::mesh_surface_update_attribute_region(RID p_mesh, int p_surface
 	const uint8_t *r = p_data.ptr();
 
 	RD::get_singleton()->buffer_update(mesh->surfaces[p_surface]->attribute_buffer, p_offset, data_size, r);
+
+	// The RAM copy (D93) follows the buffer, so the blobs gathered at the repopulation below see the update.
+	Vector<uint8_t> &ram = mesh->surfaces[p_surface]->ram_attribute_data;
+	if (!ram.is_empty()) {
+		if (p_offset >= 0 && uint64_t(p_offset) + data_size <= uint64_t(ram.size())) {
+			memcpy(ram.ptrw() + p_offset, r, data_size);
+		} else {
+			_mesh_surface_clear_ram(*mesh->surfaces[p_surface]);
+		}
+	}
 
 	// Invalidate RT cache for this surface (attributes include UVs).
 	mesh->surfaces[p_surface]->rt_invalidation_counter++;
@@ -795,8 +833,10 @@ void RendererRD::MeshStorage::mesh_surface_update_index_region(RID p_mesh, int p
 	RD::get_singleton()->buffer_update(mesh->surfaces[p_surface]->index_buffer, p_offset, data_size, r);
 
 	// Invalidate RT cache for this surface. The cluster table described the previous indices;
-	// without it the rebuilt cluster BLAS falls back to runs, which hold for any index contents.
+	// without it the rebuilt cluster BLAS falls back to runs, which hold for any index contents,
+	// and the surface no longer streams (D93).
 	mesh->surfaces[p_surface]->cluster_data.clear();
+	_mesh_surface_clear_ram(*mesh->surfaces[p_surface]);
 	mesh->surfaces[p_surface]->rt_invalidation_counter++;
 }
 

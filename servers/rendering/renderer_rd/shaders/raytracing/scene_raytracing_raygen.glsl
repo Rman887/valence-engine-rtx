@@ -808,7 +808,8 @@ void main() {
 #extension GL_NV_cluster_acceleration_structure : require
 #endif
 #ifdef USE_POSITION_FETCH
-// Unread until D93b, whose alpha test takes a streamed surface's positions here.
+// Enabled with the closest hit's; the any-hit reads no position (its alpha test takes UVs from the
+// cluster's blob, D93b).
 #extension GL_EXT_ray_tracing_position_fetch : require
 #endif
 
@@ -864,7 +865,7 @@ void main() {
 	GeometryData geom = geometries[geometry_idx];
 
 	uint i0, i1, i2;
-	get_triangle_indices(geom, i0, i1, i2);
+	rt_resolve_hit_triangle(geom, i0, i1, i2);
 	vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
 
 #ifdef RT_CUSTOM_HIT_GROUP

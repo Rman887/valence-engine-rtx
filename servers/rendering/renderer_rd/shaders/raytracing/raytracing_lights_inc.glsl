@@ -166,27 +166,24 @@ float lights_get_specular_multiplier(float specular_amount, float roughness) {
 // Inline Alpha Test (shared by all ray query proceed loops)
 // ============================================================================
 
-/// The candidate triangle's index into its surface's index buffer, the ray-query twin of
-/// rt_primitive_index() (D79): inside a cluster BLAS the primitive index counts within the
-/// cluster and the cluster ID carries its first triangle.
-uint rt_ray_query_primitive_index(rayQueryEXT q) {
+/// The candidate's cluster ID, the ray-query twin of rt_hit_cluster_id() (D79), which
+/// rt_resolve_triangle takes with the candidate's primitive index.
+int rt_ray_query_cluster_id(rayQueryEXT q) {
 #ifdef USE_CLUSTER_AS
-	int cluster_id = rayQueryGetIntersectionClusterIdNV(q, false);
-	if (cluster_id != gl_ClusterIDNoneNV) {
-		return uint(cluster_id) + uint(rayQueryGetIntersectionPrimitiveIndexEXT(q, false));
-	}
+	return rayQueryGetIntersectionClusterIdNV(q, false);
+#else
+	return RT_CLUSTER_ID_NONE;
 #endif
-	return uint(rayQueryGetIntersectionPrimitiveIndexEXT(q, false));
 }
 
 /// Inline alpha test for ray query candidates. Returns true if the hit is opaque (alpha >= 0.5).
 /// Mirrors the any-hit shader logic for use with inline ray queries.
-bool ray_query_alpha_test(uint geometry_idx, uint primitive_id, vec2 candidate_bary) {
+bool ray_query_alpha_test(uint geometry_idx, int cluster_id, uint primitive, vec2 candidate_bary) {
 	vec3 bary = vec3(1.0 - candidate_bary.x - candidate_bary.y, candidate_bary.x, candidate_bary.y);
 
 	GeometryData geom = geometries[geometry_idx];
 	uint i0, i1, i2;
-	get_triangle_indices_ex(geom, primitive_id, i0, i1, i2);
+	rt_resolve_triangle(geom, cluster_id, primitive, i0, i1, i2);
 	vec2 uv = fetch_uv(geom, i0, i1, i2, bary);
 
 	MaterialData mat = materials[geometry_idx];
@@ -218,7 +215,8 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 			// this completely ignores the actual material, so might not be accurate
 			if (ray_query_alpha_test(
 						rayQueryGetIntersectionInstanceCustomIndexEXT(shadow_rq, false),
-						rt_ray_query_primitive_index(shadow_rq),
+						rt_ray_query_cluster_id(shadow_rq),
+						uint(rayQueryGetIntersectionPrimitiveIndexEXT(shadow_rq, false)),
 						rayQueryGetIntersectionBarycentricsEXT(shadow_rq, false))) {
 				rayQueryConfirmIntersectionEXT(shadow_rq);
 			}

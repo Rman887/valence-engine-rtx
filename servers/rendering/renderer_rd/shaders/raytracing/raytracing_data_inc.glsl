@@ -48,7 +48,9 @@ struct GeometryData {
 	uint prev_vertex_address_lo;
 	uint prev_vertex_address_hi;
 
-	uint _pad[5];
+	// With FLAG_CLUSTER_GEOMETRY (D93b): the surface's first cluster geometry record, in words.
+	uint cluster_record_base;
+	uint _pad[4];
 };
 
 void get_aabb_compression_xforms(GeometryData geom, out mat4 aabb_xform, out mat4 inv_aabb_xform) {

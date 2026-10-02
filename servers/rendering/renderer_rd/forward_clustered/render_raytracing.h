@@ -91,7 +91,10 @@ struct alignas(16) RT_GeometryData {
 	// For deformed geometry: previous-frame position buffer used for motion vectors.
 	uint32_t prev_vertex_buffer_address_lo;
 	uint32_t prev_vertex_buffer_address_hi;
-	uint32_t _pad[5];
+	// With RT_GEOM_FLAG_CLUSTER_GEOMETRY (D93): the surface's first cluster geometry record, in words
+	// into the LOD table.
+	uint32_t cluster_record_base;
+	uint32_t _pad[4];
 };
 static_assert(sizeof(RT_GeometryData) == 128, "RT_GeometryData must be 128 bytes for std430");
 
@@ -256,6 +259,9 @@ enum {
 	RT_GEOM_FLAG_PROCEDURAL = 2u,
 	// Set when the BLAS uses a per-frame-deformed vertex buffer.
 	RT_GEOM_FLAG_DEFORMED = 4u,
+	// Geometry residency (D93): the surface's CLAS carry their cluster's index as their ID, and a hit
+	// reads its triangle from the cluster's blob through the records at cluster_record_base.
+	RT_GEOM_FLAG_CLUSTER_GEOMETRY = 8u,
 };
 
 /// Per-instance state for procedural RT geometry. Heap-allocated, only exists for procedural instances.
@@ -382,6 +388,13 @@ struct RTLodStream {
 	uint64_t level_wanted_frame = 0;
 };
 
+// A region of a cluster arena (D81), as a cluster geometry blob holds one (D93b).
+struct RTClusterArenaRegion {
+	int32_t chunk = -1;
+	uint64_t offset = 0;
+	uint64_t size = 0;
+};
+
 struct RTSurfaceData {
 	RID blas;
 	RT_GeometryData geometry = {};
@@ -423,6 +436,13 @@ struct RTSurfaceData {
 	RTLodStream *cluster_lod_stream = nullptr;
 	uint32_t cluster_built_count = 0; // The CLAS the population built and the compaction moves.
 	uint32_t cluster_blas_count = 0; // The clusters `blas` is over.
+	// Geometry residency (D93b): a streamed surface whose CLAS carry their cluster's index as their
+	// ID. Its hits read their triangle through RT_CLUSTER_GEOMETRY_RECORD_WORDS words a cluster in
+	// the LOD table, from this offset, in the blob of the cluster's group, one region of the cluster
+	// geometry arena per group.
+	uint32_t cluster_geometry_offset = UINT32_MAX; // Words; UINT32_MAX when the hits read the surface's own buffers.
+	uint32_t cluster_geometry_words = 0;
+	LocalVector<RTClusterArenaRegion> cluster_geometry_blobs; // Per group.
 };
 
 // An instance's cluster BLAS over the clusters the LOD selection picks for it (D86): its own
@@ -458,8 +478,17 @@ static constexpr uint32_t RT_LOD_STREAM_TOUCH_PERIOD = 8;
 static constexpr uint32_t RT_LOD_STREAM_STATE_WORDS = 3;
 static constexpr uint32_t RT_LOD_STREAM_STATE_FLAG_ROOT = 1;
 // The position-fetch check's words (D93a): hits compared, hits that differ and the largest absolute
-// difference (float bits), for float positions, compressed positions and deformed surfaces.
-static constexpr uint32_t RT_POSITION_FETCH_CHECK_WORDS = 9;
+// difference (float bits), for float positions, compressed positions and deformed surfaces; then
+// (D93b) cluster geometry hits whose blob was compared with the surface's buffers and those with a
+// word that differs.
+static constexpr uint32_t RT_POSITION_FETCH_CHECK_WORDS = 11;
+// A cluster geometry record (D93b): the cluster's blob address (two words), its vertex count |
+// triangle count << 16, its first triangle in [LOD 0 | coarse tail]. Must match the GLSL.
+static constexpr uint32_t RT_CLUSTER_GEOMETRY_RECORD_WORDS = 4;
+// A blob's sections and its clusters start at this alignment. Must match the GLSL.
+static constexpr uint32_t RT_CLUSTER_GEOMETRY_ALIGNMENT = 16;
+// Blob indices are 8 bits, cluster-local.
+static constexpr uint32_t RT_CLUSTER_GEOMETRY_MAX_VERTICES = 256;
 
 // A load of streamed groups (D92), D81's two steps at group granularity: this frame the groups'
 // CLAS are built with implicit destinations into a staging buffer, their sizes read back; when they
@@ -897,6 +926,12 @@ class RenderRaytracing {
 	LocalVector<RTClusterRetiredRegion> cluster_arena_retired;
 	uint64_t cluster_arena_reserved_bytes = 0;
 	uint64_t cluster_arena_live_bytes = 0;
+	// The cluster geometry arena (D93b): the blobs, D81's allocator instanced a second time at the
+	// blobs' alignment, its chunks declared as read by the trace through their addresses.
+	LocalVector<RTClusterArenaChunk> cluster_geometry_arena;
+	LocalVector<RTClusterRetiredRegion> cluster_geometry_arena_retired;
+	uint64_t cluster_geometry_arena_reserved_bytes = 0;
+	uint64_t cluster_geometry_arena_live_bytes = 0;
 	HashMap<uint64_t, RTSurfaceData *> cluster_compaction_pending;
 	LocalVector<RTClusterCompactionResult> cluster_compaction_results;
 	uint64_t cluster_compaction_next_ticket = 0;
@@ -1302,6 +1337,10 @@ class RenderRaytracing {
 	bool _cluster_arena_allocate(uint64_t p_size, uint32_t &r_chunk, uint64_t &r_offset);
 	void _cluster_arena_retire(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size);
 	void _cluster_arena_free(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size);
+	// Geometry residency (D93b): a streamed surface's records and every group's blob, gathered from
+	// the surface's RAM copy; false with nothing allocated when the surface cannot read through them.
+	bool _populate_cluster_geometry(void *p_mesh_surface, const RTClusterLayout &p_layout, const RTLodStream *p_stream, uint32_t p_cache_key, RTSurfaceData *r_surf_data);
+	void _release_cluster_geometry(RTSurfaceData *p_surf_data);
 	// CLAS residency (D92).
 	RTLodStream *_create_lod_stream(void *p_mesh_surface, const RTClusterLayout &p_layout, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key);
 	void _release_lod_stream(RTSurfaceData *p_surf_data);

@@ -230,6 +230,9 @@ const uint FLAG_COMPRESSED = 1u;
 const uint FLAG_PROCEDURAL = 2u;
 // Set when the BLAS uses a per-frame-deformed vertex buffer.
 const uint FLAG_DEFORMED = 4u;
+// Geometry residency (D93b): the surface's CLAS carry their cluster's index, and a hit reads its
+// triangle from the cluster's blob (rt_resolve_triangle).
+const uint FLAG_CLUSTER_GEOMETRY = 8u;
 
 // ============================================================================
 // RANDOM NUMBER GENERATION

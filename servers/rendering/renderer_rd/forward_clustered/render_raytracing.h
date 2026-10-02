@@ -348,6 +348,11 @@ struct RTLodStreamGroup {
 	uint64_t requested = 0; // frames_drawn of the first request since it was absent, 0 for none.
 	uint64_t bytes = 0; // Its region's bytes once loaded; until then estimated at the worst case.
 	uint64_t loading_bytes = 0; // What its load holds against the budget while in flight.
+	// Geometry residency (D93c), 0 when the surface reads its own buffers: its blob's bytes, which
+	// load and unload with its CLAS under the same budget, and its clusters' positions, staged for
+	// their build only; both count against a frame's upload cap.
+	uint32_t blob_bytes = 0;
+	uint32_t position_bytes = 0;
 	int32_t arena_chunk = -1;
 	uint64_t arena_offset = 0;
 };
@@ -361,6 +366,7 @@ struct RTLodStreamGroup {
 struct RTLodStream {
 	RID vertex_buffer;
 	RID index_buffer;
+	void *mesh_surface = nullptr; // Its RAM copy is what a load gathers a group's geometry from (D93c).
 	uint32_t state_offset = 0; // Words into the LOD table: RT_LOD_STREAM_STATE_WORDS per group, the selection's state.
 	uint32_t max_triangles = 0;
 	uint32_t max_vertices = 0;
@@ -377,9 +383,11 @@ struct RTLodStream {
 	LocalVector<uint64_t> level_last_used; // frames_drawn a cached level of the depth was placed.
 	uint32_t absent_groups = 0;
 	uint32_t root_groups = 0; // Not persistent, refined into nothing: requested by their own test.
-	uint64_t resident_bytes = 0;
+	uint64_t resident_bytes = 0; // With the loaded groups' blobs (D93c).
 	uint64_t loading_bytes = 0;
 	uint64_t persistent_bytes = 0;
+	uint64_t resident_blob_bytes = 0; // The part of resident_bytes that is blobs (D93c).
+	uint64_t persistent_blob_bytes = 0;
 	uint64_t pinned_frame = 0; // frames_drawn it was last referenced as pinned.
 	// A cached level placement asked for and found not resident: its depth (the finest asked that
 	// frame) and the frame, which the next residency step turns into wants for every absent group
@@ -439,10 +447,11 @@ struct RTSurfaceData {
 	// Geometry residency (D93b): a streamed surface whose CLAS carry their cluster's index as their
 	// ID. Its hits read their triangle through RT_CLUSTER_GEOMETRY_RECORD_WORDS words a cluster in
 	// the LOD table, from this offset, in the blob of the cluster's group, one region of the cluster
-	// geometry arena per group.
+	// geometry arena per group. A group's blob exists while the group is persistent, loading or
+	// resident (D93c), and its records are zero otherwise.
 	uint32_t cluster_geometry_offset = UINT32_MAX; // Words; UINT32_MAX when the hits read the surface's own buffers.
 	uint32_t cluster_geometry_words = 0;
-	LocalVector<RTClusterArenaRegion> cluster_geometry_blobs; // Per group.
+	LocalVector<RTClusterArenaRegion> cluster_geometry_blobs; // Per group; chunk -1 while it has none.
 };
 
 // An instance's cluster BLAS over the clusters the LOD selection picks for it (D86): its own
@@ -508,6 +517,27 @@ struct RTLodStreamLoad {
 	uint64_t compact_offset = 0;
 	uint32_t cluster_count = 0;
 	LocalVector<Item> items;
+};
+
+// What a build of streamed groups' CLAS reads in place of the surface's buffers (D93c): per cluster
+// of the build, its 8-bit indices' address in its group's blob (0 for a surface that reads its own
+// buffers) and its positions' offset in `positions`, where they sit in its blob's vertex order at the
+// surface's position stride and RT_CLUSTER_GEOMETRY_ALIGNMENT apart; the arena chunks the indices are
+// in. The positions go up in a buffer of the build's own, freed with the stage once the build is
+// recorded.
+struct RTClusterGeometryStage {
+	LocalVector<uint8_t> positions;
+	LocalVector<uint64_t> position_offsets;
+	LocalVector<uint64_t> index_addresses;
+	Vector<RID> blob_buffers;
+	uint64_t blob_bytes = 0;
+	RID positions_buffer;
+	uint64_t positions_address = 0;
+
+	RTClusterGeometryStage() = default;
+	RTClusterGeometryStage(const RTClusterGeometryStage &) = delete;
+	RTClusterGeometryStage &operator=(const RTClusterGeometryStage &) = delete;
+	~RTClusterGeometryStage();
 };
 
 struct RTLodStreamRead {
@@ -932,6 +962,8 @@ class RenderRaytracing {
 	LocalVector<RTClusterRetiredRegion> cluster_geometry_arena_retired;
 	uint64_t cluster_geometry_arena_reserved_bytes = 0;
 	uint64_t cluster_geometry_arena_live_bytes = 0;
+	// A gather's vertex-to-local map (D93c), grown to the largest surface and kept at 0xFFFF between clusters.
+	LocalVector<uint16_t> cluster_geometry_local;
 	HashMap<uint64_t, RTSurfaceData *> cluster_compaction_pending;
 	LocalVector<RTClusterCompactionResult> cluster_compaction_results;
 	uint64_t cluster_compaction_next_ticket = 0;
@@ -1002,6 +1034,7 @@ class RenderRaytracing {
 	uint32_t cluster_lod_stream_builds_per_frame = 0; // Clusters.
 	uint32_t cluster_lod_stream_min_age = 0; // Frames.
 	uint64_t cluster_lod_stream_cluster_worst = 0; // One CLAS's worst-case bytes, a load's estimate.
+	uint64_t cluster_lod_stream_upload_cap = 0; // Bytes of blobs and staged positions a frame's loads may upload (D93c).
 	// Geometry residency (D93), rendering/pathtracing/cluster_lod_stream_geometry on a device with
 	// position fetch: every cluster build allows data access, and hits read CLAS positions.
 	bool cluster_build_data_access = false;
@@ -1049,6 +1082,13 @@ class RenderRaytracing {
 		uint64_t failed = 0;
 		uint64_t peak_bytes = 0;
 		LocalVector<uint32_t> latency; // Frames from request to resident, since the last report.
+		// Geometry residency (D93c): the wants the upload cap deferred, the bytes of blobs and staged
+		// positions each step with a load uploaded since the last report, and the gathers' time.
+		uint64_t deferred_upload = 0;
+		uint64_t uploaded_bytes = 0;
+		LocalVector<uint32_t> upload_frames; // KB.
+		uint64_t gather_usec = 0; // A load's blob gather and position upload, on the render thread.
+		uint64_t gather_max_usec = 0; // The largest, since the last report.
 	} lod_stream_stats;
 
 	// Merged MultiMesh BLAS cache and compute shader.
@@ -1337,10 +1377,17 @@ class RenderRaytracing {
 	bool _cluster_arena_allocate(uint64_t p_size, uint32_t &r_chunk, uint64_t &r_offset);
 	void _cluster_arena_retire(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size);
 	void _cluster_arena_free(uint32_t p_chunk, uint64_t p_offset, uint64_t p_size);
-	// Geometry residency (D93b): a streamed surface's records and every group's blob, gathered from
-	// the surface's RAM copy; false with nothing allocated when the surface cannot read through them.
-	bool _populate_cluster_geometry(void *p_mesh_surface, const RTClusterLayout &p_layout, const RTLodStream *p_stream, uint32_t p_cache_key, RTSurfaceData *r_surf_data);
+	// Geometry residency (D93b, D93c): a streamed surface's records and its persistent groups'
+	// blobs, gathered from the surface's RAM copy, with what the population's build reads; false with
+	// nothing allocated when the surface cannot read through them.
+	bool _populate_cluster_geometry(void *p_mesh_surface, const RTClusterLayout &p_layout, RTLodStream *p_stream, uint32_t p_cache_key, RTSurfaceData *r_surf_data, RTClusterGeometryStage &r_stage);
 	void _release_cluster_geometry(RTSurfaceData *p_surf_data);
+	// Each item's blob gathered into its own arena region and uploaded, its records not yet written,
+	// and its clusters' build inputs appended to r_stage; false with every region of the call retired.
+	bool _stage_cluster_geometry(const LocalVector<RTLodStreamLoad::Item> &p_items, RTClusterGeometryStage &r_stage);
+	void _write_cluster_geometry_records(const RTSurfaceData *p_surf_data, uint32_t p_group);
+	void _retire_cluster_geometry_blob(RTSurfaceData *p_surf_data, uint32_t p_group);
+	bool _upload_cluster_geometry_positions(RTClusterGeometryStage &r_stage);
 	// CLAS residency (D92).
 	RTLodStream *_create_lod_stream(void *p_mesh_surface, const RTClusterLayout &p_layout, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key);
 	void _release_lod_stream(RTSurfaceData *p_surf_data);

@@ -970,7 +970,7 @@ struct RTSlotOwner {
 
 // What a viewport's PTLAS holds in one slot, and the rows its buffers hold there: the change test.
 struct RTSlotShadow {
-	float transform[12] = {}; // Rows of the 3x4, relative to rt_origin, as the record holds it.
+	float transform[12] = {}; // Rows of the 3x4, relative to its cell's origin (D94c).
 	RID blas; // Invalid: disabled.
 	uint64_t geometry_generation = 0;
 	uint64_t material_generation = 0;
@@ -979,7 +979,7 @@ struct RTSlotShadow {
 	uint32_t write_frame = 0; // The viewport's build count at the last instance write.
 	uint32_t motion_frame = 0; // The build count its motion row was last written >= 0 at.
 	uint32_t global_index = UINT32_MAX; // Its position in the global partition's list (D94b part 2).
-	Vector3i cell; // The world cell its last write placed it in.
+	Vector3i cell; // The world cell its last write placed it in, which its transform is relative to.
 	uint8_t flags = 0;
 	uint8_t mask = 0;
 	bool rows_valid = false; // The rows hold this slot's geometry and material generations.
@@ -999,7 +999,6 @@ struct RTSlotRangeView {
 struct RTSlotMultiMeshKey {
 	uint32_t serial = 0; // The range's serial it was taken for; 0 for none.
 	Transform3D instance_transform;
-	Vector3 origin;
 	RID blas;
 	uint64_t buffer_generation = 0;
 	uint64_t geometry_generation = 0;
@@ -1113,6 +1112,9 @@ struct RTViewportState {
 	HashMap<Vector3i, SlotCell> slot_cells;
 	LocalVector<uint32_t> partition_occupancy;
 	LocalVector<Vector3i> partition_cells;
+	// The translation the structure holds for each partition (D94c): its cell's origin less rt_origin,
+	// rounded to float. NaN where unknown (a new partition, a build from scratch), so it is written.
+	LocalVector<Vector3> partition_translations;
 	LocalVector<uint32_t> partition_touched; // The build that last wrote a slot of it.
 	LocalVector<uint32_t> partition_free;
 	uint32_t partition_high_water = 0;
@@ -1133,6 +1135,8 @@ struct RTViewportState {
 		uint32_t writes_blas = 0;
 		uint32_t writes_rebuilt = 0;
 		uint32_t writes_return = 0;
+		uint32_t writes_origin = 0; // Global slots rewritten for an rt_origin shift (D94c).
+		uint32_t translations = 0; // Partition translations written (D94c).
 		uint32_t disables = 0;
 		uint32_t rows = 0;
 		uint32_t motion_rows = 0;
@@ -1546,6 +1550,7 @@ class RenderRaytracing {
 	// Thread-free scratch of the commit.
 	LocalVector<RD::PartitionedInstanceWrite> slot_writes;
 	LocalVector<RT_SlotRowWrite> slot_row_writes;
+	LocalVector<RD::PartitionTranslationWrite> slot_translation_writes;
 
 	uint32_t _slot_range_acquire(RTViewportState *p_state, RTSlotOwner &r_owner, uint32_t p_key, uint32_t p_count);
 	void _slot_range_release(uint32_t p_range);
@@ -1556,10 +1561,24 @@ class RenderRaytracing {
 	uint64_t _material_row_generation(RTMaterialData *p_mat_data);
 	uint64_t _local_row_generation(uint32_t p_range, const RT_GeometryData &p_row);
 	static void _slot_relative_transform(const Transform3D &p_transform, const Vector3 &p_origin, float *r_rows);
-	_FORCE_INLINE_ bool _slot_unchanged(const RTViewportState *p_state, uint32_t p_slot, RID p_blas, const float *p_rows, uint32_t p_flags, uint8_t p_mask, uint32_t p_sbt_offset, uint64_t p_geometry_generation, uint64_t p_material_generation) const {
-		const RTSlotShadow &shadow = p_state->slots[p_slot];
-		return shadow.blas == p_blas && shadow.rows_valid && shadow.geometry_generation == p_geometry_generation && shadow.material_generation == p_material_generation && shadow.flags == uint8_t(p_flags) && shadow.mask == p_mask && shadow.sbt_offset == p_sbt_offset && memcmp(shadow.transform, p_rows, sizeof(shadow.transform)) == 0;
+	// A cell's origin (D94c): its corner on x and z, at y = 0, computed in double.
+	_FORCE_INLINE_ Vector3 _slot_cell_origin(const Vector3i &p_cell) const {
+		return Vector3(real_t(double(p_cell.x) * ptlas_cell_size), real_t(0), real_t(double(p_cell.z) * ptlas_cell_size));
 	}
+	// The walk's change test. The transform is narrowed as the shadow holds it, relative to the
+	// shadow's cell (D94c), so an rt_origin shift alone changes nothing here.
+	_FORCE_INLINE_ bool _slot_unchanged(const RTViewportState *p_state, uint32_t p_slot, RID p_blas, const Transform3D &p_transform, uint32_t p_flags, uint8_t p_mask, uint32_t p_sbt_offset, uint64_t p_geometry_generation, uint64_t p_material_generation) const {
+		const RTSlotShadow &shadow = p_state->slots[p_slot];
+		if (!(shadow.blas == p_blas && shadow.rows_valid && shadow.geometry_generation == p_geometry_generation && shadow.material_generation == p_material_generation && shadow.flags == uint8_t(p_flags) && shadow.mask == p_mask && shadow.sbt_offset == p_sbt_offset)) {
+			return false;
+		}
+		float rows[12];
+		_slot_relative_transform(p_transform, _slot_cell_origin(shadow.cell), rows);
+		return memcmp(shadow.transform, rows, sizeof(rows)) == 0;
+	}
+	Vector3 _slot_cell_translation(const RTViewportState *p_state, const Vector3i &p_cell) const;
+	Transform3D _slot_traced_transform(const RTViewportState *p_state, const RTSlotShadow &p_shadow) const;
+	Transform3D _slot_record_transform(const RTViewportState *p_state, const RTSlotShadow &p_shadow) const;
 	// Moved this frame for its motion: MOVED can be set without a change (the motion row of an
 	// unchanged transform is the identity, which -1 gives too).
 	static _FORCE_INLINE_ bool _slot_moved(bool p_status_moved, const Transform3D &p_prev, const Transform3D &p_current) {
@@ -1567,7 +1586,7 @@ class RenderRaytracing {
 	}
 	void _slot_emit(uint32_t p_slot, uint64_t p_geometry_generation, uint64_t p_material_generation);
 	bool _commit_slots(RTViewportState *p_state);
-	bool _flush_slot_writes(RTViewportState *p_state, bool p_from_scratch);
+	bool _flush_slot_writes(RTViewportState *p_state, bool p_from_scratch, bool p_translations = false);
 	void _reset_viewport_slots(RTViewportState *p_state);
 	void _reclaim_idle_viewports(RTViewportState *p_current);
 	bool _slot_multimesh_key_matches(RTViewportState *p_state, uint32_t p_range, const RTSlotMultiMeshKey &p_key);

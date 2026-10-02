@@ -225,6 +225,7 @@ void RenderRaytracing::_reset_viewport_slots(RTViewportState *p_state) {
 	p_state->slot_cells.clear();
 	p_state->partition_occupancy.reset();
 	p_state->partition_cells.reset();
+	p_state->partition_translations.reset();
 	p_state->partition_touched.reset();
 	p_state->partition_free.reset();
 	p_state->partition_high_water = 0;
@@ -289,7 +290,7 @@ bool RenderRaytracing::_slot_multimesh_key_matches(RTViewportState *p_state, uin
 	const uint32_t serial = slot_ranges[p_range].serial;
 	if (key.serial == serial && key.count == p_key.count && key.buffer_generation == p_key.buffer_generation && key.blas == p_key.blas &&
 			key.geometry_generation == p_key.geometry_generation && key.material_generation == p_key.material_generation && key.sbt_offset == p_key.sbt_offset &&
-			key.flags == p_key.flags && key.mask == p_key.mask && key.origin == p_key.origin && key.instance_transform == p_key.instance_transform) {
+			key.flags == p_key.flags && key.mask == p_key.mask && key.instance_transform == p_key.instance_transform) {
 		return true;
 	}
 	key = p_key;
@@ -298,7 +299,8 @@ bool RenderRaytracing::_slot_multimesh_key_matches(RTViewportState *p_state, uin
 }
 
 void RenderRaytracing::_slot_relative_transform(const Transform3D &p_transform, const Vector3 &p_origin, float *r_rows) {
-	// The narrowing the instance record makes, from the transform relative to rt_origin in real_t.
+	// The narrowing the instance record makes, from the transform relative to an origin (the slot's
+	// cell's, D94c) in real_t.
 	const Vector3 origin = p_transform.origin - p_origin;
 	r_rows[0] = float(p_transform.basis.rows[0][0]);
 	r_rows[1] = float(p_transform.basis.rows[0][1]);
@@ -329,6 +331,34 @@ static _FORCE_INLINE_ Transform3D _slot_rows_to_transform(const float *p_rows) {
 	t.basis.rows[2][2] = p_rows[10];
 	t.origin.z = p_rows[11];
 	return t;
+}
+
+Vector3 RenderRaytracing::_slot_cell_translation(const RTViewportState *p_state, const Vector3i &p_cell) const {
+	// A partition's translation (D94c): its cell's origin less rt_origin, in double, rounded to the
+	// float the build takes. The records, the emissive transforms and the structure all use this float.
+	const Vector3 translation = _slot_cell_origin(p_cell) - p_state->rt_origin;
+	return Vector3(float(translation.x), float(translation.y), float(translation.z));
+}
+
+Transform3D RenderRaytracing::_slot_traced_transform(const RTViewportState *p_state, const RTSlotShadow &p_shadow) const {
+	// Where the trace finds the slot, relative to rt_origin: its cell-relative rows with its cell's
+	// translation added in float, as the build adds a partition's translation to an instance's.
+	const Vector3 translation = _slot_cell_translation(p_state, p_shadow.cell);
+	Transform3D t = _slot_rows_to_transform(p_shadow.transform);
+	t.origin.x = p_shadow.transform[3] + float(translation.x);
+	t.origin.y = p_shadow.transform[7] + float(translation.y);
+	t.origin.z = p_shadow.transform[11] + float(translation.z);
+	return t;
+}
+
+Transform3D RenderRaytracing::_slot_record_transform(const RTViewportState *p_state, const RTSlotShadow &p_shadow) const {
+	// The transform the slot's record carries: a cell partition's translation is the structure's, but
+	// the global partition has none, so a global record carries its cell's translation itself and is
+	// rewritten when rt_origin moves.
+	if (p_shadow.partition == RD::PARTITION_GLOBAL) {
+		return _slot_traced_transform(p_state, p_shadow);
+	}
+	return _slot_rows_to_transform(p_shadow.transform);
 }
 
 void RenderRaytracing::_slot_emit(uint32_t p_slot, uint64_t p_geometry_generation, uint64_t p_material_generation) {
@@ -369,6 +399,7 @@ bool RenderRaytracing::_ensure_slot_capacity(RTViewportState *p_state) {
 	limits.partition_count = partition_capacity;
 	limits.max_instances_per_partition = capacity;
 	limits.max_global_instances = MIN(ptlas_global_max_instances, capacity);
+	limits.partition_translation = true; // Cells relative to their origin (D94c).
 
 	// Everything is made before the state changes: a failure frees what was made and leaves the
 	// viewport's structure and rows as they were.
@@ -530,6 +561,7 @@ uint32_t RenderRaytracing::_slot_cell_partition(RTViewportState *p_state, const 
 		partition = p_state->partition_high_water++;
 		p_state->partition_occupancy.push_back(0);
 		p_state->partition_cells.push_back(Vector3i());
+		p_state->partition_translations.push_back(Vector3(Math::NaN, Math::NaN, Math::NaN));
 		p_state->partition_touched.push_back(0);
 	}
 	p_state->partition_cells[partition] = p_cell;
@@ -605,9 +637,10 @@ void RenderRaytracing::_slot_place(RTViewportState *p_state, uint32_t p_slot, RT
 // shadows, and the frame does not trace.
 // ---------------------------------------------------------------------------
 
-bool RenderRaytracing::_flush_slot_writes(RTViewportState *p_state, bool p_from_scratch) {
+bool RenderRaytracing::_flush_slot_writes(RTViewportState *p_state, bool p_from_scratch, bool p_translations) {
 	// One build of the staged writes: the first build of a from-scratch commit disables every slot
-	// it does not write, so a later chunk of the same commit builds in place.
+	// it does not write, so a later chunk of the same commit builds in place. The commit's last build
+	// also writes the partition translations that changed (D94c).
 	RD *rd = RD::get_singleton();
 	RTViewportState::SlotCounters &counters = p_state->slot_counters;
 	const uint32_t build = p_state->slot_build;
@@ -624,8 +657,33 @@ bool RenderRaytracing::_flush_slot_writes(RTViewportState *p_state, bool p_from_
 		}
 	}
 	counters.writes += slot_writes.size();
+	if (p_from_scratch) {
+		// A structure built from scratch holds no translation it is not given; with several chunks
+		// that is the commit's first build, and its last writes them.
+		for (Vector3 &translation : p_state->partition_translations) {
+			translation = Vector3(Math::NaN, Math::NaN, Math::NaN);
+		}
+	}
+	slot_translation_writes.clear();
+	if (p_translations) {
+		for (uint32_t partition = 0; partition < p_state->partition_high_water; partition++) {
+			if (p_state->partition_occupancy[partition] == 0) {
+				continue; // Free: its translation is written when a cell takes it.
+			}
+			const Vector3 translation = _slot_cell_translation(p_state, p_state->partition_cells[partition]);
+			if (p_state->partition_translations[partition] == translation) {
+				continue;
+			}
+			p_state->partition_translations[partition] = translation;
+			RD::PartitionTranslationWrite write;
+			write.partition = partition;
+			write.translation = translation;
+			slot_translation_writes.push_back(write);
+		}
+		counters.translations += slot_translation_writes.size();
+	}
 	const uint64_t start_usec = OS::get_singleton()->get_ticks_usec();
-	const Error err = rd->ptlas_build(p_state->tlas, slot_writes, Span<RD::PartitionTranslationWrite>(), p_from_scratch);
+	const Error err = rd->ptlas_build(p_state->tlas, slot_writes, slot_translation_writes, p_from_scratch);
 	counters.build_usec += OS::get_singleton()->get_ticks_usec() - start_usec;
 	slot_writes.clear();
 	if (err != OK) {
@@ -653,6 +711,8 @@ bool RenderRaytracing::_commit_slots(RTViewportState *p_state) {
 	counters.writes_blas = 0;
 	counters.writes_rebuilt = 0;
 	counters.writes_return = 0;
+	counters.writes_origin = 0;
+	counters.translations = 0;
 	counters.disables = 0;
 	counters.rows = 0;
 	counters.motion_rows = 0;
@@ -687,7 +747,7 @@ bool RenderRaytracing::_commit_slots(RTViewportState *p_state) {
 			return; // The build from scratch writes every enabled slot from the shadows.
 		}
 		RD::PartitionedInstanceWrite write;
-		write.transform = _slot_rows_to_transform(p_shadow.transform);
+		write.transform = _slot_record_transform(p_state, p_shadow);
 		write.slot = p_slot;
 		write.partition = p_shadow.partition;
 		write.id = p_slot;
@@ -759,8 +819,8 @@ bool RenderRaytracing::_commit_slots(RTViewportState *p_state) {
 
 	// The instances the walk pushed: each against its slot's shadow.
 	const bool any_stale = p_state->tlas.is_valid() && rd->ptlas_get_stale_blas_count(p_state->tlas) > 0;
-	// An origin shift rewrites every slot (until partition translation, D94c); those writes are not
-	// changes of the instance, so they stay in their cells rather than fill the global partition.
+	// An origin shift changes the partitions' translations and the global partition's records, not the
+	// cell-relative shadows (D94c).
 	const bool origin_shifted = p_state->slot_origin_valid && p_state->slot_origin != p_state->rt_origin;
 	p_state->slot_origin = p_state->rt_origin;
 	p_state->slot_origin_valid = true;
@@ -773,8 +833,10 @@ bool RenderRaytracing::_commit_slots(RTViewportState *p_state) {
 			disable_slot(slot); // A deformed surface whose build the frame dropped (D82).
 			continue;
 		}
+		// Compared as the shadow holds it, relative to its cell.
+		const Vector3i rows_cell = shadow.cell;
 		float rows[12];
-		_slot_relative_transform(blas_transforms[i], p_state->rt_origin, rows);
+		_slot_relative_transform(blas_transforms[i], _slot_cell_origin(rows_cell), rows);
 		const uint8_t flags = uint8_t(instance_flags[i]);
 		const uint8_t mask = instance_masks[i];
 		const uint32_t sbt_offset = sbt_offsets[i];
@@ -799,7 +861,10 @@ bool RenderRaytracing::_commit_slots(RTViewportState *p_state) {
 				counters.writes_blas++; // Flags, mask or hit group: counted with the BLAS.
 			}
 			// A slot rewritten while enabled goes global; a new one to its cell.
-			_slot_place(p_state, slot, shadow, was_enabled, _slot_cell(blas_transforms[i], geometry_data[i]), was_enabled && !origin_shifted);
+			_slot_place(p_state, slot, shadow, was_enabled, _slot_cell(blas_transforms[i], geometry_data[i]), was_enabled);
+			if (shadow.cell != rows_cell) {
+				_slot_relative_transform(blas_transforms[i], _slot_cell_origin(shadow.cell), rows);
+			}
 			memcpy(shadow.transform, rows, sizeof(rows));
 			shadow.blas = blas;
 			shadow.flags = flags;
@@ -867,6 +932,22 @@ bool RenderRaytracing::_commit_slots(RTViewportState *p_state) {
 		bucket.clear();
 	}
 
+	// An origin shift: the global partition has no translation, so its records carry their cells'
+	// and are rewritten, those this build has not written already (D94c). Their write build stays,
+	// so they return to their cells as they would have.
+	if (origin_shifted) {
+		for (uint32_t slot : p_state->global_slots) {
+			const RTSlotShadow &shadow = p_state->slots[slot];
+			if (shadow.write_frame == build || !rd->acceleration_structure_is_valid(shadow.blas)) {
+				continue; // A freed BLAS is left to the structure's net (D94b, review finding 5).
+			}
+			write_slot(slot, shadow);
+			if (!from_scratch) {
+				counters.writes_origin++; // A build from scratch writes it anyway.
+			}
+		}
+	}
+
 	// The slots whose motion row the last build wrote and this one did not get -1 back.
 	for (uint32_t slot : p_state->motion_slots) {
 		RTSlotShadow &shadow = p_state->slots[slot];
@@ -921,7 +1002,7 @@ bool RenderRaytracing::_commit_slots(RTViewportState *p_state) {
 				continue;
 			}
 			RD::PartitionedInstanceWrite write;
-			write.transform = _slot_rows_to_transform(shadow.transform);
+			write.transform = _slot_record_transform(p_state, shadow);
 			write.slot = slot;
 			write.partition = shadow.partition;
 			write.id = slot;
@@ -939,7 +1020,7 @@ bool RenderRaytracing::_commit_slots(RTViewportState *p_state) {
 				first = false;
 			}
 		}
-		if (!_flush_slot_writes(p_state, first)) {
+		if (!_flush_slot_writes(p_state, first, true)) {
 			return fail();
 		}
 		counters.builds++;
@@ -947,8 +1028,8 @@ bool RenderRaytracing::_commit_slots(RTViewportState *p_state) {
 	} else {
 		// The rest of the writes; with none, the build call still writes the slots of a BLAS rebuilt
 		// in place again (or finds nothing to do).
-		const bool any = !slot_writes.is_empty();
-		if (!_flush_slot_writes(p_state, false)) {
+		const bool any = !slot_writes.is_empty() || origin_shifted;
+		if (!_flush_slot_writes(p_state, false, true)) {
 			return fail();
 		}
 		counters.builds += any ? 1 : 0;
@@ -986,9 +1067,15 @@ bool RenderRaytracing::_commit_slots(RTViewportState *p_state) {
 	counters.build_usec_sum += counters.build_usec;
 	counters.scan_usec_sum += counters.scan_usec;
 
+	if (origin_shifted) {
+		// The evidence for partition translation (D94c): a shift writes the live partitions'
+		// translations and the global partition's records, and no cell slot for the shift's sake.
+		print_verbose(vformat("RT: slots (D94c) build %d: rt_origin moved to (%.0f, %.0f, %.0f); %d partition translations of %d live partitions, %d global records rewritten for it, %d other instance writes (%d moved, %d new, %d BLAS, %d rebuilt, %d returned, %d disables).",
+				build, p_state->rt_origin.x, p_state->rt_origin.y, p_state->rt_origin.z, counters.translations, counters.partitions_live, counters.writes_origin, counters.writes - counters.writes_origin, counters.writes_moved, counters.writes_new, counters.writes_blas, counters.writes_rebuilt, counters.writes_return, counters.disables));
+	}
 	if (build == 1 || build % 300 == 0) {
-		print_verbose(vformat("RT: slots (D94b) build %d: %d live (high water %d, capacity %d), %d enabled; %d instance writes in %d builds (%d new, %d moved, %d BLAS, %d rebuilt, %d returned, %d disables), %d stale rewrites, %d row writes, %d motion rows; %d of %d partitions touched, %d global (%d overflowed), %d from-scratch builds, %d entries to the global partition (peak %d), %d returns, %d dangling disables and %d viewports reclaimed over the run; %d emissive slots; commit %d us, of which the build calls %d us (their stale scans %d us); means over the run %.1f, %.1f and %.1f us.",
-				build, slot_live, slot_high_water, p_state->slot_capacity, counters.enabled, counters.writes, counters.builds, counters.writes_new, counters.writes_moved, counters.writes_blas, counters.writes_rebuilt, counters.writes_return, counters.disables, counters.stale_rewrites, counters.rows, counters.motion_rows,
+		print_verbose(vformat("RT: slots (D94c) build %d: %d live (high water %d, capacity %d), %d enabled; %d instance writes in %d builds (%d new, %d moved, %d BLAS, %d rebuilt, %d returned, %d for an origin shift, %d disables), %d partition translations, %d stale rewrites, %d row writes, %d motion rows; %d of %d partitions touched, %d global (%d overflowed), %d from-scratch builds, %d entries to the global partition (peak %d), %d returns, %d dangling disables and %d viewports reclaimed over the run; %d emissive slots; commit %d us, of which the build calls %d us (their stale scans %d us); means over the run %.1f, %.1f and %.1f us.",
+				build, slot_live, slot_high_water, p_state->slot_capacity, counters.enabled, counters.writes, counters.builds, counters.writes_new, counters.writes_moved, counters.writes_blas, counters.writes_rebuilt, counters.writes_return, counters.writes_origin, counters.disables, counters.translations, counters.stale_rewrites, counters.rows, counters.motion_rows,
 				counters.partitions_touched, counters.partitions_live, counters.global, counters.global_overflow, counters.from_scratch, counters.global_entries_total, counters.global_peak, counters.returns_total, counters.dangling_disables, slot_counters_reclaimed, p_state->emissive_slots.size(), counters.commit_usec, counters.build_usec, counters.scan_usec, double(counters.commit_usec_sum) / build, double(counters.build_usec_sum) / build, double(counters.scan_usec_sum) / build));
 	}
 	return true;

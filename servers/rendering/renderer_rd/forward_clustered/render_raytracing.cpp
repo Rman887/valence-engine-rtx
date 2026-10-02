@@ -204,7 +204,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		slot_rows_shader.version = slot_rows_shader.shader.version_create();
 		slot_rows_shader.version_shader = slot_rows_shader.shader.version_get_shader(slot_rows_shader.version, 0);
 		slot_rows_shader.pipeline = RD::get_singleton()->compute_pipeline_create(slot_rows_shader.version_shader);
-		print_line(vformat("RT: slot-resident instances in a partitioned TLAS (D94b): instances written only when they change, in %.0f m cells of up to %d instances, %d in the global partition until %d frames unchanged.", ptlas_cell_size, ptlas_partition_max_instances, ptlas_global_max_instances, ptlas_stable_frames));
+		print_line(vformat("RT: slot-resident instances in a partitioned TLAS (D94b): instances written only when they change, in %.0f m cells of up to %d instances, %d in the global partition until %d frames unchanged; cells relative to their origin under a partition translation (D94c).", ptlas_cell_size, ptlas_partition_max_instances, ptlas_global_max_instances, ptlas_stable_frames));
 		print_verbose(vformat("RT: slot bookkeeping (D94b): %d bytes a slot's shadow, %d a range, %d a range's view, %d a MultiMesh range's key, %d a local row.", int(sizeof(RTSlotShadow)), int(sizeof(RTSlotRange)), int(sizeof(RTSlotRangeView)), int(sizeof(RTSlotMultiMeshKey)), int(sizeof(RTSlotLocalRow))));
 	}
 
@@ -7688,10 +7688,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					const uint32_t slot = slot_ranges[range].first;
 					const uint64_t geometry_generation = _local_row_generation(range, geom);
 					const uint64_t material_generation = _material_row_generation(proc_mat_data);
-					float rows[12];
-					_slot_relative_transform(instance_transform, state->rt_origin, rows);
 					const bool rebuilt = dirty_blas_list.size() != proc_builds_before;
-					if (!rebuilt && !_slot_moved(inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED, prev_instance_transform, instance_transform) && _slot_unchanged(state, slot, ps->blas, rows, inst_flags, inst_mask, hg_index, geometry_generation, material_generation)) {
+					if (!rebuilt && !_slot_moved(inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED, prev_instance_transform, instance_transform) && _slot_unchanged(state, slot, ps->blas, instance_transform, inst_flags, inst_mask, hg_index, geometry_generation, material_generation)) {
 						continue;
 					}
 					_slot_emit(slot, geometry_generation, material_generation);
@@ -8081,9 +8079,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				const uint32_t slot = slot_ranges[range].first;
 				const uint64_t geometry_generation = _surface_row_generation(surf_data);
 				const uint64_t material_generation = _material_row_generation(mat_data);
-				float rows[12];
-				_slot_relative_transform(final_transform, state->rt_origin, rows);
-				if (!slot_rebuilt && !_slot_moved(inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED, prev_instance_transform, instance_transform) && _slot_unchanged(state, slot, blas_handle, rows, inst_flags, inst_mask, mat_data->rt_sbt_offset, geometry_generation, material_generation)) {
+				if (!slot_rebuilt && !_slot_moved(inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED, prev_instance_transform, instance_transform) && _slot_unchanged(state, slot, blas_handle, final_transform, inst_flags, inst_mask, mat_data->rt_sbt_offset, geometry_generation, material_generation)) {
 					surf = surf->next;
 					continue;
 				}
@@ -8156,10 +8152,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				state->slot_mm_keys.erase(range); // An expanded key does not describe the merge.
 				const uint64_t geometry_generation = _local_row_generation(range, merged_sd.geometry);
 				const uint64_t material_generation = _material_row_generation(pending.mat_data);
-				float rows[12];
-				_slot_relative_transform(pending.instance_transform, state->rt_origin, rows);
 				const bool rebuilt = dirty_blas_list.size() != mm_slot_build_size || dirty_blas_update_list.size() != mm_slot_refit_size;
-				if (!rebuilt && _slot_unchanged(state, slot, merged_sd.blas, rows, pending.inst_flags, pending.inst_mask, pending.mat_data->rt_sbt_offset, geometry_generation, material_generation)) {
+				if (!rebuilt && _slot_unchanged(state, slot, merged_sd.blas, pending.instance_transform, pending.inst_flags, pending.inst_mask, pending.mat_data->rt_sbt_offset, geometry_generation, material_generation)) {
 					continue;
 				}
 				_slot_emit(slot, geometry_generation, material_generation);
@@ -8208,7 +8202,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				slot_moved = _slot_moved(pending.transform_moved, pending.prev_instance_transform, pending.instance_transform);
 				RTSlotMultiMeshKey key;
 				key.instance_transform = pending.instance_transform;
-				key.origin = state->rt_origin;
 				key.blas = slot_blas;
 				key.buffer_generation = mesh_storage->multimesh_get_buffer_generation(pending.mm_rid);
 				key.geometry_generation = slot_geometry_generation;
@@ -8245,9 +8238,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 
 				if (ptlas_slots_enabled) {
-					float rows[12];
-					_slot_relative_transform(final_transform, state->rt_origin, rows);
-					if (!slot_rebuilt && !slot_moved && _slot_unchanged(state, slot_first + mi, slot_blas, rows, pending.inst_flags, pending.inst_mask, pending.mat_data->rt_sbt_offset, slot_geometry_generation, slot_material_generation)) {
+					if (!slot_rebuilt && !slot_moved && _slot_unchanged(state, slot_first + mi, slot_blas, final_transform, pending.inst_flags, pending.inst_mask, pending.mat_data->rt_sbt_offset, slot_geometry_generation, slot_material_generation)) {
 						continue;
 					}
 					_slot_emit(slot_first + mi, slot_geometry_generation, slot_material_generation);
@@ -8697,8 +8688,15 @@ uint32_t RenderRaytracing::gather_emissive(const RenderDataRD *p_render_data, co
 	for (uint32_t n = 0; n < count; n++) {
 		const EmissiveCandidate &c = candidates[n];
 		RT_EmissiveInstance &e = r_emissive_data[n];
-		Transform3D relative = c.record ? c.record->transform : blas_transforms[c.index];
-		relative.origin -= p_state->rt_origin;
+		// A slot's sampled triangles sit where the trace finds them: its cell-relative rows under its
+		// partition's translation, rounded as the build rounds them (D94c).
+		Transform3D relative;
+		if (c.record) {
+			relative = _slot_traced_transform(p_state, p_state->slots[c.index]);
+		} else {
+			relative = blas_transforms[c.index];
+			relative.origin -= p_state->rt_origin;
+		}
 		RendererRD::MaterialStorage::store_transform_transposed_3x4(relative, e.xform);
 		const RT_MaterialData &mat = c.record ? c.record->material : material_data[c.index];
 		const uint32_t flags = c.record ? c.record->flags : instance_flags[c.index];

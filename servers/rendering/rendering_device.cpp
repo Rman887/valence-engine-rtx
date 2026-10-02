@@ -916,7 +916,8 @@ Error RenderingDevice::ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p
 		}
 	}
 	for (uint32_t i = 0; i < p_translations.size(); i++) {
-		ERR_FAIL_COND_V_MSG(p_translations[i].partition != PARTITION_GLOBAL && p_translations[i].partition >= limits.partition_count, ERR_INVALID_PARAMETER, "Translation " + itos(i) + " names a partition past the partitions of the partitioned TLAS.");
+		// The global partition takes no translation (VUID-VkPartitionedAccelerationStructureWritePartitionTranslationDataNV-partitionIndex-10574).
+		ERR_FAIL_COND_V_MSG(p_translations[i].partition >= limits.partition_count, ERR_INVALID_PARAMETER, "Translation " + itos(i) + " names the global partition or a partition past the partitions of the partitioned TLAS.");
 	}
 	for (const KeyValue<uint32_t, int64_t> &E : occupancy_delta) {
 		const bool global = E.key == PARTITION_GLOBAL;

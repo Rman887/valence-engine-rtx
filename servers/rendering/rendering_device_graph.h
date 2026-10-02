@@ -122,6 +122,7 @@ public:
 			TYPE_DRIVER_CALLBACK,
 			TYPE_BOTTOM_LEVEL_ACCELERATION_STRUCTURE_UPDATE,
 			TYPE_CLUSTER_ACCELERATION_STRUCTURE_BUILD,
+			TYPE_PARTITIONED_ACCELERATION_STRUCTURE_BUILD,
 			TYPE_MAX
 		};
 
@@ -368,6 +369,10 @@ private:
 	// by the caller, since which ones are written depends on the op mode.
 	struct RecordedClusterAccelerationStructureBuildCommand : RecordedCommand {
 		RDD::ClusterAccelerationStructureBuild build;
+	};
+
+	struct RecordedPartitionedAccelerationStructureBuildCommand : RecordedCommand {
+		RDD::PartitionedAccelerationStructureBuild build;
 	};
 
 	struct RecordedBufferClearCommand : RecordedCommand {
@@ -909,6 +914,8 @@ public:
 	void add_blas_update(RDD::AccelerationStructureID p_blas, RDD::BufferID p_scratch_buffer, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);
 	void add_tlas_build(RDD::AccelerationStructureID p_tlas, RDD::BufferID p_scratch_buffer, RDD::BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);
 	void add_cluster_acceleration_structure_build(const RDD::ClusterAccelerationStructureBuild &p_build, VectorView<ResourceTracker *> p_trackers, VectorView<ResourceUsage> p_usages);
+	// The operations come from host memory the build owns; p_src_trackers are the BLASes its slots reference.
+	void add_ptlas_build(const RDD::PartitionedAccelerationStructureBuild &p_build, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);
 	void add_buffer_clear(RDD::BufferID p_dst, ResourceTracker *p_dst_tracker, uint32_t p_offset, uint32_t p_size);
 	void add_buffer_copy(RDD::BufferID p_src, ResourceTracker *p_src_tracker, RDD::BufferID p_dst, ResourceTracker *p_dst_tracker, RDD::BufferCopyRegion p_region);
 	void add_buffer_get_data(RDD::BufferID p_src, ResourceTracker *p_src_tracker, RDD::BufferID p_dst, RDD::BufferCopyRegion p_region);

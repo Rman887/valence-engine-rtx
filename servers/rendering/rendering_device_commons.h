@@ -1040,6 +1040,28 @@ public:
 		uint64_t cluster_references_address = 0;
 	};
 
+	// ----- PARTITIONED TOP-LEVEL ACCELERATION STRUCTURES (VK_NV_partitioned_acceleration_structure) -----
+	//
+	// A partitioned TLAS (PTLAS) holds its instances in slots grouped into partitions. A slot
+	// keeps what was written to it until a later build writes it again, and a build rebuilds
+	// only the partitions its writes touch. Shaders bind and trace it as any TLAS. Behind
+	// rendering/pathtracing/partitioned_tlas (restart), every TLAS is one (D94).
+
+	static const uint32_t PARTITION_GLOBAL = 0xFFFFFFFF;
+
+	struct PartitionedAccelerationStructureCapabilities {
+		bool supported = false; // Enabled by the setting, and every acceleration structure binding is a PTLAS binding.
+		uint32_t max_partition_count = 0;
+	};
+
+	struct PartitionedAccelerationStructureLimits {
+		uint32_t instance_count = 0; // Slots.
+		uint32_t partition_count = 0;
+		uint32_t max_instances_per_partition = 0;
+		uint32_t max_global_instances = 0;
+		bool partition_translation = false;
+	};
+
 	/**************/
 	/**** MISC ****/
 	/**************/

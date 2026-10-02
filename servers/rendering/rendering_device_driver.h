@@ -845,6 +845,50 @@ public:
 	// freeing it releases the handle alone.
 	virtual AccelerationStructureID cluster_blas_create(BufferID p_buffer, uint64_t p_offset) = 0;
 
+	// ----- PARTITIONED TOP-LEVEL ACCELERATION STRUCTURE -----
+
+	struct PartitionedInstanceWrite {
+		Transform3D transform;
+		uint32_t slot = 0;
+		uint32_t partition = 0; // Or PARTITION_GLOBAL.
+		uint32_t id = 0; // The custom index, 24 bits.
+		uint8_t mask = 0;
+		uint32_t hit_sbt_offset = 0; // 24 bits.
+		BitField<AccelerationStructureInstanceFlagBits> flags = {};
+		AccelerationStructureID blas; // Null: the slot is disabled.
+	};
+
+	enum PartitionedOpType {
+		PARTITIONED_OP_WRITE_INSTANCE,
+		PARTITIONED_OP_WRITE_PARTITION_TRANSLATION,
+	};
+
+	// One build: the operations (written by ptlas_operation_write()) and their count, as one
+	// uint32, are read on the device.
+	struct PartitionedAccelerationStructureBuild {
+		AccelerationStructureID acceleration_structure;
+		BufferID scratch_buffer; // At least acceleration_structure_get_scratch_size_bytes(); aligned by the driver.
+		BufferID src_infos_buffer;
+		uint64_t src_infos_offset = 0;
+		BufferID src_infos_count_buffer;
+		uint64_t src_infos_count_offset = 0;
+		// False: built from scratch, from this build's writes alone (RD then writes every slot).
+		bool in_place = false;
+	};
+
+	// The structure owns its storage; its scratch size is acceleration_structure_get_scratch_size_bytes().
+	virtual const PartitionedAccelerationStructureCapabilities &get_partitioned_acceleration_structure_capabilities() {
+		static PartitionedAccelerationStructureCapabilities unsupported;
+		return unsupported;
+	}
+	virtual AccelerationStructureID ptlas_create(const PartitionedAccelerationStructureLimits &p_limits) { return AccelerationStructureID(); }
+	virtual uint32_t ptlas_instance_write_size() { return 0; }
+	virtual void ptlas_instance_write(uint8_t *r_driver_write, const PartitionedInstanceWrite &p_write) {}
+	virtual uint32_t ptlas_translation_write_size() { return 0; }
+	virtual void ptlas_translation_write(uint8_t *r_driver_write, uint32_t p_partition, const Vector3 &p_translation) {}
+	virtual uint32_t ptlas_operation_size() { return 0; }
+	virtual void ptlas_operation_write(uint8_t *r_driver_operation, PartitionedOpType p_type, uint32_t p_count, uint64_t p_address, uint32_t p_stride) {}
+
 	// ----- PIPELINE -----
 
 	struct PipelineShader {
@@ -872,6 +916,7 @@ public:
 	virtual void command_update_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) = 0;
 	virtual void command_build_tlas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count) = 0;
 	virtual void command_build_cluster_acceleration_structures(CommandBufferID p_cmd_buffer, const ClusterAccelerationStructureBuild &p_build) = 0;
+	virtual void command_build_ptlas(CommandBufferID p_cmd_buffer, const PartitionedAccelerationStructureBuild &p_build) {}
 	virtual void command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) = 0;
 	virtual void command_bind_raytracing_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) = 0;
 

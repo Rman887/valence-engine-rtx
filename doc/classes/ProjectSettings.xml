@@ -3352,6 +3352,10 @@
 			Maximum total triangle count ([code]instance_count * triangles_per_surface[/code]) for a [MultiMesh] surface to use a single merged BLAS in the path tracer. When the combined triangle count exceeds this value, the path tracer falls back to one TLAS entry per instance sharing a common BLAS instead. Lower this value to reduce peak GPU memory for large MultiMeshes; raise it to prefer the merged path (which avoids per-instance TLAS overhead).
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracing/partitioned_tlas" type="bool" setter="" getter="" default="false">
+			If [code]true[/code] and the device supports [code]VK_NV_partitioned_acceleration_structure[/code], every top-level acceleration structure is a partitioned one: its instances keep their contents between builds and a build rebuilds only the partitions it writes. Shaders trace it as any top-level structure. The image is the same up to floating-point rounding: primary hits agree, and a ray that grazes an object's silhouette after a bounce can hit or miss differently. [method RenderingDevice.tlas_create] then makes a partitioned structure of one partition and [method RenderingDevice.tlas_build] writes all of it, and every acceleration structure binding takes a partitioned structure. Without the extension, this setting has no effect.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
 		<member name="rendering/pathtracing/relative_origin_grid" type="float" setter="" getter="" default="1024.0">
 			Size in meters of the grid the path tracer's world-space anchor snaps to. The trace runs in world space relative to that anchor (the camera's grid cell on the X and Z axes), so 32-bit positions on the GPU stay precise kilometers from the origin; the anchor moves only when the camera leaves its cell. Set to [code]0.0[/code] to trace in absolute world space.
 			[b]Note:[/b] Requires a restart to take effect.

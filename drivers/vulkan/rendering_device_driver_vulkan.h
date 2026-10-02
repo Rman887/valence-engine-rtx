@@ -144,6 +144,8 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 		PFN_vkCmdTraceRaysKHR CmdTraceRaysKHR = nullptr;
 		PFN_vkGetClusterAccelerationStructureBuildSizesNV GetClusterAccelerationStructureBuildSizesNV = nullptr;
 		PFN_vkCmdBuildClusterAccelerationStructureIndirectNV CmdBuildClusterAccelerationStructureIndirectNV = nullptr;
+		PFN_vkGetPartitionedAccelerationStructuresBuildSizesNV GetPartitionedAccelerationStructuresBuildSizesNV = nullptr;
+		PFN_vkCmdBuildPartitionedAccelerationStructuresNV CmdBuildPartitionedAccelerationStructuresNV = nullptr;
 	};
 	// Debug marker extensions.
 	VkDebugReportObjectTypeEXT _convert_to_debug_report_objectType(VkObjectType p_object_type);
@@ -175,6 +177,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	bool ray_query_support = false;
 	RaytracingCapabilities raytracing_capabilities;
 	ClusterAccelerationStructureCapabilities cluster_acceleration_structure_capabilities;
+	PartitionedAccelerationStructureCapabilities partitioned_acceleration_structure_capabilities;
 	DescriptorIndexingCapabilities descriptor_indexing_capabilities;
 	bool pipeline_cache_control_support = false;
 	bool device_fault_support = false;
@@ -721,11 +724,16 @@ public:
 		// False for a cluster BLAS handle: the buffer is the caller's and outlives this info.
 		bool owns_buffer = true;
 		VkDeviceAddress cached_device_address = 0;
+		// A PTLAS: no Vulkan object, cached_device_address is its storage, bound through a
+		// partitioned descriptor.
+		bool partitioned = false;
+		VkPartitionedAccelerationStructureInstancesInputNV ptlas_input = {};
+		VkPartitionedAccelerationStructureFlagsNV ptlas_flags = {};
 
 		// Alignment of the scratch buffer for building the structure
 		uint32_t scratch_alignment;
 		// Size of the scratch buffer for building the structure
-		uint32_t scratch_size;
+		uint64_t scratch_size;
 
 		// Required for building
 		TightLocalVector<VkAccelerationStructureGeometryKHR> geometries;
@@ -746,6 +754,16 @@ public:
 	virtual void cluster_bottom_level_build_info_write(uint8_t *r_driver_info, const ClusterBottomLevelBuildInfo &p_info) override final;
 	virtual AccelerationStructureID cluster_blas_create(BufferID p_buffer, uint64_t p_offset) override final;
 
+	// ----- PARTITIONED TOP-LEVEL ACCELERATION STRUCTURE -----
+	virtual const PartitionedAccelerationStructureCapabilities &get_partitioned_acceleration_structure_capabilities() override final;
+	virtual AccelerationStructureID ptlas_create(const PartitionedAccelerationStructureLimits &p_limits) override final;
+	virtual uint32_t ptlas_instance_write_size() override final;
+	virtual void ptlas_instance_write(uint8_t *r_driver_write, const PartitionedInstanceWrite &p_write) override final;
+	virtual uint32_t ptlas_translation_write_size() override final;
+	virtual void ptlas_translation_write(uint8_t *r_driver_write, uint32_t p_partition, const Vector3 &p_translation) override final;
+	virtual uint32_t ptlas_operation_size() override final;
+	virtual void ptlas_operation_write(uint8_t *r_driver_operation, PartitionedOpType p_type, uint32_t p_count, uint64_t p_address, uint32_t p_stride) override final;
+
 private:
 	void _acceleration_structure_create(VkAccelerationStructureTypeKHR p_type, VkAccelerationStructureBuildSizesInfoKHR p_size_info, AccelerationStructureInfo *r_accel_info);
 	// Fills the Vulkan input from ours; the op-type input structs must outlive the returned struct.
@@ -760,6 +778,7 @@ public:
 	virtual void command_update_blas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer) override final;
 	virtual void command_build_tlas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count) override final;
 	virtual void command_build_cluster_acceleration_structures(CommandBufferID p_cmd_buffer, const ClusterAccelerationStructureBuild &p_build) override final;
+	virtual void command_build_ptlas(CommandBufferID p_cmd_buffer, const PartitionedAccelerationStructureBuild &p_build) override final;
 	virtual void command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) override final;
 	virtual void command_bind_raytracing_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) override final;
 	virtual void command_trace_rays(CommandBufferID p_cmd_buffer, const ShaderBindingTable &p_raygen_sbt, const ShaderBindingTable &p_miss_sbt, const ShaderBindingTable &p_hit_sbt, uint32_t p_width, uint32_t p_height, uint32_t p_depth) override final;

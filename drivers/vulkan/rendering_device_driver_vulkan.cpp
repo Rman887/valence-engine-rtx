@@ -604,6 +604,10 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 			_register_requested_device_extension(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME, false);
 		}
 	}
+	// Off, likewise: every acceleration structure binding stays a plain TLAS binding.
+	if (GLOBAL_GET("rendering/pathtracing/partitioned_tlas")) {
+		_register_requested_device_extension(VK_NV_PARTITIONED_ACCELERATION_STRUCTURE_EXTENSION_NAME, false);
+	}
 	_register_requested_device_extension(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, false);
 
 	// We don't actually use this extension, but some runtime components on some platforms
@@ -946,6 +950,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		VkPhysicalDeviceRayTracingValidationFeaturesNV raytracing_validation_features = {};
 		VkPhysicalDeviceClusterAccelerationStructureFeaturesNV cluster_acceleration_structure_features = {};
 		VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR position_fetch_features = {};
+		VkPhysicalDevicePartitionedAccelerationStructureFeaturesNV partitioned_acceleration_structure_features = {};
 
 		const bool use_1_2_features = physical_device_properties.apiVersion >= VK_API_VERSION_1_2;
 		if (use_1_2_features) {
@@ -1052,6 +1057,12 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			position_fetch_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR;
 			position_fetch_features.pNext = next_features;
 			next_features = &position_fetch_features;
+		}
+
+		if (enabled_device_extension_names.has(VK_NV_PARTITIONED_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
+			partitioned_acceleration_structure_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_FEATURES_NV;
+			partitioned_acceleration_structure_features.pNext = next_features;
+			next_features = &partitioned_acceleration_structure_features;
 		}
 
 		if (enabled_device_extension_names.has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME)) {
@@ -1162,6 +1173,13 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			cluster_acceleration_structure_capabilities.supported = acceleration_structure_features.accelerationStructure && cluster_acceleration_structure_features.clusterAccelerationStructure;
 			cluster_acceleration_structure_capabilities.position_fetch = cluster_acceleration_structure_capabilities.supported && enabled_device_extension_names.has(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME) && position_fetch_features.rayTracingPositionFetch;
 		}
+
+		if (enabled_device_extension_names.has(VK_NV_PARTITIONED_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
+			partitioned_acceleration_structure_capabilities.supported = acceleration_structure_features.accelerationStructure && partitioned_acceleration_structure_features.partitionedAccelerationStructure;
+		}
+		if (GLOBAL_GET("rendering/pathtracing/partitioned_tlas") && !partitioned_acceleration_structure_capabilities.supported) {
+			WARN_PRINT("rendering/pathtracing/partitioned_tlas is set, but this device has no partitioned acceleration structures (VK_NV_partitioned_acceleration_structure). Using plain TLASes.");
+		}
 	}
 
 	if (functions.GetPhysicalDeviceProperties2 != nullptr) {
@@ -1175,6 +1193,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		VkPhysicalDeviceAccelerationStructurePropertiesKHR acceleration_structure_properties = {};
 		VkPhysicalDeviceRayTracingPipelinePropertiesKHR raytracing_properties = {};
 		VkPhysicalDeviceClusterAccelerationStructurePropertiesNV cluster_acceleration_structure_properties = {};
+		VkPhysicalDevicePartitionedAccelerationStructurePropertiesNV partitioned_acceleration_structure_properties = {};
 		VkPhysicalDeviceProperties2 physical_device_properties_2 = {};
 
 		const bool use_1_1_properties = physical_device_properties.apiVersion >= VK_API_VERSION_1_1;
@@ -1231,6 +1250,12 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			cluster_acceleration_structure_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_PROPERTIES_NV;
 			cluster_acceleration_structure_properties.pNext = next_properties;
 			next_properties = &cluster_acceleration_structure_properties;
+		}
+
+		if (partitioned_acceleration_structure_capabilities.supported) {
+			partitioned_acceleration_structure_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_PROPERTIES_NV;
+			partitioned_acceleration_structure_properties.pNext = next_properties;
+			next_properties = &partitioned_acceleration_structure_properties;
 		}
 
 		physical_device_properties_2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
@@ -1374,6 +1399,13 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			print_verbose("  cluster bottom level byte alignment: " + itos(cluster_acceleration_structure_capabilities.cluster_bottom_level_byte_alignment));
 			print_verbose("  cluster scratch byte alignment: " + itos(cluster_acceleration_structure_capabilities.cluster_scratch_byte_alignment));
 			print_verbose(String("  position fetch: ") + (cluster_acceleration_structure_capabilities.position_fetch ? "yes" : "no"));
+		}
+
+		if (partitioned_acceleration_structure_capabilities.supported) {
+			partitioned_acceleration_structure_capabilities.max_partition_count = partitioned_acceleration_structure_properties.maxPartitionCount;
+
+			print_verbose("- Vulkan Partitioned Acceleration Structure supported");
+			print_verbose("  max partition count: " + itos(partitioned_acceleration_structure_capabilities.max_partition_count));
 		}
 	}
 
@@ -1575,6 +1607,14 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		create_info_next = &position_fetch_features;
 	}
 
+	VkPhysicalDevicePartitionedAccelerationStructureFeaturesNV partitioned_acceleration_structure_features = {};
+	if (partitioned_acceleration_structure_capabilities.supported) {
+		partitioned_acceleration_structure_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_FEATURES_NV;
+		partitioned_acceleration_structure_features.pNext = create_info_next;
+		partitioned_acceleration_structure_features.partitionedAccelerationStructure = VK_TRUE;
+		create_info_next = &partitioned_acceleration_structure_features;
+	}
+
 	VkPhysicalDeviceVulkan11Features vulkan_1_1_features = {};
 	VkPhysicalDeviceVulkan12Features vulkan_1_2_features = {};
 	VkPhysicalDevice16BitStorageFeaturesKHR storage_features = {};
@@ -1718,6 +1758,11 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		if (enabled_device_extension_names.has(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
 			device_functions.GetClusterAccelerationStructureBuildSizesNV = PFN_vkGetClusterAccelerationStructureBuildSizesNV(functions.GetDeviceProcAddr(vk_device, "vkGetClusterAccelerationStructureBuildSizesNV"));
 			device_functions.CmdBuildClusterAccelerationStructureIndirectNV = PFN_vkCmdBuildClusterAccelerationStructureIndirectNV(functions.GetDeviceProcAddr(vk_device, "vkCmdBuildClusterAccelerationStructureIndirectNV"));
+		}
+
+		if (enabled_device_extension_names.has(VK_NV_PARTITIONED_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
+			device_functions.GetPartitionedAccelerationStructuresBuildSizesNV = PFN_vkGetPartitionedAccelerationStructuresBuildSizesNV(functions.GetDeviceProcAddr(vk_device, "vkGetPartitionedAccelerationStructuresBuildSizesNV"));
+			device_functions.CmdBuildPartitionedAccelerationStructuresNV = PFN_vkCmdBuildPartitionedAccelerationStructuresNV(functions.GetDeviceProcAddr(vk_device, "vkCmdBuildPartitionedAccelerationStructuresNV"));
 		}
 	}
 
@@ -4518,7 +4563,8 @@ RDD::ShaderID RenderingDeviceDriverVulkan::shader_create_from_container(const Re
 					layout_binding.descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
 				} break;
 				case UNIFORM_TYPE_ACCELERATION_STRUCTURE: {
-					layout_binding.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+					// Every binding is a PTLAS binding while they are on (D94): RD makes every TLAS one.
+					layout_binding.descriptorType = partitioned_acceleration_structure_capabilities.supported ? VK_DESCRIPTOR_TYPE_PARTITIONED_ACCELERATION_STRUCTURE_NV : VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 				} break;
 				default: {
 					DEV_ASSERT(false);
@@ -4867,7 +4913,7 @@ VkDescriptorPool RenderingDeviceDriverVulkan::_descriptor_set_pool_create(const 
 		}
 		if (p_key.uniform_type[UNIFORM_TYPE_ACCELERATION_STRUCTURE]) {
 			*curr_vk_size = {};
-			curr_vk_size->type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+			curr_vk_size->type = partitioned_acceleration_structure_capabilities.supported ? VK_DESCRIPTOR_TYPE_PARTITIONED_ACCELERATION_STRUCTURE_NV : VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 			curr_vk_size->descriptorCount = p_key.uniform_type[UNIFORM_TYPE_ACCELERATION_STRUCTURE] * max_descriptor_sets_per_pool;
 			curr_vk_size++;
 			vk_sizes_count++;
@@ -5127,6 +5173,19 @@ RDD::UniformSetID RenderingDeviceDriverVulkan::uniform_set_create(VectorView<Bou
 			} break;
 			case UNIFORM_TYPE_ACCELERATION_STRUCTURE: {
 				const AccelerationStructureInfo *accel_info = (const AccelerationStructureInfo *)uniform.ids[0].id;
+				if (partitioned_acceleration_structure_capabilities.supported) {
+					// The layout's binding is a PTLAS binding, written by address.
+					ERR_FAIL_COND_V_MSG(!accel_info->partitioned, UniformSetID(), "Acceleration structure bindings take partitioned TLASes while rendering/pathtracing/partitioned_tlas is on.");
+					VkWriteDescriptorSetPartitionedAccelerationStructureNV *ptlas_write = ALLOCA_SINGLE(VkWriteDescriptorSetPartitionedAccelerationStructureNV);
+					*ptlas_write = {};
+					ptlas_write->sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_PARTITIONED_ACCELERATION_STRUCTURE_NV;
+					ptlas_write->accelerationStructureCount = 1;
+					ptlas_write->pAccelerationStructures = &accel_info->cached_device_address;
+
+					vk_writes[i].descriptorType = VK_DESCRIPTOR_TYPE_PARTITIONED_ACCELERATION_STRUCTURE_NV;
+					vk_writes[i].pNext = ptlas_write;
+					break;
+				}
 				VkWriteDescriptorSetAccelerationStructureKHR *acceleration_structure_write = ALLOCA_SINGLE(VkWriteDescriptorSetAccelerationStructureKHR);
 				*acceleration_structure_write = {};
 				acceleration_structure_write->sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
@@ -6885,6 +6944,128 @@ RDD::AccelerationStructureID RenderingDeviceDriverVulkan::cluster_blas_create(Bu
 #endif
 }
 
+// ----- PARTITIONED TOP-LEVEL ACCELERATION STRUCTURE -----
+
+// VUID-vkCmdBuildPartitionedAccelerationStructuresNV-pBuildInfo-10542/10544/10545: the
+// structure, its source and the scratch are 256-byte aligned.
+static const VkDeviceAddress PTLAS_ADDRESS_ALIGNMENT = 256;
+
+const RDD::PartitionedAccelerationStructureCapabilities &RenderingDeviceDriverVulkan::get_partitioned_acceleration_structure_capabilities() {
+	return partitioned_acceleration_structure_capabilities;
+}
+
+RDD::AccelerationStructureID RenderingDeviceDriverVulkan::ptlas_create(const PartitionedAccelerationStructureLimits &p_limits) {
+#if VULKAN_RAYTRACING_ENABLED
+	ERR_FAIL_COND_V_MSG(!partitioned_acceleration_structure_capabilities.supported, AccelerationStructureID(), "Vulkan partitioned acceleration structures are not supported by this device.");
+	ERR_FAIL_COND_V_MSG(p_limits.instance_count == 0 || p_limits.partition_count == 0, AccelerationStructureID(), "A partitioned TLAS needs at least one slot and one partition.");
+	// VUID-VkPartitionedAccelerationStructureInstancesInputNV-partitionCount-10535: the global
+	// partition's instances count as partitions of their own.
+	ERR_FAIL_COND_V_MSG(uint64_t(p_limits.partition_count) + p_limits.max_global_instances > partitioned_acceleration_structure_capabilities.max_partition_count, AccelerationStructureID(), "The partition count with the global partition's instances exceeds the device's maxPartitionCount.");
+
+	AccelerationStructureInfo *accel_info = VersatileResource::allocate<AccelerationStructureInfo>(resources_allocator);
+	accel_info->partitioned = true;
+	accel_info->ptlas_flags = {};
+	accel_info->ptlas_flags.sType = VK_STRUCTURE_TYPE_PARTITIONED_ACCELERATION_STRUCTURE_FLAGS_NV;
+	accel_info->ptlas_flags.enablePartitionTranslation = p_limits.partition_translation;
+	accel_info->ptlas_input = {};
+	accel_info->ptlas_input.sType = VK_STRUCTURE_TYPE_PARTITIONED_ACCELERATION_STRUCTURE_INSTANCES_INPUT_NV;
+	accel_info->ptlas_input.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+	accel_info->ptlas_input.instanceCount = p_limits.instance_count;
+	accel_info->ptlas_input.maxInstancePerPartitionCount = p_limits.max_instances_per_partition;
+	accel_info->ptlas_input.partitionCount = p_limits.partition_count;
+	accel_info->ptlas_input.maxInstanceInGlobalPartitionCount = p_limits.max_global_instances;
+
+	VkPartitionedAccelerationStructureInstancesInputNV input = accel_info->ptlas_input;
+	input.pNext = &accel_info->ptlas_flags;
+	VkAccelerationStructureBuildSizesInfoKHR size_info = {};
+	size_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+	device_functions.GetPartitionedAccelerationStructuresBuildSizesNV(vk_device, &input, &size_info);
+	ERR_FAIL_COND_V_MSG(size_info.accelerationStructureSize == 0 || size_info.accelerationStructureSize == ~VkDeviceSize(0), AccelerationStructureID(), "The driver gave no size for the partitioned TLAS.");
+	const VkDeviceSize scratch_size = MAX(size_info.buildScratchSize, size_info.updateScratchSize);
+	ERR_FAIL_COND_V_MSG(scratch_size == ~VkDeviceSize(0), AccelerationStructureID(), "The driver gave no scratch size for the partitioned TLAS.");
+	// acceleration_structure_get_scratch_size_bytes() returns 32 bits.
+	ERR_FAIL_COND_V_MSG(scratch_size + PTLAS_ADDRESS_ALIGNMENT > UINT32_MAX, AccelerationStructureID(), "The partitioned TLAS needs a scratch of 4 GB or more.");
+
+	// No Vulkan object: the structure is its address, rounded up inside a buffer one alignment larger.
+	accel_info->buffer = buffer_create(size_info.accelerationStructureSize + PTLAS_ADDRESS_ALIGNMENT, RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT | RDD::BUFFER_USAGE_STORAGE_BIT | RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT, RDD::MEMORY_ALLOCATION_TYPE_GPU, UINT64_MAX);
+	if (!accel_info->buffer) {
+		VersatileResource::free(resources_allocator, accel_info);
+		ERR_FAIL_V_MSG(AccelerationStructureID(), "Couldn't create the partitioned TLAS storage.");
+	}
+	accel_info->cached_device_address = _align_up_address(buffer_get_device_address(accel_info->buffer), PTLAS_ADDRESS_ALIGNMENT);
+	// One scratch serves the build from scratch and the update in place.
+	accel_info->scratch_alignment = PTLAS_ADDRESS_ALIGNMENT;
+	accel_info->scratch_size = scratch_size + PTLAS_ADDRESS_ALIGNMENT;
+	accel_info->build_info = {};
+	accel_info->build_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+	accel_info->build_info.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+	return AccelerationStructureID(accel_info);
+#else
+	return AccelerationStructureID();
+#endif
+}
+
+uint32_t RenderingDeviceDriverVulkan::ptlas_instance_write_size() {
+	return sizeof(VkPartitionedAccelerationStructureWriteInstanceDataNV);
+}
+
+void RenderingDeviceDriverVulkan::ptlas_instance_write(uint8_t *r_driver_write, const PartitionedInstanceWrite &p_write) {
+#if VULKAN_RAYTRACING_ENABLED
+	static_assert(uint32_t(PARTITION_GLOBAL) == VK_PARTITIONED_ACCELERATION_STRUCTURE_PARTITION_INDEX_GLOBAL_NV);
+	static_assert(uint32_t(ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT) == VK_PARTITIONED_ACCELERATION_STRUCTURE_INSTANCE_FLAG_TRIANGLE_FACING_CULL_DISABLE_BIT_NV);
+	static_assert(uint32_t(ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT) == VK_PARTITIONED_ACCELERATION_STRUCTURE_INSTANCE_FLAG_TRIANGLE_FLIP_FACING_BIT_NV);
+	static_assert(uint32_t(ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) == VK_PARTITIONED_ACCELERATION_STRUCTURE_INSTANCE_FLAG_FORCE_OPAQUE_BIT_NV);
+	static_assert(uint32_t(ACCELERATION_STRUCTURE_INSTANCE_FORCE_NO_OPAQUE_BIT) == VK_PARTITIONED_ACCELERATION_STRUCTURE_INSTANCE_FLAG_FORCE_NO_OPAQUE_BIT_NV);
+
+	VkPartitionedAccelerationStructureWriteInstanceDataNV *vk_write = (VkPartitionedAccelerationStructureWriteInstanceDataNV *)r_driver_write;
+	*vk_write = {};
+	_store_transform_transposed_3x4(p_write.transform, vk_write->transform);
+	// VUID-...-10566 and 10567: the mask is 8 bits, the hit group contribution 24.
+	vk_write->instanceID = p_write.id & 0xFFFFFF;
+	vk_write->instanceMask = p_write.mask;
+	vk_write->instanceContributionToHitGroupIndex = p_write.hit_sbt_offset & 0xFFFFFF;
+	// The four flags a TLAS instance has; bit 4 (ENABLE_EXPLICIT_BOUNDING_BOX) would read the zero AABB.
+	vk_write->instanceFlags = VkPartitionedAccelerationStructureInstanceFlagsNV(uint32_t(p_write.flags) & 0xF);
+	vk_write->instanceIndex = p_write.slot;
+	vk_write->partitionIndex = p_write.partition;
+	if (p_write.blas) {
+		const AccelerationStructureInfo *blas_info = (const AccelerationStructureInfo *)p_write.blas.id;
+		vk_write->accelerationStructure = blas_info->cached_device_address;
+	} else {
+		vk_write->accelerationStructure = 0;
+	}
+#endif
+}
+
+uint32_t RenderingDeviceDriverVulkan::ptlas_translation_write_size() {
+	return sizeof(VkPartitionedAccelerationStructureWritePartitionTranslationDataNV);
+}
+
+void RenderingDeviceDriverVulkan::ptlas_translation_write(uint8_t *r_driver_write, uint32_t p_partition, const Vector3 &p_translation) {
+#if VULKAN_RAYTRACING_ENABLED
+	VkPartitionedAccelerationStructureWritePartitionTranslationDataNV *vk_write = (VkPartitionedAccelerationStructureWritePartitionTranslationDataNV *)r_driver_write;
+	vk_write->partitionIndex = p_partition;
+	vk_write->partitionTranslation[0] = p_translation.x;
+	vk_write->partitionTranslation[1] = p_translation.y;
+	vk_write->partitionTranslation[2] = p_translation.z;
+#endif
+}
+
+uint32_t RenderingDeviceDriverVulkan::ptlas_operation_size() {
+	return sizeof(VkBuildPartitionedAccelerationStructureIndirectCommandNV);
+}
+
+void RenderingDeviceDriverVulkan::ptlas_operation_write(uint8_t *r_driver_operation, PartitionedOpType p_type, uint32_t p_count, uint64_t p_address, uint32_t p_stride) {
+#if VULKAN_RAYTRACING_ENABLED
+	VkBuildPartitionedAccelerationStructureIndirectCommandNV *vk_operation = (VkBuildPartitionedAccelerationStructureIndirectCommandNV *)r_driver_operation;
+	*vk_operation = {};
+	vk_operation->opType = p_type == PARTITIONED_OP_WRITE_INSTANCE ? VK_PARTITIONED_ACCELERATION_STRUCTURE_OP_TYPE_WRITE_INSTANCE_NV : VK_PARTITIONED_ACCELERATION_STRUCTURE_OP_TYPE_WRITE_PARTITION_TRANSLATION_NV;
+	vk_operation->argCount = p_count;
+	vk_operation->argData.startAddress = p_address;
+	vk_operation->argData.strideInBytes = p_stride;
+#endif
+}
+
 VkStridedDeviceAddressRegionKHR RenderingDeviceDriverVulkan::_sbt_to_vk_strided_device_address_region(const ShaderBindingTable &p_sbt) {
 	VkStridedDeviceAddressRegionKHR vk_strided_device_address_region = {};
 	if (p_sbt.buffer) {
@@ -6988,6 +7169,27 @@ void RenderingDeviceDriverVulkan::command_build_cluster_acceleration_structures(
 	}
 
 	device_functions.CmdBuildClusterAccelerationStructureIndirectNV(command_buffer->vk_command_buffer, &commands_info);
+#endif
+}
+
+void RenderingDeviceDriverVulkan::command_build_ptlas(CommandBufferID p_cmd_buffer, const PartitionedAccelerationStructureBuild &p_build) {
+#if VULKAN_RAYTRACING_ENABLED
+	const CommandBufferInfo *command_buffer = (const CommandBufferInfo *)p_cmd_buffer.id;
+	const AccelerationStructureInfo *accel_info = (const AccelerationStructureInfo *)p_build.acceleration_structure.id;
+	DEV_ASSERT(accel_info->partitioned);
+
+	VkBuildPartitionedAccelerationStructureInfoNV build_info = {};
+	build_info.sType = VK_STRUCTURE_TYPE_BUILD_PARTITIONED_ACCELERATION_STRUCTURE_INFO_NV;
+	build_info.input = accel_info->ptlas_input;
+	build_info.input.pNext = (void *)&accel_info->ptlas_flags;
+	// In place: source and destination are the same structure.
+	build_info.srcAccelerationStructureData = p_build.in_place ? accel_info->cached_device_address : 0;
+	build_info.dstAccelerationStructureData = accel_info->cached_device_address;
+	build_info.scratchData = _align_up_address(buffer_get_device_address(p_build.scratch_buffer), PTLAS_ADDRESS_ALIGNMENT);
+	build_info.srcInfos = buffer_get_device_address(p_build.src_infos_buffer) + p_build.src_infos_offset;
+	build_info.srcInfosCount = buffer_get_device_address(p_build.src_infos_count_buffer) + p_build.src_infos_count_offset;
+
+	device_functions.CmdBuildPartitionedAccelerationStructuresNV(command_buffer->vk_command_buffer, &build_info);
 #endif
 }
 

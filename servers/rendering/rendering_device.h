@@ -1365,10 +1365,47 @@ private:
 		};
 
 		LocalVector<InstanceBuffer> instance_buffers;
+
+		// --- Partitioned Top Level (D94) ---
+		// A slot keeps what was last written to it; a build writes some slots and leaves the rest.
+		// acceleration_structure_dependencies holds the BLASes the slots reference, counted in
+		// blas_slot_counts. A BLAS rebuilt since the last build (stale) has its slots written again
+		// by the next one; a BLAS freed while referenced has its slots disabled by it.
+		bool partitioned = false;
+		PartitionedAccelerationStructureLimits limits;
+		bool built_once = false;
+		uint64_t build_serial = 0;
+		uint32_t slot_high_water = 0; // Slots from here on were never written as enabled.
+		LocalVector<uint8_t> slot_records; // The driver record last written to each slot below slot_high_water.
+		LocalVector<RID> slot_blas;
+		LocalVector<uint32_t> slot_partition; // Kept while disabled: a slot is disabled where it is.
+		LocalVector<uint32_t> partition_occupancy; // Enabled slots per partition.
+		uint32_t global_occupancy = 0;
+		LocalVector<uint64_t> slot_written_serial;
+		HashMap<RID, uint32_t> blas_slot_counts;
+		HashSet<RID> stale_blas;
+		HashSet<RID> freed_blas;
+		uint32_t span_instance_count = 0; // The slots the last tlas_build() enabled.
+		// The last build's instance writes, and among them the slots written again for a
+		// rebuilt BLAS and those disabled for a freed one (the counters D94b reports).
+		uint32_t last_build_writes = 0;
+		uint32_t last_build_stale_rewrites = 0;
+		uint32_t last_build_dangling_disables = 0;
+
+		struct InputBuffer {
+			RDD::BufferID driver_id;
+			uint64_t frame_used = 0;
+			uint64_t used_size = 0;
+			uint64_t size = 0;
+			uint8_t *data_ptr = nullptr;
+		};
+
+		LocalVector<InputBuffer> input_buffers;
 	};
 
 	Error _acceleration_structure_scratch_buffer_create(AccelerationStructure *p_acceleration_structure);
-	void _blas_remove_tlas_dependencies(AccelerationStructure *p_blas, RID p_blas_id);
+	void _blas_remove_tlas_dependencies(AccelerationStructure *p_blas, RID p_blas_id, bool p_freed = false);
+	void _ptlas_set_slot(AccelerationStructure *p_ptlas, RID p_ptlas_id, uint32_t p_slot, RID p_blas, uint32_t p_partition);
 	void _tlas_remove_blas_dependencies(AccelerationStructure *p_tlas, RID p_tlas_id);
 	void _tlas_set_blas_reads(AccelerationStructure *p_tlas, const LocalVector<RDG::ResourceTracker *> &p_trackers);
 	void _tlas_fill_blas_read_usages(AccelerationStructure *p_tlas);
@@ -1437,6 +1474,37 @@ public:
 	Error blas_build(RID p_blas);
 	Error blas_update(RID p_blas);
 	Error tlas_build(RID p_tlas, Span<AccelerationStructureInstance> p_instances);
+
+	// ----- PARTITIONED TOP-LEVEL ACCELERATION STRUCTURES (D94) -----
+	//
+	// Available when get_partitioned_acceleration_structure_capabilities().supported, which
+	// rendering/pathtracing/partitioned_tlas (restart) asks for. Every TLAS is then one:
+	// tlas_create() makes a PTLAS of one partition and tlas_build() writes all of it. Not bound
+	// to scripts.
+
+	struct PartitionedInstanceWrite {
+		Transform3D transform;
+		uint32_t slot = 0;
+		uint32_t partition = PARTITION_GLOBAL;
+		uint32_t id = 0; // The custom index, 24 bits.
+		uint8_t mask = 0xFF;
+		uint32_t hit_sbt_offset = 0;
+		BitField<AccelerationStructureInstanceFlagBits> flags = {};
+		RID blas; // Invalid: the slot is disabled.
+	};
+
+	struct PartitionTranslationWrite {
+		uint32_t partition = 0;
+		Vector3 translation;
+	};
+
+	const PartitionedAccelerationStructureCapabilities &get_partitioned_acceleration_structure_capabilities() const;
+	RID ptlas_create(const PartitionedAccelerationStructureLimits &p_limits);
+	// Writes the given slots and translations; every other slot keeps its contents. From
+	// scratch (and always for the first build), every slot not written is disabled. A slot
+	// appears at most once, and no partition may hold more enabled slots than its limit; a
+	// build that breaks either is refused and changes nothing.
+	Error ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p_writes, Span<PartitionTranslationWrite> p_translations, bool p_from_scratch = false);
 
 	// ----- CLUSTER ACCELERATION STRUCTURES -----
 	//

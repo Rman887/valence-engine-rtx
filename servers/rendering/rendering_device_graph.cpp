@@ -1131,6 +1131,10 @@ void RenderingDeviceGraph::_run_render_commands(int32_t p_level, const RecordedC
 				const RecordedClusterAccelerationStructureBuildCommand *cluster_build_command = reinterpret_cast<const RecordedClusterAccelerationStructureBuildCommand *>(command);
 				driver->command_build_cluster_acceleration_structures(r_command_buffer, cluster_build_command->build);
 			} break;
+			case RecordedCommand::TYPE_PARTITIONED_ACCELERATION_STRUCTURE_BUILD: {
+				const RecordedPartitionedAccelerationStructureBuildCommand *ptlas_build_command = reinterpret_cast<const RecordedPartitionedAccelerationStructureBuildCommand *>(command);
+				driver->command_build_ptlas(r_command_buffer, ptlas_build_command->build);
+			} break;
 			case RecordedCommand::TYPE_BUFFER_CLEAR: {
 				const RecordedBufferClearCommand *buffer_clear_command = reinterpret_cast<const RecordedBufferClearCommand *>(command);
 				driver->command_clear_buffer(r_command_buffer, buffer_clear_command->buffer, buffer_clear_command->offset, buffer_clear_command->size);
@@ -1925,6 +1929,40 @@ void RenderingDeviceGraph::add_cluster_acceleration_structure_build(const RDD::C
 		trackers[i] = p_trackers[i];
 		usages[i] = p_usages[i];
 	}
+
+	_add_command_to_graph(trackers.ptr(), usages.ptr(), usages.size(), command_index, command);
+}
+
+void RenderingDeviceGraph::add_ptlas_build(const RDD::PartitionedAccelerationStructureBuild &p_build, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers) {
+	DEV_ASSERT(p_dst_tracker != nullptr);
+
+	int32_t command_index;
+	RecordedPartitionedAccelerationStructureBuildCommand *command = static_cast<RecordedPartitionedAccelerationStructureBuildCommand *>(_allocate_command(sizeof(RecordedPartitionedAccelerationStructureBuildCommand), command_index));
+	command->type = RecordedCommand::TYPE_PARTITIONED_ACCELERATION_STRUCTURE_BUILD;
+	command->self_stages = RDD::PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT;
+	command->build = p_build;
+	// Every build rewrites the structure and its scratch, which the previous build wrote. The
+	// tracker alone adds no access for a same-usage write in a new frame (its write index is
+	// reset), so a frame that builds and binds nothing would leave the next build an empty
+	// barrier, which is dropped. Waiting on the build stage makes the dependency explicit; a
+	// build from scratch reuses the same storage and scratch, so it waits as well.
+	command->previous_stages = command->previous_stages | RDD::PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT;
+	command->memory_barrier.src_access = command->memory_barrier.src_access | RDD::BARRIER_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT;
+	command->memory_barrier.dst_access = command->memory_barrier.dst_access | RDD::BARRIER_ACCESS_ACCELERATION_STRUCTURE_READ_BIT | RDD::BARRIER_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT;
+
+	thread_local LocalVector<ResourceTracker *> trackers;
+	thread_local LocalVector<ResourceUsage> usages;
+
+	// As a TLAS build: the BLASes are read, the structure is read (in place) and written.
+	uint32_t resource_count = p_src_trackers.size() + 1;
+	trackers.resize(resource_count);
+	usages.resize(resource_count);
+	for (uint32_t i = 0; i < p_src_trackers.size(); ++i) {
+		trackers[i] = p_src_trackers[i];
+		usages[i] = RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ;
+	}
+	trackers[resource_count - 1] = p_dst_tracker;
+	usages[resource_count - 1] = RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE;
 
 	_add_command_to_graph(trackers.ptr(), usages.ptr(), usages.size(), command_index, command);
 }
@@ -2753,6 +2791,7 @@ void RenderingDeviceGraph::end(bool p_reorder_commands, bool p_full_barriers, RD
 			5, // TYPE_DRIVER_CALLBACK
 			6, // TYPE_BOTTOM_LEVEL_ACCELERATION_STRUCTURE_UPDATE
 			6, // TYPE_CLUSTER_ACCELERATION_STRUCTURE_BUILD
+			6, // TYPE_PARTITIONED_ACCELERATION_STRUCTURE_BUILD
 		};
 		static_assert(std_size(PriorityTable) == RecordedCommand::TYPE_MAX, "PriorityTable must have one entry per RecordedCommand::Type");
 

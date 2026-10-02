@@ -278,18 +278,87 @@ Error RenderingDevice::_acceleration_structure_scratch_buffer_create(Acceleratio
 	return OK;
 }
 
-void RenderingDevice::_blas_remove_tlas_dependencies(AccelerationStructure *p_blas, RID p_blas_id) {
+void RenderingDevice::_blas_remove_tlas_dependencies(AccelerationStructure *p_blas, RID p_blas_id, bool p_freed) {
+	thread_local LocalVector<RID> kept;
+	kept.clear();
 	for (RID id : p_blas->acceleration_structure_dependencies) {
 		AccelerationStructure *tlas = acceleration_structure_owner.get_or_null(id);
 		ERR_CONTINUE(tlas == nullptr);
 		ERR_CONTINUE(tlas->type != ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
 
 		tlas->invalidated = true;
-		tlas->acceleration_structure_dependencies.erase(p_blas_id);
 		tlas->blas_read_trackers_dirty = true;
+		if (tlas->partitioned) {
+			// Its slots still reference the BLAS: the next build writes them again (a rebuild
+			// can move its bounds) or, if it is gone, disables them.
+			if (p_freed) {
+				tlas->freed_blas.insert(p_blas_id);
+				tlas->stale_blas.erase(p_blas_id);
+				tlas->acceleration_structure_dependencies.erase(p_blas_id);
+			} else {
+				tlas->stale_blas.insert(p_blas_id);
+				kept.push_back(id);
+			}
+			continue;
+		}
+		tlas->acceleration_structure_dependencies.erase(p_blas_id);
 	}
 
 	p_blas->acceleration_structure_dependencies.clear();
+	for (RID id : kept) {
+		p_blas->acceleration_structure_dependencies.insert(id);
+	}
+}
+
+void RenderingDevice::_ptlas_set_slot(AccelerationStructure *p_ptlas, RID p_ptlas_id, uint32_t p_slot, RID p_blas, uint32_t p_partition) {
+	RID &current = p_ptlas->slot_blas[p_slot];
+	uint32_t &partition = p_ptlas->slot_partition[p_slot];
+	// Occupancy counts the enabled slots of each partition.
+	if (current.is_valid()) {
+		if (partition == PARTITION_GLOBAL) {
+			p_ptlas->global_occupancy--;
+		} else {
+			p_ptlas->partition_occupancy[partition]--;
+		}
+	}
+	if (p_blas.is_valid()) {
+		if (p_partition == PARTITION_GLOBAL) {
+			p_ptlas->global_occupancy++;
+		} else {
+			p_ptlas->partition_occupancy[p_partition]++;
+		}
+	}
+	partition = p_partition;
+	if (current == p_blas) {
+		return;
+	}
+	if (current.is_valid()) {
+		HashMap<RID, uint32_t>::Iterator E = p_ptlas->blas_slot_counts.find(current);
+		ERR_FAIL_COND(!E);
+		if (--E->value == 0) {
+			p_ptlas->blas_slot_counts.remove(E);
+			p_ptlas->acceleration_structure_dependencies.erase(current);
+			p_ptlas->stale_blas.erase(current);
+			p_ptlas->freed_blas.erase(current);
+			AccelerationStructure *blas = acceleration_structure_owner.get_or_null(current);
+			if (blas != nullptr) {
+				blas->acceleration_structure_dependencies.erase(p_ptlas_id);
+			}
+			p_ptlas->blas_read_trackers_dirty = true;
+		}
+	}
+	current = p_blas;
+	if (p_blas.is_valid()) {
+		uint32_t &count = p_ptlas->blas_slot_counts[p_blas];
+		if (count++ == 0) {
+			p_ptlas->acceleration_structure_dependencies.insert(p_blas);
+			AccelerationStructure *blas = acceleration_structure_owner.get_or_null(p_blas);
+			if (blas != nullptr) {
+				blas->acceleration_structure_dependencies.insert(p_ptlas_id);
+			}
+			p_ptlas->blas_read_trackers_dirty = true;
+		}
+	}
 }
 
 void RenderingDevice::_tlas_remove_blas_dependencies(AccelerationStructure *p_tlas, RID p_tlas_id) {
@@ -508,6 +577,16 @@ BitField<RDD::BufferUsageBits> RenderingDevice::_creation_to_usage_bits(BitField
 RID RenderingDevice::tlas_create(uint32_t p_max_instance_count, BitField<AccelerationStructureFlagBits> p_flags) {
 	ERR_FAIL_COND_V_MSG(!has_feature(SUPPORTS_RAYTRACING_PIPELINE) && !has_feature(SUPPORTS_RAY_QUERY), RID(), "The current rendering device has neither raytracing pipeline nor ray query support.");
 
+	if (get_partitioned_acceleration_structure_capabilities().supported) {
+		// Every acceleration structure binding is a PTLAS binding (D94): one partition holding
+		// every slot, which tlas_build() writes whole. A PTLAS always prefers fast trace.
+		PartitionedAccelerationStructureLimits limits;
+		limits.instance_count = MAX(p_max_instance_count, 1u);
+		limits.partition_count = 1;
+		limits.max_instances_per_partition = limits.instance_count;
+		return ptlas_create(limits);
+	}
+
 	AccelerationStructure acceleration_structure;
 	acceleration_structure.type = RDD::ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
 	acceleration_structure.driver_id = driver->tlas_create(p_max_instance_count, p_flags);
@@ -579,6 +658,36 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 	AccelerationStructure *tlas = acceleration_structure_owner.get_or_null(p_tlas);
 	ERR_FAIL_NULL_V_MSG(tlas, ERR_INVALID_PARAMETER, "TLAS argument is not valid.");
 	ERR_FAIL_COND_V_MSG(p_instances.size() > tlas->max_instance_count, ERR_INVALID_PARAMETER, "Exceeded the maximum amount of instances allowed in the TLAS.");
+
+	if (tlas->partitioned) {
+		// Instance i in slot i of the one partition, and the slots the previous build enabled
+		// past the new count disabled.
+		thread_local LocalVector<PartitionedInstanceWrite> writes;
+		const uint32_t instance_count = p_instances.size();
+		writes.resize(MAX(instance_count, tlas->span_instance_count));
+		for (uint32_t i = 0; i < instance_count; i++) {
+			const AccelerationStructureInstance &rd_instance = p_instances[i];
+			ERR_FAIL_COND_V_MSG(rd_instance.blas.is_valid() && !rd_instance.hit_sbt_range, ERR_INVALID_PARAMETER, "Instance " + itos(i) + " has an invalid hit shader binding table range.");
+			PartitionedInstanceWrite &write = writes[i];
+			write.transform = rd_instance.transform;
+			write.slot = i;
+			write.partition = 0;
+			write.id = rd_instance.id;
+			write.mask = rd_instance.mask;
+			write.hit_sbt_offset = _decode_hit_sbt_range_offset(rd_instance.hit_sbt_range);
+			write.flags = rd_instance.flags;
+			write.blas = rd_instance.blas;
+		}
+		for (uint32_t i = instance_count; i < tlas->span_instance_count; i++) {
+			writes[i] = PartitionedInstanceWrite();
+			writes[i].slot = i;
+			writes[i].partition = 0;
+		}
+		Error err = ptlas_build(p_tlas, writes, Span<PartitionTranslationWrite>(), false);
+		ERR_FAIL_COND_V(err != OK, err);
+		tlas->span_instance_count = instance_count;
+		return OK;
+	}
 
 	Error err = _acceleration_structure_scratch_buffer_create(tlas);
 	ERR_FAIL_COND_V(err != OK, err);
@@ -679,6 +788,327 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 	_tlas_set_blas_reads(tlas, draw_trackers);
 
 	tlas->invalidated = false;
+
+	return OK;
+}
+
+/****************************************************/
+/**** PARTITIONED TOP-LEVEL ACCELERATION STRUCTURES ****/
+/****************************************************/
+
+const RDD::PartitionedAccelerationStructureCapabilities &RenderingDevice::get_partitioned_acceleration_structure_capabilities() const {
+	return driver->get_partitioned_acceleration_structure_capabilities();
+}
+
+RID RenderingDevice::ptlas_create(const PartitionedAccelerationStructureLimits &p_limits) {
+	ERR_FAIL_COND_V_MSG(!get_partitioned_acceleration_structure_capabilities().supported, RID(), "The current rendering device has no partitioned acceleration structure support.");
+	ERR_FAIL_COND_V_MSG(p_limits.max_instances_per_partition > p_limits.instance_count || p_limits.max_global_instances > p_limits.instance_count, RID(), "A partition cannot hold more instances than the structure has slots.");
+
+	AccelerationStructure acceleration_structure;
+	acceleration_structure.type = RDD::ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+	acceleration_structure.partitioned = true;
+	acceleration_structure.limits = p_limits;
+	acceleration_structure.max_instance_count = p_limits.instance_count;
+	acceleration_structure.partition_occupancy.resize_initialized(p_limits.partition_count);
+	acceleration_structure.driver_id = driver->ptlas_create(p_limits);
+	ERR_FAIL_COND_V_MSG(!acceleration_structure.driver_id, RID(), "Failed to create the partitioned TLAS.");
+
+	acceleration_structure.draw_tracker = RDG::resource_tracker_create();
+	acceleration_structure.draw_tracker->acceleration_structure_driver_id = acceleration_structure.driver_id;
+	// Assume we are going to build this acceleration structure
+	acceleration_structure.draw_tracker->usage = RDG::RESOURCE_USAGE_ACCELERATION_STRUCTURE_READ_WRITE;
+
+	RID id = acceleration_structure_owner.make_rid(acceleration_structure);
+#ifdef DEV_ENABLED
+	set_resource_name(id, "RID:" + itos(id.get_id()));
+#endif
+	return id;
+}
+
+Error RenderingDevice::ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p_writes, Span<PartitionTranslationWrite> p_translations, bool p_from_scratch) {
+	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+
+	ERR_FAIL_COND_V_MSG(draw_list.active, ERR_INVALID_PARAMETER, "Building a partitioned TLAS is forbidden during creation of a draw list.");
+	ERR_FAIL_COND_V_MSG(compute_list.active, ERR_INVALID_PARAMETER, "Building a partitioned TLAS is forbidden during creation of a compute list.");
+	ERR_FAIL_COND_V_MSG(raytracing_list.active, ERR_INVALID_PARAMETER, "Building a partitioned TLAS is forbidden during creation of a raytracing list.");
+
+	AccelerationStructure *ptlas = acceleration_structure_owner.get_or_null(p_ptlas);
+	ERR_FAIL_NULL_V_MSG(ptlas, ERR_INVALID_PARAMETER, "Partitioned TLAS argument is not valid.");
+	ERR_FAIL_COND_V_MSG(!ptlas->partitioned, ERR_INVALID_PARAMETER, "The acceleration structure is not a partitioned TLAS.");
+	ERR_FAIL_COND_V_MSG(!p_translations.is_empty() && !ptlas->limits.partition_translation, ERR_INVALID_PARAMETER, "Partition translations need a partitioned TLAS created with partition_translation.");
+
+	const PartitionedAccelerationStructureLimits &limits = ptlas->limits;
+	const bool from_scratch = p_from_scratch || !ptlas->built_once;
+	const bool scan_slots = !from_scratch && (!ptlas->stale_blas.is_empty() || !ptlas->freed_blas.is_empty());
+	if (!from_scratch && !scan_slots && p_writes.is_empty() && p_translations.is_empty()) {
+		// Nothing changed: the structure is as the last build left it.
+		ptlas->invalidated = false;
+		return OK;
+	}
+
+	const uint64_t serial = ++ptlas->build_serial;
+	if (ptlas->slot_written_serial.size() < limits.instance_count) {
+		ptlas->slot_written_serial.resize_initialized(limits.instance_count);
+	}
+
+	// Validate every write before anything changes. VUID-...-argData-10565: a slot is written
+	// once a build; VUID-...-10568/10569: slots and partitions in range. Occupancy counts the
+	// enabled slots of each partition; a build from scratch starts from none.
+	thread_local HashMap<uint32_t, int64_t> occupancy_delta;
+	occupancy_delta.clear();
+	uint32_t high_water = ptlas->slot_high_water;
+	for (uint32_t i = 0; i < p_writes.size(); i++) {
+		const PartitionedInstanceWrite &write = p_writes[i];
+		ERR_FAIL_COND_V_MSG(write.slot >= limits.instance_count, ERR_INVALID_PARAMETER, "Write " + itos(i) + " is past the slots of the partitioned TLAS.");
+		ERR_FAIL_COND_V_MSG(ptlas->slot_written_serial[write.slot] == serial, ERR_INVALID_PARAMETER, "Slot " + itos(write.slot) + " is written twice in one build.");
+		ptlas->slot_written_serial[write.slot] = serial;
+		if (write.partition == PARTITION_GLOBAL) {
+			ERR_FAIL_COND_V_MSG(limits.max_global_instances == 0, ERR_INVALID_PARAMETER, "This partitioned TLAS has no global partition.");
+		} else {
+			ERR_FAIL_COND_V_MSG(write.partition >= limits.partition_count, ERR_INVALID_PARAMETER, "Write " + itos(i) + " names a partition past the partitions of the partitioned TLAS.");
+		}
+		if (!from_scratch && write.slot < ptlas->slot_blas.size() && ptlas->slot_blas[write.slot].is_valid()) {
+			occupancy_delta[ptlas->slot_partition[write.slot]] -= 1;
+		}
+		if (write.blas.is_valid()) {
+			AccelerationStructure *blas = acceleration_structure_owner.get_or_null(write.blas);
+			ERR_FAIL_NULL_V(blas, ERR_INVALID_PARAMETER);
+			ERR_FAIL_COND_V(blas->type != RDD::ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL, ERR_INVALID_PARAMETER);
+			ERR_FAIL_COND_V_MSG(blas->invalidated, ERR_INVALID_PARAMETER, "BLAS either has not been built yet, or has been invalidated by an operation and needs to be rebuilt.");
+			occupancy_delta[write.partition] += 1;
+			high_water = MAX(high_water, write.slot + 1);
+		}
+	}
+	for (uint32_t i = 0; i < p_translations.size(); i++) {
+		ERR_FAIL_COND_V_MSG(p_translations[i].partition != PARTITION_GLOBAL && p_translations[i].partition >= limits.partition_count, ERR_INVALID_PARAMETER, "Translation " + itos(i) + " names a partition past the partitions of the partitioned TLAS.");
+	}
+	for (const KeyValue<uint32_t, int64_t> &E : occupancy_delta) {
+		const bool global = E.key == PARTITION_GLOBAL;
+		const int64_t current = from_scratch ? 0 : int64_t(global ? ptlas->global_occupancy : ptlas->partition_occupancy[E.key]);
+		const int64_t limit = global ? limits.max_global_instances : limits.max_instances_per_partition;
+		ERR_FAIL_COND_V_MSG(current + E.value > limit, ERR_INVALID_PARAMETER, vformat("The build would put %d enabled instances in %s, past its limit of %d.", current + E.value, global ? String("the global partition") : vformat("partition %d", E.key), limit));
+	}
+
+	Error err = _acceleration_structure_scratch_buffer_create(ptlas);
+	ERR_FAIL_COND_V(err != OK, err);
+
+	// The input, reserved before any slot changes so a failed allocation leaves the slots as
+	// the structure holds them: the operations, their count, the instance writes and the
+	// translations, each section 16-byte aligned. Each slot is written at most once, so the
+	// writes are bounded by the slots (from scratch, exactly), and by the given writes plus
+	// the slots a scan can write again.
+	const uint32_t record_size = driver->ptlas_instance_write_size();
+	const uint32_t operation_size = driver->ptlas_operation_size();
+	const uint32_t translation_size = driver->ptlas_translation_write_size();
+	const uint64_t write_bound = from_scratch ? limits.instance_count : MIN(uint64_t(limits.instance_count), uint64_t(p_writes.size()) + (scan_slots ? high_water : 0));
+	const uint64_t count_offset = STEPIFY(uint64_t(operation_size) * 2, 16);
+	const uint64_t writes_offset = count_offset + 16;
+	const uint64_t translations_offset = STEPIFY(writes_offset + write_bound * record_size, 16);
+	const uint64_t input_size = translations_offset + uint64_t(p_translations.size()) * translation_size;
+
+	uint32_t input_index = UINT32_MAX;
+	uint64_t input_offset = 0;
+	for (uint32_t i = 0; i < ptlas->input_buffers.size(); i++) {
+		AccelerationStructure::InputBuffer &input = ptlas->input_buffers[i];
+		if ((frames_drawn - input.frame_used) >= frames.size()) {
+			input.frame_used = frames_drawn;
+			input.used_size = 0;
+		}
+		const uint64_t offset = STEPIFY(input.used_size, 256);
+		if (frames_drawn == input.frame_used && offset + input_size <= input.size) {
+			input_offset = offset;
+			input.used_size = offset + input_size;
+			input_index = i;
+			break;
+		}
+	}
+	if (input_index == UINT32_MAX) {
+		// A new buffer, sized for this build with room for its successors to grow.
+		const uint64_t buffer_size = MAX(Math::next_power_of_2(input_size), uint64_t(64 * 1024));
+		ERR_FAIL_COND_V_MSG(buffer_size > UINT32_MAX, ERR_OUT_OF_MEMORY, "The input of a partitioned TLAS build exceeds 4 GB.");
+		RDD::BufferID buffer_id = driver->buffer_create(buffer_size, RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT | RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT, RDD::MEMORY_ALLOCATION_TYPE_CPU, frames_drawn);
+		ERR_FAIL_COND_V(!buffer_id, ERR_CANT_CREATE);
+		uint8_t *data_ptr = driver->buffer_map(buffer_id);
+		if (unlikely(!data_ptr)) {
+			driver->buffer_free(buffer_id);
+			ERR_FAIL_V(ERR_CANT_CREATE);
+		}
+		buffer_memory.add(buffer_size);
+
+		// The smaller buffers it outgrows are not written again; they are freed once the
+		// frames that may still read them are done.
+		for (uint32_t i = 0; i < ptlas->input_buffers.size();) {
+			AccelerationStructure::InputBuffer &old = ptlas->input_buffers[i];
+			if (old.size < buffer_size) {
+				driver->buffer_unmap(old.driver_id);
+				Buffer to_dispose;
+				to_dispose.driver_id = old.driver_id;
+				to_dispose.size = uint32_t(old.size);
+				frames[frame].buffers_to_dispose_of.push_back(to_dispose);
+				ptlas->input_buffers.remove_at_unordered(i);
+			} else {
+				i++;
+			}
+		}
+
+		AccelerationStructure::InputBuffer input;
+		input.driver_id = buffer_id;
+		input.frame_used = frames_drawn;
+		input.used_size = input_size;
+		input.size = buffer_size;
+		input.data_ptr = data_ptr;
+		input_index = ptlas->input_buffers.size();
+		ptlas->input_buffers.push_back(input);
+	}
+
+	// From here on nothing fails: the slots change with the structure.
+	if (ptlas->slot_blas.size() < high_water) {
+		ptlas->slot_blas.resize(high_water);
+		ptlas->slot_partition.resize_initialized(high_water);
+		ptlas->slot_records.resize_initialized(uint64_t(high_water) * record_size);
+	}
+	ptlas->slot_high_water = high_water;
+
+	// The slots this build sends, in order: the writes, then the slots it writes again.
+	thread_local LocalVector<uint32_t> emitted;
+	emitted.clear();
+	for (uint32_t i = 0; i < p_writes.size(); i++) {
+		const PartitionedInstanceWrite &write = p_writes[i];
+		if (write.slot >= high_water) {
+			// A disable past every slot ever enabled: nothing to send, unless the build starts
+			// from scratch, whose disables below then cover it.
+			ptlas->slot_written_serial[write.slot] = 0;
+			continue;
+		}
+		RDD::PartitionedInstanceWrite rdd_write;
+		rdd_write.transform = write.transform;
+		rdd_write.slot = write.slot;
+		rdd_write.partition = write.partition;
+		rdd_write.id = write.id;
+		rdd_write.mask = write.mask;
+		rdd_write.hit_sbt_offset = write.hit_sbt_offset;
+		rdd_write.flags = write.flags;
+		if (write.blas.is_valid()) {
+			rdd_write.blas = acceleration_structure_owner.get_or_null(write.blas)->driver_id;
+		}
+		driver->ptlas_instance_write(ptlas->slot_records.ptr() + uint64_t(write.slot) * record_size, rdd_write);
+		_ptlas_set_slot(ptlas, p_ptlas, write.slot, write.blas, write.partition);
+		emitted.push_back(write.slot);
+	}
+
+	// Slots on a BLAS rebuilt since the last build are written again with the same record;
+	// slots still on a freed BLAS are disabled where they are. The writes of this build already
+	// cover theirs, and a build from scratch disables every slot it does not write instead.
+	uint32_t stale_rewrites = 0;
+	uint32_t dangling_disables = 0;
+	if (scan_slots) {
+		for (uint32_t slot = 0; slot < high_water; slot++) {
+			const RID blas = ptlas->slot_blas[slot];
+			if (blas.is_null() || ptlas->slot_written_serial[slot] == serial) {
+				continue;
+			}
+			if (ptlas->freed_blas.has(blas)) {
+				RDD::PartitionedInstanceWrite rdd_write;
+				rdd_write.slot = slot;
+				rdd_write.partition = ptlas->slot_partition[slot];
+				driver->ptlas_instance_write(ptlas->slot_records.ptr() + uint64_t(slot) * record_size, rdd_write);
+				_ptlas_set_slot(ptlas, p_ptlas, slot, RID(), rdd_write.partition);
+				ptlas->slot_written_serial[slot] = serial;
+				emitted.push_back(slot);
+				dangling_disables++;
+			} else if (ptlas->stale_blas.has(blas)) {
+				ptlas->slot_written_serial[slot] = serial;
+				emitted.push_back(slot);
+				stale_rewrites++;
+			}
+		}
+	}
+	ptlas->stale_blas.clear();
+	ptlas->freed_blas.clear();
+	if (dangling_disables > 0) {
+		ERR_PRINT(vformat("A partitioned TLAS still referenced a freed BLAS from %d slots; they are disabled.", dangling_disables));
+	}
+
+	// From scratch, the slots this build does not write hold nothing yet: disable them, each in
+	// the partition it had (partition 0 for a slot never written).
+	const uint32_t written_count = emitted.size();
+	const uint32_t from_scratch_disables = from_scratch ? limits.instance_count - written_count : 0;
+	const uint32_t write_count = written_count + from_scratch_disables;
+	DEV_ASSERT(write_count <= write_bound);
+	const uint32_t operation_count = (write_count > 0 ? 1 : 0) + (p_translations.is_empty() ? 0 : 1);
+	ptlas->last_build_writes = write_count;
+	ptlas->last_build_stale_rewrites = stale_rewrites;
+	ptlas->last_build_dangling_disables = dangling_disables;
+	if (operation_count == 0) {
+		// Only disables of slots never enabled: the structure is unchanged.
+		ptlas->invalidated = false;
+		return OK;
+	}
+
+	AccelerationStructure::InputBuffer &input = ptlas->input_buffers[input_index];
+	const uint64_t input_address = driver->buffer_get_device_address(input.driver_id) + input_offset;
+
+	// Assembled in host memory first, then copied in one go: scattered writes to the
+	// write-combined mapping are slow (as tlas_build does).
+	const uint64_t writes_end = writes_offset + uint64_t(write_count) * record_size;
+	thread_local LocalVector<uint8_t> shadow;
+	shadow.resize(writes_end);
+	memset(shadow.ptr(), 0, writes_offset);
+	uint32_t operation_index = 0;
+	if (write_count > 0) {
+		driver->ptlas_operation_write(shadow.ptr() + uint64_t(operation_index++) * operation_size, RDD::PARTITIONED_OP_WRITE_INSTANCE, write_count, input_address + writes_offset, record_size);
+	}
+	if (!p_translations.is_empty()) {
+		driver->ptlas_operation_write(shadow.ptr() + uint64_t(operation_index++) * operation_size, RDD::PARTITIONED_OP_WRITE_PARTITION_TRANSLATION, p_translations.size(), input_address + translations_offset, translation_size);
+	}
+	memcpy(shadow.ptr() + count_offset, &operation_count, sizeof(uint32_t));
+	uint8_t *write_ptr = shadow.ptr() + writes_offset;
+	for (uint32_t slot : emitted) {
+		memcpy(write_ptr, ptlas->slot_records.ptr() + uint64_t(slot) * record_size, record_size);
+		write_ptr += record_size;
+	}
+	if (from_scratch_disables > 0) {
+		for (uint32_t slot = 0; slot < limits.instance_count; slot++) {
+			if (ptlas->slot_written_serial[slot] == serial) {
+				continue;
+			}
+			RDD::PartitionedInstanceWrite rdd_write;
+			rdd_write.slot = slot;
+			rdd_write.partition = slot < high_water ? ptlas->slot_partition[slot] : 0;
+			driver->ptlas_instance_write(write_ptr, rdd_write);
+			write_ptr += record_size;
+			if (slot < high_water) {
+				memcpy(ptlas->slot_records.ptr() + uint64_t(slot) * record_size, write_ptr - record_size, record_size);
+				_ptlas_set_slot(ptlas, p_ptlas, slot, RID(), rdd_write.partition);
+			}
+		}
+	}
+	DEV_ASSERT(write_ptr == shadow.ptr() + writes_end);
+	memcpy(input.data_ptr + input_offset, shadow.ptr(), writes_end);
+	if (!p_translations.is_empty()) {
+		shadow.resize(uint64_t(p_translations.size()) * translation_size);
+		for (uint32_t i = 0; i < p_translations.size(); i++) {
+			driver->ptlas_translation_write(shadow.ptr() + uint64_t(i) * translation_size, p_translations[i].partition, p_translations[i].translation);
+		}
+		memcpy(input.data_ptr + input_offset + translations_offset, shadow.ptr(), shadow.size());
+	}
+
+	// The build reads every BLAS its slots reference (a rebuilt partition reads all of its
+	// instances'), and a bound PTLAS lists them for the trace, as a TLAS does.
+	_tlas_update_blas_reads(p_ptlas);
+
+	RDD::PartitionedAccelerationStructureBuild build;
+	build.acceleration_structure = ptlas->driver_id;
+	build.scratch_buffer = ptlas->scratch_buffer;
+	build.src_infos_buffer = input.driver_id;
+	build.src_infos_offset = input_offset;
+	build.src_infos_count_buffer = input.driver_id;
+	build.src_infos_count_offset = input_offset + count_offset;
+	build.in_place = !from_scratch;
+	draw_graph.add_ptlas_build(build, ptlas->draw_tracker, ptlas->blas_read_trackers);
+
+	ptlas->built_once = true;
+	ptlas->invalidated = false;
 
 	return OK;
 }
@@ -8166,9 +8596,18 @@ void RenderingDevice::_free_internal(RID p_id) {
 	} else if (acceleration_structure_owner.owns(p_id)) {
 		AccelerationStructure *acceleration_structure = acceleration_structure_owner.get_or_null(p_id);
 		if (acceleration_structure->type == ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL) {
-			_blas_remove_tlas_dependencies(acceleration_structure, p_id);
+			_blas_remove_tlas_dependencies(acceleration_structure, p_id, true);
 		} else if (acceleration_structure->type == ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL) {
 			_tlas_remove_blas_dependencies(acceleration_structure, p_id);
+			// The slot state goes with it; only the driver objects and buffers wait for the frame.
+			acceleration_structure->slot_records.reset();
+			acceleration_structure->slot_blas.reset();
+			acceleration_structure->slot_partition.reset();
+			acceleration_structure->partition_occupancy.reset();
+			acceleration_structure->slot_written_serial.reset();
+			acceleration_structure->blas_slot_counts.clear();
+			acceleration_structure->stale_blas.clear();
+			acceleration_structure->freed_blas.clear();
 		}
 		RDG::resource_tracker_free(acceleration_structure->draw_tracker);
 		frames[frame].acceleration_structures_to_dispose_of.push_back(*acceleration_structure);
@@ -8397,6 +8836,12 @@ void RenderingDevice::_free_pending_resources(int p_frame) {
 			}
 
 			buffer_memory.sub(instance_buffer_size * acceleration_structure.instance_buffers.size());
+		}
+
+		for (AccelerationStructure::InputBuffer &input : acceleration_structure.input_buffers) {
+			driver->buffer_unmap(input.driver_id);
+			driver->buffer_free(input.driver_id);
+			buffer_memory.sub(input.size);
 		}
 
 		frames[p_frame].acceleration_structures_to_dispose_of.pop_front();

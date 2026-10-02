@@ -2200,6 +2200,7 @@ void MeshStorage::_multimesh_allocate_data(RID p_multimesh, int p_instances, RSE
 	multimesh->motion_vectors_previous_offset = 0;
 	multimesh->motion_vectors_last_change = -1;
 	multimesh->motion_vectors_enabled = false;
+	_multimesh_bump_buffer_generation(multimesh);
 
 	if (multimesh->instances) {
 		uint32_t buffer_size = multimesh->instances * multimesh->stride_cache * sizeof(float);
@@ -2225,6 +2226,7 @@ void MeshStorage::_multimesh_enable_motion_vectors(MultiMesh *multimesh) {
 	multimesh->motion_vectors_current_offset = 0;
 	multimesh->motion_vectors_previous_offset = 0;
 	multimesh->motion_vectors_last_change = -1;
+	_multimesh_bump_buffer_generation(multimesh);
 
 	if (!multimesh->data_cache.is_empty()) {
 		multimesh->data_cache.append_array(multimesh->data_cache);
@@ -2288,6 +2290,7 @@ void MeshStorage::_multimesh_set_mesh(RID p_multimesh, RID p_mesh) {
 		return;
 	}
 	multimesh->mesh = p_mesh;
+	_multimesh_bump_buffer_generation(multimesh);
 
 	if (multimesh->indirect) {
 		Mesh *mesh = mesh_owner.get_or_null(p_mesh);
@@ -2369,6 +2372,7 @@ void MeshStorage::_multimesh_make_local(MultiMesh *multimesh) const {
 	multimesh->previous_data_cache_dirty_regions = memnew_arr(bool, data_cache_dirty_region_count);
 	memset(multimesh->previous_data_cache_dirty_regions, 0, data_cache_dirty_region_count * sizeof(bool));
 	multimesh->previous_data_cache_dirty_region_count = 0;
+	_multimesh_bump_buffer_generation(multimesh);
 }
 
 void MeshStorage::_multimesh_update_motion_vectors_data_cache(MultiMesh *multimesh) {
@@ -2383,6 +2387,7 @@ void MeshStorage::_multimesh_update_motion_vectors_data_cache(MultiMesh *multime
 		multimesh->motion_vectors_previous_offset = multimesh->motion_vectors_current_offset;
 		multimesh->motion_vectors_current_offset = multimesh->instances - multimesh->motion_vectors_current_offset;
 		multimesh->motion_vectors_last_change = frame;
+		_multimesh_bump_buffer_generation(multimesh);
 
 		if (multimesh->previous_data_cache_dirty_region_count > 0) {
 			uint8_t *data = (uint8_t *)multimesh->data_cache.ptrw();
@@ -2530,6 +2535,7 @@ void MeshStorage::_multimesh_instance_set_transform(RID p_multimesh, int p_index
 		dataptr[11] = p_transform.origin.z;
 	}
 
+	_multimesh_bump_buffer_generation(multimesh);
 	_multimesh_mark_dirty(multimesh, p_index, true);
 }
 
@@ -2557,6 +2563,7 @@ void MeshStorage::_multimesh_instance_set_transform_2d(RID p_multimesh, int p_in
 		dataptr[7] = p_transform.columns[2][1];
 	}
 
+	_multimesh_bump_buffer_generation(multimesh);
 	_multimesh_mark_dirty(multimesh, p_index, true);
 }
 
@@ -2580,6 +2587,7 @@ void MeshStorage::_multimesh_instance_set_color(RID p_multimesh, int p_index, co
 		dataptr[3] = p_color.a;
 	}
 
+	_multimesh_bump_buffer_generation(multimesh);
 	_multimesh_mark_dirty(multimesh, p_index, false);
 }
 
@@ -2603,6 +2611,7 @@ void MeshStorage::_multimesh_instance_set_custom_data(RID p_multimesh, int p_ind
 		dataptr[3] = p_color.a;
 	}
 
+	_multimesh_bump_buffer_generation(multimesh);
 	_multimesh_mark_dirty(multimesh, p_index, false);
 }
 
@@ -2753,6 +2762,7 @@ void MeshStorage::_multimesh_set_buffer(RID p_multimesh, const Vector<float> &p_
 		}
 		multimesh->buffer_set = true;
 	}
+	_multimesh_bump_buffer_generation(multimesh);
 
 	// rendering/pathtracing/multimesh_cache_cpu_transforms: keep a CPU mirror of the
 	// transform buffer so the path tracer never needs a GPU->CPU readback.
@@ -2842,6 +2852,7 @@ void MeshStorage::_multimesh_set_visible_instances(RID p_multimesh, int p_visibl
 	}
 
 	multimesh->visible_instances = p_visible;
+	_multimesh_bump_buffer_generation(multimesh);
 
 	if (multimesh->indirect) { //we have to update the command buffer for the instance counts, in each stride this will be the second integer.
 		Mesh *mesh = mesh_owner.get_or_null(multimesh->mesh);

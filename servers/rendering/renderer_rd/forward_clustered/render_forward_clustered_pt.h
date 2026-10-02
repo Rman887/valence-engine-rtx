@@ -53,6 +53,8 @@ protected:
 	virtual void _free_rt_viewport_state(RenderSceneBuffersRD *p_render_buffers) override;
 
 public:
+	virtual void geometry_instance_free(RenderGeometryInstance *p_geometry_instance) override;
+
 	RenderForwardClusteredPT();
 	~RenderForwardClusteredPT();
 };

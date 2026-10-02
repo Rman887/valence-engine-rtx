@@ -6985,6 +6985,7 @@ RDD::AccelerationStructureID RenderingDeviceDriverVulkan::ptlas_create(const Par
 	ERR_FAIL_COND_V_MSG(scratch_size == ~VkDeviceSize(0), AccelerationStructureID(), "The driver gave no scratch size for the partitioned TLAS.");
 	// acceleration_structure_get_scratch_size_bytes() returns 32 bits.
 	ERR_FAIL_COND_V_MSG(scratch_size + PTLAS_ADDRESS_ALIGNMENT > UINT32_MAX, AccelerationStructureID(), "The partitioned TLAS needs a scratch of 4 GB or more.");
+	print_verbose(vformat("Vulkan: partitioned TLAS of %d instances, %d partitions of up to %d, %d global: %d KB of storage, %d KB of scratch (build %d KB, update %d KB).", p_limits.instance_count, p_limits.partition_count, p_limits.max_instances_per_partition, p_limits.max_global_instances, uint64_t(size_info.accelerationStructureSize) / 1024, uint64_t(scratch_size) / 1024, uint64_t(size_info.buildScratchSize) / 1024, uint64_t(size_info.updateScratchSize) / 1024));
 
 	// No Vulkan object: the structure is its address, rounded up inside a buffer one alignment larger.
 	accel_info->buffer = buffer_create(size_info.accelerationStructureSize + PTLAS_ADDRESS_ALIGNMENT, RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT | RDD::BUFFER_USAGE_STORAGE_BIT | RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT, RDD::MEMORY_ALLOCATION_TYPE_GPU, UINT64_MAX);

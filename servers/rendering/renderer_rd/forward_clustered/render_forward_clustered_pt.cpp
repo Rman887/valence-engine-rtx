@@ -397,6 +397,14 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 
 		RENDER_TIMESTAMP("Pathtracer");
 
+		// No structure or uniform set this frame (a partitioned TLAS that could not be brought up
+		// to date, D94b): nothing traces, and the output keeps its last image.
+		if (!rt_uniform_set.is_valid()) {
+			ERR_PRINT_ONCE("The path tracer's acceleration structure could not be built this frame; the trace is skipped.");
+			RD::get_singleton()->draw_command_end_label();
+			return;
+		}
+
 		// rt_flags was computed at TLAS-build time above and matches what
 		// update_uniform_set used, so pipeline + uniform set stay in sync.
 		RID rt_pipeline = raytracing->get_shader()->get_raytracing_pipeline(rt_flags);
@@ -628,6 +636,14 @@ void RenderForwardClusteredPT::_free_rt_viewport_state(RenderSceneBuffersRD *p_r
 	if (raytracing) {
 		raytracing->free_viewport_state(p_render_buffers);
 	}
+}
+
+void RenderForwardClusteredPT::geometry_instance_free(RenderGeometryInstance *p_geometry_instance) {
+	// Its PTLAS slots (D94b) are released first: every viewport disables them at its next build.
+	if (raytracing && p_geometry_instance) {
+		raytracing->release_slot_ranges(static_cast<GeometryInstanceForwardClustered *>(p_geometry_instance)->rt_slots);
+	}
+	RenderForwardClustered::geometry_instance_free(p_geometry_instance);
 }
 
 void RenderForwardClusteredPT::_render_buffers_debug_draw(const RenderDataRD *p_render_data) {

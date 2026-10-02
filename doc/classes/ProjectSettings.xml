@@ -3356,6 +3356,22 @@
 			If [code]true[/code] and the device supports [code]VK_NV_partitioned_acceleration_structure[/code], every top-level acceleration structure is a partitioned one: its instances keep their contents between builds and a build rebuilds only the partitions it writes. Shaders trace it as any top-level structure. The image is the same up to floating-point rounding: primary hits agree, and a ray that grazes an object's silhouette after a bounce can hit or miss differently. [method RenderingDevice.tlas_create] then makes a partitioned structure of one partition and [method RenderingDevice.tlas_build] writes all of it, and every acceleration structure binding takes a partitioned structure. Without the extension, this setting has no effect.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracing/ptlas_cell_size" type="float" setter="" getter="" default="128.0">
+			With [member rendering/pathtracing/partitioned_tlas], the size in meters of the world cells the path tracer's instances are grouped by: each cell's instances share partitions of the partitioned top-level structure, so an instance that changes rebuilds only its partition.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
+		<member name="rendering/pathtracing/ptlas_global_max_instances" type="int" setter="" getter="" default="65536">
+			With [member rendering/pathtracing/partitioned_tlas], the most instances the global partition holds. An instance rewritten while it is in the trace moves there, so that its changes rebuild no world cell's partition, and returns to its cell after [member rendering/pathtracing/ptlas_stable_frames] frames without a change. [code]0[/code] keeps every instance in its cell.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
+		<member name="rendering/pathtracing/ptlas_partition_max_instances" type="int" setter="" getter="" default="8192">
+			With [member rendering/pathtracing/partitioned_tlas], the most instances one partition of a world cell holds; a cell with more takes another partition.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
+		<member name="rendering/pathtracing/ptlas_stable_frames" type="int" setter="" getter="" default="16">
+			With [member rendering/pathtracing/partitioned_tlas], the frames an instance in the global partition goes unchanged before it returns to its world cell's partition.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
 		<member name="rendering/pathtracing/relative_origin_grid" type="float" setter="" getter="" default="1024.0">
 			Size in meters of the grid the path tracer's world-space anchor snaps to. The trace runs in world space relative to that anchor (the camera's grid cell on the X and Z axes), so 32-bit positions on the GPU stay precise kilometers from the origin; the anchor moves only when the camera leaves its cell. Set to [code]0.0[/code] to trace in absolute world space.
 			[b]Note:[/b] Requires a restart to take effect.

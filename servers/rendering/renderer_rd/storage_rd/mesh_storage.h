@@ -314,6 +314,9 @@ private:
 		uint32_t motion_vectors_current_offset = 0;
 		uint32_t motion_vectors_previous_offset = 0;
 		uint64_t motion_vectors_last_change = -1;
+		// Advances, unique over every MultiMesh, whenever what the path tracer reads of it may change:
+		// the elements at the current offset, their count or the mesh (D94b).
+		uint64_t buffer_generation = 0;
 		uint32_t stride_cache = 0;
 		uint32_t color_offset_cache = 0;
 		uint32_t custom_data_offset_cache = 0;
@@ -341,6 +344,8 @@ private:
 
 	MultiMesh *multimesh_dirty_list = nullptr;
 
+	static inline uint64_t multimesh_buffer_generation_counter = 0;
+	static _FORCE_INLINE_ void _multimesh_bump_buffer_generation(MultiMesh *multimesh) { multimesh->buffer_generation = ++multimesh_buffer_generation_counter; }
 	void _multimesh_make_local(MultiMesh *multimesh) const;
 	void _multimesh_enable_motion_vectors(MultiMesh *multimesh);
 	void _multimesh_update_motion_vectors_data_cache(MultiMesh *multimesh);
@@ -970,6 +975,11 @@ public:
 	_FORCE_INLINE_ uint64_t multimesh_get_last_change(RID p_multimesh) const {
 		MultiMesh *mm = multimesh_owner.get_or_null(p_multimesh);
 		return mm ? mm->motion_vectors_last_change : (uint64_t)-1;
+	}
+
+	_FORCE_INLINE_ uint64_t multimesh_get_buffer_generation(RID p_multimesh) const {
+		MultiMesh *mm = multimesh_owner.get_or_null(p_multimesh);
+		return mm ? mm->buffer_generation : 0;
 	}
 
 	_FORCE_INLINE_ RID multimesh_get_gpu_buffer(RID p_multimesh) const {

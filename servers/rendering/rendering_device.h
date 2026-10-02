@@ -1368,9 +1368,10 @@ private:
 
 		// --- Partitioned Top Level (D94) ---
 		// A slot keeps what was last written to it; a build writes some slots and leaves the rest.
-		// acceleration_structure_dependencies holds the BLASes the slots reference, counted in
-		// blas_slot_counts. A BLAS rebuilt since the last build (stale) has its slots written again
-		// by the next one; a BLAS freed while referenced has its slots disabled by it.
+		// acceleration_structure_dependencies holds the BLASes the slots reference, and blas_slots
+		// each one's slots (slot_blas_index is a slot's position in its BLAS's list). A BLAS rebuilt
+		// since the last build (stale) has its slots written again by the next one; a BLAS freed
+		// while referenced has its slots disabled by it. Both visit only that BLAS's slots (D94b).
 		bool partitioned = false;
 		PartitionedAccelerationStructureLimits limits;
 		bool built_once = false;
@@ -1382,7 +1383,8 @@ private:
 		LocalVector<uint32_t> partition_occupancy; // Enabled slots per partition.
 		uint32_t global_occupancy = 0;
 		LocalVector<uint64_t> slot_written_serial;
-		HashMap<RID, uint32_t> blas_slot_counts;
+		HashMap<RID, LocalVector<uint32_t>> blas_slots;
+		LocalVector<uint32_t> slot_blas_index;
 		HashSet<RID> stale_blas;
 		HashSet<RID> freed_blas;
 		uint32_t span_instance_count = 0; // The slots the last tlas_build() enabled.
@@ -1391,6 +1393,7 @@ private:
 		uint32_t last_build_writes = 0;
 		uint32_t last_build_stale_rewrites = 0;
 		uint32_t last_build_dangling_disables = 0;
+		uint64_t last_build_scan_usec = 0; // The stale and freed scan's time.
 
 		struct InputBuffer {
 			RDD::BufferID driver_id;
@@ -1505,6 +1508,13 @@ public:
 	// appears at most once, and no partition may hold more enabled slots than its limit; a
 	// build that breaks either is refused and changes nothing.
 	Error ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p_writes, Span<PartitionTranslationWrite> p_translations, bool p_from_scratch = false);
+	// The BLASes rebuilt since the last build whose slots the next build writes again: their
+	// count, and whether one is among them (D94b).
+	uint32_t ptlas_get_stale_blas_count(RID p_ptlas);
+	bool ptlas_is_blas_stale(RID p_ptlas, RID p_blas);
+	// The last build's instance writes, the slots it wrote again for a rebuilt BLAS and those it
+	// disabled for a freed one, and the time its scan for them took (D94b's counters).
+	void ptlas_get_last_build_counts(RID p_ptlas, uint32_t &r_writes, uint32_t &r_stale_rewrites, uint32_t &r_dangling_disables, uint64_t &r_scan_usec);
 
 	// ----- CLUSTER ACCELERATION STRUCTURES -----
 	//

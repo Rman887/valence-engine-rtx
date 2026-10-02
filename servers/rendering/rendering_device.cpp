@@ -333,10 +333,18 @@ void RenderingDevice::_ptlas_set_slot(AccelerationStructure *p_ptlas, RID p_ptla
 		return;
 	}
 	if (current.is_valid()) {
-		HashMap<RID, uint32_t>::Iterator E = p_ptlas->blas_slot_counts.find(current);
+		HashMap<RID, LocalVector<uint32_t>>::Iterator E = p_ptlas->blas_slots.find(current);
 		ERR_FAIL_COND(!E);
-		if (--E->value == 0) {
-			p_ptlas->blas_slot_counts.remove(E);
+		// Swap-remove the slot from its BLAS's list.
+		LocalVector<uint32_t> &list = E->value;
+		const uint32_t index = p_ptlas->slot_blas_index[p_slot];
+		ERR_FAIL_COND(index >= list.size() || list[index] != p_slot);
+		const uint32_t last = list[list.size() - 1];
+		list[index] = last;
+		p_ptlas->slot_blas_index[last] = index;
+		list.resize(list.size() - 1);
+		if (list.is_empty()) {
+			p_ptlas->blas_slots.remove(E);
 			p_ptlas->acceleration_structure_dependencies.erase(current);
 			p_ptlas->stale_blas.erase(current);
 			p_ptlas->freed_blas.erase(current);
@@ -349,8 +357,10 @@ void RenderingDevice::_ptlas_set_slot(AccelerationStructure *p_ptlas, RID p_ptla
 	}
 	current = p_blas;
 	if (p_blas.is_valid()) {
-		uint32_t &count = p_ptlas->blas_slot_counts[p_blas];
-		if (count++ == 0) {
+		LocalVector<uint32_t> &list = p_ptlas->blas_slots[p_blas];
+		p_ptlas->slot_blas_index[p_slot] = list.size();
+		list.push_back(p_slot);
+		if (list.size() == 1) {
 			p_ptlas->acceleration_structure_dependencies.insert(p_blas);
 			AccelerationStructure *blas = acceleration_structure_owner.get_or_null(p_blas);
 			if (blas != nullptr) {
@@ -839,9 +849,35 @@ Error RenderingDevice::ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p
 
 	const PartitionedAccelerationStructureLimits &limits = ptlas->limits;
 	const bool from_scratch = p_from_scratch || !ptlas->built_once;
-	const bool scan_slots = !from_scratch && (!ptlas->stale_blas.is_empty() || !ptlas->freed_blas.is_empty());
+	// The slots on a stale or freed BLAS, from each one's list: the scan writes or disables them.
+	thread_local LocalVector<uint32_t> scan_candidates;
+	scan_candidates.clear();
+	const bool any_stale_or_freed = !ptlas->stale_blas.is_empty() || !ptlas->freed_blas.is_empty();
+	// The scan's time (D94b's counter): this collection and the loop that writes them, not the build between.
+	uint64_t scan_usec = 0;
+	const uint64_t collect_start_usec = any_stale_or_freed ? OS::get_singleton()->get_ticks_usec() : 0;
+	if (!from_scratch && any_stale_or_freed) {
+		for (const HashSet<RID> *set : { &ptlas->stale_blas, &ptlas->freed_blas }) {
+			for (const RID &blas : *set) {
+				HashMap<RID, LocalVector<uint32_t>>::ConstIterator E = ptlas->blas_slots.find(blas);
+				if (E) {
+					for (uint32_t slot : E->value) {
+						scan_candidates.push_back(slot);
+					}
+				}
+			}
+		}
+	}
+	const bool scan_slots = !scan_candidates.is_empty();
+	if (any_stale_or_freed) {
+		scan_usec = OS::get_singleton()->get_ticks_usec() - collect_start_usec;
+	}
 	if (!from_scratch && !scan_slots && p_writes.is_empty() && p_translations.is_empty()) {
 		// Nothing changed: the structure is as the last build left it.
+		ptlas->last_build_writes = 0;
+		ptlas->last_build_stale_rewrites = 0;
+		ptlas->last_build_dangling_disables = 0;
+		ptlas->last_build_scan_usec = 0;
 		ptlas->invalidated = false;
 		return OK;
 	}
@@ -900,7 +936,7 @@ Error RenderingDevice::ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p
 	const uint32_t record_size = driver->ptlas_instance_write_size();
 	const uint32_t operation_size = driver->ptlas_operation_size();
 	const uint32_t translation_size = driver->ptlas_translation_write_size();
-	const uint64_t write_bound = from_scratch ? limits.instance_count : MIN(uint64_t(limits.instance_count), uint64_t(p_writes.size()) + (scan_slots ? high_water : 0));
+	const uint64_t write_bound = from_scratch ? limits.instance_count : MIN(uint64_t(limits.instance_count), uint64_t(p_writes.size()) + scan_candidates.size());
 	const uint64_t count_offset = STEPIFY(uint64_t(operation_size) * 2, 16);
 	const uint64_t writes_offset = count_offset + 16;
 	const uint64_t translations_offset = STEPIFY(writes_offset + write_bound * record_size, 16);
@@ -965,6 +1001,7 @@ Error RenderingDevice::ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p
 	if (ptlas->slot_blas.size() < high_water) {
 		ptlas->slot_blas.resize(high_water);
 		ptlas->slot_partition.resize_initialized(high_water);
+		ptlas->slot_blas_index.resize_initialized(high_water);
 		ptlas->slot_records.resize_initialized(uint64_t(high_water) * record_size);
 	}
 	ptlas->slot_high_water = high_water;
@@ -1001,8 +1038,9 @@ Error RenderingDevice::ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p
 	// cover theirs, and a build from scratch disables every slot it does not write instead.
 	uint32_t stale_rewrites = 0;
 	uint32_t dangling_disables = 0;
+	const uint64_t scan_start_usec = scan_slots ? OS::get_singleton()->get_ticks_usec() : 0;
 	if (scan_slots) {
-		for (uint32_t slot = 0; slot < high_water; slot++) {
+		for (uint32_t slot : scan_candidates) {
 			const RID blas = ptlas->slot_blas[slot];
 			if (blas.is_null() || ptlas->slot_written_serial[slot] == serial) {
 				continue;
@@ -1010,7 +1048,9 @@ Error RenderingDevice::ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p
 			if (ptlas->freed_blas.has(blas)) {
 				RDD::PartitionedInstanceWrite rdd_write;
 				rdd_write.slot = slot;
-				rdd_write.partition = ptlas->slot_partition[slot];
+				// A disabled record goes to partition 0, never the global partition: whether it counts
+				// against a partition's instance limit is not specified (D94b).
+				rdd_write.partition = ptlas->slot_partition[slot] == PARTITION_GLOBAL ? 0 : ptlas->slot_partition[slot];
 				driver->ptlas_instance_write(ptlas->slot_records.ptr() + uint64_t(slot) * record_size, rdd_write);
 				_ptlas_set_slot(ptlas, p_ptlas, slot, RID(), rdd_write.partition);
 				ptlas->slot_written_serial[slot] = serial;
@@ -1023,6 +1063,7 @@ Error RenderingDevice::ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p
 			}
 		}
 	}
+	ptlas->last_build_scan_usec = scan_usec + (scan_slots ? OS::get_singleton()->get_ticks_usec() - scan_start_usec : 0);
 	ptlas->stale_blas.clear();
 	ptlas->freed_blas.clear();
 	if (dangling_disables > 0) {
@@ -1074,7 +1115,7 @@ Error RenderingDevice::ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p
 			}
 			RDD::PartitionedInstanceWrite rdd_write;
 			rdd_write.slot = slot;
-			rdd_write.partition = slot < high_water ? ptlas->slot_partition[slot] : 0;
+			rdd_write.partition = slot < high_water && ptlas->slot_partition[slot] != PARTITION_GLOBAL ? ptlas->slot_partition[slot] : 0; // As above, never global.
 			driver->ptlas_instance_write(write_ptr, rdd_write);
 			write_ptr += record_size;
 			if (slot < high_water) {
@@ -1111,6 +1152,31 @@ Error RenderingDevice::ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p
 	ptlas->invalidated = false;
 
 	return OK;
+}
+
+uint32_t RenderingDevice::ptlas_get_stale_blas_count(RID p_ptlas) {
+	AccelerationStructure *ptlas = acceleration_structure_owner.get_or_null(p_ptlas);
+	ERR_FAIL_NULL_V(ptlas, 0);
+	return ptlas->stale_blas.size();
+}
+
+bool RenderingDevice::ptlas_is_blas_stale(RID p_ptlas, RID p_blas) {
+	AccelerationStructure *ptlas = acceleration_structure_owner.get_or_null(p_ptlas);
+	ERR_FAIL_NULL_V(ptlas, false);
+	return !ptlas->stale_blas.is_empty() && ptlas->stale_blas.has(p_blas);
+}
+
+void RenderingDevice::ptlas_get_last_build_counts(RID p_ptlas, uint32_t &r_writes, uint32_t &r_stale_rewrites, uint32_t &r_dangling_disables, uint64_t &r_scan_usec) {
+	r_writes = 0;
+	r_stale_rewrites = 0;
+	r_dangling_disables = 0;
+	r_scan_usec = 0;
+	AccelerationStructure *ptlas = acceleration_structure_owner.get_or_null(p_ptlas);
+	ERR_FAIL_NULL(ptlas);
+	r_writes = ptlas->last_build_writes;
+	r_stale_rewrites = ptlas->last_build_stale_rewrites;
+	r_dangling_disables = ptlas->last_build_dangling_disables;
+	r_scan_usec = ptlas->last_build_scan_usec;
 }
 
 /******************************************/
@@ -8605,7 +8671,8 @@ void RenderingDevice::_free_internal(RID p_id) {
 			acceleration_structure->slot_partition.reset();
 			acceleration_structure->partition_occupancy.reset();
 			acceleration_structure->slot_written_serial.reset();
-			acceleration_structure->blas_slot_counts.clear();
+			acceleration_structure->blas_slots.clear();
+			acceleration_structure->slot_blas_index.reset();
 			acceleration_structure->stale_blas.clear();
 			acceleration_structure->freed_blas.clear();
 		}

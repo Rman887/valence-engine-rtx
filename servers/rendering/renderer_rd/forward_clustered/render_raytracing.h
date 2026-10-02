@@ -43,6 +43,7 @@
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/cluster_lod_select.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/raytracing/ptlas_rows.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/sky_light_table.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
 
@@ -469,6 +470,10 @@ struct RTSurfaceData {
 	RID materialized_index_buffer;
 	uint64_t materialized_bytes = 0;
 	uint64_t materialized_frame = 0;
+	// The row a slot-resident instance last saw (D94b): `geometry` as of `row_generation`, which
+	// advances, unique over every row, whenever the walk finds `geometry` changed since.
+	RT_GeometryData row_snapshot = {};
+	uint64_t row_generation = 0;
 };
 
 // An instance's cluster BLAS over the clusters the LOD selection picks for it (D86): its own
@@ -775,6 +780,9 @@ struct RTMaterialData {
 	RID normal_texture_rd;
 	RID orm_texture_rd;
 	RID emission_texture_rd;
+	// As RTSurfaceData's (D94b): `data` as of `row_generation`.
+	RT_MaterialData row_snapshot = {};
+	uint64_t row_generation = 0;
 };
 
 struct RTCacheEntry {
@@ -932,6 +940,98 @@ struct RTMaterialCacheEntry {
 	uint32_t cached_rid_version = 0;
 };
 
+// Slot-resident instances (D94b), with rendering/pathtracing/partitioned_tlas: an instance keeps
+// one slot of the partitioned TLAS while it stays in the trace, written only when it changes. A
+// slot is the PTLAS instance index, the custom index and the row of the per-instance shader
+// buffers. Slots come in ranges, one per RT surface of a geometry instance (the instance owns
+// them, not its surface caches, which _mark_dirty frees): one slot, or a MultiMesh surface's
+// expanded elements. Indices are shared by every viewport; each viewport's PTLAS, rows and the
+// shadows below are its own, since the RT cull and rt_origin are per viewport.
+struct RTSlotRange {
+	uint32_t first = 0;
+	uint32_t count = 0;
+	uint32_t serial = 0; // Advances each time the id is reused, so a viewport's view of it resets.
+	uint32_t enabled_viewports = 0; // The viewports whose PTLAS may hold a slot of it enabled.
+	bool live = false;
+	bool released = false; // Its owner dropped it; its indices return once no viewport holds it.
+};
+
+// A frame-local row (a merged MultiMesh's, a procedural instance's), compared by value; kept beside
+// the ranges, since only those ranges have one.
+struct RTSlotLocalRow {
+	RT_GeometryData row = {};
+	uint64_t generation = 0;
+};
+
+// The ranges a geometry instance owns: (key << 32) | range id, the key its surface index.
+struct RTSlotOwner {
+	LocalVector<uint64_t> ranges;
+};
+
+// What a viewport's PTLAS holds in one slot, and the rows its buffers hold there: the change test.
+struct RTSlotShadow {
+	float transform[12] = {}; // Rows of the 3x4, relative to rt_origin, as the record holds it.
+	RID blas; // Invalid: disabled.
+	uint64_t geometry_generation = 0;
+	uint64_t material_generation = 0;
+	uint32_t sbt_offset = 0;
+	uint32_t partition = 0;
+	uint32_t write_frame = 0; // The viewport's build count at the last instance write.
+	uint32_t motion_frame = 0; // The build count its motion row was last written >= 0 at.
+	uint32_t global_index = UINT32_MAX; // Its position in the global partition's list (D94b part 2).
+	Vector3i cell; // The world cell its last write placed it in.
+	uint8_t flags = 0;
+	uint8_t mask = 0;
+	bool rows_valid = false; // The rows hold this slot's geometry and material generations.
+	bool motion = false; // Its motion row is >= 0.
+};
+
+// A viewport's view of one range: whether the walk reached it this build, and whether the viewport
+// holds a claim on it. Kept dense for the sweep, which reads every live range's each build.
+struct RTSlotRangeView {
+	uint32_t serial = 0;
+	uint32_t present_frame = 0;
+	bool enabled = false; // Holds a claim on the range (RTSlotRange::enabled_viewports).
+};
+
+// An expanded MultiMesh range's key (decision 6), kept beside the views: unchanged, the walk skips
+// the range whole.
+struct RTSlotMultiMeshKey {
+	uint32_t serial = 0; // The range's serial it was taken for; 0 for none.
+	Transform3D instance_transform;
+	Vector3 origin;
+	RID blas;
+	uint64_t buffer_generation = 0;
+	uint64_t geometry_generation = 0;
+	uint64_t material_generation = 0;
+	uint32_t count = 0;
+	uint32_t sbt_offset = 0;
+	uint32_t flags = 0;
+	uint8_t mask = 0;
+};
+
+// An enabled slot whose material emits (D50), for the emissive gather: what the walk's arrays
+// held for it when it was last written.
+struct RTSlotEmissive {
+	Transform3D transform; // World, as walked.
+	RT_GeometryData geometry = {};
+	RT_MaterialData material = {};
+	uint32_t sbt_offset = 0;
+	uint32_t flags = 0;
+};
+
+// One slot's rows for the scatter pass (ptlas_rows.glsl): the geometry and material rows when
+// `parts` has bit 0, and the motion index always.
+struct alignas(16) RT_SlotRowWrite {
+	uint32_t slot;
+	uint32_t parts;
+	int32_t motion_index;
+	uint32_t _pad;
+	RT_GeometryData geometry;
+	RT_MaterialData material;
+};
+static_assert(sizeof(RT_SlotRowWrite) == 240, "RT_SlotRowWrite must match ptlas_rows.glsl");
+
 /// Per-viewport raytracing state.
 ///
 /// Each viewport has its own visibility set (frustum/LOD/visibility ranges), so
@@ -987,6 +1087,74 @@ struct RTViewportState {
 	RID scene_uniform_buffer;
 
 	uint32_t frame_counter = 0;
+
+	// Slot-resident instances (D94b): `tlas` is this viewport's PTLAS, and the geometry, material and
+	// motion index buffers are indexed by slot, slot_capacity rows each, fed by the scatter pass.
+	LocalVector<RTSlotShadow> slots;
+	LocalVector<RTSlotRangeView> slot_range_views;
+	HashMap<uint32_t, RTSlotMultiMeshKey> slot_mm_keys; // By range id.
+	HashMap<uint32_t, RTSlotEmissive> emissive_slots;
+	LocalVector<uint32_t> motion_slots; // The slots whose motion row the last build wrote >= 0.
+	LocalVector<uint32_t> motion_slots_next;
+	uint32_t slot_capacity = 0;
+	uint32_t slot_build = 0; // Builds of this viewport's slots, from 1.
+	uint64_t slot_commit_frame = 0; // frames_drawn at its last commit; 0 when it holds nothing.
+	bool slot_rebuild = false; // The next build writes every enabled slot from scratch.
+	Vector3 slot_origin; // The rt_origin of the last commit.
+	bool slot_origin_valid = false;
+	RID slot_row_buffer; // The scatter's input, grow-only.
+	uint32_t slot_row_capacity = 0; // Rows.
+	// The partitions (D94b part 2): each world cell's buckets of at most ptlas_partition_max_instances
+	// enabled slots, and the global partition, which holds the slots rewritten while enabled until
+	// they go ptlas_stable_frames builds unwritten. Occupancy mirrors the PTLAS's: enabled slots.
+	struct SlotCell {
+		LocalVector<uint32_t> partitions;
+	};
+	HashMap<Vector3i, SlotCell> slot_cells;
+	LocalVector<uint32_t> partition_occupancy;
+	LocalVector<Vector3i> partition_cells;
+	LocalVector<uint32_t> partition_touched; // The build that last wrote a slot of it.
+	LocalVector<uint32_t> partition_free;
+	uint32_t partition_high_water = 0;
+	uint32_t partition_capacity = 0;
+	uint32_t partitions_live = 0;
+	LocalVector<uint32_t> global_slots;
+	// The slots written into the global partition at a build, ptlas_stable_frames + 1 buckets by
+	// build: the bucket of the build ptlas_stable_frames ago holds every candidate to return.
+	LocalVector<LocalVector<uint32_t>> global_return_buckets;
+	uint32_t global_capacity = 0;
+	uint32_t global_touched = 0;
+	// The last build's counters (D94b): instance writes by cause, row writes, and the report's tallies.
+	struct SlotCounters {
+		uint32_t enabled = 0;
+		uint32_t writes = 0;
+		uint32_t writes_new = 0;
+		uint32_t writes_moved = 0;
+		uint32_t writes_blas = 0;
+		uint32_t writes_rebuilt = 0;
+		uint32_t writes_return = 0;
+		uint32_t disables = 0;
+		uint32_t rows = 0;
+		uint32_t motion_rows = 0;
+		uint32_t partitions_live = 0;
+		uint32_t partitions_touched = 0;
+		uint32_t global = 0;
+		uint32_t global_overflow = 0;
+		uint32_t from_scratch = 0; // Over the run.
+		uint64_t returns_total = 0; // Over the run: the global partition's slots back in their cells.
+		uint64_t global_entries_total = 0; // Over the run: slots placed in the global partition.
+		uint32_t global_peak = 0;
+		uint32_t stale_rewrites = 0; // The PTLAS's own rewrites of a rebuilt BLAS's slots.
+		uint32_t dangling_disables = 0; // Over the run: the PTLAS's safety net.
+		uint32_t dangling_last = 0;
+		uint32_t builds = 0; // The build calls of the commit: one, or one per chunk.
+		uint64_t commit_usec = 0;
+		uint64_t build_usec = 0; // The PTLAS build call within the commit (its stale scan included).
+		uint64_t scan_usec = 0; // The PTLAS builds' stale and freed scans.
+		uint64_t commit_usec_sum = 0; // Over the run, for the means the report prints.
+		uint64_t build_usec_sum = 0;
+		uint64_t scan_usec_sum = 0;
+	} slot_counters;
 };
 
 class RenderRaytracing {
@@ -1287,12 +1455,14 @@ class RenderRaytracing {
 	LocalVector<uint8_t> instance_masks;
 	struct EmissiveCandidate {
 		uint32_t index;
+		const RTSlotEmissive *record; // A slot-resident instance's (D94b), else nullptr.
 		float weight;
 		float score;
 		Vector3 center; // The box's centre and half diagonal in trace space, carried to the entry (D51).
 		float radius;
 	};
 	LocalVector<EmissiveCandidate> emissive_candidates; ///< The emissive gather's ranking (D50).
+	LocalVector<Pair<uint32_t, const RTSlotEmissive *>> emissive_slot_records; ///< The emissive slots in slot order (D94b).
 	LocalVector<RT_EmissiveInstance> emissive_scratch;
 	LocalVector<RT_LightData> light_scratch; ///< The frame's light list before upload.
 	// The light tree's build scratch (D55): a leaf per positional light and per emissive entry,
@@ -1328,6 +1498,86 @@ class RenderRaytracing {
 	static constexpr uint8_t RT_INSTANCE_MASK_SHADOW = 0x02;
 	static constexpr uint8_t RT_INSTANCE_MASK_PROCEDURAL = 0x04;
 	LocalVector<uint32_t> sbt_offsets; // 0 = default material hit group
+
+	// Slot-resident instances (D94b): on with every TLAS a PTLAS (D94a). The arrays above then hold
+	// only the instances the walk could not prove unchanged, with their slots and row generations
+	// beside them; the slots of every other instance keep what they hold.
+	bool ptlas_slots_enabled = false;
+	LocalVector<uint32_t> frame_slots;
+	LocalVector<uint64_t> frame_geometry_generations;
+	LocalVector<uint64_t> frame_material_generations;
+	LocalVector<RTSlotRange> slot_ranges;
+	LocalVector<uint32_t> slot_range_free_ids;
+	struct SlotInterval {
+		uint32_t first;
+		uint32_t count;
+	};
+	LocalVector<SlotInterval> slot_free_intervals; // Sorted by first, coalesced.
+	uint32_t slot_high_water = 0; // Slots from here on were never allocated.
+	uint32_t slot_live = 0;
+	uint64_t row_generation_counter = 0;
+	HashMap<uint32_t, RTSlotLocalRow> slot_local_rows; // By range id.
+	uint32_t slot_counters_reclaimed = 0; // Idle viewports whose slots were taken back, over the run.
+	// A row the scatter writes: the frame's arrays at `source` (UINT32_MAX: the motion index alone).
+	struct SlotRowRef {
+		uint32_t slot = 0;
+		uint32_t source = UINT32_MAX;
+		int32_t motion_index = -1;
+	};
+	LocalVector<SlotRowRef> slot_row_refs;
+	struct SlotRowsShader {
+		PtlasRowsShaderRD shader;
+		RID version;
+		RID version_shader;
+		RID pipeline;
+	} slot_rows_shader;
+	static constexpr uint32_t RT_SLOT_KEY_PROCEDURAL = UINT32_MAX;
+	// rendering/pathtracing/ptlas_* (D94b part 2).
+	double ptlas_cell_size = 128.0;
+	uint32_t ptlas_partition_max_instances = 8192;
+	uint32_t ptlas_global_max_instances = 65536;
+	uint32_t ptlas_stable_frames = 16;
+	static constexpr uint32_t RT_SLOT_MIN_CAPACITY = 1024;
+	// The writes a build call takes and the rows a scatter dispatch takes, at most.
+	static constexpr uint32_t RT_SLOT_CHUNK = 65536;
+	// A viewport not committed for this many frames gives its slots back (longer than any frame in
+	// flight, and long enough that one updated now and then does not rebuild each time).
+	static constexpr uint64_t RT_SLOT_IDLE_FRAMES = 60;
+	// Thread-free scratch of the commit.
+	LocalVector<RD::PartitionedInstanceWrite> slot_writes;
+	LocalVector<RT_SlotRowWrite> slot_row_writes;
+
+	uint32_t _slot_range_acquire(RTViewportState *p_state, RTSlotOwner &r_owner, uint32_t p_key, uint32_t p_count);
+	void _slot_range_release(uint32_t p_range);
+	void _slot_range_try_free(uint32_t p_range);
+	uint32_t _slot_interval_alloc(uint32_t p_count);
+	void _slot_interval_free(uint32_t p_first, uint32_t p_count);
+	uint64_t _surface_row_generation(RTSurfaceData *p_surf_data);
+	uint64_t _material_row_generation(RTMaterialData *p_mat_data);
+	uint64_t _local_row_generation(uint32_t p_range, const RT_GeometryData &p_row);
+	static void _slot_relative_transform(const Transform3D &p_transform, const Vector3 &p_origin, float *r_rows);
+	_FORCE_INLINE_ bool _slot_unchanged(const RTViewportState *p_state, uint32_t p_slot, RID p_blas, const float *p_rows, uint32_t p_flags, uint8_t p_mask, uint32_t p_sbt_offset, uint64_t p_geometry_generation, uint64_t p_material_generation) const {
+		const RTSlotShadow &shadow = p_state->slots[p_slot];
+		return shadow.blas == p_blas && shadow.rows_valid && shadow.geometry_generation == p_geometry_generation && shadow.material_generation == p_material_generation && shadow.flags == uint8_t(p_flags) && shadow.mask == p_mask && shadow.sbt_offset == p_sbt_offset && memcmp(shadow.transform, p_rows, sizeof(shadow.transform)) == 0;
+	}
+	// Moved this frame for its motion: MOVED can be set without a change (the motion row of an
+	// unchanged transform is the identity, which -1 gives too).
+	static _FORCE_INLINE_ bool _slot_moved(bool p_status_moved, const Transform3D &p_prev, const Transform3D &p_current) {
+		return p_status_moved && p_prev != p_current;
+	}
+	void _slot_emit(uint32_t p_slot, uint64_t p_geometry_generation, uint64_t p_material_generation);
+	bool _commit_slots(RTViewportState *p_state);
+	bool _flush_slot_writes(RTViewportState *p_state, bool p_from_scratch);
+	void _reset_viewport_slots(RTViewportState *p_state);
+	void _reclaim_idle_viewports(RTViewportState *p_current);
+	bool _slot_multimesh_key_matches(RTViewportState *p_state, uint32_t p_range, const RTSlotMultiMeshKey &p_key);
+	Vector3i _slot_cell(const Transform3D &p_transform, const RT_GeometryData &p_geometry) const;
+	uint32_t _slot_cell_partition(RTViewportState *p_state, const Vector3i &p_cell);
+	void _slot_unplace(RTViewportState *p_state, RTSlotShadow &r_shadow);
+	void _slot_place(RTViewportState *p_state, uint32_t p_slot, RTSlotShadow &r_shadow, bool p_was_enabled, const Vector3i &p_cell, bool p_prefer_global);
+	bool _ensure_slot_capacity(RTViewportState *p_state);
+	bool _scatter_slot_rows(RTViewportState *p_state);
+	void _release_viewport_slots(RTViewportState *p_state);
 
 	HashMap<RenderSceneBuffersRD *, RTViewportState *> viewport_states;
 
@@ -1529,7 +1779,7 @@ class RenderRaytracing {
 			LocalVector<RID> &r_dirty_blas_update_list,
 			RTSurfaceData *r_surf_data);
 	void update_procedural_blas(RTProceduralState *p_state, LocalVector<RID> &r_dirty_blas_list);
-	void build_acceleration_structures(RTViewportState *p_state, const LocalVector<RID> &p_dirty_blas_list, const LocalVector<RID> &p_dirty_blas_update_list);
+	bool build_acceleration_structures(RTViewportState *p_state, const LocalVector<RID> &p_dirty_blas_list, const LocalVector<RID> &p_dirty_blas_update_list);
 	void finalize_buffers(RTViewportState *p_state);
 	void prepare_frame();
 	void _update_scene_uniform_buffer(RTViewportState *p_state, const RenderDataRD *p_render_data);
@@ -1540,6 +1790,8 @@ public:
 	static bool is_position_fetch_enabled() { return singleton != nullptr && singleton->cluster_lod_stream_geometry_enabled; }
 
 	void cleanup_caches();
+	// Releases a geometry instance's PTLAS slot ranges (D94b) as it is freed.
+	void release_slot_ranges(RTSlotOwner &r_owner);
 	// Releases the RT cache entry of a surface its mesh is dropping (MeshStorage's surface-freed callback).
 	void release_mesh_surface(RID p_mesh, uint32_t p_surface);
 

@@ -588,6 +588,8 @@ protected:
 	public:
 		/// Heap-allocated procedural RT state. Only created when the instance is procedural.
 		RTProceduralState *rt_procedural = nullptr;
+		/// Its PTLAS slot ranges (D94b), released when it is freed.
+		mutable RTSlotOwner rt_slots;
 
 		// lightmap
 		RID lightmap_instance;

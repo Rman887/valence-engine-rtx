@@ -190,6 +190,24 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		mm_merge_shader.pipeline[i] = RD::get_singleton()->compute_pipeline_create(mm_merge_shader.version_shader[i]);
 	}
 
+	// Slot-resident instances (D94b): with every TLAS a PTLAS (D94a), the walk writes only the
+	// instances that changed, and the scatter pass writes their rows.
+	ptlas_slots_enabled = RD::get_singleton()->get_partitioned_acceleration_structure_capabilities().supported;
+	if (ptlas_slots_enabled) {
+		ptlas_cell_size = MAX(double(GLOBAL_GET("rendering/pathtracing/ptlas_cell_size")), 1.0);
+		ptlas_partition_max_instances = uint32_t(MAX(int(GLOBAL_GET("rendering/pathtracing/ptlas_partition_max_instances")), 16));
+		ptlas_global_max_instances = uint32_t(MAX(int(GLOBAL_GET("rendering/pathtracing/ptlas_global_max_instances")), 0));
+		ptlas_stable_frames = uint32_t(MAX(int(GLOBAL_GET("rendering/pathtracing/ptlas_stable_frames")), 1));
+		Vector<String> slot_rows_modes;
+		slot_rows_modes.push_back("\n");
+		slot_rows_shader.shader.initialize(slot_rows_modes);
+		slot_rows_shader.version = slot_rows_shader.shader.version_create();
+		slot_rows_shader.version_shader = slot_rows_shader.shader.version_get_shader(slot_rows_shader.version, 0);
+		slot_rows_shader.pipeline = RD::get_singleton()->compute_pipeline_create(slot_rows_shader.version_shader);
+		print_line(vformat("RT: slot-resident instances in a partitioned TLAS (D94b): instances written only when they change, in %.0f m cells of up to %d instances, %d in the global partition until %d frames unchanged.", ptlas_cell_size, ptlas_partition_max_instances, ptlas_global_max_instances, ptlas_stable_frames));
+		print_verbose(vformat("RT: slot bookkeeping (D94b): %d bytes a slot's shadow, %d a range, %d a range's view, %d a MultiMesh range's key, %d a local row.", int(sizeof(RTSlotShadow)), int(sizeof(RTSlotRange)), int(sizeof(RTSlotRangeView)), int(sizeof(RTSlotMultiMeshKey)), int(sizeof(RTSlotLocalRow))));
+	}
+
 	// The cluster LOD selection compute (D86).
 	Vector<String> lod_select_modes;
 	lod_select_modes.push_back("\n");
@@ -249,6 +267,9 @@ RenderRaytracing::~RenderRaytracing() {
 	mm_merge_shader.shader.version_free(mm_merge_shader.version);
 	lod_select_shader.shader.version_free(lod_select_shader.version);
 	sky_light_shader.shader.version_free(sky_light_shader.version);
+	if (slot_rows_shader.version.is_valid()) {
+		slot_rows_shader.shader.version_free(slot_rows_shader.version);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +302,9 @@ RTViewportState *RenderRaytracing::_get_viewport_state(const RenderDataRD *p_ren
 void RenderRaytracing::_free_viewport_state_internal(RTViewportState *p_state) {
 	if (!p_state) {
 		return;
+	}
+	if (ptlas_slots_enabled) {
+		_release_viewport_slots(p_state);
 	}
 	if (p_state->tlas.is_valid()) {
 		RD::get_singleton()->free_rid(p_state->tlas);
@@ -894,6 +918,9 @@ void RenderRaytracing::prepare_frame() {
 	material_data.clear();
 	motion_indices.clear();
 	motion_transforms.clear();
+	frame_slots.clear();
+	frame_geometry_generations.clear();
+	frame_material_generations.clear();
 	deformed_active_this_frame.clear();
 	merged_mm_active_this_frame.clear();
 
@@ -6930,7 +6957,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 // Acceleration structure building
 // ---------------------------------------------------------------------------
 
-void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, const LocalVector<RID> &p_dirty_blas_list, const LocalVector<RID> &p_dirty_blas_update_list) {
+bool RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, const LocalVector<RID> &p_dirty_blas_list, const LocalVector<RID> &p_dirty_blas_update_list) {
 	RENDER_TIMESTAMP("BLAS Build");
 
 	for (const RID &blas_rid : p_dirty_blas_list) {
@@ -6946,6 +6973,12 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 	}
 
 	RENDER_TIMESTAMP("TLAS Build");
+
+	if (ptlas_slots_enabled) {
+		// Slot-resident instances (D94b): the writes, the builds, the rows' scatter. False when the
+		// structure could not be brought up to date, and the frame does not trace.
+		return _commit_slots(p_state);
+	}
 
 	uint32_t needed = MAX(blass.size(), (uint32_t)1);
 	if (!p_state->tlas.is_valid() || needed > p_state->tlas_max_instances) {
@@ -6972,6 +7005,7 @@ void RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 	}
 
 	RD::get_singleton()->tlas_build(p_state->tlas, instances);
+	return true;
 }
 
 void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {
@@ -6993,6 +7027,14 @@ void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {
 			RD::get_singleton()->buffer_update(p_buffer, 0, p_size, p_data);
 		}
 	};
+
+	if (ptlas_slots_enabled) {
+		// The per-instance rows are the slots' (D94b), scattered by the commit; the motion
+		// transforms stay the frame's compact list.
+		update_or_grow(p_state->motion_transform_buffer, p_state->motion_transform_buffer_capacity,
+				motion_transforms.ptr(), motion_transforms.size() * sizeof(RT_InstanceMotionData));
+		return;
+	}
 
 	update_or_grow(p_state->geometry_buffer, p_state->geometry_buffer_capacity,
 			geometry_data.ptr(), geometry_data.size() * sizeof(RT_GeometryData));
@@ -7487,6 +7529,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	prepare_frame();
 	_sweep_materialized();
 	state->has_procedural_instances = false;
+	if (ptlas_slots_enabled) {
+		state->slot_build++; // The walk stamps the ranges it reaches with it (D94b).
+	}
 
 	// The cluster LOD selection (D86) belongs to the traced primary ray (D84): under the G-buffer
 	// primary the raster's surface must agree with the traced geometry it casts its shadow and
@@ -7607,6 +7652,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				continue;
 			}
 
+			const uint32_t proc_builds_before = dirty_blas_list.size();
 			if (ps->dirty) {
 #ifdef TOOLS_ENABLED
 				uint32_t pre_proc_build_size = dirty_blas_list.size();
@@ -7621,16 +7667,39 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			}
 
 			if (ps->blas.is_valid()) {
-				blass.push_back(ps->blas);
-				blas_transforms.push_back(instance_transform);
-				sbt_offsets.push_back(hg_index);
-
 				RT_GeometryData geom = {};
 				geom.flags = RT_GEOM_FLAG_PROCEDURAL;
 				geom.vertex_buffer_address = ps->gpu_buffer_address;
 				geom.aabb_size_x = (float)ps->culling_aabb.size.x;
 				geom.aabb_size_y = (float)ps->culling_aabb.size.y;
 				geom.aabb_size_z = (float)ps->culling_aabb.size.z;
+				// Material for procedural geometry (already validated above).
+				uint16_t proc_mat_counter = material_storage->material_get_rt_invalidation_counter(proc_material_rid);
+				RTMaterialData *proc_mat_data = process_material(proc_material_rid, proc_mat_counter);
+				// Procedural instances disable triangle culling and are opaque.
+				uint32_t inst_flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT |
+						RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
+				const uint8_t inst_mask = RT_INSTANCE_MASK_GEOMETRY | RT_INSTANCE_MASK_PROCEDURAL | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0);
+				state->has_procedural_instances = true;
+
+				if (ptlas_slots_enabled) {
+					// Its slot keeps what it holds unless the instance or its rows changed (D94b).
+					const uint32_t range = _slot_range_acquire(state, inst->rt_slots, RT_SLOT_KEY_PROCEDURAL, 1);
+					const uint32_t slot = slot_ranges[range].first;
+					const uint64_t geometry_generation = _local_row_generation(range, geom);
+					const uint64_t material_generation = _material_row_generation(proc_mat_data);
+					float rows[12];
+					_slot_relative_transform(instance_transform, state->rt_origin, rows);
+					const bool rebuilt = dirty_blas_list.size() != proc_builds_before;
+					if (!rebuilt && !_slot_moved(inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED, prev_instance_transform, instance_transform) && _slot_unchanged(state, slot, ps->blas, rows, inst_flags, inst_mask, hg_index, geometry_generation, material_generation)) {
+						continue;
+					}
+					_slot_emit(slot, geometry_generation, material_generation);
+				}
+
+				blass.push_back(ps->blas);
+				blas_transforms.push_back(instance_transform);
+				sbt_offsets.push_back(hg_index);
 				geometry_data.push_back(geom);
 
 				if (inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED) {
@@ -7644,17 +7713,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					motion_indices.push_back(-1);
 				}
 
-				// Material for procedural geometry (already validated above).
-				uint16_t proc_mat_counter = material_storage->material_get_rt_invalidation_counter(proc_material_rid);
-				RTMaterialData *proc_mat_data = process_material(proc_material_rid, proc_mat_counter);
 				material_data.push_back(proc_mat_data->data);
-
-				// Procedural instances disable triangle culling and are opaque.
-				uint32_t inst_flags = RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT |
-						RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				instance_flags.push_back(inst_flags);
-				instance_masks.push_back(RT_INSTANCE_MASK_GEOMETRY | RT_INSTANCE_MASK_PROCEDURAL | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0));
-				state->has_procedural_instances = true;
+				instance_masks.push_back(inst_mask);
 			}
 			continue;
 		}
@@ -7803,6 +7864,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			void *mesh_surface = surf->surface;
 			uint32_t surface_counter = mesh_storage->mesh_surface_get_rt_invalidation_counter(mesh_surface);
+			const uint32_t pre_slot_build_size = dirty_blas_list.size();
+			const uint32_t pre_slot_refit_size = dirty_blas_update_list.size();
 
 #ifdef TOOLS_ENABLED
 			uint32_t pre_build_size = dirty_blas_list.size();
@@ -7874,118 +7937,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				surf->cached_final_transform = final_transform;
 				surf->cached_final_transform_valid = true;
 			}
-			blas_transforms.push_back(final_transform);
-
-			// The cluster LOD selection (D86): an instance of a surface whose hierarchy is on the GPU
-			// traces its own BLAS over the clusters this frame's selection picks for it, built at
-			// the flush below, unless the material is an emissive mesh light (its sampling covers
-			// the LOD 0 triangles alone, D50) or the frame's flush fails, when the surface's LOD 0
-			// BLAS stands in. The metric transforms the mesh-space spheres, so the instance's own
-			// transform, not the compressed surface's final one.
-			// Which build the instance traces is settled after the walk, where the instances of one
-			// surface can share one (D89); until then the slot holds the LOD 0 BLAS.
-			RID blas_handle = surf_data->blas;
-			if (p_primary_from_gbuffer && surf_data->geometry_streamed) {
-				WARN_PRINT_ONCE("RT: the G-buffer primary rasterizes a surface whose geometry streams at its fallback level (D93d), coarser than the traced surface; the traced primary is the look.");
-			}
-			// An emissive material samples the surface's own triangles (D50), which a surface whose
-			// buffers hold its fallback level has only as an upload (D93d).
-			if (surf_data->geometry_streamed && (mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT)) {
-				_materialize_surface(surf_data, mesh_surface, false, true);
-			}
-			if (lod_select_frame && surf_data->cluster_lod_stream && (mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT)) {
-				blas_handle = _lod_stream_pinned_blas(surf_data); // A streamed surface's LOD 0 is its cached level 0 (D92).
-			} else if (lod_select_frame && surf_data->cluster_lod_table_offset != UINT32_MAX && !(mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT)) {
-				RTLodInstanceEntry *lod_entry = _access_lod_slot(surf->rt_lod_handle);
-				lod_entry->last_used_frame = RSG::rasterizer->get_frame_number();
-				if (lod_entry->pushed_frame == RD::get_singleton()->get_frames_drawn()) {
-					blas_handle = lod_entry->frame_blas; // Settled for an earlier viewport of this frame.
-				} else {
-					RTLodSelectBatch::Candidate candidate;
-					candidate.entry = lod_entry;
-					candidate.surface = surf_data;
-					candidate.transform = instance_transform;
-					candidate.transform.origin -= state->rt_origin;
-					candidate.slot = blass.size();
-					lod_batch.candidates.push_back(candidate);
-				}
-			}
-			if (surf->rt_deformed_handle.is_valid()) {
-				// A deformed surface in the TLAS this frame: the flush counts it (D82). One with a
-				// hierarchy on a selecting frame (D87) joins the selection here, where its slot and
-				// material are known: the batch's rebuild stands in for an emissive mesh light or
-				// past the dispatch's instance limit, and a second viewport reuses the frame's build.
-				RTDeformedCacheEntry *deformed = deformed_pool.get_or_null(surf->rt_deformed_handle);
-				if (deformed && deformed->cluster_count > 0) {
-					const uint64_t frames_drawn = RD::get_singleton()->get_frames_drawn();
-					deformed->cluster_pushed_frame = frames_drawn;
-					if (surf_data != deformed->ptr) {
-						deformed->cluster_lod_pending = false; // Not the surface traced here.
-					} else if (deformed->cluster_built_frame == frames_drawn) {
-						// Built for an earlier viewport of this frame, by either path: the first
-						// viewport of a frame decides, so a G-buffer viewport rendered after a
-						// traced one traces the selection for deformed meshes, and a traced one
-						// after a G-buffer viewport traces LOD 0. Nothing is rebuilt in place
-						// twice in one frame.
-						deformed->cluster_lod_pending = false;
-					} else if (deformed->cluster_lod_pending) {
-						deformed->cluster_lod_pending = false;
-						const bool selects = !(mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT);
-						const bool fits = uint64_t(lod_batch.clas_bound) + deformed->cluster_lod_count <= cluster_lod_clas_ceiling_clusters;
-						if (selects && !fits) {
-							lod_batch.deformed_routed++; // Past the frame's CLAS region ceiling: LOD 0 through the batch.
-						}
-						if (selects && fits && lod_batch.entries.size() < cluster_lod_max_instances) {
-							Transform3D lod_transform = instance_transform;
-							lod_transform.origin -= state->rt_origin;
-							_queue_lod_deformed_instance(*deformed, lod_transform, blass.size());
-						} else {
-							uint8_t kind = deformed->cluster_lod_pending_kind;
-							if (kind == RTDeformedCacheEntry::CLUSTER_QUEUED_NONE && deformed->cluster_lod_last) {
-								kind = RTDeformedCacheEntry::CLUSTER_QUEUED_EXPIRY; // The last build was a selection: LOD 0 again first.
-							}
-							if (kind != RTDeformedCacheEntry::CLUSTER_QUEUED_NONE) {
-								_queue_deformed_cluster_rebuild(*deformed, kind);
-							}
-						}
-					}
-				}
-			}
-			blass.push_back(blas_handle);
-			geometry_data.push_back(surf_data->geometry);
-
-			if (inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED) {
-				motion_indices.push_back((int32_t)motion_transforms.size());
-				RT_InstanceMotionData motion = {};
-				Transform3D prev_final = prev_instance_transform;
-				if (surf_data->is_compressed) {
-					prev_final = prev_instance_transform * surf_data->aabb_transform;
-				}
-				prev_final.origin -= state->rt_origin;
-				RendererRD::MaterialStorage::store_transform_transposed_3x4(prev_final, motion.prev_object_to_world);
-				motion_transforms.push_back(motion);
-			} else {
-				motion_indices.push_back(-1);
-			}
-
-#ifdef TOOLS_ENABLED
-			if (collect_render_info) {
-				tlas_instance_count++;
-				uint32_t vertices = mesh_storage->mesh_surface_get_vertices_drawn_count(mesh_surface);
-				// A surface whose geometry streams draws its fallback level; the trace holds the surface (D93d).
-				uint32_t prim_count = surf_data->geometry_streamed ? surf_data->geometry.primitive_count : _rt_indices_to_primitives(surf->primitive, vertices);
-				tlas_primitive_count += prim_count;
-				uint32_t build_delta = dirty_blas_list.size() - pre_build_size;
-				uint32_t refit_delta = dirty_blas_update_list.size() - pre_refit_size;
-				rt_blas_builds += build_delta;
-				rt_blas_refits += refit_delta;
-				rt_triangles_built += prim_count * build_delta;
-				rt_triangles_refit += prim_count * refit_delta;
-			}
-#endif
-
-			sbt_offsets.push_back(mat_data->rt_sbt_offset);
-			material_data.push_back(mat_data->data);
 
 			// Determine per-instance TLAS flags from material properties.
 			uint32_t inst_flags = 0;
@@ -8025,8 +7976,142 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 				}
 			}
+			const uint8_t inst_mask = RT_INSTANCE_MASK_GEOMETRY | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0);
+
+			// The cluster LOD selection (D86): an instance of a surface whose hierarchy is on the GPU
+			// traces its own BLAS over the clusters this frame's selection picks for it, built at
+			// the flush below, unless the material is an emissive mesh light (its sampling covers
+			// the LOD 0 triangles alone, D50) or the frame's flush fails, when the surface's LOD 0
+			// BLAS stands in. The metric transforms the mesh-space spheres, so the instance's own
+			// transform, not the compressed surface's final one.
+			// Which build the instance traces is settled after the walk, where the instances of one
+			// surface can share one (D89); until then the slot holds the LOD 0 BLAS.
+			RID blas_handle = surf_data->blas;
+			// A slot-resident instance (D94b) whose BLAS this frame builds or may build after the walk
+			// is never proven unchanged here: the commit sees the BLAS it ends on.
+			bool slot_rebuilt = dirty_blas_list.size() != pre_slot_build_size || dirty_blas_update_list.size() != pre_slot_refit_size;
+			if (p_primary_from_gbuffer && surf_data->geometry_streamed) {
+				WARN_PRINT_ONCE("RT: the G-buffer primary rasterizes a surface whose geometry streams at its fallback level (D93d), coarser than the traced surface; the traced primary is the look.");
+			}
+			// An emissive material samples the surface's own triangles (D50), which a surface whose
+			// buffers hold its fallback level has only as an upload (D93d).
+			if (surf_data->geometry_streamed && (mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT)) {
+				_materialize_surface(surf_data, mesh_surface, false, true);
+			}
+			if (lod_select_frame && surf_data->cluster_lod_stream && (mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT)) {
+				blas_handle = _lod_stream_pinned_blas(surf_data); // A streamed surface's LOD 0 is its cached level 0 (D92).
+			} else if (lod_select_frame && surf_data->cluster_lod_table_offset != UINT32_MAX && !(mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT)) {
+				slot_rebuilt = true;
+				RTLodInstanceEntry *lod_entry = _access_lod_slot(surf->rt_lod_handle);
+				lod_entry->last_used_frame = RSG::rasterizer->get_frame_number();
+				if (lod_entry->pushed_frame == RD::get_singleton()->get_frames_drawn()) {
+					blas_handle = lod_entry->frame_blas; // Settled for an earlier viewport of this frame.
+				} else {
+					RTLodSelectBatch::Candidate candidate;
+					candidate.entry = lod_entry;
+					candidate.surface = surf_data;
+					candidate.transform = instance_transform;
+					candidate.transform.origin -= state->rt_origin;
+					candidate.slot = blass.size();
+					lod_batch.candidates.push_back(candidate);
+				}
+			}
+			if (surf->rt_deformed_handle.is_valid()) {
+				// A deformed surface in the TLAS this frame: the flush counts it (D82). One with a
+				// hierarchy on a selecting frame (D87) joins the selection here, where its slot and
+				// material are known: the batch's rebuild stands in for an emissive mesh light or
+				// past the dispatch's instance limit, and a second viewport reuses the frame's build.
+				RTDeformedCacheEntry *deformed = deformed_pool.get_or_null(surf->rt_deformed_handle);
+				if (deformed && deformed->cluster_count > 0) {
+					slot_rebuilt = true;
+					const uint64_t frames_drawn = RD::get_singleton()->get_frames_drawn();
+					deformed->cluster_pushed_frame = frames_drawn;
+					if (surf_data != deformed->ptr) {
+						deformed->cluster_lod_pending = false; // Not the surface traced here.
+					} else if (deformed->cluster_built_frame == frames_drawn) {
+						// Built for an earlier viewport of this frame, by either path: the first
+						// viewport of a frame decides, so a G-buffer viewport rendered after a
+						// traced one traces the selection for deformed meshes, and a traced one
+						// after a G-buffer viewport traces LOD 0. Nothing is rebuilt in place
+						// twice in one frame.
+						deformed->cluster_lod_pending = false;
+					} else if (deformed->cluster_lod_pending) {
+						deformed->cluster_lod_pending = false;
+						const bool selects = !(mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT);
+						const bool fits = uint64_t(lod_batch.clas_bound) + deformed->cluster_lod_count <= cluster_lod_clas_ceiling_clusters;
+						if (selects && !fits) {
+							lod_batch.deformed_routed++; // Past the frame's CLAS region ceiling: LOD 0 through the batch.
+						}
+						if (selects && fits && lod_batch.entries.size() < cluster_lod_max_instances) {
+							Transform3D lod_transform = instance_transform;
+							lod_transform.origin -= state->rt_origin;
+							_queue_lod_deformed_instance(*deformed, lod_transform, blass.size());
+						} else {
+							uint8_t kind = deformed->cluster_lod_pending_kind;
+							if (kind == RTDeformedCacheEntry::CLUSTER_QUEUED_NONE && deformed->cluster_lod_last) {
+								kind = RTDeformedCacheEntry::CLUSTER_QUEUED_EXPIRY; // The last build was a selection: LOD 0 again first.
+							}
+							if (kind != RTDeformedCacheEntry::CLUSTER_QUEUED_NONE) {
+								_queue_deformed_cluster_rebuild(*deformed, kind);
+							}
+						}
+					}
+				}
+			}
+
+#ifdef TOOLS_ENABLED
+			if (collect_render_info) {
+				tlas_instance_count++;
+				uint32_t vertices = mesh_storage->mesh_surface_get_vertices_drawn_count(mesh_surface);
+				// A surface whose geometry streams draws its fallback level; the trace holds the surface (D93d).
+				uint32_t prim_count = surf_data->geometry_streamed ? surf_data->geometry.primitive_count : _rt_indices_to_primitives(surf->primitive, vertices);
+				tlas_primitive_count += prim_count;
+				uint32_t build_delta = dirty_blas_list.size() - pre_build_size;
+				uint32_t refit_delta = dirty_blas_update_list.size() - pre_refit_size;
+				rt_blas_builds += build_delta;
+				rt_blas_refits += refit_delta;
+				rt_triangles_built += prim_count * build_delta;
+				rt_triangles_refit += prim_count * refit_delta;
+			}
+#endif
+
+			if (ptlas_slots_enabled) {
+				// Its slot keeps what it holds unless the instance or its rows changed (D94b).
+				const uint32_t range = _slot_range_acquire(state, inst->rt_slots, surf->surface_index, 1);
+				const uint32_t slot = slot_ranges[range].first;
+				const uint64_t geometry_generation = _surface_row_generation(surf_data);
+				const uint64_t material_generation = _material_row_generation(mat_data);
+				float rows[12];
+				_slot_relative_transform(final_transform, state->rt_origin, rows);
+				if (!slot_rebuilt && !_slot_moved(inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED, prev_instance_transform, instance_transform) && _slot_unchanged(state, slot, blas_handle, rows, inst_flags, inst_mask, mat_data->rt_sbt_offset, geometry_generation, material_generation)) {
+					surf = surf->next;
+					continue;
+				}
+				_slot_emit(slot, geometry_generation, material_generation);
+			}
+
+			blas_transforms.push_back(final_transform);
+			blass.push_back(blas_handle);
+			geometry_data.push_back(surf_data->geometry);
+
+			if (inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED) {
+				motion_indices.push_back((int32_t)motion_transforms.size());
+				RT_InstanceMotionData motion = {};
+				Transform3D prev_final = prev_instance_transform;
+				if (surf_data->is_compressed) {
+					prev_final = prev_instance_transform * surf_data->aabb_transform;
+				}
+				prev_final.origin -= state->rt_origin;
+				RendererRD::MaterialStorage::store_transform_transposed_3x4(prev_final, motion.prev_object_to_world);
+				motion_transforms.push_back(motion);
+			} else {
+				motion_indices.push_back(-1);
+			}
+
+			sbt_offsets.push_back(mat_data->rt_sbt_offset);
+			material_data.push_back(mat_data->data);
 			instance_flags.push_back(inst_flags);
-			instance_masks.push_back(RT_INSTANCE_MASK_GEOMETRY | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0));
+			instance_masks.push_back(inst_mask);
 
 			surf = surf->next;
 		}
@@ -8038,6 +8123,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 
 	for (const PendingMMSurface &pending : pending_mm_surfaces) {
+		const uint32_t mm_slot_build_size = dirty_blas_list.size();
+		const uint32_t mm_slot_refit_size = dirty_blas_update_list.size();
 #ifdef TOOLS_ENABLED
 		uint32_t mm_pre_build_size = dirty_blas_list.size();
 		uint32_t mm_pre_refit_size = dirty_blas_update_list.size();
@@ -8049,14 +8136,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 						compute_list, dirty_blas_list, dirty_blas_update_list, &merged_sd);
 
 		if (use_merged) {
-			blass.push_back(merged_sd.blas);
-			blas_transforms.push_back(pending.instance_transform);
-			geometry_data.push_back(merged_sd.geometry);
-			sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
-			material_data.push_back(pending.mat_data->data);
-			motion_indices.push_back(-1);
-			instance_flags.push_back(pending.inst_flags);
-			instance_masks.push_back(pending.inst_mask);
 #ifdef TOOLS_ENABLED
 			if (collect_render_info) {
 				tlas_instance_count++;
@@ -8070,6 +8149,29 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				rt_triangles_refit += prim_count * refit_delta;
 			}
 #endif
+			if (ptlas_slots_enabled) {
+				// One slot for the merge (D94b), its frame-local row compared by value.
+				const uint32_t range = _slot_range_acquire(state, pending.mm_surf->owner->rt_slots, pending.surface_index, 1);
+				const uint32_t slot = slot_ranges[range].first;
+				state->slot_mm_keys.erase(range); // An expanded key does not describe the merge.
+				const uint64_t geometry_generation = _local_row_generation(range, merged_sd.geometry);
+				const uint64_t material_generation = _material_row_generation(pending.mat_data);
+				float rows[12];
+				_slot_relative_transform(pending.instance_transform, state->rt_origin, rows);
+				const bool rebuilt = dirty_blas_list.size() != mm_slot_build_size || dirty_blas_update_list.size() != mm_slot_refit_size;
+				if (!rebuilt && _slot_unchanged(state, slot, merged_sd.blas, rows, pending.inst_flags, pending.inst_mask, pending.mat_data->rt_sbt_offset, geometry_generation, material_generation)) {
+					continue;
+				}
+				_slot_emit(slot, geometry_generation, material_generation);
+			}
+			blass.push_back(merged_sd.blas);
+			blas_transforms.push_back(pending.instance_transform);
+			geometry_data.push_back(merged_sd.geometry);
+			sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
+			material_data.push_back(pending.mat_data->data);
+			motion_indices.push_back(-1);
+			instance_flags.push_back(pending.inst_flags);
+			instance_masks.push_back(pending.inst_mask);
 		} else {
 			// Fallback: expanded TLAS — one entry per instance, shared BLAS.
 			const float *mm_data = mesh_storage->multimesh_get_local_data_ptr(pending.mm_rid);
@@ -8086,7 +8188,42 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				continue;
 			}
 
-			for (uint32_t mi = 0; mi < pending.mm_count; mi++) {
+			// Slot-resident (D94b): one slot per element. A range whose key is unchanged is skipped
+			// whole; otherwise each element is tested against its slot's shadow.
+			uint32_t slot_first = 0;
+			uint64_t slot_geometry_generation = 0;
+			uint64_t slot_material_generation = 0;
+			RID slot_blas;
+			bool slot_rebuilt = false;
+			bool slot_moved = false;
+			bool skip_range = false;
+			if (ptlas_slots_enabled) {
+				const uint32_t range = _slot_range_acquire(state, pending.mm_surf->owner->rt_slots, pending.surface_index, pending.mm_count);
+				slot_first = slot_ranges[range].first;
+				slot_geometry_generation = _surface_row_generation(surf_data);
+				slot_material_generation = _material_row_generation(pending.mat_data);
+				// A streamed surface's LOD 0 is its cached level 0 (D92), which the reference pins.
+				slot_blas = surf_data->cluster_lod_stream && cluster_lod_select_enabled ? _lod_stream_pinned_blas(surf_data) : surf_data->blas;
+				slot_rebuilt = dirty_blas_list.size() != mm_slot_build_size || dirty_blas_update_list.size() != mm_slot_refit_size;
+				slot_moved = _slot_moved(pending.transform_moved, pending.prev_instance_transform, pending.instance_transform);
+				RTSlotMultiMeshKey key;
+				key.instance_transform = pending.instance_transform;
+				key.origin = state->rt_origin;
+				key.blas = slot_blas;
+				key.buffer_generation = mesh_storage->multimesh_get_buffer_generation(pending.mm_rid);
+				key.geometry_generation = slot_geometry_generation;
+				key.material_generation = slot_material_generation;
+				key.count = pending.mm_count;
+				key.sbt_offset = pending.mat_data->rt_sbt_offset;
+				key.flags = pending.inst_flags;
+				key.mask = pending.inst_mask;
+				// The key is stored whenever it changed, so a rebuilt or moved range is walked whole now
+				// and may be skipped from the next build on.
+				const bool key_unchanged = _slot_multimesh_key_matches(state, range, key);
+				skip_range = !slot_rebuilt && !slot_moved && key_unchanged;
+			}
+
+			for (uint32_t mi = 0; mi < (skip_range ? 0 : pending.mm_count); mi++) {
 				const float *d = mm_data + (mm_cur_offset + mi) * mm_stride;
 				Transform3D mm_xform;
 				mm_xform.basis.rows[0][0] = d[0];
@@ -8107,8 +8244,18 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					final_transform = final_transform * surf_data->aabb_transform;
 				}
 
-				// A streamed surface's LOD 0 is its cached level 0 (D92), which the reference pins.
-				blass.push_back(surf_data->cluster_lod_stream && cluster_lod_select_enabled ? _lod_stream_pinned_blas(surf_data) : surf_data->blas);
+				if (ptlas_slots_enabled) {
+					float rows[12];
+					_slot_relative_transform(final_transform, state->rt_origin, rows);
+					if (!slot_rebuilt && !slot_moved && _slot_unchanged(state, slot_first + mi, slot_blas, rows, pending.inst_flags, pending.inst_mask, pending.mat_data->rt_sbt_offset, slot_geometry_generation, slot_material_generation)) {
+						continue;
+					}
+					_slot_emit(slot_first + mi, slot_geometry_generation, slot_material_generation);
+					blass.push_back(slot_blas);
+				} else {
+					// A streamed surface's LOD 0 is its cached level 0 (D92), which the reference pins.
+					blass.push_back(surf_data->cluster_lod_stream && cluster_lod_select_enabled ? _lod_stream_pinned_blas(surf_data) : surf_data->blas);
+				}
 				blas_transforms.push_back(final_transform);
 				geometry_data.push_back(surf_data->geometry);
 				sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
@@ -8162,7 +8309,21 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	// them; a failed flush names the handles that never got a build, and their instances leave
 	// every per-instance array here.
 	_flush_deformed_cluster_batch();
-	if (!deformed_cluster_batch.dropped_handles.is_empty()) {
+	if (!deformed_cluster_batch.dropped_handles.is_empty() && ptlas_slots_enabled) {
+		// Slot-resident (D94b): the arrays stay beside their slots, and the commit disables these.
+		for (uint32_t i = 0; i < blass.size(); i++) {
+			if (deformed_cluster_batch.dropped_handles.has(blass[i])) {
+#ifdef TOOLS_ENABLED
+				if (collect_render_info) {
+					tlas_instance_count--;
+					tlas_primitive_count -= geometry_data[i].primitive_count;
+				}
+#endif
+				blass[i] = RID();
+			}
+		}
+		deformed_cluster_batch.dropped_handles.clear();
+	} else if (!deformed_cluster_batch.dropped_handles.is_empty()) {
 		uint32_t kept = 0;
 		for (uint32_t i = 0; i < blass.size(); i++) {
 			if (deformed_cluster_batch.dropped_handles.has(blass[i])) {
@@ -8213,7 +8374,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 	SceneShaderRaytracing::get_singleton()->finalize_custom_shaders();
 
-	build_acceleration_structures(state, dirty_blas_list, dirty_blas_update_list);
+	if (!build_acceleration_structures(state, dirty_blas_list, dirty_blas_update_list)) {
+		return nullptr; // The frame skips the fog and the trace (D94b).
+	}
 	finalize_buffers(state);
 
 	return state;
@@ -8444,25 +8607,45 @@ uint32_t RenderRaytracing::gather_emissive(const RenderDataRD *p_render_data, co
 	// The shader scales emission by the exposure normalisation; the split's shares must too.
 	float exposure = p_render_data->camera_attributes.is_valid() ? RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes) : 1.0f;
 
-	for (uint32_t i = 0; i < blass.size(); i++) {
-		if (i >= material_data.size() || i >= geometry_data.size() || i >= sbt_offsets.size() || i >= instance_flags.size()) {
+	// Slot-resident instances (D94b) are read from the emissive slots the commit keeps, in slot
+	// order (the order the walk's arrays would have them in), the index a slot.
+	const bool from_slots = ptlas_slots_enabled;
+	emissive_slot_records.clear();
+	if (from_slots) {
+		for (const KeyValue<uint32_t, RTSlotEmissive> &E : p_state->emissive_slots) {
+			emissive_slot_records.push_back(Pair<uint32_t, const RTSlotEmissive *>(E.key, &E.value));
+		}
+		struct SlotComparator {
+			bool operator()(const Pair<uint32_t, const RTSlotEmissive *> &a, const Pair<uint32_t, const RTSlotEmissive *> &b) const {
+				return a.first < b.first;
+			}
+		};
+		emissive_slot_records.sort_custom<SlotComparator>();
+	}
+	const uint32_t source_count = from_slots ? emissive_slot_records.size() : blass.size();
+	for (uint32_t n = 0; n < source_count; n++) {
+		const uint32_t i = from_slots ? emissive_slot_records[n].first : n;
+		const RTSlotEmissive *record = from_slots ? emissive_slot_records[n].second : nullptr;
+		if (!from_slots && (i >= material_data.size() || i >= geometry_data.size() || i >= sbt_offsets.size() || i >= instance_flags.size())) {
 			break;
 		}
-		const RT_MaterialData &mat = material_data[i];
-		const RT_GeometryData &geom = geometry_data[i];
-		if (!(mat.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT) || sbt_offsets[i] != 0 || (geom.flags & RT_GEOM_FLAG_PROCEDURAL) || geom.primitive_count == 0) {
+		const RT_MaterialData &mat = record ? record->material : material_data[i];
+		const RT_GeometryData &geom = record ? record->geometry : geometry_data[i];
+		const uint32_t sbt_offset = record ? record->sbt_offset : sbt_offsets[i];
+		const uint32_t flags = record ? record->flags : instance_flags[i];
+		if (!(mat.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT) || sbt_offset != 0 || (geom.flags & RT_GEOM_FLAG_PROCEDURAL) || geom.primitive_count == 0) {
 			continue;
 		}
 		if (geom.vertex_buffer_address == 0 || (geom.index_format != RT_INDEX_FORMAT_NONE && geom.index_buffer_address == 0)) {
 			continue; // A surface whose geometry streams, not uploaded (D93d): its triangles cannot be sampled.
 		}
-		if (!(instance_flags[i] & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT)) {
+		if (!(flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT)) {
 			// An alpha-tested or blended emitter's any-hit skips texels a sampled point would credit; it keeps chance-hit emission.
 			continue;
 		}
 		// The instance transform already folds a compressed surface's box in (its positions are then a unit cube).
 		AABB local_box = (geom.flags & RT_GEOM_FLAG_COMPRESSED) ? AABB(Vector3(), Vector3(1, 1, 1)) : AABB(Vector3(geom.aabb_pos_x, geom.aabb_pos_y, geom.aabb_pos_z), Vector3(geom.aabb_size_x, geom.aabb_size_y, geom.aabb_size_z));
-		Transform3D relative = blas_transforms[i];
+		Transform3D relative = record ? record->transform : blas_transforms[i];
 		relative.origin -= p_state->rt_origin;
 		AABB box = relative.xform(local_box);
 		const Vector3 &sz = box.size;
@@ -8476,6 +8659,7 @@ uint32_t RenderRaytracing::gather_emissive(const RenderDataRD *p_render_data, co
 		float dist_sq = (float)(center - cam_pos).length_squared();
 		EmissiveCandidate c;
 		c.index = i;
+		c.record = record;
 		c.weight = weight;
 		c.score = weight * exposure / (dist_sq + area_proxy);
 		c.center = center;
@@ -8513,22 +8697,23 @@ uint32_t RenderRaytracing::gather_emissive(const RenderDataRD *p_render_data, co
 	for (uint32_t n = 0; n < count; n++) {
 		const EmissiveCandidate &c = candidates[n];
 		RT_EmissiveInstance &e = r_emissive_data[n];
-		Transform3D relative = blas_transforms[c.index];
+		Transform3D relative = c.record ? c.record->transform : blas_transforms[c.index];
 		relative.origin -= p_state->rt_origin;
 		RendererRD::MaterialStorage::store_transform_transposed_3x4(relative, e.xform);
-		const RT_MaterialData &mat = material_data[c.index];
+		const RT_MaterialData &mat = c.record ? c.record->material : material_data[c.index];
+		const uint32_t flags = c.record ? c.record->flags : instance_flags[c.index];
 		e.radiance[0] = mat.emission_color[0] * mat.emission_strength;
 		e.radiance[1] = mat.emission_color[1] * mat.emission_strength;
 		e.radiance[2] = mat.emission_color[2] * mat.emission_strength;
 		running += c.weight;
 		e.cdf = (n + 1 == count) ? 1.0f : (float)(running / total);
 		e.instance_index = c.index;
-		e.primitive_count = geometry_data[c.index].primitive_count;
+		e.primitive_count = c.record ? c.record->geometry.primitive_count : geometry_data[c.index].primitive_count;
 		e.flags = 0;
-		if (instance_flags[c.index] & RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT) {
+		if (flags & RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT) {
 			e.flags |= RT_EMISSIVE_FLAG_TWO_SIDED;
 		}
-		if (instance_flags[c.index] & RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT) {
+		if (flags & RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT) {
 			e.flags |= RT_EMISSIVE_FLAG_FLIP_FACING;
 		}
 		if (relative.basis.determinant() < 0.0) {

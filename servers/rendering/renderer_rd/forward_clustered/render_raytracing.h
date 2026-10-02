@@ -39,6 +39,7 @@
 #include "core/templates/local_vector.h"
 #include "core/templates/rid_owner.h"
 #include "core/templates/vector.h"
+#include "servers/rendering/mesh_cluster_lod.h"
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/cluster_lod_select.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
@@ -499,7 +500,7 @@ static constexpr uint32_t RT_CLUSTER_GEOMETRY_RECORD_WORDS = 4;
 // A blob's sections and its clusters start at this alignment. Must match the GLSL.
 static constexpr uint32_t RT_CLUSTER_GEOMETRY_ALIGNMENT = 16;
 // Blob indices are 8 bits, cluster-local.
-static constexpr uint32_t RT_CLUSTER_GEOMETRY_MAX_VERTICES = 256;
+static constexpr uint32_t RT_CLUSTER_GEOMETRY_MAX_VERTICES = MESH_CLUSTER_GEOMETRY_MAX_VERTICES;
 
 // A load of streamed groups (D92), D81's two steps at group granularity: this frame the groups'
 // CLAS are built with implicit destinations into a staging buffer, their sizes read back; when they
@@ -1022,6 +1023,8 @@ class RenderRaytracing {
 	uint64_t cluster_geometry_arena_live_bytes = 0;
 	// The population's vertex-to-local map (D93c), grown to the largest surface and kept at 0xFFFF between clusters.
 	LocalVector<uint16_t> cluster_geometry_local;
+	// Populations of surfaces the mesh storage streams the geometry of that read their own buffers (D93d).
+	uint32_t cluster_geometry_unstreamed_populations = 0;
 	HashMap<uint64_t, RTSurfaceData *> cluster_compaction_pending;
 	LocalVector<RTClusterCompactionResult> cluster_compaction_results;
 	uint64_t cluster_compaction_next_ticket = 0;
@@ -1354,6 +1357,7 @@ class RenderRaytracing {
 	// cluster table names (D80) or, without one, in runs of at most the device's cluster size; each a
 	// CLAS, one cluster BLAS over them, both built this frame into the surface's own storage. Returns
 	// false, with nothing created, if the surface does not fit.
+	void _count_unstreamed_geometry(void *p_mesh_surface, uint32_t p_cache_key, const RTSurfaceData *p_surf_data);
 	bool _populate_surface_cluster_blas(void *p_mesh_surface, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data);
 	// The clusters of a surface as the static and deformed paths both lay them out: from the
 	// surface's table (D80), or runs of at most p_max_vertices / 3 triangles without one.

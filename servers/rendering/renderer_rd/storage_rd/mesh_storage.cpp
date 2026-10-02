@@ -31,6 +31,7 @@
 #include "mesh_storage.h"
 
 #include "core/config/project_settings.h"
+#include "servers/rendering/mesh_cluster_lod.h"
 #include "servers/rendering/renderer_viewport.h"
 #include "servers/rendering/rendering_server.h"
 #include "servers/rendering/rendering_server_types.h"
@@ -55,6 +56,17 @@ bool MeshStorage::is_cluster_geometry_streaming_wanted() {
 				GLOBAL_GET("rendering/pathtracing/cluster_lod_share") && GLOBAL_GET("rendering/pathtracing/cluster_lod_cache") && GLOBAL_GET("rendering/pathtracing/cluster_blas_compaction") &&
 				GLOBAL_GET("rendering/pathtracing/cluster_lod_stream");
 		wanted = supported && stream && GLOBAL_GET("rendering/pathtracing/cluster_lod_stream_geometry") ? 1 : 0;
+	}
+	return wanted == 1;
+}
+
+bool MeshStorage::_is_cluster_geometry_ram_check_wanted() {
+	// Read once, like the switches above. A check of its own rather than --verbose: it reads every
+	// streamed surface's buffers back as the surface is added, which stalls RenderingDevice and so
+	// moves the frames D92's readbacks land in.
+	static int wanted = -1;
+	if (wanted < 0) {
+		wanted = GLOBAL_GET("rendering/pathtracing/cluster_lod_stream_geometry_ram_check") ? 1 : 0;
 	}
 	return wanted == 1;
 }
@@ -568,6 +580,9 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	}
 
 	s->vertex_count = new_surface.vertex_count;
+	s->rt_vertex_count = new_surface.vertex_count;
+	s->rt_index_count = new_surface.index_count;
+	s->rt_index_total = new_surface.index_count;
 
 	if (new_surface.format & RSE::ARRAY_FORMAT_BONES) {
 		mesh->has_bone_weights = true;
@@ -587,15 +602,26 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 		s->index_buffer_size = index_data.size();
 		s->index_count = new_surface.index_count;
 		s->index_total = index_total;
-		// Geometry residency (D93): a surface with a hierarchy's coarse levels keeps its arrays in RAM,
-		// as its buffers hold them, for the trace's blobs. The vectors share the caller's data. A
-		// skinned or blend-shaped surface is deformed, and deformed surfaces do not stream. Whether
-		// its table passes the streamable test is the population's to say; the shared test is owed
-		// with D93d, when this copy becomes the only one.
-		if (index_total > new_surface.index_count && !(new_surface.format & RSE::ARRAY_FORMAT_BONES) && mesh->blend_shape_count == 0 && is_cluster_geometry_streaming_wanted()) {
-			s->ram_vertex_data = new_surface.vertex_data;
-			s->ram_attribute_data = new_surface.attribute_data;
-			s->ram_index_data = index_data;
+		s->rt_index_total = index_total;
+		// Geometry residency (D93): a surface that streams its geometry keeps its arrays in RAM, as its
+		// buffers hold them, for the trace's blobs and for mesh_get_surface(). The vectors share the
+		// caller's data. A skinned or blend-shaped surface is deformed, and deformed surfaces do not
+		// stream; skin data marks one even without the bones flag, as for use_as_storage above. The
+		// mesh storage decides, and is the authority: the tables' tests are the ones the trace takes
+		// before it streams a surface (D93d), but the trace streams a subset of these surfaces (not
+		// the ones no instance traces, not while streaming is off or after a failed flush, not where
+		// its population fails), and stage 2 materializes the rest from this copy.
+		if (index_total > new_surface.index_count && !(new_surface.format & RSE::ARRAY_FORMAT_BONES) && new_surface.skin_data.is_empty() && mesh->blend_shape_count == 0 && is_cluster_geometry_streaming_wanted()) {
+			const RD::ClusterAccelerationStructureCapabilities &caps = RD::get_singleton()->get_cluster_acceleration_structure_capabilities();
+			LocalVector<uint16_t> local;
+			LocalVector<uint32_t> distinct;
+			if (mesh_cluster_lod_streamable(new_surface.cluster_data, new_surface.index_count, index_total, caps.max_triangles_per_cluster, caps.max_vertices_per_cluster) &&
+					mesh_cluster_lod_local_vertices(new_surface.cluster_data, index_data.ptr(), index_data.size(), is_index_16, new_surface.vertex_count, local, distinct)) {
+				s->ram_vertex_data = new_surface.vertex_data;
+				s->ram_attribute_data = new_surface.attribute_data;
+				s->ram_index_data = index_data;
+				s->ram_lods = new_surface.lods;
+			}
 		}
 		s->index_array = RD::get_singleton()->index_array_create(s->index_buffer, 0, s->index_count);
 		if (new_surface.lods.size()) {
@@ -621,6 +647,9 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 
 	s->uv_scale = new_surface.uv_scale;
 	s->cluster_data = new_surface.cluster_data;
+	if (mesh_surface_is_geometry_streamed(s) && _is_cluster_geometry_ram_check_wanted()) {
+		_mesh_surface_check_ram(*s);
+	}
 
 	if (mesh->blend_shape_count > 0) {
 		s->blend_shape_buffer = RD::get_singleton()->storage_buffer_create(new_surface.blend_shape_data.size(), new_surface.blend_shape_data);
@@ -891,8 +920,17 @@ RenderingServerTypes::SurfaceData MeshStorage::mesh_get_surface(RID p_mesh, int 
 	ERR_FAIL_NULL_V(mesh, RenderingServerTypes::SurfaceData());
 	ERR_FAIL_UNSIGNED_INDEX_V((uint32_t)p_surface, mesh->surface_count, RenderingServerTypes::SurfaceData());
 
-	Mesh::Surface &s = *mesh->surfaces[p_surface];
+	const Mesh::Surface &s = *mesh->surfaces[p_surface];
+	// A surface that streams its geometry (D93d) answers from its RAM copy, the arrays it was added
+	// with, without reading its buffers back.
+	if (mesh_surface_is_geometry_streamed(&s)) {
+		return _mesh_surface_get_from_ram(s);
+	}
+	return _mesh_surface_get_from_buffers(s);
+}
 
+RenderingServerTypes::SurfaceData MeshStorage::_mesh_surface_get_from_buffers(const Mesh::Surface &p_surface) const {
+	const Mesh::Surface &s = p_surface;
 	RenderingServerTypes::SurfaceData sd;
 	sd.format = s.format;
 	if (s.vertex_buffer.is_valid()) {
@@ -935,6 +973,73 @@ RenderingServerTypes::SurfaceData MeshStorage::mesh_get_surface(RID p_mesh, int 
 	}
 
 	return sd;
+}
+
+// The surface's arrays as it was added (D93d): its counts are the trace's, its index data the RAM
+// copy's drawn range in the index size of the whole surface. A surface that streams its geometry is
+// neither skinned nor blend-shaped, so it has no skin or blend shape data.
+RenderingServerTypes::SurfaceData MeshStorage::_mesh_surface_get_from_ram(const Mesh::Surface &p_surface) {
+	const Mesh::Surface &s = p_surface;
+	RenderingServerTypes::SurfaceData sd;
+	sd.format = s.format;
+	sd.primitive = s.primitive;
+	sd.vertex_data = s.ram_vertex_data;
+	sd.attribute_data = s.ram_attribute_data;
+	sd.vertex_count = s.rt_vertex_count;
+	sd.index_count = s.rt_index_count;
+	if (sd.index_count) {
+		const uint32_t index_size = (s.rt_vertex_count <= 65536 && s.rt_vertex_count > 0) ? sizeof(uint16_t) : sizeof(uint32_t);
+		sd.index_data = s.ram_index_data.slice(0, int64_t(sd.index_count) * index_size);
+	}
+	sd.aabb = s.aabb;
+	sd.uv_scale = s.uv_scale;
+	sd.cluster_data = s.cluster_data;
+	sd.lods = s.ram_lods;
+	sd.bone_aabbs = s.bone_aabbs;
+	sd.mesh_to_skeleton_xform = s.mesh_to_skeleton_xform;
+	return sd;
+}
+
+// The RAM check (D93d, rendering/pathtracing/cluster_lod_stream_geometry_ram_check): at a surface's
+// creation, its RAM answer against its buffers read back, byte for byte. The table, AABB, uv_scale
+// and bone fields come from the same Surface fields on both paths, so only the counts, the arrays
+// and the LODs are evidence.
+void MeshStorage::_mesh_surface_check_ram(const Mesh::Surface &p_surface) {
+	const RenderingServerTypes::SurfaceData ram = _mesh_surface_get_from_ram(p_surface);
+	const RenderingServerTypes::SurfaceData gpu = _mesh_surface_get_from_buffers(p_surface);
+	String differs;
+	if (ram.format != gpu.format || ram.primitive != gpu.primitive || ram.vertex_count != gpu.vertex_count || ram.index_count != gpu.index_count) {
+		differs += " counts";
+	}
+	if (ram.vertex_data != gpu.vertex_data) {
+		differs += " vertex";
+	}
+	if (ram.attribute_data != gpu.attribute_data) {
+		differs += " attribute";
+	}
+	if (ram.index_data != gpu.index_data) {
+		differs += " index";
+	}
+	if (!ram.skin_data.is_empty() || !gpu.skin_data.is_empty() || !ram.blend_shape_data.is_empty() || !gpu.blend_shape_data.is_empty()) {
+		differs += " deform";
+	}
+	if (ram.cluster_data != gpu.cluster_data || ram.aabb != gpu.aabb || ram.uv_scale != gpu.uv_scale || ram.bone_aabbs != gpu.bone_aabbs) {
+		differs += " fields";
+	}
+	bool lods_equal = ram.lods.size() == gpu.lods.size();
+	for (int i = 0; i < ram.lods.size() && lods_equal; i++) {
+		lods_equal = ram.lods[i].edge_length == gpu.lods[i].edge_length && ram.lods[i].index_data == gpu.lods[i].index_data;
+	}
+	if (!lods_equal) {
+		differs += " lods";
+	}
+	ram_check_surfaces++;
+	if (!differs.is_empty()) {
+		ram_check_differing++;
+		print_line(vformat("MeshStorage: a surface's RAM copy differs from its buffers (D93d):%s; %d of %d checked differ.", differs, ram_check_differing, ram_check_surfaces));
+	} else {
+		print_line(vformat("MeshStorage: a surface's RAM copy equals its buffers (D93d), %d vertices, %d indices, %d LODs; %d of %d checked differ.", ram.vertex_count, ram.index_count, ram.lods.size(), ram_check_differing, ram_check_surfaces));
+	}
 }
 
 int MeshStorage::mesh_get_surface_count(RID p_mesh) const {

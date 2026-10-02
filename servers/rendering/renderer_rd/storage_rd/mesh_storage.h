@@ -120,8 +120,8 @@ private:
 			uint32_t index_buffer_size = 0;
 			RID index_array;
 			uint32_t index_count = 0;
-			// The indices the buffer holds: index_count, plus a cluster LOD hierarchy's coarse
-			// levels when they were appended at upload (D85).
+			// The indices the raster's index buffer holds: index_count, plus a cluster LOD hierarchy's
+			// coarse levels when they were appended at upload (D85).
 			uint32_t index_total = 0;
 
 			struct LOD {
@@ -149,12 +149,24 @@ private:
 			// describes; the cluster BLAS builds from it. Kept so mesh_get_surface() returns it.
 			Vector<uint8_t> cluster_data;
 			// Geometry residency (D93): with rendering/pathtracing/cluster_lod_stream_geometry and
-			// cluster_lod_stream on, a surface whose index buffer carries a hierarchy's coarse levels
-			// keeps in RAM the bytes its vertex, attribute and index buffers were made from (the index
-			// data with its coarse tail), from which the trace's per-group blobs are gathered.
+			// cluster_lod_stream on, a surface that streams its geometry (its hierarchy's coarse levels
+			// appended to its index data, and mesh_cluster_lod_streamable() and
+			// mesh_cluster_lod_local_vertices() passing, D93d) keeps in RAM the arrays it was added
+			// with: the vertex and attribute bytes, the index bytes with their coarse tail, and Godot's
+			// LOD index arrays. The trace's per-group blobs are gathered from them and
+			// mesh_get_surface() returns them. Present exactly while the surface streams its geometry:
+			// the mesh storage decides that, and the trace streams a subset of these surfaces.
 			Vector<uint8_t> ram_vertex_data;
 			Vector<uint8_t> ram_attribute_data;
 			Vector<uint8_t> ram_index_data;
+			Vector<RenderingServerTypes::SurfaceData::LOD> ram_lods;
+			// The layout the trace reads (D93d): the surface's whole vertex and index counts, and its
+			// indices with a hierarchy's coarse levels. The raster's vertex_count, index_count and
+			// index_total describe what its buffers hold, which for a surface that streams its geometry
+			// is to become a fallback level; these stay the surface's own.
+			uint32_t rt_vertex_count = 0;
+			uint32_t rt_index_count = 0;
+			uint32_t rt_index_total = 0;
 
 			RID blend_shape_buffer;
 			uint32_t blend_shape_buffer_size = 0;
@@ -240,7 +252,16 @@ private:
 		r_surface.ram_vertex_data.clear();
 		r_surface.ram_attribute_data.clear();
 		r_surface.ram_index_data.clear();
+		r_surface.ram_lods.clear();
 	}
+	// mesh_get_surface() from the GPU buffers, and for a surface that streams its geometry from its
+	// RAM copy (D93d).
+	RenderingServerTypes::SurfaceData _mesh_surface_get_from_buffers(const Mesh::Surface &p_surface) const;
+	static RenderingServerTypes::SurfaceData _mesh_surface_get_from_ram(const Mesh::Surface &p_surface);
+	void _mesh_surface_check_ram(const Mesh::Surface &p_surface);
+	static bool _is_cluster_geometry_ram_check_wanted();
+	uint32_t ram_check_surfaces = 0;
+	uint32_t ram_check_differing = 0;
 
 	void _mesh_instance_clear(MeshInstance *mi);
 	void _mesh_instance_add_surface(MeshInstance *mi, Mesh *mesh, uint32_t p_surface);
@@ -517,14 +538,33 @@ public:
 		return s->uv_scale;
 	}
 
-	_FORCE_INLINE_ uint32_t mesh_surface_get_index_total(void *p_surface) {
-		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
-		return s->index_total;
-	}
-
 	_FORCE_INLINE_ const Vector<uint8_t> &mesh_surface_get_cluster_data(void *p_surface) {
 		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
 		return s->cluster_data;
+	}
+
+	// The trace's layout (D93d): the surface's whole vertex and index counts, whatever its buffers hold.
+	_FORCE_INLINE_ uint32_t mesh_surface_get_rt_vertex_count(void *p_surface) {
+		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
+		return s->rt_vertex_count;
+	}
+
+	_FORCE_INLINE_ uint32_t mesh_surface_get_rt_index_count(void *p_surface) {
+		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
+		return s->rt_index_count;
+	}
+
+	_FORCE_INLINE_ uint32_t mesh_surface_get_rt_index_total(void *p_surface) {
+		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
+		return s->rt_index_total;
+	}
+
+	// Whether the surface streams its geometry (D93d): it keeps its arrays in RAM. The mesh storage
+	// decides; the trace streams a subset of these surfaces and must not read the others' buffers
+	// as the whole surface once they hold a fallback level.
+	_FORCE_INLINE_ bool mesh_surface_is_geometry_streamed(const void *p_surface) const {
+		const Mesh::Surface *s = reinterpret_cast<const Mesh::Surface *>(p_surface);
+		return !s->ram_index_data.is_empty();
 	}
 
 	// The surface's arrays in RAM (D93), empty unless it keeps them.

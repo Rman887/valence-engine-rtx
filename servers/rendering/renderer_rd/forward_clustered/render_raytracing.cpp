@@ -1296,8 +1296,9 @@ static void _fill_surface_geometry_data(
 		*r_index_buffer = index_buffer;
 	}
 
-	uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(p_mesh_surface);
-	uint32_t index_count = mesh_storage->mesh_surface_get_index_count(p_mesh_surface, 0);
+	// The surface's whole counts (D93d), which its buffers hold unless it streams its geometry.
+	uint32_t vertex_count = mesh_storage->mesh_surface_get_rt_vertex_count(p_mesh_surface);
+	uint32_t index_count = mesh_storage->mesh_surface_get_rt_index_count(p_mesh_surface);
 
 	geom.vertex_count = vertex_count;
 
@@ -1450,6 +1451,7 @@ void RenderRaytracing::_populate_surface_blas(
 	if (cluster_blas_enabled) {
 		if (p_vertex_buffer_override.is_null() && !p_allow_update && !is_2d && index_buffer.is_valid() && index_count > 0) {
 			if (_populate_surface_cluster_blas(p_mesh_surface, vertex_buffer, index_buffer, p_cache_key, r_surf_data)) {
+				_count_unstreamed_geometry(p_mesh_surface, p_cache_key, r_surf_data);
 				return;
 			}
 			_release_cluster_geometry(r_surf_data); // A triangle BLAS reads the surface's own buffers.
@@ -1457,6 +1459,7 @@ void RenderRaytracing::_populate_surface_blas(
 			print_verbose(vformat("RT: surface [%d] on the triangle BLAS path (deformed %d, 2D %d, indexed %d).", p_cache_key, int(p_vertex_buffer_override.is_valid() || p_allow_update), int(is_2d), int(index_buffer.is_valid() && index_count > 0)));
 		}
 	}
+	_count_unstreamed_geometry(p_mesh_surface, p_cache_key, r_surf_data);
 
 	// Create BLAS using the new geometry-based API.
 	{
@@ -1497,6 +1500,16 @@ void RenderRaytracing::_populate_surface_blas(
 				String(p_vertex_buffer_override.is_valid() ? "RT BLAS deformed [" : "RT BLAS [") + itos(p_cache_key) + "]");
 		r_dirty_blas_list.push_back(r_surf_data->blas);
 	}
+}
+
+// Stage 2's materialization worklist (D93d): a surface the mesh storage streams the geometry of,
+// whose trace nonetheless reads the surface's own buffers.
+void RenderRaytracing::_count_unstreamed_geometry(void *p_mesh_surface, uint32_t p_cache_key, const RTSurfaceData *p_surf_data) {
+	if (!RendererRD::MeshStorage::get_singleton()->mesh_surface_is_geometry_streamed(p_mesh_surface) || (p_surf_data->geometry.flags & RT_GEOM_FLAG_CLUSTER_GEOMETRY)) {
+		return;
+	}
+	cluster_geometry_unstreamed_populations++;
+	print_verbose(vformat("RT: surface [%d] streams its geometry in the mesh storage, but the trace reads its own buffers (%d such populations over the run; D93d's stage 2 materializes them).", p_cache_key, cluster_geometry_unstreamed_populations));
 }
 
 bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data) {
@@ -1855,7 +1868,7 @@ void RenderRaytracing::_cluster_layout_for_surface(void *p_mesh_surface, uint32_
 				// A table marked stale (its positions updated in place since it was built, D86) is
 				// taken as its LOD 0 clusters: the coarse levels no longer describe the surface.
 				const bool stale = (table[7] & RenderingServerTypes::MESH_CLUSTER_LOD_FLAG_STALE) != 0;
-				const bool tailed = valid && !stale && coarse_triangles > 0 && uint64_t(RendererRD::MeshStorage::get_singleton()->mesh_surface_get_index_total(p_mesh_surface)) >= (uint64_t(table[5]) + coarse_triangles) * 3;
+				const bool tailed = valid && !stale && coarse_triangles > 0 && uint64_t(RendererRD::MeshStorage::get_singleton()->mesh_surface_get_rt_index_total(p_mesh_surface)) >= (uint64_t(table[5]) + coarse_triangles) * 3;
 				const uint32_t taken = tailed ? cluster_count : lod0_clusters;
 				if (valid) {
 					r_layout.triangles.reserve(taken);
@@ -2957,40 +2970,12 @@ bool RenderRaytracing::_populate_cluster_geometry(void *p_mesh_surface, const RT
 	_cluster_geometry_strides(geom, normal_stride, attribute_stride);
 
 	// Each cluster's distinct vertices, the count its blob section and its build use: within the
-	// 8-bit indices and the bound the builds are sized with, its triangles in order.
-	if (cluster_geometry_local.size() < vertex_count) {
-		const uint32_t from = cluster_geometry_local.size();
-		cluster_geometry_local.resize(vertex_count);
-		memset(cluster_geometry_local.ptr() + from, 0xFF, sizeof(uint16_t) * (vertex_count - from));
-	}
-	uint16_t *local = cluster_geometry_local.ptr();
+	// 8-bit indices and the bound the builds are sized with, its triangles in order. The test is the
+	// one the mesh storage took (D93d).
 	LocalVector<uint32_t> distinct;
-	distinct.resize(cluster_count);
-	LocalVector<uint32_t> seen;
-	const uint8_t *index_bytes = index_data.ptr();
-	uint64_t cursor = 0;
-	for (uint32_t c = 0; c < cluster_count; c++) {
-		const uint64_t first = uint64_t(p_stream->cluster_first_triangle[c]) * 3;
-		const uint64_t end = first + uint64_t(p_layout.triangles[c]) * 3;
-		bool valid = cursor == first;
-		for (uint64_t i = first; i < end && valid; i++) {
-			const uint32_t index = index_16 ? reinterpret_cast<const uint16_t *>(index_bytes)[i] : reinterpret_cast<const uint32_t *>(index_bytes)[i];
-			valid = index < vertex_count;
-			if (valid && local[index] == 0xFFFF) {
-				local[index] = uint16_t(seen.size());
-				seen.push_back(index);
-			}
-		}
-		cursor = end;
-		distinct[c] = seen.size();
-		for (const uint32_t vertex : seen) {
-			local[vertex] = 0xFFFF;
-		}
-		seen.clear();
-		if (!valid || distinct[c] > MIN(RT_CLUSTER_GEOMETRY_MAX_VERTICES, p_stream->max_vertices)) {
-			print_verbose(vformat("RT: cluster BLAS [%d] streams its CLAS but reads its own buffers: cluster %d indexes past the surface, out of order or past %d vertices (D93b).", p_cache_key, c, MIN(RT_CLUSTER_GEOMETRY_MAX_VERTICES, p_stream->max_vertices)));
-			return false;
-		}
+	if (!mesh_cluster_lod_local_vertices(RendererRD::MeshStorage::get_singleton()->mesh_surface_get_cluster_data(p_mesh_surface), index_data.ptr(), index_data.size(), index_16, vertex_count, cluster_geometry_local, distinct) || distinct.size() != cluster_count) {
+		print_verbose(vformat("RT: cluster BLAS [%d] streams its CLAS but reads its own buffers: a cluster indexes past the surface or past %d vertices (D93b).", p_cache_key, MIN(RT_CLUSTER_GEOMETRY_MAX_VERTICES, p_stream->max_vertices)));
+		return false;
 	}
 	bool sized = true;
 	for (RTLodStreamGroup &group : p_stream->groups) {
@@ -3925,22 +3910,25 @@ static _FORCE_INLINE_ bool _lod_stream_pinned(const RTLodStream *p_stream, uint6
 // build infos assume it), its links must stay inside the table, every refinement must go one depth
 // finer (its finest level is a cached level, D90, which needs that) and its bounds and errors must
 // be numbers (the tree's test). The persistent groups are the terminal ones, the coarsest of their
-// part of the surface; their clusters, in runs in cluster order, are the population's build.
+// part of the surface; their clusters, in runs in cluster order, are the population's build. The
+// test is mesh_cluster_lod_streamable(), which the mesh storage takes too when it decides whether a
+// surface streams its geometry (D93d).
 RTLodStream *RenderRaytracing::_create_lod_stream(void *p_mesh_surface, const RTClusterLayout &p_layout, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key) {
 	const uint32_t HEADER_WORDS = RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS;
 	const uint32_t CLUSTER_WORDS = RenderingServerTypes::MESH_CLUSTER_LOD_CLUSTER_WORDS;
 	const uint32_t GROUP_WORDS = RenderingServerTypes::MESH_CLUSTER_LOD_GROUP_WORDS;
-	const Vector<uint8_t> &table_bytes = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_cluster_data(p_mesh_surface);
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	const Vector<uint8_t> &table_bytes = mesh_storage->mesh_surface_get_cluster_data(p_mesh_surface);
+	const RD::ClusterAccelerationStructureCapabilities &caps = RD::get_singleton()->get_cluster_acceleration_structure_capabilities();
 	const uint32_t cluster_count = p_layout.triangles.size();
-	if (table_bytes.size() < int64_t(HEADER_WORDS * sizeof(uint32_t))) {
+	if (!mesh_cluster_lod_streamable(table_bytes, mesh_storage->mesh_surface_get_rt_index_count(p_mesh_surface), mesh_storage->mesh_surface_get_rt_index_total(p_mesh_surface), caps.max_triangles_per_cluster, caps.max_vertices_per_cluster)) {
+		WARN_PRINT_ONCE(vformat("RT: cluster BLAS [%d]: the hierarchy cannot stream (its groups' runs, links or depths are not as the residency needs); every level stays built.", p_cache_key));
 		return nullptr;
 	}
 	const uint32_t *table = reinterpret_cast<const uint32_t *>(table_bytes.ptr());
 	const uint32_t group_count = table[2];
 	const uint32_t level_count = table[3];
-	if (table[0] != RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION || table[1] != cluster_count || group_count == 0 || level_count < 2 || level_count > group_count) {
-		return nullptr;
-	}
+	ERR_FAIL_COND_V(table[1] != cluster_count, nullptr); // The layout took every level of this very table.
 	const uint32_t *cluster_words = table + HEADER_WORDS;
 	const uint32_t *group_words = cluster_words + uint64_t(CLUSTER_WORDS) * cluster_count;
 
@@ -3959,39 +3947,22 @@ RTLodStream *RenderRaytracing::_create_lod_stream(void *p_mesh_surface, const RT
 		stream->depth_resident[l] = 0;
 		stream->level_last_used[l] = 0;
 	}
-	bool valid = true;
-	uint64_t covered = 0;
-	for (uint32_t g = 0; g < group_count && valid; g++) {
+	for (uint32_t g = 0; g < group_count; g++) {
 		const uint32_t *w = group_words + uint64_t(g) * GROUP_WORDS;
 		RTLodStreamGroup &group = stream->groups[g];
 		group.depth = w[0];
 		group.first_cluster = w[1];
 		group.cluster_count = w[2];
-		valid = group.depth < level_count && group.cluster_count > 0 && uint64_t(group.first_cluster) + group.cluster_count <= cluster_count;
-		for (int k = 3; k < 8 && valid; k++) {
-			valid = !Math::is_nan(_bits_float(w[k]));
-		}
-		for (uint32_t c = group.first_cluster; c < group.first_cluster + group.cluster_count && valid; c++) {
-			valid = cluster_words[uint64_t(c) * CLUSTER_WORDS + 1] == g;
-		}
-		covered += group.cluster_count;
 		if (_bits_float(w[7]) >= 3.0e38f) {
 			group.state = RTLodStreamGroup::PERSISTENT;
-		} else if (valid) {
+		} else {
 			stream->depth_streamed[group.depth]++;
 			stream->absent_groups++;
 		}
 	}
-	valid = valid && covered == cluster_count;
-	// Each cluster's refinement one depth finer, and each group's children (the groups its clusters
-	// were simplified from, each once) and from them its parents, as two runs of the links.
-	for (uint32_t c = 0; c < cluster_count && valid; c++) {
-		const uint32_t *w = cluster_words + uint64_t(c) * CLUSTER_WORDS;
-		const int32_t refined = int32_t(w[2]);
-		const uint32_t depth = stream->groups[w[1]].depth;
-		valid = refined < int32_t(group_count) && (refined < 0 ? depth == 0 : depth > 0 && stream->groups[refined].depth == depth - 1);
-	}
-	if (valid) {
+	// Each group's children (the groups its clusters were simplified from, each once) and from them
+	// its parents, as two runs of the links.
+	{
 		for (uint32_t g = 0; g < group_count; g++) {
 			RTLodStreamGroup &group = stream->groups[g];
 			group.children_first = stream->links.size();
@@ -4055,11 +4026,6 @@ RTLodStream *RenderRaytracing::_create_lod_stream(void *p_mesh_surface, const RT
 			stream->persistent_triangles += p_layout.triangles[c];
 			stream->persistent_vertices += p_layout.vertices[c];
 		}
-	}
-	if (!valid || stream->persistent_clusters == 0 || stream->persistent_clusters == cluster_count) {
-		WARN_PRINT_ONCE(vformat("RT: cluster BLAS [%d]: the hierarchy cannot stream (its groups' runs, links or depths are not as the residency needs); every level stays built.", p_cache_key));
-		memdelete(stream);
-		return nullptr;
 	}
 	print_verbose(vformat("RT: cluster BLAS [%d] streams (D92): %d groups, %d persistent in %d clusters, %d refined into nothing (requested by their own test).", p_cache_key, group_count, group_count - stream->absent_groups, stream->persistent_clusters, stream->root_groups));
 	return stream;
@@ -4951,7 +4917,7 @@ void RenderRaytracing::_process_lod_stream() {
 				upload_p50 = lod_stream_stats.upload_frames[lod_stream_stats.upload_frames.size() / 2];
 				upload_max = lod_stream_stats.upload_frames[lod_stream_stats.upload_frames.size() - 1];
 			}
-			print_verbose(vformat("RT: cluster geometry (D93c): %d KB of blobs resident with their groups (in the figures above) and %d KB persistent, %d KB in %d KB of arena chunks; uploads (blobs and staged positions) p50 %d KB, max %d KB a frame over %d frames with loads since the last report, %d KB over the run (cap %d KB a frame), deferred %d for the upload cap; loads on the render thread (gathers issued and placed, builds recorded) %d us at most in a frame since the last report, %d us over the run, gathers issued %d frames after admission, %d waited for over the run, %d in flight.", resident_blob_bytes / 1024, persistent_blob_bytes / 1024, cluster_geometry_arena_live_bytes / 1024, cluster_geometry_arena_reserved_bytes / 1024, upload_p50, upload_max, lod_stream_stats.upload_frames.size(), lod_stream_stats.uploaded_bytes / 1024, cluster_lod_stream_upload_cap / 1024, lod_stream_stats.deferred_upload, lod_stream_stats.gather_max_usec, lod_stream_stats.gather_usec, RT_LOD_STREAM_GATHER_LATENCY, lod_stream_stats.gather_waits, cluster_lod_stream_gathers.size()));
+			print_verbose(vformat("RT: cluster geometry (D93c): %d KB of blobs resident with their groups (in the figures above) and %d KB persistent, %d KB in %d KB of arena chunks; uploads (blobs and staged positions) p50 %d KB, max %d KB a frame over %d frames with loads since the last report, %d KB over the run (cap %d KB a frame), deferred %d for the upload cap; loads on the render thread (gathers issued and placed, builds recorded) %d us at most in a frame since the last report, %d us over the run, gathers issued %d frames after admission, %d waited for over the run, %d in flight; %d populations over the run read their own buffers though the mesh storage streams their geometry (D93d).", resident_blob_bytes / 1024, persistent_blob_bytes / 1024, cluster_geometry_arena_live_bytes / 1024, cluster_geometry_arena_reserved_bytes / 1024, upload_p50, upload_max, lod_stream_stats.upload_frames.size(), lod_stream_stats.uploaded_bytes / 1024, cluster_lod_stream_upload_cap / 1024, lod_stream_stats.deferred_upload, lod_stream_stats.gather_max_usec, lod_stream_stats.gather_usec, RT_LOD_STREAM_GATHER_LATENCY, lod_stream_stats.gather_waits, cluster_lod_stream_gathers.size(), cluster_geometry_unstreamed_populations));
 			lod_stream_stats.gather_max_usec = 0;
 			lod_stream_stats.upload_frames.clear();
 		}

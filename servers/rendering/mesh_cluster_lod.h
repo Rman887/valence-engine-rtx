@@ -52,3 +52,11 @@ bool mesh_cluster_lod_streamable(const Vector<uint8_t> &p_cluster_data, uint32_t
 // vertex-to-local map at 0xFFFF, grown as needed and left so. Call it only on a table the first
 // accepted.
 bool mesh_cluster_lod_local_vertices(const Vector<uint8_t> &p_cluster_data, const uint8_t *p_index_data, uint64_t p_index_bytes, bool p_index_16, uint32_t p_vertex_count, LocalVector<uint16_t> &r_scratch, LocalVector<uint32_t> &r_distinct);
+
+// The fallback level of a surface that streams its geometry (D93d), which the raster draws: the
+// coarsest discrete level (D90's rule, a valid cut: a cluster is in the depths from just under the
+// group it was simplified from, 0 at LOD 0, down to its own group's depth, or to the last depth when
+// its group is terminal) with at least p_ratio of LOD 0's triangles. r_runs takes its clusters as
+// (first triangle in [LOD 0 | coarse tail], triangle count) pairs in cluster order. Call it only on
+// a table mesh_cluster_lod_streamable() accepted.
+void mesh_cluster_lod_fallback_level(const Vector<uint8_t> &p_cluster_data, float p_ratio, LocalVector<uint32_t> &r_runs, uint32_t &r_depth, uint64_t &r_triangles);

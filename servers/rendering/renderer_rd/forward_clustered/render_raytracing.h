@@ -455,6 +455,20 @@ struct RTSurfaceData {
 	uint32_t cluster_geometry_offset = UINT32_MAX; // Words; UINT32_MAX when the hits read the surface's own buffers.
 	uint32_t cluster_geometry_words = 0;
 	LocalVector<RTClusterArenaRegion> cluster_geometry_blobs; // Per group; chunk -1 while it has none.
+	// Geometry residency (D93d): the mesh storage streams this surface's geometry, so its own buffers
+	// hold the fallback level the raster draws. The trace reads the surface through its blobs, and
+	// `geometry` addresses no buffer; where it must read the whole surface's buffers (its population
+	// could not stream it, an emissive material samples its triangles, a MultiMesh merge bakes from
+	// it), they are uploaded from the mesh storage's RAM copy into buffers of its own, which
+	// `geometry` then addresses. Held for the population's life, or released past the minimum age
+	// without use.
+	bool geometry_streamed = false;
+	bool materialized_held = false;
+	RID materialized_vertex_buffer;
+	RID materialized_attribute_buffer;
+	RID materialized_index_buffer;
+	uint64_t materialized_bytes = 0;
+	uint64_t materialized_frame = 0;
 };
 
 // An instance's cluster BLAS over the clusters the LOD selection picks for it (D86): its own
@@ -1025,6 +1039,18 @@ class RenderRaytracing {
 	LocalVector<uint16_t> cluster_geometry_local;
 	// Populations of surfaces the mesh storage streams the geometry of that read their own buffers (D93d).
 	uint32_t cluster_geometry_unstreamed_populations = 0;
+	// Uploads of such surfaces' arrays (D93d): those released past the minimum age without use, and
+	// the bytes held now, at most, and the uploads made over the run.
+	LocalVector<RTSurfaceData *> materialized_transient;
+	uint64_t materialized_live_bytes = 0;
+	uint64_t materialized_peak_bytes = 0;
+	uint32_t materialized_uploads = 0;
+	uint64_t materialized_swept_frame = 0;
+	// A frame's transient uploads (an emissive material's, a merge's bake), within
+	// cluster_lod_stream_upload_cap in the walk's order; the first of a frame always goes.
+	uint64_t materialized_frame_bytes = 0;
+	uint32_t materialized_frame_uploads = 0;
+	uint32_t materialized_deferred = 0; // Over the run.
 	HashMap<uint64_t, RTSurfaceData *> cluster_compaction_pending;
 	LocalVector<RTClusterCompactionResult> cluster_compaction_results;
 	uint64_t cluster_compaction_next_ticket = 0;
@@ -1358,7 +1384,11 @@ class RenderRaytracing {
 	// CLAS, one cluster BLAS over them, both built this frame into the surface's own storage. Returns
 	// false, with nothing created, if the surface does not fit.
 	void _count_unstreamed_geometry(void *p_mesh_surface, uint32_t p_cache_key, const RTSurfaceData *p_surf_data);
-	bool _populate_surface_cluster_blas(void *p_mesh_surface, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data);
+	bool _materialize_surface(RTSurfaceData *p_surf_data, void *p_mesh_surface, bool p_held, bool p_capped = false);
+	void _release_materialized(RTSurfaceData *p_surf_data);
+	void _sweep_materialized();
+	bool _plan_merged_mm(RID p_mm_rid, RID p_mm_gpu_buffer, void *p_mesh_surface, uint32_t p_mm_count, uint32_t p_surface_index, uint32_t p_surface_counter, bool &r_bakes);
+	bool _populate_surface_cluster_blas(void *p_mesh_surface, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data, bool p_blobs_only = false);
 	// The clusters of a surface as the static and deformed paths both lay them out: from the
 	// surface's table (D80), or runs of at most p_max_vertices / 3 triangles without one.
 	// A cluster LOD table (D85) lists every level's clusters, the LOD 0 clusters first: the
@@ -1493,6 +1523,7 @@ class RenderRaytracing {
 			uint32_t p_surface_index,
 			uint32_t p_surface_counter,
 			const AABB &p_mm_aabb,
+			const RTSurfaceData *p_source,
 			RD::ComputeListID p_compute_list,
 			LocalVector<RID> &r_dirty_blas_list,
 			LocalVector<RID> &r_dirty_blas_update_list,

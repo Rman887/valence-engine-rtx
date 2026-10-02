@@ -167,3 +167,56 @@ bool mesh_cluster_lod_local_vertices(const Vector<uint8_t> &p_cluster_data, cons
 	}
 	return valid;
 }
+
+void mesh_cluster_lod_fallback_level(const Vector<uint8_t> &p_cluster_data, float p_ratio, LocalVector<uint32_t> &r_runs, uint32_t &r_depth, uint64_t &r_triangles) {
+	const uint32_t CLUSTER_WORDS = RenderingServerTypes::MESH_CLUSTER_LOD_CLUSTER_WORDS;
+	const uint32_t GROUP_WORDS = RenderingServerTypes::MESH_CLUSTER_LOD_GROUP_WORDS;
+	const uint32_t *table = reinterpret_cast<const uint32_t *>(p_cluster_data.ptr());
+	const uint32_t cluster_count = table[1];
+	const uint32_t level_count = table[3];
+	const uint32_t *cluster_words = table + RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS;
+	const uint32_t *group_words = cluster_words + uint64_t(CLUSTER_WORDS) * cluster_count;
+
+	// Each cluster's depths, and each depth's triangles.
+	LocalVector<uint64_t> level_triangles;
+	level_triangles.resize(level_count);
+	for (uint64_t &triangles : level_triangles) {
+		triangles = 0;
+	}
+	LocalVector<uint32_t> first_depth;
+	LocalVector<uint32_t> last_depth;
+	first_depth.resize(cluster_count);
+	last_depth.resize(cluster_count);
+	for (uint32_t c = 0; c < cluster_count; c++) {
+		const uint32_t *w = cluster_words + uint64_t(c) * CLUSTER_WORDS;
+		const uint32_t *group = group_words + uint64_t(w[1]) * GROUP_WORDS;
+		const int32_t refined = int32_t(w[2]);
+		float error;
+		memcpy(&error, group + 7, sizeof(float));
+		first_depth[c] = refined < 0 ? 0 : group_words[uint64_t(refined) * GROUP_WORDS] + 1;
+		last_depth[c] = error >= 3.0e38f ? level_count - 1 : MIN(group[0], level_count - 1);
+		for (uint32_t l = first_depth[c]; l <= last_depth[c]; l++) {
+			level_triangles[l] += w[0] & 0xFFFFu;
+		}
+	}
+	const uint64_t wanted = uint64_t(Math::ceil(double(level_triangles[0]) * double(CLAMP(p_ratio, 0.0f, 1.0f))));
+	r_depth = 0;
+	for (uint32_t l = level_count; l-- > 0;) {
+		if (level_triangles[l] >= MAX(wanted, uint64_t(1))) {
+			r_depth = l;
+			break;
+		}
+	}
+	r_triangles = level_triangles[r_depth];
+
+	r_runs.clear();
+	uint32_t first_triangle = 0;
+	for (uint32_t c = 0; c < cluster_count; c++) {
+		const uint32_t triangles = cluster_words[uint64_t(c) * CLUSTER_WORDS] & 0xFFFFu;
+		if (first_depth[c] <= r_depth && r_depth <= last_depth[c]) {
+			r_runs.push_back(first_triangle);
+			r_runs.push_back(triangles);
+		}
+		first_triangle += triangles;
+	}
+}

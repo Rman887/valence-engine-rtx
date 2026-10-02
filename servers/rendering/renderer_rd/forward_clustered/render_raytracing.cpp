@@ -1421,6 +1421,28 @@ void RenderRaytracing::_populate_surface_blas(
 	RD *rd = RD::get_singleton();
 	RT_GeometryData &geom = r_surf_data->geometry;
 
+	// Geometry residency (D93d): a surface whose geometry the mesh storage streams has its fallback
+	// level in its buffers, which the trace never reads. Its blobs carry its hits, with no buffer
+	// addressed; where they cannot (no stream, a failed population, an allocation), the surface's
+	// arrays are uploaded from the RAM copy for the population's life and it builds from those.
+	r_surf_data->geometry_streamed = p_vertex_buffer_override.is_null() && RendererRD::MeshStorage::get_singleton()->mesh_surface_is_geometry_streamed(p_mesh_surface);
+	if (r_surf_data->geometry_streamed) {
+		vertex_buffer = RID();
+		attribute_buffer = RID();
+		index_buffer = RID();
+		if (cluster_blas_enabled && !p_allow_update && geom.primitive_count > 0 && _populate_surface_cluster_blas(p_mesh_surface, RID(), RID(), p_cache_key, r_surf_data, true)) {
+			return;
+		}
+		_release_cluster_geometry(r_surf_data);
+		if (!_materialize_surface(r_surf_data, p_mesh_surface, true)) {
+			WARN_PRINT_ONCE(vformat("RT: surface [%d] streams its geometry, and neither its blobs nor an upload of its arrays could be made; it is not traced.", p_cache_key));
+			return;
+		}
+		vertex_buffer = r_surf_data->materialized_vertex_buffer;
+		attribute_buffer = r_surf_data->materialized_attribute_buffer;
+		index_buffer = r_surf_data->materialized_index_buffer;
+	}
+
 	// Hit shaders read these through their addresses; an in-place update must wait for an earlier frame's trace.
 	// An override is a per-frame copy, declared on the trace instead (register_raytracing_buffer_dependencies).
 	if (vertex_buffer.is_valid()) {
@@ -1509,16 +1531,135 @@ void RenderRaytracing::_count_unstreamed_geometry(void *p_mesh_surface, uint32_t
 		return;
 	}
 	cluster_geometry_unstreamed_populations++;
-	print_verbose(vformat("RT: surface [%d] streams its geometry in the mesh storage, but the trace reads its own buffers (%d such populations over the run; D93d's stage 2 materializes them).", p_cache_key, cluster_geometry_unstreamed_populations));
+	print_verbose(vformat("RT: surface [%d] streams its geometry in the mesh storage, but the trace reads an upload of its arrays (%d such populations over the run, D93d).", p_cache_key, cluster_geometry_unstreamed_populations));
 }
 
-bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data) {
+// Uploads of a streamed surface's arrays (D93d), as RTSurfaceData describes them: the RAM copy's
+// vertex (padded as the mesh storage pads it), attribute and index data, the coarse tail included,
+// in buffers the surface data owns, which `geometry` addresses. A transient upload is touched by each
+// frame that needs it and released past the minimum age; a held one lives with the population. A
+// capped upload (an emissive material's, a merge's bake) counts against cluster_lod_stream_upload_cap
+// in the walk's order, so which frame it lands in never depends on timing; past the cap it waits for
+// a later frame (the merge takes the expanded path, the emissive sampling skips the surface), and
+// the first of a frame always goes. A population's upload, the fallback when blobs fail, is not capped.
+bool RenderRaytracing::_materialize_surface(RTSurfaceData *p_surf_data, void *p_mesh_surface, bool p_held, bool p_capped) {
+	RD *rd = RD::get_singleton();
+	p_surf_data->materialized_frame = rd->get_frames_drawn();
+	if (p_surf_data->materialized_vertex_buffer.is_valid()) {
+		if (p_held && !p_surf_data->materialized_held) {
+			p_surf_data->materialized_held = true;
+			materialized_transient.erase(p_surf_data);
+		}
+		return true;
+	}
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	const Vector<uint8_t> &ram_vertices = mesh_storage->mesh_surface_get_ram_vertex_data(p_mesh_surface);
+	const Vector<uint8_t> &ram_attributes = mesh_storage->mesh_surface_get_ram_attribute_data(p_mesh_surface);
+	const Vector<uint8_t> &ram_indices = mesh_storage->mesh_surface_get_ram_index_data(p_mesh_surface);
+	RT_GeometryData &geom = p_surf_data->geometry;
+	if (ram_vertices.is_empty() || ram_indices.is_empty() || geom.index_format == RT_INDEX_FORMAT_NONE) {
+		return false;
+	}
+	const BitField<RD::BufferCreationBits> flags = RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT | RD::BUFFER_CREATION_AS_STORAGE_BIT;
+	const uint64_t format = mesh_storage->mesh_surface_get_format(p_mesh_surface);
+	Vector<uint8_t> vertices = ram_vertices;
+	if (!(format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) && (format & RSE::ARRAY_FORMAT_NORMAL) && !(format & RSE::ARRAY_FORMAT_TANGENT)) {
+		vertices.resize_initialized(vertices.size() + sizeof(uint16_t) * 2);
+	}
+	const uint64_t bytes = uint64_t(vertices.size()) + ram_attributes.size() + ram_indices.size();
+	if (p_capped && materialized_frame_uploads > 0 && materialized_frame_bytes + bytes > cluster_lod_stream_upload_cap) {
+		materialized_deferred++;
+		return false;
+	}
+	const uint32_t index_size = geom.index_format == RT_INDEX_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t);
+	RID vertex_buffer = rd->vertex_buffer_create(vertices.size(), vertices, flags);
+	RID attribute_buffer = ram_attributes.is_empty() ? RID() : rd->vertex_buffer_create(ram_attributes.size(), ram_attributes, flags);
+	RID index_buffer = rd->index_buffer_create(ram_indices.size() / index_size, geom.index_format == RT_INDEX_FORMAT_UINT16 ? RD::INDEX_BUFFER_FORMAT_UINT16 : RD::INDEX_BUFFER_FORMAT_UINT32, ram_indices, false, flags);
+	if (vertex_buffer.is_null() || index_buffer.is_null() || (attribute_buffer.is_null() && !ram_attributes.is_empty())) {
+		for (const RID &buffer : { vertex_buffer, attribute_buffer, index_buffer }) {
+			if (buffer.is_valid()) {
+				rd->free_rid(buffer);
+			}
+		}
+		return false;
+	}
+	rd->set_resource_name(vertex_buffer, "RT uploaded vertices");
+	rd->set_resource_name(index_buffer, "RT uploaded indices");
+	p_surf_data->materialized_vertex_buffer = vertex_buffer;
+	p_surf_data->materialized_attribute_buffer = attribute_buffer;
+	p_surf_data->materialized_index_buffer = index_buffer;
+	geom.vertex_buffer_address = rd->buffer_get_device_address(vertex_buffer);
+	rd->buffer_add_device_address_read_stages(vertex_buffer, RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT);
+	if (attribute_buffer.is_valid()) {
+		rd->set_resource_name(attribute_buffer, "RT uploaded attributes");
+		geom.attribute_buffer_address = rd->buffer_get_device_address(attribute_buffer);
+		rd->buffer_add_device_address_read_stages(attribute_buffer, RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT);
+	}
+	geom.index_buffer_address = rd->buffer_get_device_address(index_buffer);
+	rd->buffer_add_device_address_read_stages(index_buffer, RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT);
+	p_surf_data->materialized_bytes = bytes;
+	if (p_capped) {
+		materialized_frame_bytes += bytes;
+		materialized_frame_uploads++;
+	}
+	p_surf_data->materialized_held = p_held;
+	if (!p_held) {
+		materialized_transient.push_back(p_surf_data);
+	}
+	materialized_live_bytes += p_surf_data->materialized_bytes;
+	materialized_peak_bytes = MAX(materialized_peak_bytes, materialized_live_bytes);
+	materialized_uploads++;
+	return true;
+}
+
+// The upload goes, and `geometry` addresses no buffer again. RenderingDevice keeps the buffers past
+// the frames that may still read them.
+void RenderRaytracing::_release_materialized(RTSurfaceData *p_surf_data) {
+	if (p_surf_data->materialized_vertex_buffer.is_null()) {
+		return;
+	}
+	RD *rd = RD::get_singleton();
+	for (RID *buffer : { &p_surf_data->materialized_vertex_buffer, &p_surf_data->materialized_attribute_buffer, &p_surf_data->materialized_index_buffer }) {
+		if (buffer->is_valid()) {
+			rd->free_rid(*buffer);
+			*buffer = RID();
+		}
+	}
+	p_surf_data->geometry.vertex_buffer_address = 0;
+	p_surf_data->geometry.attribute_buffer_address = 0;
+	p_surf_data->geometry.index_buffer_address = 0;
+	materialized_live_bytes -= p_surf_data->materialized_bytes;
+	p_surf_data->materialized_bytes = 0;
+	if (!p_surf_data->materialized_held) {
+		materialized_transient.erase(p_surf_data);
+	}
+	p_surf_data->materialized_held = false;
+}
+
+// Once a frame: transient uploads no frame needed within the minimum age go.
+void RenderRaytracing::_sweep_materialized() {
+	const uint64_t frames_drawn = RD::get_singleton()->get_frames_drawn();
+	if (materialized_swept_frame == frames_drawn) {
+		return;
+	}
+	materialized_swept_frame = frames_drawn;
+	materialized_frame_bytes = 0;
+	materialized_frame_uploads = 0;
+	for (uint32_t i = materialized_transient.size(); i-- > 0;) {
+		RTSurfaceData *surf_data = materialized_transient[i];
+		if (frames_drawn - surf_data->materialized_frame > cluster_lod_stream_min_age) {
+			_release_materialized(surf_data);
+		}
+	}
+}
+
+bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data, bool p_blobs_only) {
 	RD *rd = RD::get_singleton();
 	const RT_GeometryData &geom = r_surf_data->geometry;
 	const RD::ClusterAccelerationStructureCapabilities &caps = rd->get_cluster_acceleration_structure_capabilities();
 
 	const uint32_t primitive_count = geom.primitive_count;
-	if (primitive_count == 0 || geom.vertex_buffer_address == 0 || geom.index_buffer_address == 0 || caps.max_triangles_per_cluster == 0 || caps.max_vertices_per_cluster < 3) {
+	if (primitive_count == 0 || (!p_blobs_only && (geom.vertex_buffer_address == 0 || geom.index_buffer_address == 0)) || caps.max_triangles_per_cluster == 0 || caps.max_vertices_per_cluster < 3) {
 		print_verbose(vformat("RT: surface [%d] on the triangle BLAS path: %d triangles, addresses %d/%d, clusters of %d/%d.", p_cache_key, primitive_count, int(geom.vertex_buffer_address != 0), int(geom.index_buffer_address != 0), caps.max_triangles_per_cluster, caps.max_vertices_per_cluster));
 		return false;
 	}
@@ -1553,6 +1694,14 @@ bool RenderRaytracing::_populate_surface_cluster_blas(void *p_mesh_surface, RID 
 	// builds read the blobs' indices and staged positions, not its buffers (D93c).
 	RTClusterGeometryStage geometry_stage;
 	const bool cluster_geometry = stream && cluster_lod_stream_geometry_enabled && _populate_cluster_geometry(p_mesh_surface, layout, stream, p_cache_key, r_surf_data, geometry_stage);
+	if (p_blobs_only && !cluster_geometry) {
+		// A surface whose buffers hold its fallback level builds from blobs or not at all; the caller
+		// uploads its arrays and builds again (D93d).
+		if (stream) {
+			memdelete(stream);
+		}
+		return false;
+	}
 
 	// Sizes (D81): the CLAS are built with implicit destinations into a staging buffer, so their
 	// size query returns one region for all of them and the build writes each one's size back;
@@ -2868,6 +3017,8 @@ void RenderRaytracing::_release_surface_data(RTSurfaceData *p_surf_data) {
 	}
 	_release_surface_cluster_lod(p_surf_data);
 	_release_cluster_geometry(p_surf_data);
+	_release_materialized(p_surf_data);
+	p_surf_data->geometry_streamed = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -2879,7 +3030,7 @@ void RenderRaytracing::_release_surface_data(RTSurfaceData *p_surf_data) {
 static _FORCE_INLINE_ void _cluster_geometry_strides(const RT_GeometryData &p_geom, uint32_t &r_normal_stride, uint32_t &r_attribute_stride) {
 	const bool compressed = (p_geom.flags & RT_GEOM_FLAG_COMPRESSED) != 0;
 	r_normal_stride = p_geom.normal_byte_offset != RT_OFFSET_NONE ? (compressed ? 8u : p_geom.normal_stride) : 0u;
-	r_attribute_stride = p_geom.attribute_buffer_address != 0 ? p_geom.attribute_stride : 0u;
+	r_attribute_stride = p_geom.attribute_stride; // Not the address: a surface whose geometry streams has none (D93d).
 }
 
 // One cluster's section of its blob, and where its attribute block and its indices start in it.
@@ -4917,7 +5068,7 @@ void RenderRaytracing::_process_lod_stream() {
 				upload_p50 = lod_stream_stats.upload_frames[lod_stream_stats.upload_frames.size() / 2];
 				upload_max = lod_stream_stats.upload_frames[lod_stream_stats.upload_frames.size() - 1];
 			}
-			print_verbose(vformat("RT: cluster geometry (D93c): %d KB of blobs resident with their groups (in the figures above) and %d KB persistent, %d KB in %d KB of arena chunks; uploads (blobs and staged positions) p50 %d KB, max %d KB a frame over %d frames with loads since the last report, %d KB over the run (cap %d KB a frame), deferred %d for the upload cap; loads on the render thread (gathers issued and placed, builds recorded) %d us at most in a frame since the last report, %d us over the run, gathers issued %d frames after admission, %d waited for over the run, %d in flight; %d populations over the run read their own buffers though the mesh storage streams their geometry (D93d).", resident_blob_bytes / 1024, persistent_blob_bytes / 1024, cluster_geometry_arena_live_bytes / 1024, cluster_geometry_arena_reserved_bytes / 1024, upload_p50, upload_max, lod_stream_stats.upload_frames.size(), lod_stream_stats.uploaded_bytes / 1024, cluster_lod_stream_upload_cap / 1024, lod_stream_stats.deferred_upload, lod_stream_stats.gather_max_usec, lod_stream_stats.gather_usec, RT_LOD_STREAM_GATHER_LATENCY, lod_stream_stats.gather_waits, cluster_lod_stream_gathers.size(), cluster_geometry_unstreamed_populations));
+			print_verbose(vformat("RT: cluster geometry (D93c): %d KB of blobs resident with their groups (in the figures above) and %d KB persistent, %d KB in %d KB of arena chunks; uploads (blobs and staged positions) p50 %d KB, max %d KB a frame over %d frames with loads since the last report, %d KB over the run (cap %d KB a frame), deferred %d for the upload cap; loads on the render thread (gathers issued and placed, builds recorded) %d us at most in a frame since the last report, %d us over the run, gathers issued %d frames after admission, %d waited for over the run, %d in flight; %d populations over the run read an upload of their arrays (D93d); uploads %d KB held, %d KB at most, %d over the run, %d deferred for the cap; RAM copies %d KB, fallback levels %d KB.", resident_blob_bytes / 1024, persistent_blob_bytes / 1024, cluster_geometry_arena_live_bytes / 1024, cluster_geometry_arena_reserved_bytes / 1024, upload_p50, upload_max, lod_stream_stats.upload_frames.size(), lod_stream_stats.uploaded_bytes / 1024, cluster_lod_stream_upload_cap / 1024, lod_stream_stats.deferred_upload, lod_stream_stats.gather_max_usec, lod_stream_stats.gather_usec, RT_LOD_STREAM_GATHER_LATENCY, lod_stream_stats.gather_waits, cluster_lod_stream_gathers.size(), cluster_geometry_unstreamed_populations, materialized_live_bytes / 1024, materialized_peak_bytes / 1024, materialized_uploads, materialized_deferred, RendererRD::MeshStorage::get_singleton()->get_cluster_geometry_ram_bytes() / 1024, RendererRD::MeshStorage::get_singleton()->get_cluster_geometry_fallback_bytes() / 1024));
 			lod_stream_stats.gather_max_usec = 0;
 			lod_stream_stats.upload_frames.clear();
 		}
@@ -6857,6 +7008,40 @@ void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {
 // Merged MultiMesh BLAS builder
 // ---------------------------------------------------------------------------
 
+// A MultiMesh-surface's merge, planned without side effects (D93d), so the TLAS walk (which
+// uploads a streamed surface's arrays for a bake) and _build_merged_mm_blas() cannot disagree.
+// False when the surface does not merge: no instance buffer, a compressed format (positions are
+// UNORM16x4, not float3), no triangles, or more merged triangles than the cap. r_bakes when the
+// call would bake: on the frame's first touch, with no entry yet, a structure or surface change,
+// moved transforms or a BLAS never built.
+bool RenderRaytracing::_plan_merged_mm(RID p_mm_rid, RID p_mm_gpu_buffer, void *p_mesh_surface, uint32_t p_mm_count, uint32_t p_surface_index, uint32_t p_surface_counter, bool &r_bakes) {
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	r_bakes = false;
+	if (p_mm_gpu_buffer.is_null() || (mesh_storage->mesh_surface_get_format(p_mesh_surface) & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES)) {
+		return false;
+	}
+	const uint32_t vertex_count = mesh_storage->mesh_surface_get_rt_vertex_count(p_mesh_surface);
+	const uint32_t index_count = mesh_storage->mesh_surface_get_rt_index_count(p_mesh_surface);
+	const uint32_t prim_count = index_count > 0 ? index_count / 3 : vertex_count / 3;
+	static const uint32_t MM_MERGED_BLAS_MAX_TRIANGLES = (uint32_t)GLOBAL_GET("rendering/pathtracing/multimesh_merged_blas_max_triangles");
+	if (prim_count == 0 || vertex_count == 0 || (uint64_t)p_mm_count * prim_count > MM_MERGED_BLAS_MAX_TRIANGLES) {
+		return false;
+	}
+	const uint32_t li = p_mm_rid.get_local_index();
+	const RTMergedMMEntry *entry = nullptr;
+	if (li < mm_handles.size() && mm_handles[li].mm_validator == static_cast<uint32_t>(p_mm_rid.get_id() >> 32) && p_surface_index < mm_handles[li].per_surface.size()) {
+		entry = merged_mm_pool.get_or_null(mm_handles[li].per_surface[p_surface_index]);
+	}
+	if (!entry) {
+		r_bakes = true;
+		return true;
+	}
+	const bool first_touch = entry->last_used_frame != RSG::rasterizer->get_frame_number();
+	const bool built = entry->blas_built_once && entry->last_mm_count == p_mm_count && entry->last_surface_counter == p_surface_counter;
+	r_bakes = first_touch && (!built || entry->cached_mm_last_change != mesh_storage->multimesh_get_last_change(p_mm_rid));
+	return true;
+}
+
 bool RenderRaytracing::_build_merged_mm_blas(
 		RID p_mm_rid,
 		RID p_mm_gpu_buffer,
@@ -6865,31 +7050,42 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		uint32_t p_surface_index,
 		uint32_t p_surface_counter,
 		const AABB &p_mm_aabb,
+		const RTSurfaceData *p_source,
 		RD::ComputeListID p_compute_list,
 		LocalVector<RID> &r_dirty_blas_list,
 		LocalVector<RID> &r_dirty_blas_update_list,
 		RTSurfaceData *r_surf_data) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 
-	uint32_t vertex_count = mesh_storage->mesh_surface_get_vertex_count(p_mesh_surface);
+	// Whether the surface merges, and whether this call bakes (D93d): the plan the walk took.
+	bool needs_rebake = false;
+	if (!_plan_merged_mm(p_mm_rid, p_mm_gpu_buffer, p_mesh_surface, p_mm_count, p_surface_index, p_surface_counter, needs_rebake)) {
+		return false;
+	}
+
+	// The surface's own counts and buffers, switched together: a surface whose geometry streams has
+	// its fallback level in its buffers, and bakes from the upload of its arrays (D93d), which only a
+	// bake needs; without one, the expanded path traces it through its blobs that frame.
+	uint32_t vertex_count = mesh_storage->mesh_surface_get_rt_vertex_count(p_mesh_surface);
+	uint32_t index_count = mesh_storage->mesh_surface_get_rt_index_count(p_mesh_surface);
 	RID index_buffer = mesh_storage->mesh_surface_get_index_buffer(p_mesh_surface, 0);
-	uint32_t index_count = mesh_storage->mesh_surface_get_index_count(p_mesh_surface, 0);
-	bool indexed = index_buffer.is_valid() && index_count > 0;
+	RID source_vertex_buffer = mesh_storage->mesh_surface_get_vertex_buffer(p_mesh_surface);
+	RID source_attribute_buffer = mesh_storage->mesh_surface_get_attribute_buffer(p_mesh_surface);
+	const bool geometry_streamed = mesh_storage->mesh_surface_is_geometry_streamed(p_mesh_surface);
+	if (geometry_streamed) {
+		const bool uploaded = p_source && p_source->materialized_vertex_buffer.is_valid();
+		index_buffer = uploaded ? p_source->materialized_index_buffer : RID();
+		source_vertex_buffer = uploaded ? p_source->materialized_vertex_buffer : RID();
+		source_attribute_buffer = uploaded ? p_source->materialized_attribute_buffer : RID();
+	}
+	if (geometry_streamed && needs_rebake && source_vertex_buffer.is_null()) {
+		return false; // No upload for the bake, before anything changes (D93d): the expanded path this frame.
+	}
+	bool indexed = (index_buffer.is_valid() || geometry_streamed) && index_count > 0;
 	uint32_t prim_count = indexed ? (index_count / 3) : (vertex_count / 3);
 
-	// Skip compressed meshes: their positions are UNORM16x4, not float3.
+	// Compressed meshes, an empty surface and the merged triangle cap are the plan's (_plan_merged_mm).
 	uint64_t surface_format = mesh_storage->mesh_surface_get_format(p_mesh_surface);
-	if (surface_format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) {
-		return false;
-	}
-
-	if (prim_count == 0 || vertex_count == 0) {
-		return false;
-	}
-	static const uint32_t MM_MERGED_BLAS_MAX_TRIANGLES = (uint32_t)GLOBAL_GET("rendering/pathtracing/multimesh_merged_blas_max_triangles");
-	if ((uint64_t)p_mm_count * prim_count > MM_MERGED_BLAS_MAX_TRIANGLES) {
-		return false; // Too large; fall back to expanded TLAS.
-	}
 
 	// Side table -> pool: dense direct index keyed by RID local_index, with a
 	// validator stamp to detect RID local-index recycling for a different MM.
@@ -7039,25 +7235,29 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		}
 	}
 
+	// The plan's bake (_plan_merged_mm) is this one, from the state before the changes above; were they
+	// to differ, the walk would have uploaded for the wrong frame.
+	ERR_FAIL_COND_V_MSG(needs_rebake != (first_touch_this_frame && (transforms_changed || !entry.blas_built_once)), false, "RT: a merged MultiMesh's plan and its bake disagree (D93d).");
+
 	RID src_attr_buf;
 	if (has_attr) {
-		src_attr_buf = mesh_storage->mesh_surface_get_attribute_buffer(p_mesh_surface);
-		ERR_FAIL_COND_V(!src_attr_buf.is_valid(), false);
+		src_attr_buf = source_attribute_buffer;
+		ERR_FAIL_COND_V(needs_rebake && !src_attr_buf.is_valid(), false);
 	} else {
 		src_attr_buf = entry.merged_attr_buffer;
 	}
 
 	MergeShader::Mode merge_mode = indexed ? MergeShader::MODE_INDEXED : MergeShader::MODE_NON_INDEXED;
 
-	// Pre-validate source vertex buffer before opening the compute list.
-	RID vtx_buf = mesh_storage->mesh_surface_get_vertex_buffer(p_mesh_surface);
-	ERR_FAIL_COND_V(!vtx_buf.is_valid(), false);
-	uint64_t vtx_bda = rd->buffer_get_device_address(vtx_buf);
+	// Pre-validate source vertex buffer before opening the compute list. A streamed surface's merge
+	// reads it only when it bakes (D93d).
+	RID vtx_buf = source_vertex_buffer;
+	ERR_FAIL_COND_V(needs_rebake && !vtx_buf.is_valid(), false);
+	uint64_t vtx_bda = vtx_buf.is_valid() ? rd->buffer_get_device_address(vtx_buf) : 0;
 	// The merge reads the source mesh through addresses; an in-place update must wait for an earlier frame's merge.
-	rd->buffer_add_device_address_read_stages(vtx_buf, RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-
-	const bool needs_rebake = first_touch_this_frame &&
-			(transforms_changed || !entry.blas_built_once);
+	if (vtx_buf.is_valid()) {
+		rd->buffer_add_device_address_read_stages(vtx_buf, RDD::PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+	}
 
 	// --- Single merged dispatch: bake vertices + TBN + attributes + (optional) indices ---
 	if (needs_rebake) {
@@ -7205,6 +7405,10 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		entry.cached_mm_last_change = mm_last_change;
 	}
 
+	if (!entry.blas_built_once) {
+		return false; // Never built (an earlier failure this frame): the expanded path, not an unbuilt BLAS.
+	}
+
 	// --- Populate r_surf_data from the metadata already computed above, then override merged buffer addresses.
 	*r_surf_data = meta_sd;
 	r_surf_data->blas = entry.blas;
@@ -7281,6 +7485,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	}
 
 	prepare_frame();
+	_sweep_materialized();
 	state->has_procedural_instances = false;
 
 	// The cluster LOD selection (D86) belongs to the traced primary ray (D84): under the G-buffer
@@ -7355,6 +7560,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		uint32_t inst_flags;
 		uint8_t inst_mask;
 		AABB mm_aabb;
+		RTSurfaceData *source = nullptr; // A surface whose geometry streams: its population, holding the upload of its arrays (D93d).
 	};
 	LocalVector<PendingMMSurface> pending_mm_surfaces;
 
@@ -7548,6 +7754,22 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 
 				PendingMMSurface pending;
+				// A surface whose buffers hold its fallback level reaches the merge's bake, and an
+				// emissive material's sampling, only through an upload of its arrays (D93d), made here
+				// before the merge's compute list opens and hosted by the surface's population, which
+				// the expanded path traces anyway. A merge that does not bake this frame reads nothing
+				// of the surface, so its upload goes past the minimum age.
+				if (mesh_storage->mesh_surface_is_geometry_streamed(mesh_surface)) {
+					if (p_primary_from_gbuffer) {
+						WARN_PRINT_ONCE("RT: the G-buffer primary rasterizes a MultiMesh of a surface whose geometry streams at its fallback level (D93d), coarser than the traced surface; the traced primary is the look.");
+					}
+					bool bakes = false;
+					const bool merges = _plan_merged_mm(mm_rid, mm_gpu_buffer, mesh_surface, mm_count, mm_surf->surface_index, surface_counter, bakes);
+					pending.source = process_surface(mm_surf, mesh_surface, surface_counter, instance_transform, dirty_blas_list);
+					if (pending.source && pending.source->geometry_streamed && ((merges && bakes) || (mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT))) {
+						_materialize_surface(pending.source, mesh_surface, false, true);
+					}
+				}
 				pending.mm_rid = mm_rid;
 				pending.mm_gpu_buffer = mm_gpu_buffer;
 				pending.mm_surf = mm_surf;
@@ -7663,6 +7885,14 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			// Which build the instance traces is settled after the walk, where the instances of one
 			// surface can share one (D89); until then the slot holds the LOD 0 BLAS.
 			RID blas_handle = surf_data->blas;
+			if (p_primary_from_gbuffer && surf_data->geometry_streamed) {
+				WARN_PRINT_ONCE("RT: the G-buffer primary rasterizes a surface whose geometry streams at its fallback level (D93d), coarser than the traced surface; the traced primary is the look.");
+			}
+			// An emissive material samples the surface's own triangles (D50), which a surface whose
+			// buffers hold its fallback level has only as an upload (D93d).
+			if (surf_data->geometry_streamed && (mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT)) {
+				_materialize_surface(surf_data, mesh_surface, false, true);
+			}
 			if (lod_select_frame && surf_data->cluster_lod_stream && (mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT)) {
 				blas_handle = _lod_stream_pinned_blas(surf_data); // A streamed surface's LOD 0 is its cached level 0 (D92).
 			} else if (lod_select_frame && surf_data->cluster_lod_table_offset != UINT32_MAX && !(mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT)) {
@@ -7742,7 +7972,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			if (collect_render_info) {
 				tlas_instance_count++;
 				uint32_t vertices = mesh_storage->mesh_surface_get_vertices_drawn_count(mesh_surface);
-				uint32_t prim_count = _rt_indices_to_primitives(surf->primitive, vertices);
+				// A surface whose geometry streams draws its fallback level; the trace holds the surface (D93d).
+				uint32_t prim_count = surf_data->geometry_streamed ? surf_data->geometry.primitive_count : _rt_indices_to_primitives(surf->primitive, vertices);
 				tlas_primitive_count += prim_count;
 				uint32_t build_delta = dirty_blas_list.size() - pre_build_size;
 				uint32_t refit_delta = dirty_blas_update_list.size() - pre_refit_size;
@@ -7814,7 +8045,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		RTSurfaceData merged_sd;
 		bool use_merged = pending.mm_gpu_buffer.is_valid() &&
 				_build_merged_mm_blas(pending.mm_rid, pending.mm_gpu_buffer, pending.mesh_surface,
-						pending.mm_count, pending.surface_index, pending.surface_counter, pending.mm_aabb,
+						pending.mm_count, pending.surface_index, pending.surface_counter, pending.mm_aabb, pending.source,
 						compute_list, dirty_blas_list, dirty_blas_update_list, &merged_sd);
 
 		if (use_merged) {
@@ -7905,7 +8136,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			if (collect_render_info) {
 				tlas_instance_count += pending.mm_count;
 				uint32_t vertices = mesh_storage->mesh_surface_get_vertices_drawn_count(pending.mesh_surface);
-				uint32_t prim_count = _rt_indices_to_primitives(pending.mm_surf->primitive, vertices);
+				uint32_t prim_count = surf_data->geometry_streamed ? surf_data->geometry.primitive_count : _rt_indices_to_primitives(pending.mm_surf->primitive, vertices); // As above (D93d).
 				tlas_primitive_count += prim_count * pending.mm_count;
 				uint32_t build_delta = dirty_blas_list.size() - mm_pre_build_size;
 				uint32_t refit_delta = dirty_blas_update_list.size() - mm_pre_refit_size;
@@ -8221,6 +8452,9 @@ uint32_t RenderRaytracing::gather_emissive(const RenderDataRD *p_render_data, co
 		const RT_GeometryData &geom = geometry_data[i];
 		if (!(mat.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT) || sbt_offsets[i] != 0 || (geom.flags & RT_GEOM_FLAG_PROCEDURAL) || geom.primitive_count == 0) {
 			continue;
+		}
+		if (geom.vertex_buffer_address == 0 || (geom.index_format != RT_INDEX_FORMAT_NONE && geom.index_buffer_address == 0)) {
+			continue; // A surface whose geometry streams, not uploaded (D93d): its triangles cannot be sampled.
 		}
 		if (!(instance_flags[i] & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT)) {
 			// An alpha-tested or blended emitter's any-hit skips texels a sampled point would credit; it keeps chance-hit emission.

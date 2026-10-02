@@ -99,7 +99,7 @@ uint rt_resolve_triangle(inout GeometryData geom, int cluster_id, uint primitive
 			// widened to 8 bytes with the tangent angle's word, each section 16-byte aligned.
 			bool has_normal = geom.normal_byte_offset != OFFSET_NONE;
 			uint normal_stride = has_normal ? ((geom.flags & FLAG_COMPRESSED) != 0u ? 8u : geom.normal_stride) : 0u;
-			uint attribute_stride = geom.attribute_address != 0ul ? geom.attribute_stride : 0u;
+			uint attribute_stride = geom.attribute_stride; // A surface whose geometry streams addresses no buffer (D93d).
 			const uint align_mask = CLUSTER_GEOMETRY_ALIGNMENT - 1u;
 			uint64_t attributes = blob + uint64_t((vertex_count * normal_stride + align_mask) & ~align_mask);
 			Uint32Buffer words = Uint32Buffer(attributes + uint64_t((vertex_count * attribute_stride + align_mask) & ~align_mask));

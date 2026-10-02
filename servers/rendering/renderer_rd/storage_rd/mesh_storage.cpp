@@ -60,6 +60,14 @@ bool MeshStorage::is_cluster_geometry_streaming_wanted() {
 	return wanted == 1;
 }
 
+float MeshStorage::_cluster_geometry_fallback_ratio() {
+	static float ratio = -1.0f;
+	if (ratio < 0.0f) {
+		ratio = CLAMP(float(GLOBAL_GET("rendering/pathtracing/cluster_lod_stream_fallback_ratio")), 0.0f, 1.0f);
+	}
+	return ratio;
+}
+
 bool MeshStorage::_is_cluster_geometry_ram_check_wanted() {
 	// Read once, like the switches above. A check of its own rather than --verbose: it reads every
 	// streamed surface's buffers back as the surface is added, which stalls RenderingDevice and so
@@ -416,6 +424,91 @@ static void _cluster_lod_index_tail(const RenderingServerTypes::SurfaceData &p_s
 	r_index_total = p_surface.index_count + coarse_index_count;
 }
 
+// The fallback level of a surface that streams its geometry (D93d), the arrays the raster's buffers
+// are made from: mesh_cluster_lod_fallback_level()'s triangles, read from the index data with its
+// coarse tail, their vertices compacted in first-use order (r_vertices maps each back to the
+// surface's own), the indices remapped and packed to 16 bits when the level's vertices allow. The
+// vertex data keeps the surface's layout, the positions and then the normal block, and the attribute
+// data its interleaving. False when the arrays do not have the size the format gives them.
+static bool _cluster_fallback_arrays(const RenderingServerTypes::SurfaceData &p_surface, const Vector<uint8_t> &p_index_data, bool p_index_16, float p_ratio, LocalVector<uint32_t> &r_vertices, Vector<uint8_t> &r_vertex_data, Vector<uint8_t> &r_attribute_data, Vector<uint8_t> &r_index_data, uint32_t &r_vertex_count, uint32_t &r_index_count, bool &r_index_16) {
+	uint32_t offsets[RSE::ARRAY_MAX];
+	uint32_t vertex_element_size = 0, normal_element_size = 0, attrib_element_size = 0, skin_element_size = 0;
+	RS::get_singleton()->mesh_surface_make_offsets_from_format(p_surface.format, p_surface.vertex_count, p_surface.index_count, offsets, vertex_element_size, normal_element_size, attrib_element_size, skin_element_size);
+	const uint64_t vertex_count = p_surface.vertex_count;
+	if (uint64_t(p_surface.vertex_data.size()) != (uint64_t(vertex_element_size) + normal_element_size) * vertex_count || uint64_t(p_surface.attribute_data.size()) != uint64_t(attrib_element_size) * vertex_count) {
+		return false;
+	}
+
+	LocalVector<uint32_t> runs;
+	uint32_t depth = 0;
+	uint64_t triangles = 0;
+	mesh_cluster_lod_fallback_level(p_surface.cluster_data, p_ratio, runs, depth, triangles);
+	if (triangles == 0 || triangles * 3 > UINT32_MAX) {
+		return false;
+	}
+
+	// The level's indices into the surface, then into its compacted vertices.
+	LocalVector<uint32_t> remap;
+	remap.resize(p_surface.vertex_count);
+	memset(remap.ptr(), 0xFF, sizeof(uint32_t) * remap.size());
+	LocalVector<uint32_t> indices;
+	indices.reserve(uint32_t(triangles * 3));
+	r_vertices.clear();
+	const uint8_t *index_bytes = p_index_data.ptr();
+	for (uint32_t r = 0; r < runs.size(); r += 2) {
+		const uint64_t first = uint64_t(runs[r]) * 3;
+		const uint64_t end = first + uint64_t(runs[r + 1]) * 3;
+		for (uint64_t i = first; i < end; i++) {
+			const uint32_t index = p_index_16 ? reinterpret_cast<const uint16_t *>(index_bytes)[i] : reinterpret_cast<const uint32_t *>(index_bytes)[i];
+			if (remap[index] == UINT32_MAX) {
+				remap[index] = r_vertices.size();
+				r_vertices.push_back(index);
+			}
+			indices.push_back(remap[index]);
+		}
+	}
+
+	r_vertex_count = r_vertices.size();
+	r_index_count = indices.size();
+	r_index_16 = r_vertex_count <= 65536;
+	r_vertex_data.resize(uint64_t(vertex_element_size + normal_element_size) * r_vertex_count);
+	r_attribute_data.resize(uint64_t(attrib_element_size) * r_vertex_count);
+	r_index_data.resize(uint64_t(r_index_count) * (r_index_16 ? sizeof(uint16_t) : sizeof(uint32_t)));
+	const uint8_t *vertex_from = p_surface.vertex_data.ptr();
+	const uint8_t *attribute_from = p_surface.attribute_data.ptr();
+	uint8_t *vertex_to = r_vertex_data.ptrw();
+	uint8_t *attribute_to = r_attribute_data.ptrw();
+	for (uint32_t v = 0; v < r_vertex_count; v++) {
+		const uint64_t o = r_vertices[v];
+		memcpy(vertex_to + uint64_t(v) * vertex_element_size, vertex_from + o * vertex_element_size, vertex_element_size);
+		if (normal_element_size) {
+			memcpy(vertex_to + uint64_t(vertex_element_size) * r_vertex_count + uint64_t(v) * normal_element_size, vertex_from + uint64_t(vertex_element_size) * vertex_count + o * normal_element_size, normal_element_size);
+		}
+		if (attrib_element_size) {
+			memcpy(attribute_to + uint64_t(v) * attrib_element_size, attribute_from + o * attrib_element_size, attrib_element_size);
+		}
+	}
+	uint8_t *index_to = r_index_data.ptrw();
+	for (uint32_t i = 0; i < r_index_count; i++) {
+		if (r_index_16) {
+			reinterpret_cast<uint16_t *>(index_to)[i] = uint16_t(indices[i]);
+		} else {
+			reinterpret_cast<uint32_t *>(index_to)[i] = indices[i];
+		}
+	}
+	return true;
+}
+
+// The attribute bytes of a surface's fallback level, from its RAM copy (D93d).
+static void _cluster_fallback_attributes(const Vector<uint8_t> &p_attribute_data, uint32_t p_vertex_count, const LocalVector<uint32_t> &p_vertices, Vector<uint8_t> &r_attribute_data) {
+	const uint64_t stride = p_vertex_count ? p_attribute_data.size() / p_vertex_count : 0;
+	r_attribute_data.resize(stride * p_vertices.size());
+	uint8_t *to = r_attribute_data.ptrw();
+	for (uint32_t v = 0; v < p_vertices.size(); v++) {
+		memcpy(to + uint64_t(v) * stride, p_attribute_data.ptr() + uint64_t(p_vertices[v]) * stride, stride);
+	}
+}
+
 /// Returns stride
 void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::SurfaceData &p_surface) {
 	Mesh *mesh = mesh_owner.get_or_null(p_mesh);
@@ -550,7 +643,59 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 		requested_storage_flag.set_flag(RD::BUFFER_CREATION_AS_STORAGE_BIT);
 	}
 
-	if (new_surface.vertex_data.size()) {
+	// A cluster LOD hierarchy (D85) appends its coarse levels' triangles to the index buffer
+	// past the drawn range: the raster's index array covers index_count as before, the trace
+	// addresses every cluster through the one buffer.
+	const bool is_index_16 = new_surface.vertex_count <= 65536 && new_surface.vertex_count > 0;
+	Vector<uint8_t> index_data = new_surface.index_data;
+	uint32_t index_total = new_surface.index_count;
+	if (new_surface.index_count) {
+		_cluster_lod_index_tail(new_surface, is_index_16, index_data, index_total);
+	}
+
+	// Geometry residency (D93): a surface that streams its geometry keeps in RAM the arrays it was
+	// added with (the index data with its coarse tail), for the trace's blobs and for
+	// mesh_get_surface(); the vectors share the caller's data. Its buffers hold its fallback level
+	// (D93d), which every raster consumer draws, and the trace reads the whole surface through
+	// blobs or an upload of its own. A skinned or blend-shaped surface is deformed, and deformed
+	// surfaces do not stream; skin data marks one even without the bones flag, as for
+	// use_as_storage above. The mesh storage decides, and is the authority: the tables' tests are
+	// the ones the trace takes before it streams a surface, but the trace streams a subset of these
+	// surfaces (not the ones no instance traces, not while streaming is off or after a failed
+	// flush, not where its population fails) and uploads the rest from this copy.
+	Vector<uint8_t> buffer_vertex_data = new_surface.vertex_data;
+	Vector<uint8_t> buffer_attribute_data = new_surface.attribute_data;
+	Vector<uint8_t> buffer_index_data = index_data;
+	uint32_t buffer_vertex_count = new_surface.vertex_count;
+	uint32_t buffer_index_count = new_surface.index_count;
+	uint32_t buffer_index_total = index_total;
+	bool buffer_index_16 = is_index_16;
+	if (index_total > new_surface.index_count && !(new_surface.format & RSE::ARRAY_FORMAT_BONES) && new_surface.skin_data.is_empty() && mesh->blend_shape_count == 0 && is_cluster_geometry_streaming_wanted()) {
+		const RD::ClusterAccelerationStructureCapabilities &caps = RD::get_singleton()->get_cluster_acceleration_structure_capabilities();
+		LocalVector<uint16_t> local;
+		LocalVector<uint32_t> distinct;
+		LocalVector<uint32_t> fallback_vertices;
+		if (mesh_cluster_lod_streamable(new_surface.cluster_data, new_surface.index_count, index_total, caps.max_triangles_per_cluster, caps.max_vertices_per_cluster) &&
+				mesh_cluster_lod_local_vertices(new_surface.cluster_data, index_data.ptr(), index_data.size(), is_index_16, new_surface.vertex_count, local, distinct) &&
+				_cluster_fallback_arrays(new_surface, index_data, is_index_16, _cluster_geometry_fallback_ratio(), fallback_vertices, buffer_vertex_data, buffer_attribute_data, buffer_index_data, buffer_vertex_count, buffer_index_count, buffer_index_16)) {
+			buffer_index_total = buffer_index_count;
+			s->fallback_in_buffers = true;
+			s->ram_vertex_data = new_surface.vertex_data;
+			s->ram_attribute_data = new_surface.attribute_data;
+			s->ram_index_data = index_data;
+			s->ram_lods = new_surface.lods;
+			s->ram_fallback_vertices = fallback_vertices;
+		} else {
+			buffer_vertex_data = new_surface.vertex_data;
+			buffer_attribute_data = new_surface.attribute_data;
+			buffer_index_data = index_data;
+			buffer_vertex_count = new_surface.vertex_count;
+			buffer_index_count = new_surface.index_count;
+			buffer_index_16 = is_index_16;
+		}
+	}
+
+	if (buffer_vertex_data.size()) {
 		// If we have an uncompressed surface that contains normals, but not tangents, we need to differentiate the array
 		// from a compressed array in the shader. To do so, we allow the normal to read 4 components out of the buffer
 		// But only give it 2 components per normal. So essentially, each vertex reads the next normal in normal.zw.
@@ -560,71 +705,42 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 		if (!(new_surface.format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) && (new_surface.format & RSE::ARRAY_FORMAT_NORMAL) && !(new_surface.format & RSE::ARRAY_FORMAT_TANGENT)) {
 			// Unfortunately, we need to copy the buffer, which is fine as doing a resize triggers a CoW anyway.
 			Vector<uint8_t> new_vertex_data;
-			new_vertex_data.resize_initialized(new_surface.vertex_data.size() + sizeof(uint16_t) * 2);
-			memcpy(new_vertex_data.ptrw(), new_surface.vertex_data.ptr(), new_surface.vertex_data.size());
+			new_vertex_data.resize_initialized(buffer_vertex_data.size() + sizeof(uint16_t) * 2);
+			memcpy(new_vertex_data.ptrw(), buffer_vertex_data.ptr(), buffer_vertex_data.size());
 			s->vertex_buffer = RD::get_singleton()->vertex_buffer_create(new_vertex_data.size(), new_vertex_data, as_storage_flag);
 			s->vertex_buffer_size = new_vertex_data.size();
 		} else {
-			s->vertex_buffer = RD::get_singleton()->vertex_buffer_create(new_surface.vertex_data.size(), new_surface.vertex_data, as_storage_flag);
-			s->vertex_buffer_size = new_surface.vertex_data.size();
+			s->vertex_buffer = RD::get_singleton()->vertex_buffer_create(buffer_vertex_data.size(), buffer_vertex_data, as_storage_flag);
+			s->vertex_buffer_size = buffer_vertex_data.size();
 		}
 	}
 
-	if (new_surface.attribute_data.size()) {
-		s->attribute_buffer = RD::get_singleton()->vertex_buffer_create(new_surface.attribute_data.size(), new_surface.attribute_data, requested_storage_flag);
-		s->attribute_buffer_size = new_surface.attribute_data.size();
+	if (buffer_attribute_data.size()) {
+		s->attribute_buffer = RD::get_singleton()->vertex_buffer_create(buffer_attribute_data.size(), buffer_attribute_data, requested_storage_flag);
+		s->attribute_buffer_size = buffer_attribute_data.size();
 	}
 	if (new_surface.skin_data.size()) {
 		s->skin_buffer = RD::get_singleton()->vertex_buffer_create(new_surface.skin_data.size(), new_surface.skin_data, as_storage_flag);
 		s->skin_buffer_size = new_surface.skin_data.size();
 	}
 
-	s->vertex_count = new_surface.vertex_count;
+	s->vertex_count = buffer_vertex_count;
 	s->rt_vertex_count = new_surface.vertex_count;
 	s->rt_index_count = new_surface.index_count;
-	s->rt_index_total = new_surface.index_count;
+	s->rt_index_total = index_total;
 
 	if (new_surface.format & RSE::ARRAY_FORMAT_BONES) {
 		mesh->has_bone_weights = true;
 	}
 
 	if (new_surface.index_count) {
-		bool is_index_16 = new_surface.vertex_count <= 65536 && new_surface.vertex_count > 0;
-
-		// A cluster LOD hierarchy (D85) appends its coarse levels' triangles to the index buffer
-		// past the drawn range: the raster's index array covers index_count as before, the trace
-		// addresses every cluster through the one buffer.
-		Vector<uint8_t> index_data = new_surface.index_data;
-		uint32_t index_total = new_surface.index_count;
-		_cluster_lod_index_tail(new_surface, is_index_16, index_data, index_total);
-
-		s->index_buffer = RD::get_singleton()->index_buffer_create(index_total, is_index_16 ? RD::INDEX_BUFFER_FORMAT_UINT16 : RD::INDEX_BUFFER_FORMAT_UINT32, index_data, false, requested_storage_flag);
-		s->index_buffer_size = index_data.size();
-		s->index_count = new_surface.index_count;
-		s->index_total = index_total;
-		s->rt_index_total = index_total;
-		// Geometry residency (D93): a surface that streams its geometry keeps its arrays in RAM, as its
-		// buffers hold them, for the trace's blobs and for mesh_get_surface(). The vectors share the
-		// caller's data. A skinned or blend-shaped surface is deformed, and deformed surfaces do not
-		// stream; skin data marks one even without the bones flag, as for use_as_storage above. The
-		// mesh storage decides, and is the authority: the tables' tests are the ones the trace takes
-		// before it streams a surface (D93d), but the trace streams a subset of these surfaces (not
-		// the ones no instance traces, not while streaming is off or after a failed flush, not where
-		// its population fails), and stage 2 materializes the rest from this copy.
-		if (index_total > new_surface.index_count && !(new_surface.format & RSE::ARRAY_FORMAT_BONES) && new_surface.skin_data.is_empty() && mesh->blend_shape_count == 0 && is_cluster_geometry_streaming_wanted()) {
-			const RD::ClusterAccelerationStructureCapabilities &caps = RD::get_singleton()->get_cluster_acceleration_structure_capabilities();
-			LocalVector<uint16_t> local;
-			LocalVector<uint32_t> distinct;
-			if (mesh_cluster_lod_streamable(new_surface.cluster_data, new_surface.index_count, index_total, caps.max_triangles_per_cluster, caps.max_vertices_per_cluster) &&
-					mesh_cluster_lod_local_vertices(new_surface.cluster_data, index_data.ptr(), index_data.size(), is_index_16, new_surface.vertex_count, local, distinct)) {
-				s->ram_vertex_data = new_surface.vertex_data;
-				s->ram_attribute_data = new_surface.attribute_data;
-				s->ram_index_data = index_data;
-				s->ram_lods = new_surface.lods;
-			}
-		}
+		s->index_buffer = RD::get_singleton()->index_buffer_create(buffer_index_total, buffer_index_16 ? RD::INDEX_BUFFER_FORMAT_UINT16 : RD::INDEX_BUFFER_FORMAT_UINT32, buffer_index_data, false, requested_storage_flag);
+		s->index_buffer_size = buffer_index_data.size();
+		s->index_count = buffer_index_count;
+		s->index_total = buffer_index_total;
 		s->index_array = RD::get_singleton()->index_array_create(s->index_buffer, 0, s->index_count);
-		if (new_surface.lods.size()) {
+		// Godot's LODs index the surface's own vertices; a fallback level is drawn without them.
+		if (new_surface.lods.size() && !mesh_surface_is_geometry_streamed(s)) {
 			s->lods = memnew_arr(Mesh::Surface::LOD, new_surface.lods.size());
 			s->lod_count = new_surface.lods.size();
 
@@ -647,8 +763,12 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 
 	s->uv_scale = new_surface.uv_scale;
 	s->cluster_data = new_surface.cluster_data;
-	if (mesh_surface_is_geometry_streamed(s) && _is_cluster_geometry_ram_check_wanted()) {
-		_mesh_surface_check_ram(*s);
+	if (mesh_surface_is_geometry_streamed(s)) {
+		cluster_geometry_ram_bytes += _mesh_surface_ram_bytes(*s);
+		cluster_geometry_fallback_bytes += uint64_t(s->vertex_buffer_size) + s->attribute_buffer_size + s->index_buffer_size;
+		if (_is_cluster_geometry_ram_check_wanted()) {
+			_mesh_surface_check_ram(*s, new_surface, buffer_vertex_data, buffer_attribute_data, buffer_index_data);
+		}
 	}
 
 	if (mesh->blend_shape_count > 0) {
@@ -725,6 +845,7 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 
 void MeshStorage::_mesh_surface_clear(Mesh *p_mesh, int p_surface) {
 	Mesh::Surface &s = *p_mesh->surfaces[p_surface];
+	_mesh_surface_clear_ram(s);
 
 	if (s.vertex_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(s.vertex_buffer); // Clears arrays as dependency automatically, including all versions.
@@ -787,6 +908,12 @@ void MeshStorage::mesh_surface_update_vertex_region(RID p_mesh, int p_surface, i
 	uint64_t data_size = p_data.size();
 	const uint8_t *r = p_data.ptr();
 
+	// A surface that streams its geometry (D93d) gets its own arrays back in its buffers first, so the
+	// region lands at the offsets it names; its RAM copy goes below.
+	if (mesh_surface_is_geometry_streamed(mesh->surfaces[p_surface])) {
+		_mesh_surface_restore_buffers(p_mesh, mesh, p_surface);
+	}
+
 	RD::get_singleton()->buffer_update(mesh->surfaces[p_surface]->vertex_buffer, p_offset, data_size, r);
 
 	// A cluster LOD hierarchy (D85) was simplified from the previous positions: its coarse
@@ -817,16 +944,29 @@ void MeshStorage::mesh_surface_update_attribute_region(RID p_mesh, int p_surface
 	uint64_t data_size = p_data.size();
 	const uint8_t *r = p_data.ptr();
 
+	// A surface that streams its geometry (D93d): the region goes into the RAM copy, which the blobs
+	// gathered at the repopulation below read, and the fallback level's attributes are made again
+	// from it. A region past the copy gets the surface's own arrays back in its buffers first, and
+	// the copy goes below.
+	Mesh::Surface *surface = mesh->surfaces[p_surface];
+	if (mesh_surface_is_geometry_streamed(surface)) {
+		Vector<uint8_t> &attributes = surface->ram_attribute_data;
+		if (p_offset >= 0 && uint64_t(p_offset) + data_size <= uint64_t(attributes.size())) {
+			memcpy(attributes.ptrw() + p_offset, r, data_size);
+			Vector<uint8_t> fallback;
+			_cluster_fallback_attributes(attributes, surface->rt_vertex_count, surface->ram_fallback_vertices, fallback);
+			RD::get_singleton()->buffer_update(surface->attribute_buffer, 0, fallback.size(), fallback.ptr());
+			surface->rt_invalidation_counter++;
+			return;
+		}
+		_mesh_surface_restore_buffers(p_mesh, mesh, p_surface);
+	}
+
 	RD::get_singleton()->buffer_update(mesh->surfaces[p_surface]->attribute_buffer, p_offset, data_size, r);
 
-	// The RAM copy (D93) follows the buffer, so the blobs gathered at the repopulation below see the update.
-	Vector<uint8_t> &ram = mesh->surfaces[p_surface]->ram_attribute_data;
-	if (!ram.is_empty()) {
-		if (p_offset >= 0 && uint64_t(p_offset) + data_size <= uint64_t(ram.size())) {
-			memcpy(ram.ptrw() + p_offset, r, data_size);
-		} else {
-			_mesh_surface_clear_ram(*mesh->surfaces[p_surface]);
-		}
+	// Past the RAM copy: it goes, and the surface no longer streams.
+	if (mesh_surface_is_geometry_streamed(mesh->surfaces[p_surface])) {
+		_mesh_surface_clear_ram(*mesh->surfaces[p_surface]);
 	}
 
 	// Invalidate RT cache for this surface (attributes include UVs).
@@ -858,6 +998,12 @@ void RendererRD::MeshStorage::mesh_surface_update_index_region(RID p_mesh, int p
 
 	uint64_t data_size = p_data.size();
 	const uint8_t *r = p_data.ptr();
+
+	// A surface that streams its geometry (D93d) gets its own arrays back in its buffers first, so the
+	// region lands at the offsets it names; its RAM copy goes below.
+	if (mesh_surface_is_geometry_streamed(mesh->surfaces[p_surface])) {
+		_mesh_surface_restore_buffers(p_mesh, mesh, p_surface);
+	}
 
 	RD::get_singleton()->buffer_update(mesh->surfaces[p_surface]->index_buffer, p_offset, data_size, r);
 
@@ -913,6 +1059,98 @@ RID MeshStorage::mesh_surface_get_material(RID p_mesh, int p_surface) const {
 	ERR_FAIL_UNSIGNED_INDEX_V((uint32_t)p_surface, mesh->surface_count, RID());
 
 	return mesh->surfaces[p_surface]->material;
+}
+
+// A surface that streams its geometry gets its own arrays back in its buffers (D93d), from its RAM
+// copy, before a region write lands at the offsets the arrays have: the fallback level's buffers go,
+// with the vertex arrays cached over them here and in the mesh's instances, and the whole vertex,
+// attribute and index buffers (the coarse tail included) and Godot's LODs are made as
+// mesh_add_surface() makes them, and an indirect MultiMesh of the mesh draws the surface's count
+// again. The caller writes the region, then drops the RAM copy.
+void MeshStorage::_mesh_surface_restore_buffers(RID p_mesh_rid, Mesh *p_mesh, int p_surface) {
+	Mesh::Surface &s = *p_mesh->surfaces[p_surface];
+	RD *rd = RD::get_singleton();
+	if (s.fallback_in_buffers) {
+		cluster_geometry_fallback_bytes -= uint64_t(s.vertex_buffer_size) + s.attribute_buffer_size + s.index_buffer_size;
+		s.fallback_in_buffers = false;
+	}
+	// The buffers' dependents (vertex and index arrays) go with them.
+	if (s.vertex_buffer.is_valid()) {
+		rd->free_rid(s.vertex_buffer);
+		s.vertex_buffer = RID();
+	}
+	if (s.attribute_buffer.is_valid()) {
+		rd->free_rid(s.attribute_buffer);
+		s.attribute_buffer = RID();
+	}
+	if (s.index_buffer.is_valid()) {
+		rd->free_rid(s.index_buffer);
+		s.index_buffer = RID();
+		s.index_array = RID();
+	}
+	s.version_lock.lock();
+	if (s.versions) {
+		memfree(s.versions); // reallocs, so free with memfree.
+		s.versions = nullptr;
+		s.version_count = 0;
+	}
+	s.version_lock.unlock();
+	for (MeshInstance *mi : p_mesh->instances) {
+		if (uint32_t(p_surface) < mi->surfaces.size() && mi->surfaces[p_surface].versions) {
+			memfree(mi->surfaces[p_surface].versions);
+			mi->surfaces[p_surface].versions = nullptr;
+			mi->surfaces[p_surface].version_count = 0;
+		}
+	}
+
+	// A surface that streams its geometry is neither skinned nor blend-shaped (mesh_add_surface).
+	BitField<RD::BufferCreationBits> flags = (s.format & RSE::ARRAY_FLAG_USE_STORAGE_BUFFER) ? RD::BUFFER_CREATION_AS_STORAGE_BIT : 0;
+	if (rd->has_feature(RD::SUPPORTS_RAYTRACING_PIPELINE) || rd->has_feature(RD::SUPPORTS_RAY_QUERY)) {
+		flags.set_flag(RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT);
+		flags.set_flag(RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+		flags.set_flag(RD::BUFFER_CREATION_AS_STORAGE_BIT);
+	}
+	if (s.ram_vertex_data.size()) {
+		Vector<uint8_t> vertex_data = s.ram_vertex_data;
+		if (!(s.format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) && (s.format & RSE::ARRAY_FORMAT_NORMAL) && !(s.format & RSE::ARRAY_FORMAT_TANGENT)) {
+			vertex_data.resize_initialized(vertex_data.size() + sizeof(uint16_t) * 2); // The pad mesh_add_surface() gives the normal block.
+		}
+		s.vertex_buffer = rd->vertex_buffer_create(vertex_data.size(), vertex_data, flags);
+		s.vertex_buffer_size = vertex_data.size();
+	}
+	if (s.ram_attribute_data.size()) {
+		s.attribute_buffer = rd->vertex_buffer_create(s.ram_attribute_data.size(), s.ram_attribute_data, flags);
+		s.attribute_buffer_size = s.ram_attribute_data.size();
+	}
+	s.vertex_count = s.rt_vertex_count;
+	s.index_count = s.rt_index_count;
+	s.index_total = s.rt_index_total;
+	const bool is_index_16 = s.vertex_count <= 65536 && s.vertex_count > 0;
+	s.index_buffer = rd->index_buffer_create(s.index_total, is_index_16 ? RD::INDEX_BUFFER_FORMAT_UINT16 : RD::INDEX_BUFFER_FORMAT_UINT32, s.ram_index_data, false, flags);
+	s.index_buffer_size = s.ram_index_data.size();
+	s.index_array = rd->index_array_create(s.index_buffer, 0, s.index_count);
+	if (s.ram_lods.size()) {
+		s.lods = memnew_arr(Mesh::Surface::LOD, s.ram_lods.size());
+		s.lod_count = s.ram_lods.size();
+		for (int i = 0; i < s.ram_lods.size(); i++) {
+			const uint32_t indices = s.ram_lods[i].index_data.size() / (is_index_16 ? 2 : 4);
+			s.lods[i].index_buffer = rd->index_buffer_create(indices, is_index_16 ? RD::INDEX_BUFFER_FORMAT_UINT16 : RD::INDEX_BUFFER_FORMAT_UINT32, s.ram_lods[i].index_data, false, flags);
+			s.lods[i].index_buffer_size = s.ram_lods[i].index_data.size();
+			s.lods[i].index_array = rd->index_array_create(s.lods[i].index_buffer, 0, indices);
+			s.lods[i].edge_length = s.ram_lods[i].edge_length;
+			s.lods[i].index_count = indices;
+		}
+	}
+	// An indirect MultiMesh's command buffer holds each surface's draw count, written when its mesh
+	// was set (_multimesh_set_mesh); the instance count beside it stays. Rare enough to walk them all.
+	const uint32_t count = mesh_surface_get_vertices_drawn_count(&s);
+	for (const RID &multimesh_rid : multimesh_owner.get_owned_list()) {
+		MultiMesh *multimesh = multimesh_owner.get_or_null(multimesh_rid);
+		if (multimesh && multimesh->indirect && multimesh->mesh == p_mesh_rid && multimesh->command_buffer.is_valid() && uint32_t(p_surface) < multimesh->command_buffer_surfaces) {
+			rd->buffer_update(multimesh->command_buffer, p_surface * sizeof(uint32_t) * INDIRECT_MULTIMESH_COMMAND_STRIDE, sizeof(uint32_t), &count);
+		}
+	}
+	p_mesh->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_MESH);
 }
 
 RenderingServerTypes::SurfaceData MeshStorage::mesh_get_surface(RID p_mesh, int p_surface) const {
@@ -1001,44 +1239,42 @@ RenderingServerTypes::SurfaceData MeshStorage::_mesh_surface_get_from_ram(const 
 }
 
 // The RAM check (D93d, rendering/pathtracing/cluster_lod_stream_geometry_ram_check): at a surface's
-// creation, its RAM answer against its buffers read back, byte for byte. The table, AABB, uv_scale
-// and bone fields come from the same Surface fields on both paths, so only the counts, the arrays
-// and the LODs are evidence.
-void MeshStorage::_mesh_surface_check_ram(const Mesh::Surface &p_surface) {
+// creation, mesh_get_surface()'s answer from the RAM copy against the arrays the surface was added
+// with, and the buffers read back against the fallback level's arrays they were made from, byte for
+// byte. The table, AABB, uv_scale and bone fields come from the same Surface fields on every path,
+// so only the counts, the arrays and the LODs are evidence.
+void MeshStorage::_mesh_surface_check_ram(const Mesh::Surface &p_surface, const RenderingServerTypes::SurfaceData &p_given, const Vector<uint8_t> &p_vertex_data, const Vector<uint8_t> &p_attribute_data, const Vector<uint8_t> &p_index_data) {
 	const RenderingServerTypes::SurfaceData ram = _mesh_surface_get_from_ram(p_surface);
 	const RenderingServerTypes::SurfaceData gpu = _mesh_surface_get_from_buffers(p_surface);
 	String differs;
-	if (ram.format != gpu.format || ram.primitive != gpu.primitive || ram.vertex_count != gpu.vertex_count || ram.index_count != gpu.index_count) {
+	if (ram.format != p_given.format || ram.primitive != p_given.primitive || ram.vertex_count != p_given.vertex_count || ram.index_count != p_given.index_count) {
 		differs += " counts";
 	}
-	if (ram.vertex_data != gpu.vertex_data) {
+	if (ram.vertex_data != p_given.vertex_data) {
 		differs += " vertex";
 	}
-	if (ram.attribute_data != gpu.attribute_data) {
+	if (ram.attribute_data != p_given.attribute_data) {
 		differs += " attribute";
 	}
-	if (ram.index_data != gpu.index_data) {
+	if (ram.index_data != p_given.index_data) {
 		differs += " index";
 	}
-	if (!ram.skin_data.is_empty() || !gpu.skin_data.is_empty() || !ram.blend_shape_data.is_empty() || !gpu.blend_shape_data.is_empty()) {
-		differs += " deform";
-	}
-	if (ram.cluster_data != gpu.cluster_data || ram.aabb != gpu.aabb || ram.uv_scale != gpu.uv_scale || ram.bone_aabbs != gpu.bone_aabbs) {
-		differs += " fields";
-	}
-	bool lods_equal = ram.lods.size() == gpu.lods.size();
+	bool lods_equal = ram.lods.size() == p_given.lods.size();
 	for (int i = 0; i < ram.lods.size() && lods_equal; i++) {
-		lods_equal = ram.lods[i].edge_length == gpu.lods[i].edge_length && ram.lods[i].index_data == gpu.lods[i].index_data;
+		lods_equal = ram.lods[i].edge_length == p_given.lods[i].edge_length && ram.lods[i].index_data == p_given.lods[i].index_data;
 	}
 	if (!lods_equal) {
 		differs += " lods";
 	}
+	if (gpu.vertex_data != p_vertex_data || gpu.attribute_data != p_attribute_data || gpu.index_data != p_index_data || gpu.vertex_count != p_surface.vertex_count || !gpu.lods.is_empty()) {
+		differs += " fallback";
+	}
 	ram_check_surfaces++;
 	if (!differs.is_empty()) {
 		ram_check_differing++;
-		print_line(vformat("MeshStorage: a surface's RAM copy differs from its buffers (D93d):%s; %d of %d checked differ.", differs, ram_check_differing, ram_check_surfaces));
+		print_line(vformat("MeshStorage: a surface's RAM copy or fallback level differs (D93d):%s; %d of %d checked differ.", differs, ram_check_differing, ram_check_surfaces));
 	} else {
-		print_line(vformat("MeshStorage: a surface's RAM copy equals its buffers (D93d), %d vertices, %d indices, %d LODs; %d of %d checked differ.", ram.vertex_count, ram.index_count, ram.lods.size(), ram_check_differing, ram_check_surfaces));
+		print_line(vformat("MeshStorage: a surface's RAM copy equals its arrays and its buffers its fallback level (D93d), %d vertices, %d indices and %d LODs, the fallback %d vertices and %d indices; %d of %d checked differ.", ram.vertex_count, ram.index_count, ram.lods.size(), p_surface.vertex_count, p_surface.index_count, ram_check_differing, ram_check_surfaces));
 	}
 }
 
@@ -2074,6 +2310,7 @@ void MeshStorage::_multimesh_set_mesh(RID p_multimesh, RID p_mesh) {
 
 			RID newBuffer = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t) * INDIRECT_MULTIMESH_COMMAND_STRIDE * mesh->surface_count, newVector, RD::STORAGE_BUFFER_USAGE_DISPATCH_INDIRECT);
 			multimesh->command_buffer = newBuffer;
+			multimesh->command_buffer_surfaces = mesh->surface_count;
 		}
 	}
 

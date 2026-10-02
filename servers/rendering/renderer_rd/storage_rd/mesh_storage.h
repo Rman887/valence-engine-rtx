@@ -160,6 +160,10 @@ private:
 			Vector<uint8_t> ram_attribute_data;
 			Vector<uint8_t> ram_index_data;
 			Vector<RenderingServerTypes::SurfaceData::LOD> ram_lods;
+			// The fallback level's vertices (D93d), each the index of the surface's own vertex it was
+			// compacted from; its buffers hold that level while fallback_in_buffers holds.
+			LocalVector<uint32_t> ram_fallback_vertices;
+			bool fallback_in_buffers = false;
 			// The layout the trace reads (D93d): the surface's whole vertex and index counts, and its
 			// indices with a hierarchy's coarse levels. The raster's vertex_count, index_count and
 			// index_total describe what its buffers hold, which for a surface that streams its geometry
@@ -247,18 +251,36 @@ private:
 	RD::VertexFormatID _mesh_surface_generate_vertex_format(uint64_t p_surface_format, uint64_t p_input_mask, bool p_instanced_surface, bool p_input_motion_vectors, bool p_point_size_emulated, uint32_t &r_position_stride);
 	void _mesh_surface_generate_version_for_input_mask(Mesh::Surface::Version &v, Mesh::Surface *s, uint64_t p_input_mask, bool p_input_motion_vectors, bool p_point_size_emulated, MeshInstance::Surface *mis = nullptr, uint32_t p_current_buffer = 0, uint32_t p_previous_buffer = 0);
 	void _mesh_surface_clear(Mesh *p_mesh, int p_surface);
-	// Drops a surface's RAM copy (D93): its hierarchy is gone or no longer describes it.
-	static void _mesh_surface_clear_ram(Mesh::Surface &r_surface) {
+	// Drops a surface's RAM copy (D93): its hierarchy is gone or no longer describes it, or the
+	// surface is going. A surface whose buffers still hold its fallback level is being freed.
+	void _mesh_surface_clear_ram(Mesh::Surface &r_surface) {
+		cluster_geometry_ram_bytes -= _mesh_surface_ram_bytes(r_surface);
+		if (r_surface.fallback_in_buffers) {
+			cluster_geometry_fallback_bytes -= uint64_t(r_surface.vertex_buffer_size) + r_surface.attribute_buffer_size + r_surface.index_buffer_size;
+			r_surface.fallback_in_buffers = false;
+		}
 		r_surface.ram_vertex_data.clear();
 		r_surface.ram_attribute_data.clear();
 		r_surface.ram_index_data.clear();
 		r_surface.ram_lods.clear();
+		r_surface.ram_fallback_vertices.clear();
 	}
+	static uint64_t _mesh_surface_ram_bytes(const Mesh::Surface &p_surface) {
+		uint64_t bytes = uint64_t(p_surface.ram_vertex_data.size()) + p_surface.ram_attribute_data.size() + p_surface.ram_index_data.size() + sizeof(uint32_t) * p_surface.ram_fallback_vertices.size();
+		for (const RenderingServerTypes::SurfaceData::LOD &lod : p_surface.ram_lods) {
+			bytes += lod.index_data.size();
+		}
+		return bytes;
+	}
+	void _mesh_surface_restore_buffers(RID p_mesh_rid, Mesh *p_mesh, int p_surface);
+	uint64_t cluster_geometry_ram_bytes = 0;
+	uint64_t cluster_geometry_fallback_bytes = 0;
+	static float _cluster_geometry_fallback_ratio();
 	// mesh_get_surface() from the GPU buffers, and for a surface that streams its geometry from its
 	// RAM copy (D93d).
 	RenderingServerTypes::SurfaceData _mesh_surface_get_from_buffers(const Mesh::Surface &p_surface) const;
 	static RenderingServerTypes::SurfaceData _mesh_surface_get_from_ram(const Mesh::Surface &p_surface);
-	void _mesh_surface_check_ram(const Mesh::Surface &p_surface);
+	void _mesh_surface_check_ram(const Mesh::Surface &p_surface, const RenderingServerTypes::SurfaceData &p_given, const Vector<uint8_t> &p_vertex_data, const Vector<uint8_t> &p_attribute_data, const Vector<uint8_t> &p_index_data);
 	static bool _is_cluster_geometry_ram_check_wanted();
 	uint32_t ram_check_surfaces = 0;
 	uint32_t ram_check_differing = 0;
@@ -287,6 +309,7 @@ private:
 		bool aabb_dirty = false;
 		bool buffer_set = false;
 		bool indirect = false;
+		uint32_t command_buffer_surfaces = 0; // The surfaces command_buffer holds a draw count for (D93d).
 		bool motion_vectors_enabled = false;
 		uint32_t motion_vectors_current_offset = 0;
 		uint32_t motion_vectors_previous_offset = 0;
@@ -566,6 +589,10 @@ public:
 		const Mesh::Surface *s = reinterpret_cast<const Mesh::Surface *>(p_surface);
 		return !s->ram_index_data.is_empty();
 	}
+
+	// Geometry residency's host memory (D93d): the RAM copies held, and the fallback levels' buffers.
+	uint64_t get_cluster_geometry_ram_bytes() const { return cluster_geometry_ram_bytes; }
+	uint64_t get_cluster_geometry_fallback_bytes() const { return cluster_geometry_fallback_bytes; }
 
 	// The surface's arrays in RAM (D93), empty unless it keeps them.
 	_FORCE_INLINE_ const Vector<uint8_t> &mesh_surface_get_ram_vertex_data(void *p_surface) {

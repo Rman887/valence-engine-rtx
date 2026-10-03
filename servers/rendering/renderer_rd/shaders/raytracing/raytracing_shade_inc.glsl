@@ -458,7 +458,9 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			vec3 spec_origin = offset_ray_origin(h.hit_pos, spec_dir);
 
 			rayQueryEXT spec_rq;
-			rayQueryInitializeEXT(spec_rq, tlas, RT_RAY_FLAGS | gl_RayFlagsTerminateOnFirstHitEXT,
+			// The closest hit: terminating on the first one would record whichever surface
+			// traversal order reaches first, not the reflected one.
+			rayQueryInitializeEXT(spec_rq, tlas, RT_RAY_FLAGS,
 					0xFF, spec_origin, 0.001, spec_dir, 10000.0);
 			while (rayQueryProceedEXT(spec_rq)) {
 				if (rayQueryGetIntersectionTypeEXT(spec_rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {

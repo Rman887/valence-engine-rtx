@@ -830,6 +830,13 @@ struct RTDeformedCacheEntry {
 	uint32_t cached_vertex_count = 0;
 	uint32_t cached_full_size = 0;
 	bool prev_pos_seeded = false; // False until the first owned->prev copy has run.
+	// The opacity micromap the triangle BLAS carries (D96 OMMc): the surface's, as the instance's
+	// walk wants it for its alpha-tested material. 0 for none; the walk builds the BLAS again when
+	// it wants another, and any other rebuild takes the last one wanted. A micromap the BLAS could
+	// not carry is not asked for again.
+	uint64_t omm_serial = 0;
+	uint64_t omm_wanted_serial = 0;
+	uint64_t omm_failed_serial = 0;
 
 	// The cluster path (D82): the entry owns the storage of its cluster BLAS alone (one worst-case
 	// slot at the aligned base); its CLAS are built on every frame the data changes, from
@@ -1004,6 +1011,7 @@ struct RTOmmEntry {
 	LocalVector<RD::MicromapUsage> index_usages; // The primitives' references per level, special indices left out.
 	RID static_blas; // The surface's BLAS with the micromap, for its static instances.
 	LocalVector<RID> merged_handles; // The merged MultiMesh entries that carry it.
+	LocalVector<RID> deformed_handles; // The deformed cache entries whose triangle BLAS carries it (OMMc).
 	uint32_t descriptors = 0;
 	uint32_t special_primitives = 0;
 	uint64_t micromap_bytes = 0;
@@ -1570,6 +1578,10 @@ class RenderRaytracing {
 	uint32_t _build_light_tree_node(uint32_t p_begin, uint32_t p_end); // The light tree's recursive build (D55).
 	void _build_light_tree_cut(uint32_t p_cut_size, LocalVector<RT_LightTreeNode> &r_cut, uint32_t p_slot_shift, uint32_t p_alias_base, bool p_power_pick); // A cut the shader scores per hit (D56), the primary or the indirect one (D59), with its leaves' alias tables (D60, D61).
 	void _release_deformed_blas(RTDeformedCacheEntry &p_entry);
+	// The deformed triangle BLAS over owned_vb_full, carrying the micromap the walk wants (D96 OMMc).
+	void _build_deformed_triangle_blas(RID p_handle, RTDeformedCacheEntry &r_entry, void *p_mesh_surface, uint32_t p_cache_key, uint32_t p_surface_counter, LocalVector<RID> &r_dirty_blas_list);
+	// The hit row's deformed flag and previous-position address, which a build's row fill clears.
+	void _mark_deformed_geometry(RTDeformedCacheEntry &r_entry);
 	RTMergedMMEntry *_access_merged_mm_slot(RID &r_handle);
 
 	LocalVector<uint32_t> material_free_slots;
@@ -1777,7 +1789,9 @@ class RenderRaytracing {
 			bool p_allow_update,
 			uint32_t p_cache_key,
 			RTSurfaceData *r_surf_data,
-			LocalVector<RID> &r_dirty_blas_list);
+			LocalVector<RID> &r_dirty_blas_list,
+			const RTOmmEntry *p_omm = nullptr, // A triangle BLAS's micromap (D96 OMMc); r_omm_attached says whether it carries it.
+			bool *r_omm_attached = nullptr);
 	// The cluster path of _populate_surface_blas (D79): the surface's triangles as the clusters its
 	// cluster table names (D80) or, without one, in runs of at most the device's cluster size; each a
 	// CLAS, one cluster BLAS over them, both built this frame into the surface's own storage. Returns
@@ -1839,6 +1853,12 @@ class RenderRaytracing {
 	// The merged BLAS's micromap fields, the base surface's index repeated p_mm_count times; false without one.
 	bool _omm_merged_geometry(RTMergedMMEntry &r_entry, uint32_t p_mm_count, uint32_t p_primitives_per_element, RD::AccelerationStructureGeometry &r_geometry);
 	void _omm_release_merged(RTMergedMMEntry &r_entry);
+	// A deformed triangle BLAS's micromap (OMMc): the built entry of p_serial over the surface's current
+	// contents, or nullptr; then its fields on the BLAS's geometry, false where the surface does not match.
+	RTOmmEntry *_omm_deformed_entry(uint64_t p_serial, uint32_t p_surface_counter);
+	bool _omm_deformed_geometry(const RTOmmEntry *p_entry, const RT_GeometryData &p_geometry, RD::AccelerationStructureGeometry &r_geometry);
+	// Records that the deformed entry's BLAS carries the micromap, so that its release takes the BLAS along.
+	void _omm_deformed_attached(RID p_handle, RTDeformedCacheEntry &r_entry, RTOmmEntry *p_omm);
 	void _omm_release_entry(RTOmmEntry *p_entry);
 	void _omm_release_mesh_surface(RID p_mesh, uint32_t p_surface);
 	void _omm_setup(RTOmmEntry *p_entry);

@@ -884,6 +884,7 @@ void RenderRaytracing::_release_deformed_blas(RTDeformedCacheEntry &p_entry) {
 	}
 	p_entry.ptr->blas = RID();
 	p_entry.blas_built_once = false;
+	p_entry.omm_serial = 0; // Its micromap (D96) was the BLAS's.
 	// The cluster layout (D82) is tied to the handle's slot; the storage stays for the next layout.
 	p_entry.cluster_count = 0;
 	p_entry.cluster_built_frame = 0;
@@ -1243,8 +1244,7 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 		} else if (clustered) {
 			_queue_deformed_cluster_rebuild(entry, RTDeformedCacheEntry::CLUSTER_QUEUED_FIRST_BUILD);
 		} else {
-			_populate_surface_blas(p_mesh_surface, entry.owned_vb_full, true, true, true,
-					static_cast<uint32_t>(p_source.cache_key), entry.ptr, r_dirty_blas_list);
+			_build_deformed_triangle_blas(surf->rt_deformed_handle, entry, p_mesh_surface, static_cast<uint32_t>(p_source.cache_key), p_source.surface_counter, r_dirty_blas_list);
 		}
 		entry.blas_built_once = entry.ptr->blas.is_valid();
 	} else if (entry.cluster_count > 0 && p_lod_select && entry.cluster_lod_table_offset != UINT32_MAX) {
@@ -1273,12 +1273,7 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 		cache_hits++;
 	}
 
-	if (entry.ptr && entry.ptr->blas.is_valid()) {
-		entry.ptr->geometry.flags |= RT_GEOM_FLAG_DEFORMED;
-		uint64_t prev_addr = rd->buffer_get_device_address(entry.prev_pos_vb);
-		entry.ptr->geometry.prev_vertex_buffer_address_lo = static_cast<uint32_t>(prev_addr & 0xFFFFFFFFULL);
-		entry.ptr->geometry.prev_vertex_buffer_address_hi = static_cast<uint32_t>(prev_addr >> 32);
-	}
+	_mark_deformed_geometry(entry);
 
 	surf->cached_final_transform_valid = false;
 
@@ -1291,6 +1286,28 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 	entry.last_used_frame = current_frame;
 
 	return entry.ptr;
+}
+
+void RenderRaytracing::_mark_deformed_geometry(RTDeformedCacheEntry &r_entry) {
+	if (r_entry.ptr && r_entry.ptr->blas.is_valid()) {
+		r_entry.ptr->geometry.flags |= RT_GEOM_FLAG_DEFORMED;
+		uint64_t prev_addr = RD::get_singleton()->buffer_get_device_address(r_entry.prev_pos_vb);
+		r_entry.ptr->geometry.prev_vertex_buffer_address_lo = static_cast<uint32_t>(prev_addr & 0xFFFFFFFFULL);
+		r_entry.ptr->geometry.prev_vertex_buffer_address_hi = static_cast<uint32_t>(prev_addr >> 32);
+	}
+}
+
+void RenderRaytracing::_build_deformed_triangle_blas(RID p_handle, RTDeformedCacheEntry &r_entry, void *p_mesh_surface, uint32_t p_cache_key, uint32_t p_surface_counter, LocalVector<RID> &r_dirty_blas_list) {
+	// Opacity micromaps (D96 OMMc): the BLAS carries the micromap its instance's walk wants, once
+	// baked over the surface's current contents; refits keep it, as the build info does.
+	RTOmmEntry *omm = _omm_deformed_entry(r_entry.omm_wanted_serial, p_surface_counter);
+	bool omm_attached = false;
+	_populate_surface_blas(p_mesh_surface, r_entry.owned_vb_full, true, true, true, p_cache_key, r_entry.ptr, r_dirty_blas_list, omm, &omm_attached);
+	if (omm_attached) {
+		_omm_deformed_attached(p_handle, r_entry, omm);
+	} else if (omm != nullptr) {
+		r_entry.omm_failed_serial = omm->serial;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1476,7 +1493,9 @@ void RenderRaytracing::_populate_surface_blas(
 		bool p_allow_update,
 		uint32_t p_cache_key,
 		RTSurfaceData *r_surf_data,
-		LocalVector<RID> &r_dirty_blas_list) {
+		LocalVector<RID> &r_dirty_blas_list,
+		const RTOmmEntry *p_omm,
+		bool *r_omm_attached) {
 	RID vertex_buffer, attribute_buffer, index_buffer;
 	_fill_surface_geometry_data(p_mesh_surface, p_force_uncompressed, r_surf_data,
 			&vertex_buffer, &attribute_buffer, &index_buffer);
@@ -1552,6 +1571,7 @@ void RenderRaytracing::_populate_surface_blas(
 	{
 		RD::AccelerationStructureGeometry as_geom;
 		_fill_surface_triangle_geometry(vertex_buffer, index_buffer, geom, is_2d, compressed, as_geom);
+		const bool omm_attached = p_omm != nullptr && _omm_deformed_geometry(p_omm, geom, as_geom);
 
 		BitField<RD::AccelerationStructureFlagBits> as_flags = p_prefer_fast_build
 				? RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT
@@ -1567,6 +1587,9 @@ void RenderRaytracing::_populate_surface_blas(
 		RD::get_singleton()->set_resource_name(r_surf_data->blas,
 				String(p_vertex_buffer_override.is_valid() ? "RT BLAS deformed [" : "RT BLAS [") + itos(p_cache_key) + "]");
 		r_dirty_blas_list.push_back(r_surf_data->blas);
+		if (r_omm_attached) {
+			*r_omm_attached = omm_attached;
+		}
 	}
 }
 
@@ -7936,6 +7959,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			// MeshInstance skinning/blend shapes provide a deformed vertex buffer.
 			RTSurfaceData *surf_data = nullptr;
+			uint32_t deformed_cache_key = 0;
 			if (inst->mesh_instance.is_valid()) {
 				RID curr_vb = mesh_storage->mesh_instance_get_vertex_buffer(inst->mesh_instance, surf->surface_index);
 				if (curr_vb.is_valid()) {
@@ -7948,6 +7972,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					src.cache_version = static_cast<uint32_t>(mi_id >> 32);
 					src.cache_key = (static_cast<uint64_t>(mi_index) << 16) | (surf->surface_index & 0xFFFFu);
 					src.surface_counter = surface_counter;
+					deformed_cache_key = static_cast<uint32_t>(src.cache_key);
 					surf_data = process_deformed_surface(surf, mesh_surface, src, dirty_blas_list, dirty_blas_update_list, lod_deformed_frame && cluster_lod_deformed_enabled);
 				}
 			}
@@ -8050,16 +8075,54 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			// surface can share one (D89); until then the slot holds the LOD 0 BLAS.
 			RID blas_handle = surf_data->blas;
 			// Opacity micromaps (D96): an alpha-tested standard material, or a custom shader with
-			// render_mode opacity_micromap, on a static triangle BLAS traces the surface's BLAS that
-			// carries its micromap, once baked. Only such an instance: a micromap's transparent states
-			// cull even where FORCE_OPAQUE is set.
-			if (omm_enabled && !(inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) && (mat_data->rt_sbt_offset == 0 || mat_data->omm_custom) &&
-					!surf->rt_deformed_handle.is_valid() && !(surf_data->geometry.flags & RT_GEOM_FLAG_DEFORMED) && surf_data->cluster_count == 0 &&
-					!surf_data->geometry_streamed && surf->owner->data->base_type == RSE::INSTANCE_MESH) {
-				RTOmmEntry *omm = _omm_request(surf->owner->data->base, surf->surface_index, surface_counter, mat_data);
-				const RID omm_blas = _omm_surface_blas(omm, mesh_surface, surf_data, dirty_blas_list);
-				if (omm_blas.is_valid()) {
-					blas_handle = omm_blas;
+			// render_mode opacity_micromap, on a triangle BLAS traces its surface's micromap, once
+			// baked. Only such an instance: a micromap's transparent states cull even where
+			// FORCE_OPAQUE is set.
+			if (omm_enabled) {
+				const bool omm_material = !(inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) && (mat_data->rt_sbt_offset == 0 || mat_data->omm_custom) &&
+						surf->owner->data->base_type == RSE::INSTANCE_MESH;
+				if (!surf->rt_deformed_handle.is_valid() && !(surf_data->geometry.flags & RT_GEOM_FLAG_DEFORMED)) {
+					// A static BLAS is shared by every instance of the surface: such an instance
+					// traces the surface's second BLAS, which carries the micromap.
+					if (omm_material && surf_data->cluster_count == 0 && !surf_data->geometry_streamed) {
+						RTOmmEntry *omm = _omm_request(surf->owner->data->base, surf->surface_index, surface_counter, mat_data);
+						const RID omm_blas = _omm_surface_blas(omm, mesh_surface, surf_data, dirty_blas_list);
+						if (omm_blas.is_valid()) {
+							blas_handle = omm_blas;
+						}
+					}
+				} else if (surf->rt_deformed_handle.is_valid()) {
+					// A deformed triangle BLAS is the instance's own (OMMc): it carries the micromap
+					// itself. Not a compressed surface: the deformed row reads its attributes as
+					// uncompressed (force_uncompressed), the bake as they are, so the two would not agree.
+					RTDeformedCacheEntry *deformed = deformed_pool.get_or_null(surf->rt_deformed_handle);
+					if (deformed != nullptr && deformed->ptr == surf_data && deformed->cluster_count == 0) {
+						uint64_t serial = 0;
+						if (omm_material && !(mesh_storage->mesh_surface_get_format(mesh_surface) & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES)) {
+							const RTOmmEntry *omm = _omm_request(surf->owner->data->base, surf->surface_index, surface_counter, mat_data);
+							if (omm != nullptr && omm->state == RTOmmEntry::STATE_BUILT && omm->serial != deformed->omm_failed_serial) {
+								serial = omm->serial;
+							}
+						}
+						deformed->omm_wanted_serial = serial;
+						if (serial != deformed->omm_serial) {
+							// Settled in this walk, as a merge is before its build: the BLAS traced this
+							// frame never carries a micromap the material no longer asks for, whose
+							// transparent states would cull even under FORCE_OPAQUE. The build or refit
+							// the processing queued for it is dropped, and the BLAS is built again here.
+							dirty_blas_list.resize(pre_slot_build_size);
+							dirty_blas_update_list.resize(pre_slot_refit_size);
+							_release_deformed_blas(*deformed);
+							_build_deformed_triangle_blas(surf->rt_deformed_handle, *deformed, mesh_surface, deformed_cache_key, surface_counter, dirty_blas_list);
+							deformed->blas_built_once = surf_data->blas.is_valid();
+							_mark_deformed_geometry(*deformed);
+							if (!surf_data->blas.is_valid()) {
+								surf = surf->next;
+								continue;
+							}
+							blas_handle = surf_data->blas;
+						}
+					}
 				}
 			}
 			// A slot-resident instance (D94b) whose BLAS this frame builds or may build after the walk

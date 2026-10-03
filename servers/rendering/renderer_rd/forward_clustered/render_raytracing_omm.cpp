@@ -834,6 +834,42 @@ bool RenderRaytracing::_omm_merged_geometry(RTMergedMMEntry &r_entry, uint32_t p
 	return true;
 }
 
+RTOmmEntry *RenderRaytracing::_omm_deformed_entry(uint64_t p_serial, uint32_t p_surface_counter) {
+	if (p_serial == 0) {
+		return nullptr;
+	}
+	RTOmmEntry **found = omm_by_serial.getptr(p_serial);
+	if (found == nullptr || (*found)->state != RTOmmEntry::STATE_BUILT || (*found)->key.surface_counter != p_surface_counter) {
+		return nullptr; // Released, or baked over the surface's earlier contents: the walk asks again.
+	}
+	return *found;
+}
+
+bool RenderRaytracing::_omm_deformed_geometry(const RTOmmEntry *p_entry, const RT_GeometryData &p_geometry, RD::AccelerationStructureGeometry &r_geometry) {
+	// The deformed BLAS reads the mesh's own index buffer, or its vertices in order, as the bake does:
+	// primitive p is the bake's.
+	if (p_entry->primitive_count != p_geometry.primitive_count) {
+		return false;
+	}
+	_omm_geometry_attach(p_entry, p_entry->index_buffer, p_entry->index_usages, r_geometry);
+	return true;
+}
+
+void RenderRaytracing::_omm_deformed_attached(RID p_handle, RTDeformedCacheEntry &r_entry, RTOmmEntry *p_omm) {
+	r_entry.omm_serial = p_omm->serial;
+	// Entries that no longer carry it (rebuilt, released, their slot gone) leave the list here.
+	for (int64_t i = int64_t(p_omm->deformed_handles.size()) - 1; i >= 0; i--) {
+		const RTDeformedCacheEntry *deformed = deformed_pool.get_or_null(p_omm->deformed_handles[i]);
+		if (deformed == nullptr || deformed->omm_serial != p_omm->serial) {
+			p_omm->deformed_handles.remove_at_unordered(i);
+		}
+	}
+	if (p_omm->deformed_handles.find(p_handle) < 0) {
+		p_omm->deformed_handles.push_back(p_handle);
+	}
+	omm_stats.blases++;
+}
+
 void RenderRaytracing::_omm_release_merged(RTMergedMMEntry &r_entry) {
 	if (r_entry.omm_index_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(r_entry.omm_index_buffer);
@@ -856,6 +892,18 @@ void RenderRaytracing::_omm_release_entry(RTOmmEntry *p_entry) {
 		}
 		merged->blas_built_once = false;
 		_omm_release_merged(*merged);
+	}
+	// A deformed triangle BLAS that carries it would be freed with the micromap: it goes now, and its
+	// surface builds it again, plain, at its next processing (OMMc). Never mid-walk on a BLAS the walk
+	// queued: the walk's request releases only micromaps of a surface's earlier contents, which a
+	// rebuild this frame no longer attached.
+	for (const RID &handle : p_entry->deformed_handles) {
+		RTDeformedCacheEntry *deformed = deformed_pool.get_or_null(handle);
+		if (deformed == nullptr || deformed->omm_serial != p_entry->serial) {
+			continue;
+		}
+		_release_deformed_blas(*deformed);
+		deformed->omm_wanted_serial = 0;
 	}
 	if (p_entry->static_blas.is_valid() && rd->acceleration_structure_is_valid(p_entry->static_blas)) {
 		rd->free_rid(p_entry->static_blas);

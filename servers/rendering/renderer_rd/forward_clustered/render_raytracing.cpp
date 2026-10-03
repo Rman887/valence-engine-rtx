@@ -6578,6 +6578,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		s_default_mat.data.uv1_scale[1] = 1.0f;
 		s_default_mat.data.uv1_offset[0] = 0.0f;
 		s_default_mat.data.uv1_offset[1] = 0.0f;
+		s_default_mat.data.alpha_threshold = 0.5f;
 		s_default_mat_initialized = true;
 	}
 
@@ -6644,6 +6645,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.uv1_offset[1] = 0.0f;
 	mat.normal_map_depth = 1.0f;
 	mat.uniform_address = 0;
+	mat.alpha_threshold = 0.5f;
 
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
@@ -6931,6 +6933,19 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		Vector3 o = uv1_offset_var;
 		mat.uv1_offset[0] = o.x;
 		mat.uv1_offset[1] = o.y;
+	}
+
+	// The alpha test's cutoff, from the material's own uniform when its shader declares one
+	// (BaseMaterial3D does in alpha scissor mode); 0.5 otherwise.
+	if (shader_declares("alpha_scissor_threshold")) {
+		Variant threshold_var = material_storage->material_get_param(p_material_rid, "alpha_scissor_threshold");
+		if (threshold_var.get_type() == Variant::NIL) {
+			// A ShaderMaterial leaves a uniform at its default out of its parameters; the raster packs the default.
+			threshold_var = shader_data->get_default_parameter("alpha_scissor_threshold");
+		}
+		if (threshold_var.get_type() == Variant::FLOAT) {
+			mat.alpha_threshold = threshold_var;
+		}
 	}
 
 	// Point filtering: check if material requests nearest filtering (e.g. pixel art).

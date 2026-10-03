@@ -176,7 +176,8 @@ int rt_ray_query_cluster_id(rayQueryEXT q) {
 #endif
 }
 
-/// Inline alpha test for ray query candidates. Returns true if the hit is opaque (alpha >= 0.5).
+/// Inline alpha test for ray query candidates. Returns true if the hit is opaque (alpha >= the material's
+/// alpha_threshold, sampled at level 0 as HG0's any-hit does).
 /// Mirrors the any-hit shader logic for use with inline ray queries.
 bool ray_query_alpha_test(uint geometry_idx, int cluster_id, uint primitive, vec2 candidate_bary) {
 	vec3 bary = vec3(1.0 - candidate_bary.x - candidate_bary.y, candidate_bary.x, candidate_bary.y);
@@ -188,10 +189,10 @@ bool ray_query_alpha_test(uint geometry_idx, int cluster_id, uint primitive, vec
 
 	MaterialData mat = materials[geometry_idx];
 	uv = uv * mat.uv1_scale + mat.uv1_offset;
-	float alpha = texture(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv).a;
+	float alpha = textureLod(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, 0.0).a;
 	alpha *= mat.albedo_color.a;
 
-	return alpha >= 0.5;
+	return alpha >= mat.alpha_threshold;
 }
 
 // ============================================================================

@@ -107,7 +107,7 @@ struct RT_InstanceMotionData {
 };
 static_assert(sizeof(RT_InstanceMotionData) == 48, "RT_InstanceMotionData must be 48 bytes");
 
-// Must match GLSL MaterialData (std430, 96 bytes).
+// Must match GLSL MaterialData (std430, 112 bytes).
 struct alignas(16) RT_MaterialData {
 	uint32_t albedo_texture_idx;
 	uint32_t normal_texture_idx;
@@ -125,8 +125,10 @@ struct alignas(16) RT_MaterialData {
 	float normal_map_depth; // Strength [0..N], default 1.0 (not Z-depth).
 	float specular; // Dielectric specular [0..1], default 0.5 -> F0 = 0.04.
 	uint64_t uniform_address; // BDA for custom shader uniform buffer (0 = none).
+	float alpha_threshold; // The alpha test's cutoff: opaque where alpha >= it (default 0.5).
+	uint32_t _pad[3];
 };
-static_assert(sizeof(RT_MaterialData) == 96, "RT_MaterialData must be 96 bytes for std430");
+static_assert(sizeof(RT_MaterialData) == 112, "RT_MaterialData must be 112 bytes for std430");
 
 // Light types for raytracing (matches GLSL RT_LIGHT_TYPE_* defines).
 enum RTLightType : uint32_t {
@@ -1029,7 +1031,7 @@ struct alignas(16) RT_SlotRowWrite {
 	RT_GeometryData geometry;
 	RT_MaterialData material;
 };
-static_assert(sizeof(RT_SlotRowWrite) == 240, "RT_SlotRowWrite must match ptlas_rows.glsl");
+static_assert(sizeof(RT_SlotRowWrite) == 256, "RT_SlotRowWrite must match ptlas_rows.glsl");
 
 /// Per-viewport raytracing state.
 ///

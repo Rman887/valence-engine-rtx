@@ -903,10 +903,11 @@ void main() {
 	vec2 uv = fetch_uv(geom, i0, i1, i2, bary);
 	MaterialData mat = materials[geometry_idx];
 	uv = uv * mat.uv1_scale + mat.uv1_offset;
-	float alpha = texture(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv).a;
+	// The base level, explicitly: an opacity micromap is baked from it (D96).
+	float alpha = textureLod(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, 0.0).a;
 	alpha *= mat.albedo_color.a;
 
-	if (alpha < 0.5) {
+	if (alpha < mat.alpha_threshold) {
 		ignoreIntersectionEXT;
 	}
 #endif

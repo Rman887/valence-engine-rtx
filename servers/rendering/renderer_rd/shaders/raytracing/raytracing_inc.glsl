@@ -46,7 +46,7 @@
 //   [0]=rg, [1]=bR, [2]=GB  (packHalf2x16 pairs).
 // The next-bounce origin is not stored: raygen reconstructs it from the
 // current ray and hit_t as `offset_ray_origin(ray_origin + ray_dir * hit_t,
-// offset_normal)`. The offset normal and next direction are stored as
+// offset_normal, hit_t)`. The offset normal and next direction are stored as
 // 16-bit unorm octahedral pairs (effective angular error <~0.001 deg,
 // below the 8-bit normal quantization baked into offset_ray_origin).
 // Use PathState + path_pack/path_unpack for fp32 working copies.
@@ -374,11 +374,21 @@ float _offset_component(float p, float n_comp, int of_comp) {
 	return (abs(p) < origin) ? (p + float_scale * n_comp) : p_i;
 }
 
-vec3 offset_ray_origin(vec3 p, vec3 n) {
+// t is the distance along the ray that found p. A position's error scales with the magnitudes
+// that went into it, not with each component's own: a component near zero (a water plane at
+// trace-space y = 0) took 256 ULP of itself, or a fixed 1/65536 below 1/32, less than the error
+// of a position rebuilt along a long ray or from raster depth (the G-buffer primary). Each
+// component therefore moves at least a few ULP of the largest coordinate (the anchor-relative
+// grid, up to 1024 m from the camera under D20) and 1/65536 of the ray's length along n.
+vec3 offset_ray_origin(vec3 p, vec3 n, float t) {
 	const float int_scale = 256.0;
+	const float floor_scale = 1.0 / 65536.0;
 	ivec3 of = ivec3(int_scale * n);
-	return vec3(
+	vec3 p_wb = vec3(
 			_offset_component(p.x, n.x, of.x),
 			_offset_component(p.y, n.y, of.y),
 			_offset_component(p.z, n.z, of.z));
+	float scale = max(max(max(abs(p.x), abs(p.y)), abs(p.z)) * (1.0 / 32.0), t);
+	vec3 floor_offset = n * (floor_scale * scale);
+	return mix(p_wb, p + floor_offset, greaterThan(abs(floor_offset), abs(p_wb - p)));
 }

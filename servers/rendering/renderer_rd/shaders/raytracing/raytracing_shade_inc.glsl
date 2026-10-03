@@ -459,7 +459,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			// has almost no normal component at grazing angles, so offsetting along it left the origin
 			// on the surface and a cull-disabled one hit itself.
 			vec3 spec_dir = mirrorDirectionAcrossPlane(reflect(-V, N), h.geometry_normal);
-			vec3 spec_origin = offset_ray_origin(h.hit_pos, h.geometry_normal);
+			vec3 spec_origin = offset_ray_origin(h.hit_pos, h.geometry_normal, hit_t);
 
 			rayQueryEXT spec_rq;
 			// The closest hit: terminating on the first one would record whichever surface
@@ -513,7 +513,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// takes its sample here (the miss weighs against it either way).
 	bool tree_sky = light_tree_enabled() && sky_light_enabled() && sky_total > 0.0;
 	if (rt_light_count > 0u || rt_emissive_count > 0u || p_sky > 0.0 || tree_sky) {
-		vec3 hit_pos_offset = offset_ray_origin(h.hit_pos, h.geometry_normal);
+		vec3 hit_pos_offset = offset_ray_origin(h.hit_pos, h.geometry_normal, hit_t);
 		bool is_indirect = (diffuse_bounces > 0u);
 		// One light sample per hit (D50): the analytic lights or the emissive list, chosen by the
 		// per-frame share, the contribution divided by its share. Nothing is drawn for the choice

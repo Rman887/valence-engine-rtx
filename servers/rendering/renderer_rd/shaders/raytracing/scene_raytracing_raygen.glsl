@@ -151,7 +151,8 @@ void trace_path_ray(vec3 ray_origin, vec3 ray_dir, uint mask, float max_distance
 /// full primary ray (sky and procedural geometry without a raster backdrop).
 /// ray_origin and ray_dir are the raygen's own primary ray, anchor-relative;
 /// the hit is rebuilt along it from the raster's reverse-Z depth, never from
-/// a written position, so it sits on the same float grid as the TLAS.
+/// a written position, so it sits on the same float grid as the TLAS. Its depth
+/// error grows with the distance, which offset_ray_origin's floor covers.
 bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir) {
 	float depth = texelFetch(sampler2D(gbuffer_depth, SAMPLER_NEAREST_CLAMP), pixel, 0).r;
 	if (depth <= 0.0) {
@@ -351,7 +352,7 @@ void main() {
 					break;
 				}
 				vec3 hit_pos = ray_origin + ray_dir * ps.hit_t;
-				ray_origin = offset_ray_origin(hit_pos, ps.offset_normal);
+				ray_origin = offset_ray_origin(hit_pos, ps.offset_normal, ps.hit_t);
 				ray_dir = ps.next_ray_dir;
 				continue;
 			}
@@ -368,7 +369,7 @@ void main() {
 			}
 			// Reconstruct the next ray origin from the current ray + hit distance, apply bias
 			vec3 hit_pos = ray_origin + ray_dir * ps.hit_t;
-			ray_origin = offset_ray_origin(hit_pos, ps.offset_normal);
+			ray_origin = offset_ray_origin(hit_pos, ps.offset_normal, ps.hit_t);
 			ray_dir = ps.next_ray_dir;
 		}
 

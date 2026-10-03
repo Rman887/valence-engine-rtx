@@ -5711,7 +5711,43 @@
 		<constant name="VIEWPORT_RENDER_INFO_RT_INSTANCES_COMPILING" value="8" enum="ViewportRenderInfo">
 			Instances left out of this frame's TLAS because their custom hit group is still compiling, which takes several frames under [member ProjectSettings.rendering/pathtracing/async_shader_compilation]. A hit group that failed to compile is not counted, so zero means every instance that can be traced is in the frame. A MultiMesh counts each of its instances and a procedural instance counts once, so the count is not in the unit of [constant VIEWPORT_RENDER_INFO_RT_TLAS_INSTANCES] (ray tracing only, editor builds only).
 		</constant>
-		<constant name="VIEWPORT_RENDER_INFO_MAX" value="9" enum="ViewportRenderInfo">
+		<constant name="VIEWPORT_RENDER_INFO_RT_SLOTS_ENABLED" value="9" enum="ViewportRenderInfo">
+			Instance slots enabled in this viewport's partitioned TLAS after this frame's commit: the instances it traces. A frame whose commit failed traces nothing and reads 0 on every partitioned TLAS counter (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).
+		</constant>
+		<constant name="VIEWPORT_RENDER_INFO_RT_SLOT_WRITES" value="10" enum="ViewportRenderInfo">
+			Instance records written to the partitioned TLAS this frame: new, moved, BLAS changed or rebuilt, flags, mask or hit group changed, returned from the global partition, rewritten for an origin shift, and disabled. A build from scratch writes every enabled slot and nothing else (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).
+		</constant>
+		<constant name="VIEWPORT_RENDER_INFO_RT_SLOT_DISABLES" value="11" enum="ViewportRenderInfo">
+			Slots disabled this frame: instances no longer in the frame's TLAS, and the old slots of a MultiMesh whose instance count changed, whose instances move to new slots. Counted in [constant VIEWPORT_RENDER_INFO_RT_SLOT_WRITES] as well, except on a build from scratch, whose writes are the enabled slots only. The safety net's disables are [constant VIEWPORT_RENDER_INFO_RT_PTLAS_DANGLING_DISABLES] (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).
+		</constant>
+		<constant name="VIEWPORT_RENDER_INFO_RT_SLOT_STALE_REWRITES" value="12" enum="ViewportRenderInfo">
+			Slots the partitioned TLAS wrote again this frame on its own because their BLAS was rebuilt or refit while the instance was otherwise unchanged. Not counted in [constant VIEWPORT_RENDER_INFO_RT_SLOT_WRITES] (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).
+		</constant>
+		<constant name="VIEWPORT_RENDER_INFO_RT_SLOT_ROWS" value="13" enum="ViewportRenderInfo">
+			Per-instance geometry and material rows written by the scatter pass this frame. Rows that only update an instance's motion index are not counted (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).
+		</constant>
+		<constant name="VIEWPORT_RENDER_INFO_RT_PARTITIONS_LIVE" value="14" enum="ViewportRenderInfo">
+			Partitions of the partitioned TLAS that hold at least one enabled slot after this frame's commit, the global partition not included (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).
+		</constant>
+		<constant name="VIEWPORT_RENDER_INFO_RT_PARTITIONS_TOUCHED" value="15" enum="ViewportRenderInfo">
+			Partitions named by this frame's instance writes, the global partition included. The partition a slot leaves and the partitions of [constant VIEWPORT_RENDER_INFO_RT_SLOT_STALE_REWRITES] and [constant VIEWPORT_RENDER_INFO_RT_PTLAS_DANGLING_DISABLES] are not counted, so this is a lower bound on the partitions rebuilt (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).
+		</constant>
+		<constant name="VIEWPORT_RENDER_INFO_RT_PARTITION_TRANSLATIONS" value="16" enum="ViewportRenderInfo">
+			Partition translations written this frame: after the ray-tracing origin moved, for a partition a new cell took, and after a build from scratch (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).
+		</constant>
+		<constant name="VIEWPORT_RENDER_INFO_RT_SLOTS_GLOBAL" value="17" enum="ViewportRenderInfo">
+			Slots in the global partition after this frame's commit: instances rewritten recently while enabled, which return to their cell once they have not been written for [member ProjectSettings.rendering/pathtracing/ptlas_stable_frames] builds (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).
+		</constant>
+		<constant name="VIEWPORT_RENDER_INFO_RT_SLOTS_GLOBAL_OVERFLOW" value="18" enum="ViewportRenderInfo">
+			Writes this frame that went to their cell's partition instead of the global partition because the global partition was full at [member ProjectSettings.rendering/pathtracing/ptlas_global_max_instances]. With that setting at 0 every rewrite of an enabled slot counts (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).
+		</constant>
+		<constant name="VIEWPORT_RENDER_INFO_RT_PTLAS_FROM_SCRATCH" value="19" enum="ViewportRenderInfo">
+			1 when this frame built the partitioned TLAS from scratch, otherwise 0: the first frame of a viewport or of its new render buffers, a capacity increase, a viewport rendering again after idling, or the frame after a failed build (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).
+		</constant>
+		<constant name="VIEWPORT_RENDER_INFO_RT_PTLAS_DANGLING_DISABLES" value="20" enum="ViewportRenderInfo">
+			Slots the partitioned TLAS disabled this frame because they still referenced a freed BLAS. This is a safety net, so any value other than 0 points to a bug (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).
+		</constant>
+		<constant name="VIEWPORT_RENDER_INFO_MAX" value="21" enum="ViewportRenderInfo">
 			Represents the size of the [enum ViewportRenderInfo] enum.
 		</constant>
 		<constant name="VIEWPORT_RENDER_INFO_TYPE_VISIBLE" value="0" enum="ViewportRenderInfoType">

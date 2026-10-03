@@ -8365,7 +8365,29 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 	SceneShaderRaytracing::get_singleton()->finalize_custom_shaders();
 
-	if (!build_acceleration_structures(state, dirty_blas_list, dirty_blas_update_list)) {
+	const bool built = build_acceleration_structures(state, dirty_blas_list, dirty_blas_update_list);
+#ifdef TOOLS_ENABLED
+	if (built && collect_render_info && ptlas_slots_enabled) {
+		// The slot commit's counters (D94b), read after it ran. A failed commit leaves them partly
+		// this frame's and partly the last success's, so that frame, which does not trace, reads 0
+		// and the next reads a build from scratch.
+		const RTViewportState::SlotCounters &counters = state->slot_counters;
+		int *info = p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE];
+		info[RSE::VIEWPORT_RENDER_INFO_RT_SLOTS_ENABLED] += counters.enabled;
+		info[RSE::VIEWPORT_RENDER_INFO_RT_SLOT_WRITES] += counters.writes;
+		info[RSE::VIEWPORT_RENDER_INFO_RT_SLOT_DISABLES] += counters.disables;
+		info[RSE::VIEWPORT_RENDER_INFO_RT_SLOT_STALE_REWRITES] += counters.stale_rewrites;
+		info[RSE::VIEWPORT_RENDER_INFO_RT_SLOT_ROWS] += counters.rows;
+		info[RSE::VIEWPORT_RENDER_INFO_RT_PARTITIONS_LIVE] += counters.partitions_live;
+		info[RSE::VIEWPORT_RENDER_INFO_RT_PARTITIONS_TOUCHED] += counters.partitions_touched;
+		info[RSE::VIEWPORT_RENDER_INFO_RT_PARTITION_TRANSLATIONS] += counters.translations;
+		info[RSE::VIEWPORT_RENDER_INFO_RT_SLOTS_GLOBAL] += counters.global;
+		info[RSE::VIEWPORT_RENDER_INFO_RT_SLOTS_GLOBAL_OVERFLOW] += counters.global_overflow;
+		info[RSE::VIEWPORT_RENDER_INFO_RT_PTLAS_FROM_SCRATCH] += counters.from_scratch_last;
+		info[RSE::VIEWPORT_RENDER_INFO_RT_PTLAS_DANGLING_DISABLES] += counters.dangling_last;
+	}
+#endif
+	if (!built) {
 		return nullptr; // The frame skips the fog and the trace (D94b).
 	}
 	finalize_buffers(state);

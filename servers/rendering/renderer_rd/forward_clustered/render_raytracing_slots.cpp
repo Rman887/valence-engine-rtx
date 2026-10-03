@@ -734,6 +734,7 @@ bool RenderRaytracing::_commit_slots(RTViewportState *p_state) {
 	counters.build_usec = 0;
 	counters.scan_usec = 0;
 	counters.dangling_last = 0;
+	counters.from_scratch_last = 0;
 	counters.builds = 0;
 
 	const uint32_t build = p_state->slot_build;
@@ -1037,6 +1038,7 @@ bool RenderRaytracing::_commit_slots(RTViewportState *p_state) {
 		}
 		counters.builds++;
 		counters.from_scratch++;
+		counters.from_scratch_last = 1;
 	} else {
 		// The rest of the writes; with none, the build call still writes the slots of a BLAS rebuilt
 		// in place again (or finds nothing to do).

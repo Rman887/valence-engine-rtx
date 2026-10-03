@@ -1145,6 +1145,7 @@ struct RTViewportState {
 		uint32_t global = 0;
 		uint32_t global_overflow = 0;
 		uint32_t from_scratch = 0; // Over the run.
+		uint32_t from_scratch_last = 0; // 1 when the last commit built from scratch.
 		uint64_t returns_total = 0; // Over the run: the global partition's slots back in their cells.
 		uint64_t global_entries_total = 0; // Over the run: slots placed in the global partition.
 		uint32_t global_peak = 0;

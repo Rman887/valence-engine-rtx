@@ -6647,6 +6647,7 @@ static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_B
 static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT, VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR));
 static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_LOW_MEMORY_BIT, VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR));
 static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT, VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR));
+static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_ALLOW_CLUSTER_OPACITY_MICROMAPS_BIT, VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_CLUSTER_OPACITY_MICROMAPS_BIT_NV));
 
 // RDD::AccelerationStructureGeometryFlagBits == VkGeometryFlagsKHR.
 static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT, VK_GEOMETRY_OPAQUE_BIT_KHR));
@@ -7084,6 +7085,23 @@ void RenderingDeviceDriverVulkan::cluster_triangle_build_info_write(uint8_t *r_d
 	vk_info->vertexBufferStride = p_info.vertex_stride;
 	vk_info->indexBuffer = p_info.index_address;
 	vk_info->vertexBuffer = p_info.vertex_address;
+	// An opacity micromap (D96); without one the fields stay zero, the micromap off for the cluster.
+	if (p_info.opacity_micromap_address != 0) {
+		switch (p_info.opacity_micromap_index_type) {
+			case ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT8:
+				vk_info->opacityMicromapIndexType = VK_CLUSTER_ACCELERATION_STRUCTURE_INDEX_FORMAT_8BIT_NV;
+				break;
+			case ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT16:
+				vk_info->opacityMicromapIndexType = VK_CLUSTER_ACCELERATION_STRUCTURE_INDEX_FORMAT_16BIT_NV;
+				break;
+			case ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT32:
+				vk_info->opacityMicromapIndexType = VK_CLUSTER_ACCELERATION_STRUCTURE_INDEX_FORMAT_32BIT_NV;
+				break;
+		}
+		vk_info->opacityMicromapIndexBufferStride = p_info.opacity_micromap_index_stride;
+		vk_info->opacityMicromapArray = p_info.opacity_micromap_address;
+		vk_info->opacityMicromapIndexBuffer = p_info.opacity_micromap_index_address;
+	}
 #endif
 }
 

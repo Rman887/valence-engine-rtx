@@ -451,6 +451,7 @@ struct RTSurfaceData {
 	RTLodStream *cluster_lod_stream = nullptr;
 	uint32_t cluster_built_count = 0; // The CLAS the population built and the compaction moves.
 	uint32_t cluster_blas_count = 0; // The clusters `blas` is over.
+	bool cluster_omm = false; // Its CLAS carry an opacity micromap (D96 OMMd): its builds are flagged for one.
 	// Geometry residency (D93b): a streamed surface whose CLAS carry their cluster's index as their
 	// ID. Its hits read their triangle through RT_CLUSTER_GEOMETRY_RECORD_WORDS words a cluster in
 	// the LOD table, from this offset, in the blob of the cluster's group, one region of the cluster
@@ -860,6 +861,9 @@ struct RTDeformedCacheEntry {
 	uint64_t cluster_pushed_frame = 0; // frames_drawn when the surface last entered the TLAS instance list.
 	uint8_t cluster_frame_kind = CLUSTER_QUEUED_NONE; // Why it is in this frame's batch.
 	LocalVector<uint8_t> cluster_infos; // cluster_count driver build infos.
+	// The infos reference an opacity micromap (D96 OMMd): the BLAS storage was sized, and the batch
+	// builds the entry, with the micromap flag, in a build of its own.
+	bool cluster_omm = false;
 	RID cluster_index_buffer; // The mesh's index buffer the infos read, listed as a source at each rebuild.
 	// The cluster LOD hierarchy on the GPU (D87): the entry's region of the shared LOD table
 	// (each cluster's group and the group it refines, the groups' bounds and errors, and every
@@ -908,6 +912,8 @@ struct RTDeformedClusterBatch {
 	LocalVector<RID> source_buffers; // Each entry's owned vertex buffer, and each distinct index buffer once.
 	LocalVector<RID> index_buffers_seen;
 	LocalVector<RID> blas_handles;
+	LocalVector<uint32_t> order; // The flush's entry order, those with a micromap first (D96 OMMd); grow-only.
+	LocalVector<uint32_t> info_offsets; // Each entry's first byte in clas_infos; grow-only.
 	uint32_t total_triangles = 0;
 	uint32_t total_vertices = 0;
 	uint32_t max_cluster_triangles = 0;
@@ -1010,8 +1016,12 @@ struct RTOmmEntry {
 	LocalVector<int32_t> indices; // Its host copy, which a merged MultiMesh repeats per element.
 	LocalVector<RD::MicromapUsage> index_usages; // The primitives' references per level, special indices left out.
 	RID static_blas; // The surface's BLAS with the micromap, for its static instances.
+	// On the cluster path (OMMd): the surface's LOD 0 CLAS again, each carrying the micromap, and a
+	// cluster BLAS over them, staged then compacted as the surface's own; `blas` is the handle.
+	RTSurfaceData *cluster_surface = nullptr;
+	bool cluster_failed = false; // Its population failed; not asked for again.
 	LocalVector<RID> merged_handles; // The merged MultiMesh entries that carry it.
-	LocalVector<RID> deformed_handles; // The deformed cache entries whose triangle BLAS carries it (OMMc).
+	LocalVector<RID> deformed_handles; // The deformed cache entries whose triangle BLAS (OMMc) or CLAS (OMMd) carry it.
 	uint32_t descriptors = 0;
 	uint32_t special_primitives = 0;
 	uint64_t micromap_bytes = 0;
@@ -1580,6 +1590,8 @@ class RenderRaytracing {
 	void _release_deformed_blas(RTDeformedCacheEntry &p_entry);
 	// The deformed triangle BLAS over owned_vb_full, carrying the micromap the walk wants (D96 OMMc).
 	void _build_deformed_triangle_blas(RID p_handle, RTDeformedCacheEntry &r_entry, void *p_mesh_surface, uint32_t p_cache_key, uint32_t p_surface_counter, LocalVector<RID> &r_dirty_blas_list);
+	// The deformed cluster layout, its CLAS carrying the micromap the walk wants (D96 OMMd); as _populate_deformed_cluster_layout.
+	bool _build_deformed_cluster_layout(RID p_handle, RTDeformedCacheEntry &r_entry, void *p_mesh_surface, uint32_t p_cache_key, uint32_t p_surface_counter);
 	// The hit row's deformed flag and previous-position address, which a build's row fill clears.
 	void _mark_deformed_geometry(RTDeformedCacheEntry &r_entry);
 	RTMergedMMEntry *_access_merged_mm_slot(RID &r_handle);
@@ -1801,7 +1813,8 @@ class RenderRaytracing {
 	void _release_materialized(RTSurfaceData *p_surf_data);
 	void _sweep_materialized();
 	bool _plan_merged_mm(RID p_mm_rid, RID p_mm_gpu_buffer, void *p_mesh_surface, uint32_t p_mm_count, uint32_t p_surface_index, uint32_t p_surface_counter, bool &r_bakes);
-	bool _populate_surface_cluster_blas(void *p_mesh_surface, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data, bool p_blobs_only = false);
+	// With p_omm (D96 OMMd), the LOD 0 clusters alone, each CLAS carrying the micromap: no hierarchy, no streaming.
+	bool _populate_surface_cluster_blas(void *p_mesh_surface, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data, bool p_blobs_only = false, const RTOmmEntry *p_omm = nullptr);
 	// The clusters of a surface as the static and deformed paths both lay them out: from the
 	// surface's table (D80), or runs of at most p_max_vertices / 3 triangles without one.
 	// A cluster LOD table (D85) lists every level's clusters, the LOD 0 clusters first: the
@@ -1822,8 +1835,11 @@ class RenderRaytracing {
 	// The deformed cluster path (D82): the entry's storage, handle, infos and slot addresses for
 	// the surface's current layout. Returns false, with the entry's cluster fields cleared, if the
 	// surface does not fit, and the caller builds a triangle BLAS instead.
-	bool _populate_deformed_cluster_layout(void *p_mesh_surface, uint32_t p_cache_key, RTDeformedCacheEntry &r_entry);
+	// With p_omm (D96 OMMd) every CLAS carries the micromap, and the entry takes no hierarchy (D87).
+	bool _populate_deformed_cluster_layout(void *p_mesh_surface, uint32_t p_cache_key, RTDeformedCacheEntry &r_entry, const RTOmmEntry *p_omm = nullptr, bool *r_omm_attached = nullptr);
 	void _queue_deformed_cluster_rebuild(RTDeformedCacheEntry &p_entry, uint8_t p_kind);
+	// Takes the entry back out of this frame's batch when it is the last one queued; false if it is not.
+	bool _unqueue_deformed_cluster_rebuild(RTDeformedCacheEntry &p_entry);
 	bool _deformed_cluster_region_expired(const RTDeformedCacheEntry &p_entry, uint64_t p_frames_drawn) const;
 	// A region of the pool for this flush's CLAS: one whose last trace has been waited on, grown
 	// to p_alloc if too small, or a new one; -1 if none could be made. The batch and the
@@ -1848,6 +1864,11 @@ class RenderRaytracing {
 	RTOmmEntry *_omm_request(RID p_mesh, uint32_t p_surface_index, uint32_t p_surface_counter, const RTMaterialData *p_material);
 	// The surface's BLAS with its built micromap, made and queued for a build the first time; RID() until the micromap is built.
 	RID _omm_surface_blas(RTOmmEntry *p_entry, void *p_mesh_surface, const RTSurfaceData *p_surf_data, LocalVector<RID> &r_dirty_blas_list);
+	// A cluster surface's (OMMd): the LOD 0 CLAS again with the micromap, a cluster BLAS over them.
+	RID _omm_surface_cluster_blas(RTOmmEntry *p_entry, void *p_mesh_surface, const RTSurfaceData *p_surf_data);
+	// A CLAS info's micromap fields for a surface of p_primitive_count primitives (OMMd): the micromap's
+	// address and the address of the index of primitive 0; false where the micromap does not match.
+	bool _omm_cluster_addresses(const RTOmmEntry *p_entry, uint32_t p_primitive_count, uint64_t &r_micromap_address, uint64_t &r_index_address) const;
 	// Sets which micromap a merged MultiMesh's BLAS carries; a change frees the BLAS so the merge makes it again.
 	void _omm_attach_merged(RID p_mm_rid, uint32_t p_surface_index, const RTOmmEntry *p_entry);
 	// The merged BLAS's micromap fields, the base surface's index repeated p_mm_count times; false without one.
@@ -1948,6 +1969,15 @@ class RenderRaytracing {
 		BitField<RD::AccelerationStructureFlagBits> flags = p_base;
 		if (cluster_build_data_access) {
 			flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT);
+		}
+		return flags;
+	}
+	// A cluster build whose CLAS reference opacity micromaps (D96 OMMd): only those builds are flagged,
+	// since the flag sizes every structure of the build for a micromap.
+	_FORCE_INLINE_ BitField<RD::AccelerationStructureFlagBits> _cluster_build_flags_omm(RD::AccelerationStructureFlagBits p_base, bool p_omm) const {
+		BitField<RD::AccelerationStructureFlagBits> flags = _cluster_build_flags(p_base);
+		if (p_omm) {
+			flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_CLUSTER_OPACITY_MICROMAPS_BIT);
 		}
 		return flags;
 	}

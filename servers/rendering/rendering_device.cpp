@@ -856,7 +856,8 @@ RID RenderingDevice::micromap_create(Span<MicromapUsage> p_usages) {
 	micromap.size = size;
 	micromap.scratch_size = scratch_size;
 	micromap.storage.size = size;
-	micromap.storage.usage = RDD::BUFFER_USAGE_MICROMAP_STORAGE_BIT | RDD::BUFFER_USAGE_STORAGE_BIT;
+	// Device address: a cluster build references the micromap by its address (D96).
+	micromap.storage.usage = RDD::BUFFER_USAGE_MICROMAP_STORAGE_BIT | RDD::BUFFER_USAGE_STORAGE_BIT | RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT;
 	micromap.storage.driver_id = driver->buffer_create(size, micromap.storage.usage, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
 	ERR_FAIL_COND_V(!micromap.storage.driver_id, RID());
 	buffer_memory.add(micromap.storage.size);
@@ -927,6 +928,12 @@ uint64_t RenderingDevice::micromap_get_size(RID p_micromap) {
 	Micromap *micromap = micromap_owner.get_or_null(p_micromap);
 	ERR_FAIL_NULL_V(micromap, 0);
 	return micromap->size;
+}
+
+uint64_t RenderingDevice::micromap_get_device_address(RID p_micromap) {
+	Micromap *micromap = micromap_owner.get_or_null(p_micromap);
+	ERR_FAIL_NULL_V(micromap, 0);
+	return driver->buffer_get_device_address(micromap->storage.driver_id);
 }
 
 RID RenderingDevice::ptlas_create(const PartitionedAccelerationStructureLimits &p_limits) {
@@ -1479,6 +1486,12 @@ Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAcceler
 	for (const RID &source : p_build.source_acceleration_structure_buffers) {
 		ERR_FAIL_COND_V(!resolve(source, "source acceleration structure buffer", &buffer), ERR_INVALID_PARAMETER);
 		track(buffer, RDG::RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ);
+	}
+	for (const RID &source : p_build.source_micromaps) {
+		Micromap *micromap = micromap_owner.get_or_null(source);
+		ERR_FAIL_NULL_V_MSG(micromap, ERR_INVALID_PARAMETER, "A source micromap of the cluster acceleration structure build is not a valid micromap.");
+		ERR_FAIL_COND_V_MSG(!p_build.input.flags.has_flag(ACCELERATION_STRUCTURE_ALLOW_CLUSTER_OPACITY_MICROMAPS_BIT), ERR_INVALID_PARAMETER, "A cluster build that reads micromaps needs ACCELERATION_STRUCTURE_ALLOW_CLUSTER_OPACITY_MICROMAPS_BIT.");
+		track_tracker(micromap->storage.draw_tracker, RDG::RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ);
 	}
 	LocalVector<Pair<AccelerationStructure *, RID>> destination_handles;
 	for (const RID &handle : p_build.dst_acceleration_structures) {

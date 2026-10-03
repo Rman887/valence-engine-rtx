@@ -924,6 +924,9 @@ public:
 		// VK_KHR_ray_tracing_position_fetch: hit shaders may read the hit triangle's positions
 		// from the structure (D93). Valid only where the device reports position fetch.
 		ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT = (1 << 11),
+		// VK_NV_cluster_acceleration_structure with VK_EXT_opacity_micromap: a triangle cluster build
+		// may reference an opacity micromap (D96). Cluster builds only.
+		ACCELERATION_STRUCTURE_ALLOW_CLUSTER_OPACITY_MICROMAPS_BIT = (1 << 12),
 	};
 
 	enum AccelerationStructureGeometryFlagBits {
@@ -1031,6 +1034,13 @@ public:
 		uint32_t index_stride = 0;
 		uint64_t vertex_address = 0;
 		uint32_t vertex_stride = 0;
+		// An opacity micromap (D96), 0 for none: the micromap's address (micromap_get_device_address())
+		// and one index a triangle of the cluster, an entry of the micromap or a MicromapSpecialIndex.
+		// Needs ACCELERATION_STRUCTURE_ALLOW_CLUSTER_OPACITY_MICROMAPS_BIT on the build.
+		uint64_t opacity_micromap_address = 0;
+		uint64_t opacity_micromap_index_address = 0;
+		IndexType opacity_micromap_index_type = CLUSTER_INDEX_TYPE_UINT32;
+		uint32_t opacity_micromap_index_stride = 0;
 	};
 
 	// One cluster BLAS build's arguments: a strided array of CLAS device addresses.

@@ -746,6 +746,48 @@ RID RenderRaytracing::_omm_surface_blas(RTOmmEntry *p_entry, void *p_mesh_surfac
 	return p_entry->static_blas;
 }
 
+RID RenderRaytracing::_omm_surface_cluster_blas(RTOmmEntry *p_entry, void *p_mesh_surface, const RTSurfaceData *p_surf_data) {
+	if (p_entry == nullptr || p_entry->state != RTOmmEntry::STATE_BUILT || p_entry->cluster_failed) {
+		return RID();
+	}
+	if (p_entry->cluster_surface != nullptr) {
+		return p_entry->cluster_surface->blas; // Its staging BLAS, then the compacted one (D81).
+	}
+
+	// The surface's LOD 0 clusters again, over its own buffers as its population reads them, each CLAS
+	// carrying the micromap. The cluster IDs are the plain population's, so the hits read the same
+	// triangles through the instance's row.
+	RD *rd = RD::get_singleton();
+	RTSurfaceData *surface = memnew(RTSurfaceData);
+	RID vertex_buffer, attribute_buffer, index_buffer;
+	_fill_surface_geometry_data(p_mesh_surface, false, surface, &vertex_buffer, &attribute_buffer, &index_buffer);
+	bool built = vertex_buffer.is_valid() && index_buffer.is_valid() && surface->geometry.index_format != RT_INDEX_FORMAT_NONE && surface->is_compressed == p_surf_data->is_compressed;
+	if (built) {
+		surface->geometry.vertex_buffer_address = rd->buffer_get_device_address(vertex_buffer);
+		surface->geometry.index_buffer_address = rd->buffer_get_device_address(index_buffer);
+		built = _populate_surface_cluster_blas(p_mesh_surface, vertex_buffer, index_buffer, p_surf_data->cluster_cache_key, surface, false, p_entry);
+	}
+	if (!built) {
+		_release_surface_data(surface);
+		memdelete(surface);
+		p_entry->cluster_failed = true;
+		return RID();
+	}
+	p_entry->cluster_surface = surface;
+	omm_stats.blases++;
+	return surface->blas;
+}
+
+bool RenderRaytracing::_omm_cluster_addresses(const RTOmmEntry *p_entry, uint32_t p_primitive_count, uint64_t &r_micromap_address, uint64_t &r_index_address) const {
+	if (p_entry == nullptr || p_entry->state != RTOmmEntry::STATE_BUILT || p_entry->primitive_count != p_primitive_count || p_entry->micromap.is_null() || p_entry->index_buffer.is_null()) {
+		return false;
+	}
+	RD *rd = RD::get_singleton();
+	r_micromap_address = rd->micromap_get_device_address(p_entry->micromap);
+	r_index_address = rd->buffer_get_device_address(p_entry->index_buffer);
+	return r_micromap_address != 0 && r_index_address != 0;
+}
+
 void RenderRaytracing::_omm_attach_merged(RID p_mm_rid, uint32_t p_surface_index, const RTOmmEntry *p_entry) {
 	const uint32_t li = p_mm_rid.get_local_index();
 	if (li >= mm_handles.size() || mm_handles[li].mm_validator != uint32_t(p_mm_rid.get_id() >> 32) || p_surface_index >= mm_handles[li].per_surface.size()) {
@@ -894,9 +936,10 @@ void RenderRaytracing::_omm_release_entry(RTOmmEntry *p_entry) {
 		_omm_release_merged(*merged);
 	}
 	// A deformed triangle BLAS that carries it would be freed with the micromap: it goes now, and its
-	// surface builds it again, plain, at its next processing (OMMc). Never mid-walk on a BLAS the walk
-	// queued: the walk's request releases only micromaps of a surface's earlier contents, which a
-	// rebuild this frame no longer attached.
+	// surface builds it again, plain, at its next processing (OMMc). A deformed cluster BLAS (OMMd) goes
+	// the same way: its CLAS reference the micromap by address, which nothing else keeps alive. Never
+	// mid-walk on a BLAS the walk queued: the walk's request releases only micromaps of a surface's
+	// earlier contents, which a rebuild this frame no longer attached.
 	for (const RID &handle : p_entry->deformed_handles) {
 		RTDeformedCacheEntry *deformed = deformed_pool.get_or_null(handle);
 		if (deformed == nullptr || deformed->omm_serial != p_entry->serial) {
@@ -907,6 +950,13 @@ void RenderRaytracing::_omm_release_entry(RTOmmEntry *p_entry) {
 	}
 	if (p_entry->static_blas.is_valid() && rd->acceleration_structure_is_valid(p_entry->static_blas)) {
 		rd->free_rid(p_entry->static_blas);
+	}
+	// The cluster copy's staging or arena region (OMMd) is retired with the micromap's free: both
+	// outlast every frame that may still trace them.
+	if (p_entry->cluster_surface != nullptr) {
+		_release_surface_data(p_entry->cluster_surface);
+		memdelete(p_entry->cluster_surface);
+		p_entry->cluster_surface = nullptr;
 	}
 	if (p_entry->micromap.is_valid()) {
 		rd->free_rid(p_entry->micromap);

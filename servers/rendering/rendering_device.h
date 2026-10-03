@@ -1558,6 +1558,8 @@ public:
 	RID micromap_create(Span<MicromapUsage> p_usages);
 	Error micromap_build(RID p_micromap, RID p_data_buffer, uint64_t p_data_offset, RID p_triangle_buffer, uint64_t p_triangle_offset);
 	uint64_t micromap_get_size(RID p_micromap);
+	// The address a cluster build's ClusterTriangleBuildInfo::opacity_micromap_address takes (D96).
+	uint64_t micromap_get_device_address(RID p_micromap);
 
 	// ----- CLUSTER ACCELERATION STRUCTURES -----
 	//
@@ -1597,6 +1599,9 @@ public:
 		// The buffers holding built structures the operation reads through its infos (a move's
 		// sources, the CLAS a cluster BLAS is built over).
 		Vector<RID> source_acceleration_structure_buffers;
+		// The opacity micromaps (micromap_create) the CLAS infos reference by address (D96): the build
+		// is ordered after theirs. The caller keeps each alive while a CLAS built over it may be traced.
+		Vector<RID> source_micromaps;
 		// The cluster BLAS handles (cluster_blas_create) a bottom-level build writes: listing them
 		// makes each usable by a TLAS and gives the TLAS build's read the barrier it needs.
 		Vector<RID> dst_acceleration_structures;

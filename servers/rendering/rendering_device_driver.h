@@ -142,6 +142,7 @@ public:
 	DEFINE_ID(Semaphore);
 	DEFINE_ID(AccelerationStructure);
 	DEFINE_ID(RaytracingPipeline);
+	DEFINE_ID(Micromap);
 
 public:
 	/*****************/
@@ -176,6 +177,8 @@ public:
 		BUFFER_USAGE_DEVICE_ADDRESS_BIT = (1 << 17),
 		BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT = (1 << 19),
 		BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT = (1 << 20),
+		BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT = (1 << 23),
+		BUFFER_USAGE_MICROMAP_STORAGE_BIT = (1 << 24),
 		// There are no Vulkan-equivalent. Try to use unused/unclaimed bits.
 		BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT = (1 << 31),
 	};
@@ -768,6 +771,14 @@ public:
 			uint32_t index_offset;
 			uint32_t index_count;
 			IndexBufferFormat index_format;
+			// An opacity micromap (D96), when micromap is set: one index per primitive (an entry
+			// of the micromap or a special index), and the references per level and format.
+			MicromapID micromap;
+			BufferID micromap_index_buffer;
+			uint64_t micromap_index_offset;
+			IndexBufferFormat micromap_index_format;
+			const MicromapUsage *micromap_usages;
+			uint32_t micromap_usage_count;
 		};
 
 		// Procedural geometry: each AABB is two float3 (min, max), packed
@@ -889,6 +900,28 @@ public:
 	virtual uint32_t ptlas_operation_size() { return 0; }
 	virtual void ptlas_operation_write(uint8_t *r_driver_operation, PartitionedOpType p_type, uint32_t p_count, uint64_t p_address, uint32_t p_stride) {}
 
+	// ----- OPACITY MICROMAP -----
+
+	// One build: the states and the triangle array (an entry per micromap triangle, written as
+	// the capabilities' triangle_entry_size bytes: the data offset, the level and the format).
+	struct MicromapBuild {
+		MicromapID micromap;
+		BufferID data_buffer;
+		uint64_t data_offset = 0;
+		BufferID triangle_buffer;
+		uint64_t triangle_offset = 0;
+		BufferID scratch_buffer; // At least the build's scratch size; aligned by the driver.
+	};
+
+	virtual const OpacityMicromapCapabilities &get_opacity_micromap_capabilities() {
+		static OpacityMicromapCapabilities unsupported;
+		return unsupported;
+	}
+	virtual void micromap_get_build_sizes(VectorView<MicromapUsage> p_usages, uint64_t &r_size, uint64_t &r_scratch_size) {}
+	// The micromap lives in p_storage, created with BUFFER_USAGE_MICROMAP_STORAGE_BIT, which it does not own.
+	virtual MicromapID micromap_create(BufferID p_storage, uint64_t p_size, VectorView<MicromapUsage> p_usages) { return MicromapID(); }
+	virtual void micromap_free(MicromapID p_micromap) {}
+
 	// ----- PIPELINE -----
 
 	struct PipelineShader {
@@ -917,6 +950,7 @@ public:
 	virtual void command_build_tlas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count) = 0;
 	virtual void command_build_cluster_acceleration_structures(CommandBufferID p_cmd_buffer, const ClusterAccelerationStructureBuild &p_build) = 0;
 	virtual void command_build_ptlas(CommandBufferID p_cmd_buffer, const PartitionedAccelerationStructureBuild &p_build) {}
+	virtual void command_build_micromap(CommandBufferID p_cmd_buffer, const MicromapBuild &p_build) {}
 	virtual void command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) = 0;
 	virtual void command_bind_raytracing_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) = 0;
 

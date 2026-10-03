@@ -608,6 +608,10 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 	if (GLOBAL_GET("rendering/pathtracing/partitioned_tlas")) {
 		_register_requested_device_extension(VK_NV_PARTITIONED_ACCELERATION_STRUCTURE_EXTENSION_NAME, false);
 	}
+	// Off, likewise: no BLAS carries a micromap and no pipeline opts into them (D96).
+	if (GLOBAL_GET("rendering/pathtracing/opacity_micromaps")) {
+		_register_requested_device_extension(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME, false);
+	}
 	_register_requested_device_extension(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, false);
 
 	// We don't actually use this extension, but some runtime components on some platforms
@@ -951,6 +955,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		VkPhysicalDeviceClusterAccelerationStructureFeaturesNV cluster_acceleration_structure_features = {};
 		VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR position_fetch_features = {};
 		VkPhysicalDevicePartitionedAccelerationStructureFeaturesNV partitioned_acceleration_structure_features = {};
+		VkPhysicalDeviceOpacityMicromapFeaturesEXT opacity_micromap_features = {};
 
 		const bool use_1_2_features = physical_device_properties.apiVersion >= VK_API_VERSION_1_2;
 		if (use_1_2_features) {
@@ -1063,6 +1068,12 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			partitioned_acceleration_structure_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_FEATURES_NV;
 			partitioned_acceleration_structure_features.pNext = next_features;
 			next_features = &partitioned_acceleration_structure_features;
+		}
+
+		if (enabled_device_extension_names.has(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME)) {
+			opacity_micromap_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
+			opacity_micromap_features.pNext = next_features;
+			next_features = &opacity_micromap_features;
 		}
 
 		if (enabled_device_extension_names.has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME)) {
@@ -1180,6 +1191,13 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		if (GLOBAL_GET("rendering/pathtracing/partitioned_tlas") && !partitioned_acceleration_structure_capabilities.supported) {
 			WARN_PRINT("rendering/pathtracing/partitioned_tlas is set, but this device has no partitioned acceleration structures (VK_NV_partitioned_acceleration_structure). Using plain TLASes.");
 		}
+
+		if (enabled_device_extension_names.has(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME)) {
+			opacity_micromap_capabilities.supported = acceleration_structure_features.accelerationStructure && opacity_micromap_features.micromap;
+		}
+		if (GLOBAL_GET("rendering/pathtracing/opacity_micromaps") && !opacity_micromap_capabilities.supported) {
+			WARN_PRINT("rendering/pathtracing/opacity_micromaps is set, but this device has no opacity micromaps (VK_EXT_opacity_micromap). Alpha-tested surfaces keep the any-hit test alone.");
+		}
 	}
 
 	if (functions.GetPhysicalDeviceProperties2 != nullptr) {
@@ -1194,6 +1212,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		VkPhysicalDeviceRayTracingPipelinePropertiesKHR raytracing_properties = {};
 		VkPhysicalDeviceClusterAccelerationStructurePropertiesNV cluster_acceleration_structure_properties = {};
 		VkPhysicalDevicePartitionedAccelerationStructurePropertiesNV partitioned_acceleration_structure_properties = {};
+		VkPhysicalDeviceOpacityMicromapPropertiesEXT opacity_micromap_properties = {};
 		VkPhysicalDeviceProperties2 physical_device_properties_2 = {};
 
 		const bool use_1_1_properties = physical_device_properties.apiVersion >= VK_API_VERSION_1_1;
@@ -1256,6 +1275,12 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			partitioned_acceleration_structure_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_PROPERTIES_NV;
 			partitioned_acceleration_structure_properties.pNext = next_properties;
 			next_properties = &partitioned_acceleration_structure_properties;
+		}
+
+		if (opacity_micromap_capabilities.supported) {
+			opacity_micromap_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_PROPERTIES_EXT;
+			opacity_micromap_properties.pNext = next_properties;
+			next_properties = &opacity_micromap_properties;
 		}
 
 		physical_device_properties_2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
@@ -1406,6 +1431,15 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 
 			print_verbose("- Vulkan Partitioned Acceleration Structure supported");
 			print_verbose("  max partition count: " + itos(partitioned_acceleration_structure_capabilities.max_partition_count));
+		}
+
+		if (opacity_micromap_capabilities.supported) {
+			opacity_micromap_capabilities.max_2_state_subdivision_level = opacity_micromap_properties.maxOpacity2StateSubdivisionLevel;
+			opacity_micromap_capabilities.max_4_state_subdivision_level = opacity_micromap_properties.maxOpacity4StateSubdivisionLevel;
+			opacity_micromap_capabilities.triangle_entry_size = sizeof(VkMicromapTriangleEXT);
+
+			print_verbose("- Vulkan Opacity Micromap supported");
+			print_verbose("  max subdivision level: " + itos(opacity_micromap_capabilities.max_4_state_subdivision_level) + " (4-state), " + itos(opacity_micromap_capabilities.max_2_state_subdivision_level) + " (2-state)");
 		}
 	}
 
@@ -1613,6 +1647,14 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		partitioned_acceleration_structure_features.pNext = create_info_next;
 		partitioned_acceleration_structure_features.partitionedAccelerationStructure = VK_TRUE;
 		create_info_next = &partitioned_acceleration_structure_features;
+	}
+
+	VkPhysicalDeviceOpacityMicromapFeaturesEXT opacity_micromap_features = {};
+	if (opacity_micromap_capabilities.supported) {
+		opacity_micromap_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
+		opacity_micromap_features.pNext = create_info_next;
+		opacity_micromap_features.micromap = VK_TRUE;
+		create_info_next = &opacity_micromap_features;
 	}
 
 	VkPhysicalDeviceVulkan11Features vulkan_1_1_features = {};
@@ -6612,10 +6654,27 @@ static_assert(ENUM_MEMBERS_EQUAL(RDD::ACCELERATION_STRUCTURE_GEOMETRY_NO_DUPLICA
 
 RDD::AccelerationStructureID RenderingDeviceDriverVulkan::blas_create(VectorView<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags) {
 #if VULKAN_RAYTRACING_ENABLED
+	// Opacity micromaps (D96): the attachments and their usages live as long as the structure,
+	// since every build and update reads them through the geometries.
+	bool has_micromap = false;
+	uint32_t micromap_usage_total = 0;
+	for (uint32_t i = 0; i < p_geometries.size(); i++) {
+		if (p_geometries[i].type == AccelerationStructureGeometry::TYPE_TRIANGLES && p_geometries[i].geometry.triangles.micromap) {
+			ERR_FAIL_COND_V_MSG(!opacity_micromap_capabilities.supported, AccelerationStructureID(), "Vulkan opacity micromaps are not supported by this device.");
+			has_micromap = true;
+			micromap_usage_total += p_geometries[i].geometry.triangles.micromap_usage_count;
+		}
+	}
+
 	AccelerationStructureInfo *accel_info = VersatileResource::allocate<AccelerationStructureInfo>(resources_allocator);
 
 	accel_info->geometries.resize(p_geometries.size());
 	accel_info->range_infos.resize(p_geometries.size());
+	if (has_micromap) {
+		accel_info->micromap_attachments.resize(p_geometries.size());
+		accel_info->micromap_usages.resize(micromap_usage_total);
+	}
+	uint32_t micromap_usage_next = 0;
 
 	thread_local LocalVector<uint32_t> max_primitive_counts;
 	max_primitive_counts.resize(p_geometries.size());
@@ -6647,6 +6706,29 @@ RDD::AccelerationStructureID RenderingDeviceDriverVulkan::blas_create(VectorView
 				} else {
 					vk_geometry.geometry.triangles.indexType = VK_INDEX_TYPE_NONE_KHR;
 					primitive_count = t.vertex_count / 3;
+				}
+
+				// A geometry whose primitives all take special indices references no entry: no usage counts.
+				if (t.micromap) {
+					const MicromapInfo *micromap_info = (const MicromapInfo *)t.micromap.id;
+					VkMicromapUsageEXT *usages = t.micromap_usage_count > 0 ? accel_info->micromap_usages.ptr() + micromap_usage_next : nullptr;
+					for (uint32_t j = 0; j < t.micromap_usage_count; j++) {
+						usages[j].count = t.micromap_usages[j].count;
+						usages[j].subdivisionLevel = t.micromap_usages[j].subdivision_level;
+						usages[j].format = t.micromap_usages[j].format;
+					}
+					VkAccelerationStructureTrianglesOpacityMicromapEXT &attachment = accel_info->micromap_attachments[i];
+					attachment = {};
+					attachment.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_TRIANGLES_OPACITY_MICROMAP_EXT;
+					attachment.indexType = (t.micromap_index_format == INDEX_BUFFER_FORMAT_UINT16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+					attachment.indexBuffer.deviceAddress = buffer_get_device_address(t.micromap_index_buffer) + t.micromap_index_offset;
+					attachment.indexStride = (t.micromap_index_format == INDEX_BUFFER_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t));
+					attachment.baseTriangle = 0;
+					attachment.usageCountsCount = t.micromap_usage_count;
+					attachment.pUsageCounts = usages;
+					attachment.micromap = micromap_info->vk_micromap;
+					vk_geometry.geometry.triangles.pNext = &attachment;
+					micromap_usage_next += t.micromap_usage_count;
 				}
 			} break;
 
@@ -6805,6 +6887,96 @@ uint32_t RenderingDeviceDriverVulkan::acceleration_structure_get_scratch_size_by
 	AccelerationStructureInfo *accel_info = (AccelerationStructureInfo *)p_acceleration_structure.id;
 	ERR_FAIL_NULL_V_MSG(accel_info, 0, "Vulkan raytracing acceleration structure input parameter is not valid.");
 	return accel_info->scratch_size;
+}
+
+// ----- OPACITY MICROMAP -----
+
+const RDD::OpacityMicromapCapabilities &RenderingDeviceDriverVulkan::get_opacity_micromap_capabilities() {
+	return opacity_micromap_capabilities;
+}
+
+#if VULKAN_RAYTRACING_ENABLED
+static void _micromap_usages_to_vk(VectorView<RDD::MicromapUsage> p_usages, TightLocalVector<VkMicromapUsageEXT> &r_usages) {
+	r_usages.resize(p_usages.size());
+	for (uint32_t i = 0; i < p_usages.size(); i++) {
+		r_usages[i].count = p_usages[i].count;
+		r_usages[i].subdivisionLevel = p_usages[i].subdivision_level;
+		r_usages[i].format = p_usages[i].format;
+	}
+}
+
+static VkMicromapBuildInfoEXT _micromap_build_info(const TightLocalVector<VkMicromapUsageEXT> &p_usages) {
+	VkMicromapBuildInfoEXT build_info = {};
+	build_info.sType = VK_STRUCTURE_TYPE_MICROMAP_BUILD_INFO_EXT;
+	build_info.type = VK_MICROMAP_TYPE_OPACITY_MICROMAP_EXT;
+	build_info.flags = VK_BUILD_MICROMAP_PREFER_FAST_TRACE_BIT_EXT;
+	build_info.mode = VK_BUILD_MICROMAP_MODE_BUILD_EXT;
+	build_info.usageCountsCount = p_usages.size();
+	build_info.pUsageCounts = p_usages.ptr();
+	build_info.triangleArrayStride = sizeof(VkMicromapTriangleEXT);
+	return build_info;
+}
+#endif
+
+void RenderingDeviceDriverVulkan::micromap_get_build_sizes(VectorView<MicromapUsage> p_usages, uint64_t &r_size, uint64_t &r_scratch_size) {
+	r_size = 0;
+	r_scratch_size = 0;
+#if VULKAN_RAYTRACING_ENABLED
+	ERR_FAIL_COND_MSG(!opacity_micromap_capabilities.supported, "Vulkan opacity micromaps are not supported by this device.");
+	TightLocalVector<VkMicromapUsageEXT> usages;
+	_micromap_usages_to_vk(p_usages, usages);
+	const VkMicromapBuildInfoEXT build_info = _micromap_build_info(usages);
+	VkMicromapBuildSizesInfoEXT size_info = {};
+	size_info.sType = VK_STRUCTURE_TYPE_MICROMAP_BUILD_SIZES_INFO_EXT;
+	vkGetMicromapBuildSizesEXT(vk_device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info, &size_info);
+	r_size = size_info.micromapSize;
+	// The build aligns the scratch's address up, so the size carries the alignment.
+	r_scratch_size = size_info.buildScratchSize + acceleration_structure_capabilities.min_acceleration_structure_scratch_offset_alignment;
+#endif
+}
+
+RDD::MicromapID RenderingDeviceDriverVulkan::micromap_create(BufferID p_storage, uint64_t p_size, VectorView<MicromapUsage> p_usages) {
+#if VULKAN_RAYTRACING_ENABLED
+	ERR_FAIL_COND_V_MSG(!opacity_micromap_capabilities.supported, MicromapID(), "Vulkan opacity micromaps are not supported by this device.");
+	ERR_FAIL_COND_V(!p_storage, MicromapID());
+	MicromapInfo *micromap_info = VersatileResource::allocate<MicromapInfo>(resources_allocator);
+	_micromap_usages_to_vk(p_usages, micromap_info->usages);
+	const VkMicromapBuildInfoEXT build_info = _micromap_build_info(micromap_info->usages);
+	VkMicromapBuildSizesInfoEXT size_info = {};
+	size_info.sType = VK_STRUCTURE_TYPE_MICROMAP_BUILD_SIZES_INFO_EXT;
+	vkGetMicromapBuildSizesEXT(vk_device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info, &size_info);
+	micromap_info->scratch_size = size_info.buildScratchSize + acceleration_structure_capabilities.min_acceleration_structure_scratch_offset_alignment;
+	if (size_info.micromapSize > p_size) {
+		VersatileResource::free(resources_allocator, micromap_info);
+		ERR_FAIL_V_MSG(MicromapID(), "The micromap's storage is smaller than the driver's size for its usages.");
+	}
+
+	VkMicromapCreateInfoEXT create_info = {};
+	create_info.sType = VK_STRUCTURE_TYPE_MICROMAP_CREATE_INFO_EXT;
+	create_info.buffer = ((const BufferInfo *)p_storage.id)->vk_buffer;
+	create_info.offset = 0;
+	create_info.size = size_info.micromapSize;
+	create_info.type = VK_MICROMAP_TYPE_OPACITY_MICROMAP_EXT;
+	const VkResult err = vkCreateMicromapEXT(vk_device, &create_info, nullptr, &micromap_info->vk_micromap);
+	if (err != VK_SUCCESS) {
+		VersatileResource::free(resources_allocator, micromap_info);
+		ERR_FAIL_V_MSG(MicromapID(), vformat("Couldn't create a Vulkan opacity micromap (VkResult error %d).", err));
+	}
+	return MicromapID(micromap_info);
+#else
+	return MicromapID();
+#endif
+}
+
+void RenderingDeviceDriverVulkan::micromap_free(MicromapID p_micromap) {
+#if VULKAN_RAYTRACING_ENABLED
+	MicromapInfo *micromap_info = (MicromapInfo *)p_micromap.id;
+	ERR_FAIL_NULL(micromap_info);
+	if (micromap_info->vk_micromap != VK_NULL_HANDLE) {
+		vkDestroyMicromapEXT(vk_device, micromap_info->vk_micromap, nullptr);
+	}
+	VersatileResource::free(resources_allocator, micromap_info);
+#endif
 }
 
 // ----- CLUSTER ACCELERATION STRUCTURE -----
@@ -7194,6 +7366,36 @@ void RenderingDeviceDriverVulkan::command_build_ptlas(CommandBufferID p_cmd_buff
 #endif
 }
 
+void RenderingDeviceDriverVulkan::command_build_micromap(CommandBufferID p_cmd_buffer, const MicromapBuild &p_build) {
+#if VULKAN_RAYTRACING_ENABLED
+	const CommandBufferInfo *command_buffer = (const CommandBufferInfo *)p_cmd_buffer.id;
+	MicromapInfo *micromap_info = (MicromapInfo *)p_build.micromap.id;
+	ERR_FAIL_NULL(micromap_info);
+
+	// The micromap build stage and its accesses exist only in synchronization2, which the device
+	// does not enable, and the render graph's barriers are synchronization1. A full memory
+	// dependency on each side (all commands, memory writes to memory reads and writes) is what
+	// synchronization1 expresses that covers them: the inputs the bake wrote before, the micromap
+	// the BLAS builds read after. A micromap is built once per bake, so the coarse barriers cost
+	// nothing that matters (D96).
+	VkMemoryBarrier memory_barrier = {};
+	memory_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+	memory_barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+	memory_barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+	vkCmdPipelineBarrier(command_buffer->vk_command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &memory_barrier, 0, nullptr, 0, nullptr);
+
+	VkMicromapBuildInfoEXT build_info = _micromap_build_info(micromap_info->usages);
+	build_info.dstMicromap = micromap_info->vk_micromap;
+	build_info.data.deviceAddress = buffer_get_device_address(p_build.data_buffer) + p_build.data_offset;
+	build_info.triangleArray.deviceAddress = buffer_get_device_address(p_build.triangle_buffer) + p_build.triangle_offset;
+	// The acceleration structure scratch alignment applies to micromap builds as well.
+	build_info.scratchData.deviceAddress = _align_up_address(buffer_get_device_address(p_build.scratch_buffer), acceleration_structure_capabilities.min_acceleration_structure_scratch_offset_alignment);
+	vkCmdBuildMicromapsEXT(command_buffer->vk_command_buffer, 1, &build_info);
+
+	vkCmdPipelineBarrier(command_buffer->vk_command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &memory_barrier, 0, nullptr, 0, nullptr);
+#endif
+}
+
 void RenderingDeviceDriverVulkan::command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) {
 	const CommandBufferInfo *command_buffer = (const CommandBufferInfo *)p_cmd_buffer.id;
 	vkCmdBindPipeline(command_buffer->vk_command_buffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, (VkPipeline)p_pipeline.id);
@@ -7315,6 +7517,11 @@ RDD::RaytracingPipelineID RenderingDeviceDriverVulkan::raytracing_pipeline_creat
 		cluster_create_info.sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CLUSTER_ACCELERATION_STRUCTURE_CREATE_INFO_NV;
 		cluster_create_info.allowClusterAccelerationStructure = VK_TRUE;
 		pipeline_create_info.pNext = &cluster_create_info;
+	}
+	// Tracing a BLAS with an opacity micromap needs the pipeline to declare it (D96); ray queries
+	// use them whenever the extension is enabled.
+	if (opacity_micromap_capabilities.supported) {
+		pipeline_create_info.flags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
 	}
 
 	VkPipeline vk_pipeline = VK_NULL_HANDLE;

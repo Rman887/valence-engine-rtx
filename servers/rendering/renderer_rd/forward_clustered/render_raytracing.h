@@ -43,6 +43,7 @@
 #include "servers/rendering/renderer_rd/bindless_block.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/cluster_lod_select.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/multimesh_merge.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/raytracing/opacity_micromap.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/ptlas_rows.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/sky_light_table.glsl.gen.h"
 #include "servers/rendering/rendering_device.h"
@@ -477,6 +478,11 @@ struct RTSurfaceData {
 	RT_GeometryData row_snapshot = {};
 	uint64_t row_generation = 0;
 };
+
+// A surface's geometry metadata from its format, and the buffers a BLAS of it reads.
+void _fill_surface_geometry_data(void *p_mesh_surface, bool p_force_uncompressed, RTSurfaceData *r_surf_data, RID *r_vertex_buffer = nullptr, RID *r_attribute_buffer = nullptr, RID *r_index_buffer = nullptr);
+// The triangle geometry of a surface's own BLAS over its buffers, as _populate_surface_blas builds it.
+void _fill_surface_triangle_geometry(RID p_vertex_buffer, RID p_index_buffer, const RT_GeometryData &p_geometry, bool p_2d, bool p_compressed, RD::AccelerationStructureGeometry &r_geometry);
 
 // An instance's cluster BLAS over the clusters the LOD selection picks for it (D86): its own
 // worst-case slot in the arena, rebuilt on every frame the instance enters the TLAS from the
@@ -933,6 +939,87 @@ struct RTMergedMMEntry {
 	uint64_t cached_mm_last_change = 0;
 	bool blas_built_once = false;
 	bool indexed = false; // selects MODE_INDEXED vs MODE_NON_INDEXED variant
+
+	// The opacity micromap the merge's BLAS carries (D96): the base surface's, its index repeated
+	// per element. 0 for none; the BLAS is made again when it changes. A micromap the merge
+	// could not carry is not asked for again.
+	uint64_t omm_serial = 0;
+	uint64_t omm_failed_serial = 0;
+	RID omm_index_buffer;
+	// The serial the frame's latest walk wanted, and the last frame two walks disagreed.
+	uint64_t omm_wanted_serial = 0;
+	uint64_t omm_wanted_frame = UINT64_MAX;
+	uint64_t omm_conflict_frame = UINT64_MAX;
+};
+
+// Opacity micromaps (D96, docs/r1-opacity-micromaps.md): one per surface and the alpha test's
+// inputs, baked on the GPU in two passes with a readback between them and attached to a BLAS of
+// the surface's own. Exact for the standard hit group's alpha test, so the image does not change.
+struct RTOmmKey {
+	uint64_t mesh_id = 0;
+	uint32_t surface_index = 0;
+	uint32_t surface_counter = 0; // The surface's RT invalidation counter.
+	uint64_t texture_id = 0; // The RD texture the trace samples for alpha.
+	uint32_t uv_scale[2] = {}; // Float bits.
+	uint32_t uv_offset[2] = {};
+	uint32_t albedo_alpha = 0;
+	uint32_t threshold = 0;
+
+	bool operator==(const RTOmmKey &p_other) const {
+		return mesh_id == p_other.mesh_id && surface_index == p_other.surface_index && surface_counter == p_other.surface_counter && texture_id == p_other.texture_id && uv_scale[0] == p_other.uv_scale[0] && uv_scale[1] == p_other.uv_scale[1] && uv_offset[0] == p_other.uv_offset[0] && uv_offset[1] == p_other.uv_offset[1] && albedo_alpha == p_other.albedo_alpha && threshold == p_other.threshold;
+	}
+	static uint32_t hash(const RTOmmKey &p_key) {
+		uint32_t h = hash_murmur3_one_64(p_key.mesh_id);
+		h = hash_murmur3_one_32(p_key.surface_index, h);
+		h = hash_murmur3_one_32(p_key.surface_counter, h);
+		h = hash_murmur3_one_64(p_key.texture_id, h);
+		h = hash_murmur3_one_32(p_key.uv_scale[0], h);
+		h = hash_murmur3_one_32(p_key.uv_scale[1], h);
+		h = hash_murmur3_one_32(p_key.uv_offset[0], h);
+		h = hash_murmur3_one_32(p_key.uv_offset[1], h);
+		h = hash_murmur3_one_32(p_key.albedo_alpha, h);
+		h = hash_murmur3_one_32(p_key.threshold, h);
+		return hash_fmix32(h);
+	}
+};
+
+struct RTOmmEntry {
+	enum State {
+		STATE_QUEUED, // Waits for its setup pass.
+		STATE_SETUP, // The setup pass ran; its readback is in flight.
+		STATE_BUILT, // The micromap is built; BLASes may carry it.
+		STATE_FAILED, // Not baked (its surface or texture went away, or an allocation failed); the any-hit decides.
+	};
+	RTOmmKey key;
+	State state = STATE_QUEUED;
+	uint64_t serial = 0; // Unique over the run; what a merged MultiMesh entry refers to it by.
+	uint64_t ticket = 0; // The readback in flight.
+	uint32_t primitive_count = 0;
+	uint32_t last_used_frame = 0;
+	RID setup_buffer;
+	RID micromap;
+	RID index_buffer; // One int32 a primitive: a micromap entry or a special index.
+	LocalVector<int32_t> indices; // Its host copy, which a merged MultiMesh repeats per element.
+	LocalVector<RD::MicromapUsage> index_usages; // The primitives' references per level, special indices left out.
+	RID static_blas; // The surface's BLAS with the micromap, for its static instances.
+	LocalVector<RID> merged_handles; // The merged MultiMesh entries that carry it.
+	uint32_t descriptors = 0;
+	uint32_t special_primitives = 0;
+	uint64_t micromap_bytes = 0;
+	uint64_t known = 0; // Micro-triangles, from the bake's counts.
+	uint64_t unknown = 0;
+};
+
+struct RTOmmPyramid {
+	RID buffer;
+	uint32_t level_count = 0;
+	uint32_t last_used_frame = 0;
+};
+
+struct RTOmmReadback {
+	uint64_t ticket = 0;
+	bool stats = false;
+	PackedByteArray data;
 };
 
 struct RTMaterialCacheEntry {
@@ -1228,6 +1315,45 @@ class RenderRaytracing {
 	uint32_t materialized_deferred = 0; // Over the run.
 	HashMap<uint64_t, RTSurfaceData *> cluster_compaction_pending;
 	LocalVector<RTClusterCompactionResult> cluster_compaction_results;
+
+	// Opacity micromaps (D96), with rendering/pathtracing/opacity_micromaps.
+	bool omm_enabled = false;
+	float omm_scale = 2.0f;
+	uint32_t omm_max_level = 10;
+	HashMap<RTOmmKey, RTOmmEntry *, RTOmmKey> omm_entries;
+	HashMap<uint64_t, RTOmmEntry *> omm_by_serial;
+	HashMap<uint64_t, RTOmmEntry *> omm_pending; // By readback ticket.
+	LocalVector<RTOmmEntry *> omm_queue;
+	LocalVector<RTOmmReadback> omm_readbacks;
+	HashMap<RID, RTOmmPyramid> omm_pyramids; // By texture.
+	uint64_t omm_next_serial = 1;
+	uint64_t omm_next_ticket = 1;
+	uint64_t omm_processed_frame = UINT64_MAX;
+	RID omm_sampler;
+	struct OmmShader {
+		enum Mode {
+			MODE_PYRAMID_BASE,
+			MODE_PYRAMID_REDUCE,
+			MODE_SETUP,
+			MODE_BAKE,
+			MODE_MAX,
+		};
+		OpacityMicromapShaderRD shader;
+		RID version;
+		RID version_shader[MODE_MAX];
+		RID pipeline[MODE_MAX];
+	} omm_shader;
+	struct OmmStats {
+		uint32_t baked = 0;
+		uint32_t failed = 0;
+		uint64_t micromap_bytes = 0;
+		uint64_t descriptors = 0;
+		uint64_t primitives = 0;
+		uint64_t special_primitives = 0;
+		uint64_t known = 0;
+		uint64_t unknown = 0;
+		uint32_t blases = 0;
+	} omm_stats;
 	uint64_t cluster_compaction_next_ticket = 0;
 	uint32_t cluster_compactions_total = 0;
 	uint64_t cluster_bytes_staged_total = 0;
@@ -1696,6 +1822,28 @@ class RenderRaytracing {
 	// the arena, rebuilds the BLAS there and frees the staging.
 	static void _on_cluster_sizes_read(const PackedByteArray &p_sizes, uint64_t p_ticket);
 	void _process_cluster_compactions();
+
+	// Opacity micromaps (D96), in render_raytracing_omm.cpp.
+	void _omm_initialize();
+	void _omm_finalize();
+	// Once a frame, before the walk: readbacks become bakes and micromaps, queued surfaces get their setup pass.
+	void _omm_process();
+	// The entry for a surface traced with an alpha-tested standard material, queued for a bake the
+	// first time it is asked for; nullptr when the material does not qualify.
+	RTOmmEntry *_omm_request(RID p_mesh, uint32_t p_surface_index, uint32_t p_surface_counter, const RTMaterialData *p_material);
+	// The surface's BLAS with its built micromap, made and queued for a build the first time; RID() until the micromap is built.
+	RID _omm_surface_blas(RTOmmEntry *p_entry, void *p_mesh_surface, const RTSurfaceData *p_surf_data, LocalVector<RID> &r_dirty_blas_list);
+	// Sets which micromap a merged MultiMesh's BLAS carries; a change frees the BLAS so the merge makes it again.
+	void _omm_attach_merged(RID p_mm_rid, uint32_t p_surface_index, const RTOmmEntry *p_entry);
+	// The merged BLAS's micromap fields, the base surface's index repeated p_mm_count times; false without one.
+	bool _omm_merged_geometry(RTMergedMMEntry &r_entry, uint32_t p_mm_count, uint32_t p_primitives_per_element, RD::AccelerationStructureGeometry &r_geometry);
+	void _omm_release_merged(RTMergedMMEntry &r_entry);
+	void _omm_release_entry(RTOmmEntry *p_entry);
+	void _omm_release_mesh_surface(RID p_mesh, uint32_t p_surface);
+	void _omm_setup(RTOmmEntry *p_entry);
+	void _omm_bake(RTOmmEntry *p_entry, const PackedByteArray &p_setup);
+	bool _omm_pyramid(RID p_texture, uint32_t p_width, uint32_t p_height, RTOmmPyramid *&r_pyramid);
+	static void _on_omm_read(const PackedByteArray &p_data, uint64_t p_ticket, bool p_stats);
 	// The cluster LOD selection (D86): the surface's region of the LOD table, an instance's slot,
 	// the frame's batch, and the flush that runs the selection and builds every instance's BLAS.
 	bool _cluster_lod_table_allocate(uint32_t p_words, uint32_t &r_offset);

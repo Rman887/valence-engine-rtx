@@ -492,6 +492,31 @@ RID RenderingDevice::blas_create(Span<AccelerationStructureGeometry> p_geometrie
 					t_out.index_count = 0;
 					t_out.index_format = {};
 				}
+
+				// An opacity micromap (D96): the BLAS build reads its storage and the index buffer.
+				t_out.micromap = RDD::MicromapID();
+				t_out.micromap_index_buffer = RDD::BufferID();
+				t_out.micromap_index_offset = 0;
+				t_out.micromap_index_format = INDEX_BUFFER_FORMAT_UINT32;
+				t_out.micromap_usages = nullptr;
+				t_out.micromap_usage_count = 0;
+				if (t_in.micromap.is_valid()) {
+					Micromap *micromap = micromap_owner.get_or_null(t_in.micromap);
+					ERR_FAIL_NULL_V_MSG(micromap, RID(), "The geometry's micromap is not a valid micromap.");
+					Buffer *micromap_index_buffer = storage_buffer_owner.get_or_null(t_in.micromap_index_buffer);
+					ERR_FAIL_NULL_V_MSG(micromap_index_buffer, RID(), "The geometry's micromap index buffer must be a valid storage buffer.");
+					ERR_FAIL_COND_V_MSG(!micromap_index_buffer->usage.has_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT) || !micromap_index_buffer->usage.has_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT), RID(), "The micromap index buffer must be created with BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT and BUFFER_CREATION_DEVICE_ADDRESS_BIT.");
+					const uint32_t primitive_count = t_in.index_buffer.is_valid() ? t_in.index_count / 3 : t_in.vertex_count / 3;
+					ERR_FAIL_COND_V_MSG(t_in.micromap_index_offset + uint64_t(primitive_count) * sizeof(uint32_t) > micromap_index_buffer->size, RID(), "The micromap index buffer is smaller than one index per primitive.");
+					t_out.micromap = micromap->driver_id;
+					t_out.micromap_index_buffer = micromap_index_buffer->driver_id;
+					t_out.micromap_index_offset = t_in.micromap_index_offset;
+					t_out.micromap_usages = t_in.micromap_usages.ptr();
+					t_out.micromap_usage_count = t_in.micromap_usages.size();
+					draw_trackers.push_back(micromap->storage.draw_tracker);
+					draw_trackers.push_back(micromap_index_buffer->draw_tracker);
+					_check_transfer_worker_buffer(micromap_index_buffer);
+				}
 			} break;
 
 			case AccelerationStructureGeometry::TYPE_AABBS: {
@@ -547,6 +572,10 @@ RID RenderingDevice::blas_create(Span<AccelerationStructureGeometry> p_geometrie
 				_add_dependency(id, geometry.geometry.triangles.vertex_buffer);
 				if (geometry.geometry.triangles.index_buffer.is_valid()) {
 					_add_dependency(id, geometry.geometry.triangles.index_buffer);
+				}
+				if (geometry.geometry.triangles.micromap.is_valid()) {
+					_add_dependency(id, geometry.geometry.triangles.micromap);
+					_add_dependency(id, geometry.geometry.triangles.micromap_index_buffer);
 				}
 			} break;
 			case AccelerationStructureGeometry::TYPE_AABBS: {
@@ -808,6 +837,96 @@ Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance
 
 const RDD::PartitionedAccelerationStructureCapabilities &RenderingDevice::get_partitioned_acceleration_structure_capabilities() const {
 	return driver->get_partitioned_acceleration_structure_capabilities();
+}
+
+const RDD::OpacityMicromapCapabilities &RenderingDevice::get_opacity_micromap_capabilities() const {
+	return driver->get_opacity_micromap_capabilities();
+}
+
+RID RenderingDevice::micromap_create(Span<MicromapUsage> p_usages) {
+	ERR_FAIL_COND_V_MSG(!driver->get_opacity_micromap_capabilities().supported, RID(), "The current rendering device has no opacity micromap support.");
+	ERR_FAIL_COND_V_MSG(p_usages.is_empty(), RID(), "A micromap needs at least one entry.");
+
+	uint64_t size = 0;
+	uint64_t scratch_size = 0;
+	driver->micromap_get_build_sizes(VectorView<MicromapUsage>(p_usages.ptr(), p_usages.size()), size, scratch_size);
+	ERR_FAIL_COND_V_MSG(size == 0, RID(), "The driver gave no size for the micromap.");
+
+	Micromap micromap;
+	micromap.size = size;
+	micromap.scratch_size = scratch_size;
+	micromap.storage.size = size;
+	micromap.storage.usage = RDD::BUFFER_USAGE_MICROMAP_STORAGE_BIT | RDD::BUFFER_USAGE_STORAGE_BIT;
+	micromap.storage.driver_id = driver->buffer_create(size, micromap.storage.usage, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
+	ERR_FAIL_COND_V(!micromap.storage.driver_id, RID());
+	buffer_memory.add(micromap.storage.size);
+	micromap.driver_id = driver->micromap_create(micromap.storage.driver_id, size, VectorView<MicromapUsage>(p_usages.ptr(), p_usages.size()));
+	if (!micromap.driver_id) {
+		buffer_memory.sub(micromap.storage.size);
+		driver->buffer_free(micromap.storage.driver_id);
+		ERR_FAIL_V_MSG(RID(), "Failed to create the micromap.");
+	}
+	micromap.storage.draw_tracker = RDG::resource_tracker_create();
+	micromap.storage.draw_tracker->buffer_driver_id = micromap.storage.driver_id;
+
+	RID id = micromap_owner.make_rid(micromap);
+#ifdef DEV_ENABLED
+	set_resource_name(id, "RID:" + itos(id.get_id()));
+#endif
+	return id;
+}
+
+Error RenderingDevice::micromap_build(RID p_micromap, RID p_data_buffer, uint64_t p_data_offset, RID p_triangle_buffer, uint64_t p_triangle_offset) {
+	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+	ERR_FAIL_COND_V_MSG(draw_list.active, ERR_INVALID_PARAMETER, "Building a micromap is forbidden during creation of a draw list.");
+	ERR_FAIL_COND_V_MSG(compute_list.active, ERR_INVALID_PARAMETER, "Building a micromap is forbidden during creation of a compute list.");
+	ERR_FAIL_COND_V_MSG(raytracing_list.active, ERR_INVALID_PARAMETER, "Building a micromap is forbidden during creation of a raytracing list.");
+
+	Micromap *micromap = micromap_owner.get_or_null(p_micromap);
+	ERR_FAIL_NULL_V_MSG(micromap, ERR_INVALID_PARAMETER, "The micromap is not valid.");
+	Buffer *data_buffer = _get_buffer_from_owner(p_data_buffer);
+	Buffer *triangle_buffer = _get_buffer_from_owner(p_triangle_buffer);
+	ERR_FAIL_NULL_V_MSG(data_buffer, ERR_INVALID_PARAMETER, "The micromap's data buffer is not a valid buffer.");
+	ERR_FAIL_NULL_V_MSG(triangle_buffer, ERR_INVALID_PARAMETER, "The micromap's triangle buffer is not a valid buffer.");
+	for (const Buffer *input : { data_buffer, triangle_buffer }) {
+		ERR_FAIL_COND_V_MSG(!input->usage.has_flag(RDD::BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT) || !input->usage.has_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT), ERR_INVALID_PARAMETER, "The micromap's inputs must be created with BUFFER_CREATION_MICROMAP_BUILD_INPUT_READ_ONLY_BIT and BUFFER_CREATION_DEVICE_ADDRESS_BIT.");
+	}
+	ERR_FAIL_COND_V(p_data_offset >= data_buffer->size || p_triangle_offset >= triangle_buffer->size, ERR_INVALID_PARAMETER);
+	_check_transfer_worker_buffer(data_buffer);
+	_check_transfer_worker_buffer(triangle_buffer);
+
+	// The scratch lives for this frame's build alone; its size includes the driver's alignment.
+	Buffer scratch = Buffer();
+	scratch.size = MAX(micromap->scratch_size, uint64_t(4));
+	scratch.driver_id = driver->buffer_create(scratch.size, RDD::BUFFER_USAGE_STORAGE_BIT | RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
+	ERR_FAIL_COND_V(!scratch.driver_id, ERR_CANT_CREATE);
+	buffer_memory.add(scratch.size);
+	frames[frame].buffers_to_dispose_of.push_back(scratch);
+
+	RDD::MicromapBuild build;
+	build.micromap = micromap->driver_id;
+	build.data_buffer = data_buffer->driver_id;
+	build.data_offset = p_data_offset;
+	build.triangle_buffer = triangle_buffer->driver_id;
+	build.triangle_offset = p_triangle_offset;
+	build.scratch_buffer = scratch.driver_id;
+
+	thread_local LocalVector<RDG::ResourceTracker *> sources;
+	sources.clear();
+	if (data_buffer->draw_tracker != nullptr) {
+		sources.push_back(data_buffer->draw_tracker);
+	}
+	if (triangle_buffer->draw_tracker != nullptr && triangle_buffer->draw_tracker != data_buffer->draw_tracker) {
+		sources.push_back(triangle_buffer->draw_tracker);
+	}
+	draw_graph.add_micromap_build(build, micromap->storage.draw_tracker, sources);
+	return OK;
+}
+
+uint64_t RenderingDevice::micromap_get_size(RID p_micromap) {
+	Micromap *micromap = micromap_owner.get_or_null(p_micromap);
+	ERR_FAIL_NULL_V(micromap, 0);
+	return micromap->size;
 }
 
 RID RenderingDevice::ptlas_create(const PartitionedAccelerationStructureLimits &p_limits) {
@@ -2360,6 +2479,10 @@ RID RenderingDevice::storage_buffer_create(uint32_t p_size_bytes, Span<uint8_t> 
 				"The GPU doesn't support cluster acceleration structures.");
 #endif
 		buffer.usage.set_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT);
+	}
+	if (p_creation_bits.has_flag(BUFFER_CREATION_MICROMAP_BUILD_INPUT_READ_ONLY_BIT)) {
+		ERR_FAIL_COND_V_MSG(!driver->get_opacity_micromap_capabilities().supported, RID(), "The GPU doesn't support opacity micromaps.");
+		buffer.usage.set_flag(RDD::BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT);
 	}
 
 	buffer.driver_id = driver->buffer_create(buffer.size, buffer.usage, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
@@ -8707,6 +8830,13 @@ void RenderingDevice::_free_internal(RID p_id) {
 		RDG::resource_tracker_free(acceleration_structure->draw_tracker);
 		frames[frame].acceleration_structures_to_dispose_of.push_back(*acceleration_structure);
 		acceleration_structure_owner.free(p_id);
+	} else if (micromap_owner.owns(p_id)) {
+		Micromap *micromap = micromap_owner.get_or_null(p_id);
+		RDG::resource_tracker_free(micromap->storage.draw_tracker);
+		micromap->storage.draw_tracker = nullptr;
+		frames[frame].micromaps_to_dispose_of.push_back(micromap->driver_id);
+		frames[frame].buffers_to_dispose_of.push_back(micromap->storage);
+		micromap_owner.free(p_id);
 	} else if (raytracing_pipeline_owner.owns(p_id)) {
 		RaytracingPipeline *pipeline = raytracing_pipeline_owner.get_or_null(p_id);
 		frames[frame].raytracing_pipelines_to_dispose_of.push_back(*pipeline);
@@ -8771,6 +8901,9 @@ void RenderingDevice::set_resource_name(RID p_id, const String &p_name) {
 	} else if (acceleration_structure_owner.owns(p_id)) {
 		AccelerationStructure *acceleration_structure = acceleration_structure_owner.get_or_null(p_id);
 		driver->set_object_name(RDD::OBJECT_TYPE_ACCELERATION_STRUCTURE, acceleration_structure->driver_id, p_name);
+	} else if (micromap_owner.owns(p_id)) {
+		Micromap *micromap = micromap_owner.get_or_null(p_id);
+		driver->set_object_name(RDD::OBJECT_TYPE_BUFFER, micromap->storage.driver_id, p_name);
 	} else if (raytracing_pipeline_owner.owns(p_id)) {
 		RaytracingPipeline *pipeline = raytracing_pipeline_owner.get_or_null(p_id);
 		driver->set_object_name(RDD::OBJECT_TYPE_RAYTRACING_PIPELINE, pipeline->driver_id, p_name);
@@ -8940,6 +9073,12 @@ void RenderingDevice::_free_pending_resources(int p_frame) {
 		}
 
 		frames[p_frame].acceleration_structures_to_dispose_of.pop_front();
+	}
+
+	// Micromaps, once the structures that read them are gone (D96).
+	while (frames[p_frame].micromaps_to_dispose_of.front()) {
+		driver->micromap_free(frames[p_frame].micromaps_to_dispose_of.front()->get());
+		frames[p_frame].micromaps_to_dispose_of.pop_front();
 	}
 
 	// Uniform sets.
@@ -9868,6 +10007,7 @@ void RenderingDevice::finalize() {
 	_free_rids(compute_pipeline_owner, "Compute");
 	_free_rids(raytracing_pipeline_owner, "RaytracingPipeline");
 	_free_rids(acceleration_structure_owner, "AccelerationStructure");
+	_free_rids(micromap_owner, "Micromap");
 	_free_rids(hit_sbt_owner, "HitShaderBindingTable");
 	_free_rids(uniform_set_owner, "UniformSet");
 	_free_rids(texture_buffer_owner, "TextureBuffer");

@@ -178,6 +178,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	RaytracingCapabilities raytracing_capabilities;
 	ClusterAccelerationStructureCapabilities cluster_acceleration_structure_capabilities;
 	PartitionedAccelerationStructureCapabilities partitioned_acceleration_structure_capabilities;
+	OpacityMicromapCapabilities opacity_micromap_capabilities;
 	DescriptorIndexingCapabilities descriptor_indexing_capabilities;
 	bool pipeline_cache_control_support = false;
 	bool device_fault_support = false;
@@ -739,6 +740,15 @@ public:
 		TightLocalVector<VkAccelerationStructureGeometryKHR> geometries;
 		VkAccelerationStructureBuildGeometryInfoKHR build_info;
 		TightLocalVector<VkAccelerationStructureBuildRangeInfoKHR> range_infos;
+		// Per geometry, chained into its triangles when it has an opacity micromap (D96).
+		TightLocalVector<VkAccelerationStructureTrianglesOpacityMicromapEXT> micromap_attachments;
+		TightLocalVector<VkMicromapUsageEXT> micromap_usages;
+	};
+
+	struct MicromapInfo {
+		VkMicromapEXT vk_micromap = VK_NULL_HANDLE;
+		TightLocalVector<VkMicromapUsageEXT> usages;
+		uint64_t scratch_size = 0;
 	};
 
 	virtual AccelerationStructureID blas_create(VectorView<AccelerationStructureGeometry> p_geometries, BitField<AccelerationStructureFlagBits> p_flags) override final;
@@ -764,6 +774,12 @@ public:
 	virtual uint32_t ptlas_operation_size() override final;
 	virtual void ptlas_operation_write(uint8_t *r_driver_operation, PartitionedOpType p_type, uint32_t p_count, uint64_t p_address, uint32_t p_stride) override final;
 
+	// ----- OPACITY MICROMAP -----
+	virtual const OpacityMicromapCapabilities &get_opacity_micromap_capabilities() override final;
+	virtual void micromap_get_build_sizes(VectorView<MicromapUsage> p_usages, uint64_t &r_size, uint64_t &r_scratch_size) override final;
+	virtual MicromapID micromap_create(BufferID p_storage, uint64_t p_size, VectorView<MicromapUsage> p_usages) override final;
+	virtual void micromap_free(MicromapID p_micromap) override final;
+
 private:
 	void _acceleration_structure_create(VkAccelerationStructureTypeKHR p_type, VkAccelerationStructureBuildSizesInfoKHR p_size_info, AccelerationStructureInfo *r_accel_info);
 	// Fills the Vulkan input from ours; the op-type input structs must outlive the returned struct.
@@ -779,6 +795,7 @@ public:
 	virtual void command_build_tlas(CommandBufferID p_cmd_buffer, AccelerationStructureID p_acceleration_structure, BufferID p_scratch_buffer, BufferID p_instance_buffer, uint32_t p_instance_offset, uint32_t p_instance_count) override final;
 	virtual void command_build_cluster_acceleration_structures(CommandBufferID p_cmd_buffer, const ClusterAccelerationStructureBuild &p_build) override final;
 	virtual void command_build_ptlas(CommandBufferID p_cmd_buffer, const PartitionedAccelerationStructureBuild &p_build) override final;
+	virtual void command_build_micromap(CommandBufferID p_cmd_buffer, const MicromapBuild &p_build) override final;
 	virtual void command_bind_raytracing_pipeline(CommandBufferID p_cmd_buffer, RaytracingPipelineID p_pipeline) override final;
 	virtual void command_bind_raytracing_uniform_set(CommandBufferID p_cmd_buffer, UniformSetID p_uniform_set, ShaderID p_shader, uint32_t p_set_index) override final;
 	virtual void command_trace_rays(CommandBufferID p_cmd_buffer, const ShaderBindingTable &p_raygen_sbt, const ShaderBindingTable &p_miss_sbt, const ShaderBindingTable &p_hit_sbt, uint32_t p_width, uint32_t p_height, uint32_t p_depth) override final;
@@ -864,7 +881,9 @@ private:
 			ShaderInfo,
 			UniformSetInfo,
 			RenderPassInfo,
-			CommandBufferInfo>;
+			CommandBufferInfo,
+			AccelerationStructureInfo,
+			MicromapInfo>;
 	PagedAllocator<VersatileResource, true> resources_allocator;
 
 	/******************/

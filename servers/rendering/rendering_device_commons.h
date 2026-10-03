@@ -1062,6 +1062,39 @@ public:
 		bool partition_translation = false;
 	};
 
+	// ----- OPACITY MICROMAPS (VK_EXT_opacity_micromap) -----
+	//
+	// A micromap holds per micro-triangle opacity states that a triangle geometry's BLAS reads
+	// through a per-primitive index, so traversal resolves known states without the any-hit
+	// shader. Behind rendering/pathtracing/opacity_micromaps (restart, D96).
+
+	enum MicromapFormat {
+		MICROMAP_FORMAT_OPACITY_2_STATE = 1,
+		MICROMAP_FORMAT_OPACITY_4_STATE = 2,
+	};
+
+	// Special indices a primitive may take instead of a micromap entry.
+	enum MicromapSpecialIndex {
+		MICROMAP_SPECIAL_INDEX_FULLY_TRANSPARENT = -1,
+		MICROMAP_SPECIAL_INDEX_FULLY_OPAQUE = -2,
+		MICROMAP_SPECIAL_INDEX_FULLY_UNKNOWN_TRANSPARENT = -3,
+		MICROMAP_SPECIAL_INDEX_FULLY_UNKNOWN_OPAQUE = -4,
+	};
+
+	// How many entries (of a micromap) or references (of a geometry) use one level and format.
+	struct MicromapUsage {
+		uint32_t count = 0;
+		uint32_t subdivision_level = 0;
+		uint32_t format = MICROMAP_FORMAT_OPACITY_4_STATE;
+	};
+
+	struct OpacityMicromapCapabilities {
+		bool supported = false; // Enabled by the setting; RT pipelines then opt into micromaps.
+		uint32_t max_2_state_subdivision_level = 0;
+		uint32_t max_4_state_subdivision_level = 0;
+		uint32_t triangle_entry_size = 0; // Bytes of one entry of the build's triangle array.
+	};
+
 	/**************/
 	/**** MISC ****/
 	/**************/

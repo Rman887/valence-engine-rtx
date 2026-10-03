@@ -4180,6 +4180,8 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/ptlas_partition_max_instances", PROPERTY_HINT_RANGE, "16,1048576,1"), 8192);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/ptlas_global_max_instances", PROPERTY_HINT_RANGE, "0,1048576,1"), 65536);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/ptlas_stable_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 16);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/opacity_micromap_scale", PROPERTY_HINT_RANGE, "0.25,64,0.01"), 2.0);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/opacity_micromap_max_level", PROPERTY_HINT_RANGE, "1,12,1"), 10);
 
 	// OpenGL limits
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/limits/opengl/max_renderable_elements", PROPERTY_HINT_RANGE, "1024,65536,1"), 65536);

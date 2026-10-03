@@ -1135,6 +1135,10 @@ void RenderingDeviceGraph::_run_render_commands(int32_t p_level, const RecordedC
 				const RecordedPartitionedAccelerationStructureBuildCommand *ptlas_build_command = reinterpret_cast<const RecordedPartitionedAccelerationStructureBuildCommand *>(command);
 				driver->command_build_ptlas(r_command_buffer, ptlas_build_command->build);
 			} break;
+			case RecordedCommand::TYPE_MICROMAP_BUILD: {
+				const RecordedMicromapBuildCommand *micromap_build_command = reinterpret_cast<const RecordedMicromapBuildCommand *>(command);
+				driver->command_build_micromap(r_command_buffer, micromap_build_command->build);
+			} break;
 			case RecordedCommand::TYPE_BUFFER_CLEAR: {
 				const RecordedBufferClearCommand *buffer_clear_command = reinterpret_cast<const RecordedBufferClearCommand *>(command);
 				driver->command_clear_buffer(r_command_buffer, buffer_clear_command->buffer, buffer_clear_command->offset, buffer_clear_command->size);
@@ -1967,6 +1971,33 @@ void RenderingDeviceGraph::add_ptlas_build(const RDD::PartitionedAccelerationStr
 	_add_command_to_graph(trackers.ptr(), usages.ptr(), usages.size(), command_index, command);
 }
 
+void RenderingDeviceGraph::add_micromap_build(const RDD::MicromapBuild &p_build, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers) {
+	DEV_ASSERT(p_dst_tracker != nullptr);
+
+	int32_t command_index;
+	RecordedMicromapBuildCommand *command = static_cast<RecordedMicromapBuildCommand *>(_allocate_command(sizeof(RecordedMicromapBuildCommand), command_index));
+	command->type = RecordedCommand::TYPE_MICROMAP_BUILD;
+	// Synchronization1 has no micromap build stage: the command waits and is waited on as all
+	// commands, and the driver puts a full memory dependency on both sides of the build.
+	command->self_stages = RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT;
+	command->build = p_build;
+
+	thread_local LocalVector<ResourceTracker *> trackers;
+	thread_local LocalVector<ResourceUsage> usages;
+
+	uint32_t resource_count = p_src_trackers.size() + 1;
+	trackers.resize(resource_count);
+	usages.resize(resource_count);
+	for (uint32_t i = 0; i < p_src_trackers.size(); i++) {
+		trackers[i] = p_src_trackers[i];
+		usages[i] = RESOURCE_USAGE_STORAGE_BUFFER_READ;
+	}
+	trackers[resource_count - 1] = p_dst_tracker;
+	usages[resource_count - 1] = RESOURCE_USAGE_STORAGE_BUFFER_READ_WRITE;
+
+	_add_command_to_graph(trackers.ptr(), usages.ptr(), usages.size(), command_index, command);
+}
+
 void RenderingDeviceGraph::add_buffer_clear(RDD::BufferID p_dst, ResourceTracker *p_dst_tracker, uint32_t p_offset, uint32_t p_size) {
 	DEV_ASSERT(p_dst_tracker != nullptr);
 
@@ -2792,6 +2823,7 @@ void RenderingDeviceGraph::end(bool p_reorder_commands, bool p_full_barriers, RD
 			6, // TYPE_BOTTOM_LEVEL_ACCELERATION_STRUCTURE_UPDATE
 			6, // TYPE_CLUSTER_ACCELERATION_STRUCTURE_BUILD
 			6, // TYPE_PARTITIONED_ACCELERATION_STRUCTURE_BUILD
+			6, // TYPE_MICROMAP_BUILD
 		};
 		static_assert(std_size(PriorityTable) == RecordedCommand::TYPE_MAX, "PriorityTable must have one entry per RecordedCommand::Type");
 

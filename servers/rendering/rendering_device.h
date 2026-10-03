@@ -864,6 +864,8 @@ public:
 		BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT = (1 << 3),
 		// The buffer holds acceleration structures built into it by cluster_acceleration_structure_build().
 		BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT = (1 << 4),
+		// The buffer holds an opacity micromap's states or triangle array, read by micromap_build().
+		BUFFER_CREATION_MICROMAP_BUILD_INPUT_READ_ONLY_BIT = (1 << 5),
 	};
 
 	enum StorageBufferUsage {
@@ -1420,6 +1422,16 @@ private:
 
 	RID_Owner<AccelerationStructure, true> acceleration_structure_owner;
 
+	// An opacity micromap (D96) and the storage it lives in, which a BLAS build reads.
+	struct Micromap {
+		RDD::MicromapID driver_id;
+		Buffer storage;
+		uint64_t size = 0;
+		uint64_t scratch_size = 0;
+	};
+
+	RID_Owner<Micromap, true> micromap_owner;
+
 public:
 	// RD-layer BLAS geometry entry. Mirrors RDD::AccelerationStructureGeometry
 	// but uses RIDs instead of BufferIDs, and tracks dependencies on those
@@ -1439,6 +1451,14 @@ public:
 			RID index_buffer;
 			uint32_t index_offset = 0;
 			uint32_t index_count = 0;
+			// An opacity micromap of micromap_create() (D96), read through one int32 per primitive
+			// (an entry of the micromap or a MicromapSpecialIndex) from a storage buffer created with
+			// BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT and
+			// BUFFER_CREATION_DEVICE_ADDRESS_BIT, and the references it makes per level and format.
+			RID micromap;
+			RID micromap_index_buffer;
+			uint64_t micromap_index_offset = 0;
+			Vector<MicromapUsage> micromap_usages;
 		};
 
 		// Procedural geometry: buffer of float3 (min, max) AABB pairs.
@@ -1524,6 +1544,20 @@ public:
 	// scratch's disables of the slots it does not fill, included) and, in place, those an enabled
 	// record left. Translations are not counted. Valid until the next build of the structure.
 	Span<uint32_t> ptlas_get_last_build_partitions(RID p_ptlas);
+
+	// ----- OPACITY MICROMAPS (D96) -----
+	//
+	// Available when get_opacity_micromap_capabilities().supported, which
+	// rendering/pathtracing/opacity_micromaps (restart) asks for. A micromap is sized for its
+	// entries' levels and formats at creation and built once from two buffers created with
+	// BUFFER_CREATION_MICROMAP_BUILD_INPUT_READ_ONLY_BIT and BUFFER_CREATION_DEVICE_ADDRESS_BIT:
+	// the packed states and one triangle_entry_size entry per micromap triangle. A BLAS reads it
+	// through its triangles' micromap fields. Not bound to scripts.
+
+	const OpacityMicromapCapabilities &get_opacity_micromap_capabilities() const;
+	RID micromap_create(Span<MicromapUsage> p_usages);
+	Error micromap_build(RID p_micromap, RID p_data_buffer, uint64_t p_data_offset, RID p_triangle_buffer, uint64_t p_triangle_offset);
+	uint64_t micromap_get_size(RID p_micromap);
 
 	// ----- CLUSTER ACCELERATION STRUCTURES -----
 	//
@@ -1982,6 +2016,7 @@ private:
 		List<RenderPipeline> render_pipelines_to_dispose_of;
 		List<ComputePipeline> compute_pipelines_to_dispose_of;
 		List<AccelerationStructure> acceleration_structures_to_dispose_of;
+		List<RDD::MicromapID> micromaps_to_dispose_of; // After the acceleration structures, which trace them.
 		List<RaytracingPipeline> raytracing_pipelines_to_dispose_of;
 
 		// Pending asynchronous data transfer for buffers.

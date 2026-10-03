@@ -123,6 +123,7 @@ public:
 			TYPE_BOTTOM_LEVEL_ACCELERATION_STRUCTURE_UPDATE,
 			TYPE_CLUSTER_ACCELERATION_STRUCTURE_BUILD,
 			TYPE_PARTITIONED_ACCELERATION_STRUCTURE_BUILD,
+			TYPE_MICROMAP_BUILD,
 			TYPE_MAX
 		};
 
@@ -373,6 +374,10 @@ private:
 
 	struct RecordedPartitionedAccelerationStructureBuildCommand : RecordedCommand {
 		RDD::PartitionedAccelerationStructureBuild build;
+	};
+
+	struct RecordedMicromapBuildCommand : RecordedCommand {
+		RDD::MicromapBuild build;
 	};
 
 	struct RecordedBufferClearCommand : RecordedCommand {
@@ -916,6 +921,8 @@ public:
 	void add_cluster_acceleration_structure_build(const RDD::ClusterAccelerationStructureBuild &p_build, VectorView<ResourceTracker *> p_trackers, VectorView<ResourceUsage> p_usages);
 	// The operations come from host memory the build owns; p_src_trackers are the BLASes its slots reference.
 	void add_ptlas_build(const RDD::PartitionedAccelerationStructureBuild &p_build, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);
+	// The inputs are read and the micromap's storage written; the driver adds the barriers the micromap stage needs.
+	void add_micromap_build(const RDD::MicromapBuild &p_build, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);
 	void add_buffer_clear(RDD::BufferID p_dst, ResourceTracker *p_dst_tracker, uint32_t p_offset, uint32_t p_size);
 	void add_buffer_copy(RDD::BufferID p_src, ResourceTracker *p_src_tracker, RDD::BufferID p_dst, ResourceTracker *p_dst_tracker, RDD::BufferCopyRegion p_region);
 	void add_buffer_get_data(RDD::BufferID p_src, ResourceTracker *p_src_tracker, RDD::BufferID p_dst, RDD::BufferCopyRegion p_region);

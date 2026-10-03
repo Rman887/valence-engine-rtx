@@ -231,6 +231,9 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		sky_light_shader.version_shader[i] = sky_light_shader.shader.version_get_shader(sky_light_shader.version, i);
 		sky_light_shader.pipeline[i] = RD::get_singleton()->compute_pipeline_create(sky_light_shader.version_shader[i]);
 	}
+
+	// Opacity micromaps (D96).
+	_omm_initialize();
 }
 
 RenderRaytracing::~RenderRaytracing() {
@@ -266,6 +269,13 @@ RenderRaytracing::~RenderRaytracing() {
 
 	mm_merge_shader.shader.version_free(mm_merge_shader.version);
 	lod_select_shader.shader.version_free(lod_select_shader.version);
+	if (omm_shader.version.is_valid()) {
+		omm_shader.shader.version_free(omm_shader.version);
+	}
+	if (omm_sampler.is_valid()) {
+		RD::get_singleton()->free_rid(omm_sampler);
+		omm_sampler = RID();
+	}
 	sky_light_shader.shader.version_free(sky_light_shader.version);
 	if (slot_rows_shader.version.is_valid()) {
 		slot_rows_shader.shader.version_free(slot_rows_shader.version);
@@ -746,10 +756,13 @@ void RenderRaytracing::cleanup_caches() {
 				rd->free_rid(e->replicated_idx_buffer);
 				e->replicated_idx_buffer = RID();
 			}
+			_omm_release_merged(*e);
 			merged_mm_pool.free(live[i]);
 		}
 	}
 	mm_handles.clear();
+	// The micromaps, once no merge's BLAS carries one (D96).
+	_omm_finalize();
 	deformed_active_this_frame.clear();
 	merged_mm_active_this_frame.clear();
 
@@ -897,6 +910,8 @@ void RenderRaytracing::prepare_frame() {
 	// Sizes read back since the last frame move their CLAS into the arena before the TLAS
 	// instances of this frame take each surface's handle (D81).
 	_process_cluster_compactions();
+	// Opacity micromaps (D96): bakes whose setup is back, and the setups of surfaces asked for since.
+	_omm_process();
 	// Then the streamed groups (D92): loads whose sizes are back become resident, and the requests
 	// and uses read back since admit, evict and start loads, all before this frame's selection.
 	if (cluster_lod_stream_enabled) {
@@ -1024,6 +1039,7 @@ void RenderRaytracing::prepare_frame() {
 				rd->free_rid(e->replicated_idx_buffer);
 				e->replicated_idx_buffer = RID();
 			}
+			_omm_release_merged(*e);
 			merged_mm_pool.free(live[i]);
 		}
 	}
@@ -1283,13 +1299,13 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 
 // Fills RTSurfaceData geometry metadata from the surface format.
 // Returns the RIDs needed for BLAS creation so _populate_surface_blas can use them.
-static void _fill_surface_geometry_data(
+void RendererSceneRenderImplementation::_fill_surface_geometry_data(
 		void *p_mesh_surface,
 		bool p_force_uncompressed,
 		RTSurfaceData *r_surf_data,
-		RID *r_vertex_buffer = nullptr,
-		RID *r_attribute_buffer = nullptr,
-		RID *r_index_buffer = nullptr) {
+		RID *r_vertex_buffer,
+		RID *r_attribute_buffer,
+		RID *r_index_buffer) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 
 	uint64_t surface_format = mesh_storage->mesh_surface_get_format(p_mesh_surface);
@@ -1428,6 +1444,30 @@ static void _fill_surface_geometry_data(
 	}
 }
 
+void RendererSceneRenderImplementation::_fill_surface_triangle_geometry(RID p_vertex_buffer, RID p_index_buffer, const RT_GeometryData &p_geometry, bool p_2d, bool p_compressed, RD::AccelerationStructureGeometry &r_geometry) {
+	RD::DataFormat pos_format;
+	if (p_2d) {
+		pos_format = RD::DATA_FORMAT_R32G32_SFLOAT;
+	} else if (p_compressed) {
+		pos_format = RD::DATA_FORMAT_R16G16B16A16_UNORM;
+	} else {
+		pos_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
+	}
+
+	// Type defaults to TYPE_TRIANGLES; set explicitly for clarity.
+	r_geometry.type = RD::AccelerationStructureGeometry::TYPE_TRIANGLES;
+	r_geometry.geometry.triangles.vertex_buffer = p_vertex_buffer;
+	r_geometry.geometry.triangles.vertex_stride = p_geometry.position_stride;
+	r_geometry.geometry.triangles.vertex_count = p_geometry.vertex_count;
+	r_geometry.geometry.triangles.vertex_format = pos_format;
+
+	const uint32_t index_count = (p_geometry.index_format != RT_INDEX_FORMAT_NONE) ? p_geometry.primitive_count * 3 : 0;
+	if (p_index_buffer.is_valid() && index_count > 0) {
+		r_geometry.geometry.triangles.index_buffer = p_index_buffer;
+		r_geometry.geometry.triangles.index_count = index_count;
+	}
+}
+
 void RenderRaytracing::_populate_surface_blas(
 		void *p_mesh_surface,
 		RID p_vertex_buffer_override,
@@ -1487,9 +1527,7 @@ void RenderRaytracing::_populate_surface_blas(
 		rd->buffer_add_device_address_read_stages(index_buffer, RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT);
 	}
 
-	uint32_t vertex_count = geom.vertex_count;
 	uint32_t index_count = (geom.index_format != RT_INDEX_FORMAT_NONE) ? geom.primitive_count * 3 : 0;
-	uint32_t position_stride = geom.position_stride;
 
 	bool is_2d = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_format(p_mesh_surface) & RSE::ARRAY_FLAG_USE_2D_VERTICES;
 	bool compressed = r_surf_data->is_compressed;
@@ -1512,27 +1550,8 @@ void RenderRaytracing::_populate_surface_blas(
 
 	// Create BLAS using the new geometry-based API.
 	{
-		RD::DataFormat pos_format;
-		if (is_2d) {
-			pos_format = RD::DATA_FORMAT_R32G32_SFLOAT;
-		} else if (compressed) {
-			pos_format = RD::DATA_FORMAT_R16G16B16A16_UNORM;
-		} else {
-			pos_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
-		}
-
 		RD::AccelerationStructureGeometry as_geom;
-		// Type defaults to TYPE_TRIANGLES; set explicitly for clarity.
-		as_geom.type = RD::AccelerationStructureGeometry::TYPE_TRIANGLES;
-		as_geom.geometry.triangles.vertex_buffer = vertex_buffer;
-		as_geom.geometry.triangles.vertex_stride = position_stride;
-		as_geom.geometry.triangles.vertex_count = vertex_count;
-		as_geom.geometry.triangles.vertex_format = pos_format;
-
-		if (index_buffer.is_valid() && index_count > 0) {
-			as_geom.geometry.triangles.index_buffer = index_buffer;
-			as_geom.geometry.triangles.index_count = index_count;
-		}
+		_fill_surface_triangle_geometry(vertex_buffer, index_buffer, geom, is_2d, compressed, as_geom);
 
 		BitField<RD::AccelerationStructureFlagBits> as_flags = p_prefer_fast_build
 				? RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT
@@ -2997,6 +3016,8 @@ void RenderRaytracing::_cluster_arena_free(uint32_t p_chunk, uint64_t p_offset, 
 }
 
 void RenderRaytracing::release_mesh_surface(RID p_mesh, uint32_t p_surface) {
+	// Its opacity micromaps and their BLASes (D96).
+	_omm_release_mesh_surface(p_mesh, p_surface);
 	// The RT cache entry of a surface its mesh is dropping: its BLAS, staging or arena region go
 	// now rather than when the cache slot is next reused.
 	const uint32_t cache_key = (p_mesh.get_local_index() << 8) | (p_surface & 0xFF);
@@ -6677,6 +6698,9 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	if (albedo_rd.is_valid()) {
 		mat.albedo_texture_idx = bindless_block->add_texture(albedo_rd);
 	}
+	// An opacity micromap's alpha source (D96): only the texture the hit shaders read, not one a full
+	// bindless table replaced with the default.
+	mat_data->albedo_texture_rd = mat.albedo_texture_idx != 0 ? albedo_rd : RID();
 
 	RID normal_rd = get_material_texture("texture_normal");
 	if (normal_rd.is_valid() && shader_declares("texture_normal")) {
@@ -7175,6 +7199,7 @@ bool RenderRaytracing::_build_merged_mm_blas(
 			if (old->replicated_idx_buffer.is_valid()) {
 				rd_local->free_rid(old->replicated_idx_buffer);
 			}
+			_omm_release_merged(*old);
 			merged_mm_pool.free(h);
 			h = RID();
 		}
@@ -7443,6 +7468,7 @@ bool RenderRaytracing::_build_merged_mm_blas(
 			as_geom.geometry.triangles.index_buffer = entry.replicated_idx_buffer;
 			as_geom.geometry.triangles.index_count = p_mm_count * index_count;
 		}
+		_omm_merged_geometry(entry, p_mm_count, prim_count, as_geom); // Its micromap, when it carries one (D96).
 
 		BitField<RD::AccelerationStructureFlagBits> as_flags =
 				RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT |
@@ -7621,6 +7647,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		uint8_t inst_mask;
 		AABB mm_aabb;
 		RTSurfaceData *source = nullptr; // A surface whose geometry streams: its population, holding the upload of its arrays (D93d).
+		bool omm_eligible = false; // An alpha-tested standard material on a surface whose geometry is resident (D96).
 	};
 	LocalVector<PendingMMSurface> pending_mm_surfaces;
 
@@ -7858,6 +7885,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				pending.inst_flags = inst_flags;
 				pending.inst_mask = RT_INSTANCE_MASK_GEOMETRY | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0);
 				pending.mm_aabb = mesh_storage->_multimesh_get_aabb(mm_rid);
+				pending.omm_eligible = omm_enabled && !(inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) && mat_data->rt_sbt_offset == 0 && !mesh_storage->mesh_surface_is_geometry_streamed(mesh_surface);
 				pending_mm_surfaces.push_back(pending);
 
 				mm_surf = mm_surf->next;
@@ -8000,6 +8028,18 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			// Which build the instance traces is settled after the walk, where the instances of one
 			// surface can share one (D89); until then the slot holds the LOD 0 BLAS.
 			RID blas_handle = surf_data->blas;
+			// Opacity micromaps (D96): an alpha-tested standard material on a static triangle BLAS
+			// traces the surface's BLAS that carries its micromap, once baked. Only such an instance:
+			// a micromap's transparent states cull even where FORCE_OPAQUE is set.
+			if (omm_enabled && !(inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) && mat_data->rt_sbt_offset == 0 &&
+					!surf->rt_deformed_handle.is_valid() && !(surf_data->geometry.flags & RT_GEOM_FLAG_DEFORMED) && surf_data->cluster_count == 0 &&
+					!surf_data->geometry_streamed && surf->owner->data->base_type == RSE::INSTANCE_MESH) {
+				RTOmmEntry *omm = _omm_request(surf->owner->data->base, surf->surface_index, surface_counter, mat_data);
+				const RID omm_blas = _omm_surface_blas(omm, mesh_surface, surf_data, dirty_blas_list);
+				if (omm_blas.is_valid()) {
+					blas_handle = omm_blas;
+				}
+			}
 			// A slot-resident instance (D94b) whose BLAS this frame builds or may build after the walk
 			// is never proven unchanged here: the commit sees the BLAS it ends on.
 			bool slot_rebuilt = dirty_blas_list.size() != pre_slot_build_size || dirty_blas_update_list.size() != pre_slot_refit_size;
@@ -8131,6 +8171,30 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	// -----------------------------------------------------------------------
 	// Phase 2: GPU compute — merged MultiMesh BLAS dispatches.
 	// -----------------------------------------------------------------------
+	// Opacity micromaps (D96): a merge is shared by every instance of its MultiMesh, and a micromap's
+	// transparent states cull even where FORCE_OPAQUE is set, so the merge carries the base surface's
+	// micromap, once baked, only when every instance of it this frame asks for the same one. Otherwise
+	// it stays plain and the any-hit decides for all of them.
+	HashMap<uint64_t, const RTOmmEntry *> mm_omm_agreed;
+	if (omm_enabled) {
+		for (const PendingMMSurface &pending : pending_mm_surfaces) {
+			const RTOmmEntry *omm = nullptr;
+			if (pending.omm_eligible) {
+				RTOmmEntry *requested = _omm_request(mesh_storage->multimesh_get_mesh(pending.mm_rid), pending.surface_index, pending.surface_counter, pending.mat_data);
+				if (requested != nullptr && requested->state == RTOmmEntry::STATE_BUILT) {
+					omm = requested;
+				}
+			}
+			const uint64_t key = (uint64_t(pending.mm_rid.get_local_index()) << 32) | pending.surface_index;
+			const RTOmmEntry **agreed = mm_omm_agreed.getptr(key);
+			if (agreed == nullptr) {
+				mm_omm_agreed.insert(key, omm);
+			} else if (*agreed != omm) {
+				*agreed = nullptr;
+			}
+		}
+	}
+
 	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 
 	for (const PendingMMSurface &pending : pending_mm_surfaces) {
@@ -8140,6 +8204,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		uint32_t mm_pre_build_size = dirty_blas_list.size();
 		uint32_t mm_pre_refit_size = dirty_blas_update_list.size();
 #endif
+		if (omm_enabled) {
+			_omm_attach_merged(pending.mm_rid, pending.surface_index, mm_omm_agreed[(uint64_t(pending.mm_rid.get_local_index()) << 32) | pending.surface_index]);
+		}
 		RTSurfaceData merged_sd;
 		bool use_merged = pending.mm_gpu_buffer.is_valid() &&
 				_build_merged_mm_blas(pending.mm_rid, pending.mm_gpu_buffer, pending.mesh_surface,

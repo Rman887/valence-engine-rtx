@@ -29,7 +29,7 @@
 /**************************************************************************/
 
 // Opacity micromaps (D96, docs/r1-opacity-micromaps.md). A surface traced with an alpha-tested
-// standard material gets a micromap baked from the material's alpha texture: a setup pass gives
+// standard material, or a custom shader with render_mode opacity_micromap, gets a micromap baked from the material's alpha texture: a setup pass gives
 // each primitive its UVs as the trace computes them, its subdivision level and whether the whole
 // triangle is transparent or opaque; the CPU reads that back, gives uniform primitives a special
 // index and deduplicates the rest by their UVs; the bake pass then writes every micro-triangle's
@@ -154,7 +154,7 @@ void RenderRaytracing::_omm_initialize() {
 	// texelFetch alone reads it; any sampler state serves.
 	omm_sampler = rd->sampler_create(RD::SamplerState());
 
-	print_line(vformat("RT: opacity micromaps (D96): exact 4-state micromaps baked from alpha-tested standard materials, a micro-triangle about %.2f texels, levels up to %d.", omm_scale, omm_max_level));
+	print_line(vformat("RT: opacity micromaps (D96): exact 4-state micromaps baked from alpha-tested standard materials and opted-in shaders, a micro-triangle about %.2f texels, levels up to %d.", omm_scale, omm_max_level));
 }
 
 void RenderRaytracing::_omm_finalize() {
@@ -176,8 +176,9 @@ void RenderRaytracing::_omm_finalize() {
 }
 
 RTOmmEntry *RenderRaytracing::_omm_request(RID p_mesh, uint32_t p_surface_index, uint32_t p_surface_counter, const RTMaterialData *p_material) {
-	// The standard hit group's alpha test alone: its texture's alpha times the color's against the threshold.
-	if (!omm_enabled || p_material == nullptr || p_material->is_custom_shader || p_material->rt_sbt_offset != 0 || p_material->albedo_texture_rd.is_null()) {
+	// The standard alpha test alone, which an opted-in custom shader traces too: its texture's alpha times
+	// the color's against the threshold.
+	if (!omm_enabled || p_material == nullptr || ((p_material->is_custom_shader || p_material->rt_sbt_offset != 0) && !p_material->omm_custom) || p_material->albedo_texture_rd.is_null()) {
 		return nullptr;
 	}
 	if (!(p_material->data.albedo_color[3] > 0.0f) || !(p_material->data.alpha_threshold > 0.0f)) {

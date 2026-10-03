@@ -6667,6 +6667,8 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.normal_map_depth = 1.0f;
 	mat.uniform_address = 0;
 	mat.alpha_threshold = 0.5f;
+	bool omm_custom = false;
+	RID omm_custom_alpha_rd; // An opted-in custom shader's hint_alpha texture, with a real bindless slot.
 
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	RendererRD::TextureStorage *texture_storage = RendererRD::TextureStorage::get_singleton();
@@ -6798,6 +6800,9 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 						RID rd_tex = ts->texture_get_rd_texture(tex_rid, tui.use_color);
 						if (rd_tex.is_valid()) {
 							bindless_idx = bindless_block->add_texture(rd_tex);
+							if (tui.buffer_offset == cse->alpha_texture_buffer_offset && bindless_idx != 0) {
+								omm_custom_alpha_rd = rd_tex;
+							}
 						}
 					}
 				} else {
@@ -6808,6 +6813,9 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 							RID rd_tex = ts->texture_get_rd_texture(tex_rid, tui.use_color);
 							if (rd_tex.is_valid()) {
 								bindless_idx = bindless_block->add_texture(rd_tex);
+								if (tui.buffer_offset == cse->alpha_texture_buffer_offset && bindless_idx != 0) {
+									omm_custom_alpha_rd = rd_tex;
+								}
 							}
 						}
 					}
@@ -6851,6 +6859,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 				memcpy(&alpha_idx, ubo_data.ptr() + cse->alpha_texture_buffer_offset, 4);
 				mat.albedo_texture_idx = alpha_idx;
 			}
+			omm_custom = cse->opacity_micromap;
 
 			// Try the suballoc pool first. Common materials (UBO <= slot size)
 			// just buffer_update an existing slot - O(1), no driver allocation,
@@ -6970,6 +6979,18 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		if (threshold_var.get_type() == Variant::FLOAT) {
 			mat.alpha_threshold = threshold_var;
 		}
+	}
+
+	// A custom shader with render_mode opacity_micromap (D96) traces the standard alpha test over its
+	// hint_alpha texture at the raw UV, and its micromap is baked from the same row.
+	mat_data->omm_custom = omm_custom;
+	if (omm_custom) {
+		mat.uv1_scale[0] = 1.0f;
+		mat.uv1_scale[1] = 1.0f;
+		mat.uv1_offset[0] = 0.0f;
+		mat.uv1_offset[1] = 0.0f;
+		mat.albedo_color[3] = 1.0f;
+		mat_data->albedo_texture_rd = omm_custom_alpha_rd;
 	}
 
 	// Point filtering: check if material requests nearest filtering (e.g. pixel art).
@@ -7647,7 +7668,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		uint8_t inst_mask;
 		AABB mm_aabb;
 		RTSurfaceData *source = nullptr; // A surface whose geometry streams: its population, holding the upload of its arrays (D93d).
-		bool omm_eligible = false; // An alpha-tested standard material on a surface whose geometry is resident (D96).
+		bool omm_eligible = false; // An alpha-tested standard material, or a custom shader with render_mode opacity_micromap, on a surface whose geometry is resident (D96).
 	};
 	LocalVector<PendingMMSurface> pending_mm_surfaces;
 
@@ -7885,7 +7906,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				pending.inst_flags = inst_flags;
 				pending.inst_mask = RT_INSTANCE_MASK_GEOMETRY | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0);
 				pending.mm_aabb = mesh_storage->_multimesh_get_aabb(mm_rid);
-				pending.omm_eligible = omm_enabled && !(inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) && mat_data->rt_sbt_offset == 0 && !mesh_storage->mesh_surface_is_geometry_streamed(mesh_surface);
+				pending.omm_eligible = omm_enabled && !(inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) && (mat_data->rt_sbt_offset == 0 || mat_data->omm_custom) && !mesh_storage->mesh_surface_is_geometry_streamed(mesh_surface);
 				pending_mm_surfaces.push_back(pending);
 
 				mm_surf = mm_surf->next;
@@ -8028,10 +8049,11 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			// Which build the instance traces is settled after the walk, where the instances of one
 			// surface can share one (D89); until then the slot holds the LOD 0 BLAS.
 			RID blas_handle = surf_data->blas;
-			// Opacity micromaps (D96): an alpha-tested standard material on a static triangle BLAS
-			// traces the surface's BLAS that carries its micromap, once baked. Only such an instance:
-			// a micromap's transparent states cull even where FORCE_OPAQUE is set.
-			if (omm_enabled && !(inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) && mat_data->rt_sbt_offset == 0 &&
+			// Opacity micromaps (D96): an alpha-tested standard material, or a custom shader with
+			// render_mode opacity_micromap, on a static triangle BLAS traces the surface's BLAS that
+			// carries its micromap, once baked. Only such an instance: a micromap's transparent states
+			// cull even where FORCE_OPAQUE is set.
+			if (omm_enabled && !(inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) && (mat_data->rt_sbt_offset == 0 || mat_data->omm_custom) &&
 					!surf->rt_deformed_handle.is_valid() && !(surf_data->geometry.flags & RT_GEOM_FLAG_DEFORMED) && surf_data->cluster_count == 0 &&
 					!surf_data->geometry_streamed && surf->owner->data->base_type == RSE::INSTANCE_MESH) {
 				RTOmmEntry *omm = _omm_request(surf->owner->data->base, surf->surface_index, surface_counter, mat_data);

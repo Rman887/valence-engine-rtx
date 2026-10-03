@@ -595,9 +595,12 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 
 	bool detected_alpha_clip = false;
 	actions.usage_flag_pointers["ALPHA_SCISSOR_THRESHOLD"] = &detected_alpha_clip;
-	actions.usage_flag_pointers["ALPHA_HASH_SCALE"] = &detected_alpha_clip;
+	bool detected_alpha_hash = false;
+	actions.usage_flag_pointers["ALPHA_HASH_SCALE"] = &detected_alpha_hash;
 	bool detected_transmission = false;
 	actions.usage_flag_pointers["TRANSMISSION"] = &detected_transmission;
+	bool detected_opacity_micromap = false;
+	actions.render_mode_flags["opacity_micromap"] = &detected_opacity_micromap;
 
 	HashMap<StringName, ShaderLanguage::ShaderNode::Uniform> uniform_sink;
 	actions.uniforms = &uniform_sink;
@@ -611,7 +614,7 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	}
 
 	r_entry.is_procedural = p_is_procedural;
-	r_entry.uses_alpha_clip = detected_alpha_clip;
+	r_entry.uses_alpha_clip = detected_alpha_clip || detected_alpha_hash;
 	r_entry.uses_transmission = detected_transmission;
 	r_entry.vertex_code = gen_code.code.has("vertex") ? gen_code.code["vertex"] : String();
 	r_entry.fragment_code = gen_code.code.has("fragment") ? gen_code.code["fragment"] : String();
@@ -625,6 +628,18 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	r_entry.uniform_offsets = gen_code.uniform_offsets;
 	r_entry.uniforms = uniform_sink;
 	_finalize_uniforms_with_textures(r_entry, gen_code, uniform_sink, /*strip_intersection_globals=*/p_is_procedural);
+
+	// An opted-in shader traces the standard alpha test over its hint_alpha texture (D96): the base any-hit,
+	// which reads the material row the micromap is baked from, in place of the shader's own code.
+	r_entry.opacity_micromap = false;
+	if (detected_opacity_micromap) {
+		if (p_is_procedural || r_entry.alpha_texture_buffer_offset == UINT32_MAX || detected_alpha_hash) {
+			WARN_PRINT(vformat("RT: render_mode opacity_micromap needs a triangle surface and a hint_alpha texture, and no ALPHA_HASH_SCALE; the shader of material %d keeps its own alpha test and takes no opacity micromap.", p_material.get_id()));
+		} else {
+			r_entry.opacity_micromap = true;
+			r_entry.uses_alpha_clip = false;
+		}
+	}
 	return true;
 }
 

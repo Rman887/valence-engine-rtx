@@ -406,6 +406,9 @@ public:
 		bool uses_transmission = false; // Writes TRANSMISSION; the instance keeps its back faces so the refracted ray finds its exit interface
 		bool is_procedural = false; // Uses intersection shader instead of triangle geometry
 		uint32_t alpha_texture_buffer_offset = UINT32_MAX; // Byte offset of hint_alpha texture index in CustomMaterialUniforms UBO; UINT32_MAX if absent
+		// render_mode opacity_micromap with a hint_alpha texture (D96): the trace's alpha test is the standard
+		// any-hit's over that texture at the raw UV against alpha_scissor_threshold, and the surface takes a micromap.
+		bool opacity_micromap = false;
 	};
 
 	// 128-bit identity (dual hash64 with distinct salt). Treated as source equality.

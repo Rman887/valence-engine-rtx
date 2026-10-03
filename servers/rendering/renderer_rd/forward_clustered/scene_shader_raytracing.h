@@ -73,7 +73,8 @@ public:
 	// Bits 11-12: The SER coherence hint (RT_SER_HINT_*)
 	// Bit 13:    Cluster BLAS (RT_FLAG_CLUSTER_AS)
 	// Bits 14-15: Position fetch and its verbose check (D93)
-	// Bits 16-20: Free
+	// Bit 16:    Opacity micromaps in 2-state on indirect rays (D96 OMMe)
+	// Bits 17-20: Free
 	// Bits 21-28: Sample count
 	// Bits 29-31: Max bounce count (offset by 1: 0=1 bounce, 7=8 bounces)
 	enum RaytracingFlags {
@@ -92,6 +93,7 @@ public:
 		RT_FLAG_CLUSTER_AS = (1 << 13), // Static BLAS built from triangle clusters (D79): hit shaders add gl_ClusterIDNV to gl_PrimitiveID. Set when rendering/pathtracing/cluster_blas is on and the device has the extension.
 		RT_FLAG_POSITION_FETCH = (1 << 14), // Cluster builds allow data access and the hit stages enable position fetch (D93). Set while geometry residency is on.
 		RT_FLAG_POSITION_FETCH_CHECK = (1 << 15), // A verbose run's closest hit compares fetched positions with the vertex buffer's (D93). Set only with RT_FLAG_POSITION_FETCH.
+		RT_FLAG_OMM_INDIRECT_2_STATE = (1 << 16), // Rays past the path's first diffuse bounce resolve unknown micro-triangles by their side (D96 OMMe). Set while micromaps are on with rendering/pathtracing/opacity_micromap_indirect_2_state.
 	};
 
 	// The coherence hint the raygen hands reorderThreadEXT beside the hit's shader (D75), the

@@ -16,7 +16,8 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // between their smallest and largest alpha. A micro-triangle is transparent when the largest alpha
 // over every texel a bilinear sample inside it can read fails the test, opaque when the smallest
 // passes, and unknown (the any-hit decides) otherwise. A margin of ALPHA_MARGIN on each side covers
-// the filter's precision.
+// the filter's precision. An unknown micro-triangle is unknown-opaque when the test passes at its
+// centre, sampled as the any-hit samples; only a ray that forces two states reads which (D96 OMMe).
 //
 // MODE_PYRAMID_BASE and MODE_PYRAMID_REDUCE build a min/max pyramid of the texture's alpha, so a box
 // of any size is a few reads. MODE_SETUP takes one primitive a thread: its UVs as the trace computes
@@ -205,8 +206,10 @@ uint classify(vec2 p_a, vec2 p_b, vec2 p_c) {
 	if (largest < params.threshold - ALPHA_MARGIN) {
 		return STATE_TRANSPARENT;
 	}
-	// Undecided; which unknown only matters to a ray that forces two states (OMMe).
-	return (clamp(r.x, 0.0, 1.0) + clamp(r.y, 0.0, 1.0)) * 0.5 * params.albedo_alpha >= params.threshold ? STATE_UNKNOWN_OPAQUE : STATE_UNKNOWN_TRANSPARENT;
+	// Undecided: the side of the test at the centre, through the bake's linear, repeating sampler at
+	// level 0 as the any-hit samples. Only a ray that forces two states reads which (OMMe).
+	vec2 centre = (p_a + p_b + p_c) * (1.0 / 3.0);
+	return textureLod(alpha_texture, centre, 0.0).a * params.albedo_alpha >= params.threshold ? STATE_UNKNOWN_OPAQUE : STATE_UNKNOWN_TRANSPARENT;
 }
 #endif
 

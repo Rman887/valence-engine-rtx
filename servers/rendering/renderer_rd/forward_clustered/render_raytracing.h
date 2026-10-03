@@ -1337,6 +1337,7 @@ class RenderRaytracing {
 
 	// Opacity micromaps (D96), with rendering/pathtracing/opacity_micromaps.
 	bool omm_enabled = false;
+	bool omm_indirect_2_state = false;
 	float omm_scale = 2.0f;
 	uint32_t omm_max_level = 10;
 	HashMap<RTOmmKey, RTOmmEntry *, RTOmmKey> omm_entries;
@@ -2009,6 +2010,8 @@ public:
 	void initialize(RenderForwardClustered *p_owner);
 	// Geometry residency (D93) is on: the hit stages compile with position fetch.
 	static bool is_position_fetch_enabled() { return singleton != nullptr && singleton->cluster_lod_stream_geometry_enabled; }
+	// Opacity micromaps are on and rays past the first diffuse bounce trace them in 2-state (D96 OMMe).
+	static bool is_omm_indirect_2_state_enabled() { return singleton != nullptr && singleton->omm_enabled && singleton->omm_indirect_2_state; }
 
 	void cleanup_caches();
 	// Releases a geometry instance's PTLAS slot ranges (D94b) as it is freed.

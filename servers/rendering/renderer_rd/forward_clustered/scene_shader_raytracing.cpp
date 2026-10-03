@@ -775,6 +775,10 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_e
 		}
 	}
 
+	if (RenderRaytracing::is_omm_indirect_2_state_enabled()) {
+		flags |= RT_FLAG_OMM_INDIRECT_2_STATE;
+	}
+
 	if (GLOBAL_GET("rendering/pathtracing/use_shader_execution_reordering")) {
 		flags |= RT_FLAG_SER_ENABLED;
 		// The hint's form rides in the flags (D75), so a change rebuilds the ray-tracing pipelines
@@ -835,6 +839,10 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 	// device with the extension, and a variant would double the raygen set compiled at start.
 	if (p_rt_flags & RT_FLAG_CLUSTER_AS) {
 		inject_define(sources, "#define USE_CLUSTER_AS\n");
+	}
+	// A define for the same reason: the opacity micromap capability needs the extension (D96 OMMe).
+	if (p_rt_flags & RT_FLAG_OMM_INDIRECT_2_STATE) {
+		inject_define(sources, "#define USE_OMM_INDIRECT_2_STATE\n");
 	}
 	// Defines for the same reason: the position-fetch capability is legal only with the extension (D93).
 	if (p_rt_flags & RT_FLAG_POSITION_FETCH) {

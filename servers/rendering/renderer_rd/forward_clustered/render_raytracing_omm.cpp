@@ -131,6 +131,7 @@ void RenderRaytracing::_omm_initialize() {
 	if (!omm_enabled) {
 		return;
 	}
+	omm_indirect_2_state = GLOBAL_GET("rendering/pathtracing/opacity_micromap_indirect_2_state");
 	omm_scale = CLAMP(float(GLOBAL_GET("rendering/pathtracing/opacity_micromap_scale")), 0.25f, 64.0f);
 	omm_max_level = uint32_t(CLAMP(int(GLOBAL_GET("rendering/pathtracing/opacity_micromap_max_level")), 1, 12));
 	omm_max_level = MIN(omm_max_level, caps.max_4_state_subdivision_level);
@@ -151,10 +152,17 @@ void RenderRaytracing::_omm_initialize() {
 		omm_shader.version_shader[i] = omm_shader.shader.version_get_shader(omm_shader.version, i);
 		omm_shader.pipeline[i] = rd->compute_pipeline_create(omm_shader.version_shader[i]);
 	}
-	// texelFetch alone reads it; any sampler state serves.
-	omm_sampler = rd->sampler_create(RD::SamplerState());
+	// texelFetch reads the texels; the unknown micro-triangle's centre is sampled as the any-hit
+	// samples (SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT at level 0), so its side matches (OMMe).
+	RD::SamplerState omm_sampler_state;
+	omm_sampler_state.mag_filter = RD::SAMPLER_FILTER_LINEAR;
+	omm_sampler_state.min_filter = RD::SAMPLER_FILTER_LINEAR;
+	omm_sampler_state.mip_filter = RD::SAMPLER_FILTER_LINEAR;
+	omm_sampler_state.repeat_u = RD::SAMPLER_REPEAT_MODE_REPEAT;
+	omm_sampler_state.repeat_v = RD::SAMPLER_REPEAT_MODE_REPEAT;
+	omm_sampler = rd->sampler_create(omm_sampler_state);
 
-	print_line(vformat("RT: opacity micromaps (D96): exact 4-state micromaps baked from alpha-tested standard materials and opted-in shaders, a micro-triangle about %.2f texels, levels up to %d.", omm_scale, omm_max_level));
+	print_line(vformat("RT: opacity micromaps (D96): exact 4-state micromaps baked from alpha-tested standard materials and opted-in shaders, a micro-triangle about %.2f texels, levels up to %d%s.", omm_scale, omm_max_level, omm_indirect_2_state ? ", 2-state past the first diffuse bounce" : ""));
 }
 
 void RenderRaytracing::_omm_finalize() {

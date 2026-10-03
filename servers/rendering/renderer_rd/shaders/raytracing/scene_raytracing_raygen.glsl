@@ -24,6 +24,9 @@
 #ifdef USE_CLUSTER_AS
 #extension GL_NV_cluster_acceleration_structure : require
 #endif
+#ifdef USE_OMM_INDIRECT_2_STATE
+#extension GL_EXT_opacity_micromap : require
+#endif
 
 #define GLSL 1
 #define RT_STAGE_RAYGEN 1
@@ -106,7 +109,7 @@ layout(set = 0, binding = 41) uniform texture2D gbuffer_scattering;
 void trace_path_ray(vec3 ray_origin, vec3 ray_dir, uint mask, float max_distance) {
 #ifdef USE_SER
 	hitObjectEXT hitObject;
-	hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS, mask, 0, 0, 0, ray_origin, 0.001, ray_dir, max_distance, 0);
+	hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS | RT_OMM_RAY_FLAGS(get_diffuse_bounces(payload.packed_bounces_flags)), mask, 0, 0, 0, ray_origin, 0.001, ray_dir, max_distance, 0);
 
 	// The reorder sorts the threads on the hit's shader by itself (the hit group, or the miss);
 	// the hint refines that order. Its form is the pipeline's (D75, RT_GET_SER_HINT(), the
@@ -142,7 +145,7 @@ void trace_path_ray(vec3 ray_origin, vec3 ray_dir, uint mask, float max_distance
 
 	hitObjectExecuteShaderEXT(hitObject, 0);
 #else
-	traceRayEXT(tlas, RT_RAY_FLAGS, mask, 0, 0, 0, ray_origin, 0.001, ray_dir, max_distance, 0);
+	traceRayEXT(tlas, RT_RAY_FLAGS | RT_OMM_RAY_FLAGS(get_diffuse_bounces(payload.packed_bounces_flags)), mask, 0, 0, 0, ray_origin, 0.001, ray_dir, max_distance, 0);
 #endif
 }
 
@@ -582,6 +585,9 @@ void main() {
 
 #ifdef USE_CLUSTER_AS
 #extension GL_NV_cluster_acceleration_structure : require
+#endif
+#ifdef USE_OMM_INDIRECT_2_STATE
+#extension GL_EXT_opacity_micromap : require
 #endif
 #ifdef USE_POSITION_FETCH
 #extension GL_EXT_ray_tracing_position_fetch : require

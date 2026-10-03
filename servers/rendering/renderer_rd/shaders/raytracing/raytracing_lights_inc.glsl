@@ -202,12 +202,13 @@ bool ray_query_alpha_test(uint geometry_idx, int cluster_id, uint primitive, vec
 /// Returns true if light is visible.
 /// Uses SkipClosestHitShader so only any_hit (alpha test) and miss are invoked.
 /// TerminateOnFirstHit causes early exit on first confirmed opaque hit.
-bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout uint rng_state) {
+/// omm_flags: RT_OMM_RAY_FLAGS of the vertex's arriving diffuse count (D96 OMMe).
+bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, uint omm_flags, inout uint rng_state) {
 #ifdef USE_RAY_QUERY_SHADOWS
 	// Ray queries are significantly faster, but can not handle complex alpha materials
 	rayQueryEXT shadow_rq;
 	rayQueryInitializeEXT(shadow_rq, tlas,
-			gl_RayFlagsTerminateOnFirstHitEXT,
+			gl_RayFlagsTerminateOnFirstHitEXT | omm_flags,
 			RT_MASK_SHADOW, origin, 0.001, direction, max_dist - 0.001);
 
 	while (rayQueryProceedEXT(shadow_rq)) {
@@ -228,7 +229,7 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 #elif defined(USE_SER)
 	hitObjectEXT hitObject;
 	hitObjectTraceRayEXT(hitObject, tlas,
-			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT | omm_flags,
 			RT_MASK_SHADOW, 0, 0, 0,
 			origin, 0.001, direction, max_dist - 0.001, 0);
 
@@ -252,7 +253,7 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, inout 
 	path_pack(payload, shadow_ps);
 
 	traceRayEXT(tlas,
-			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT | omm_flags,
 			RT_MASK_SHADOW, 0, 0, 0,
 			origin, 0.001, direction, max_dist - 0.001, 0);
 

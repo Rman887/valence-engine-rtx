@@ -555,7 +555,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		} else {
 			have_sample = lights_sample_direct(hit_pos_offset, N, brdf_mat, ps.rng_state, is_indirect, rt_light_count, light_sample);
 		}
-		if (have_sample && lights_trace_shadow_ray(hit_pos_offset, light_sample.direction, light_sample.shadow_distance, ps.rng_state)) {
+		if (have_sample && lights_trace_shadow_ray(hit_pos_offset, light_sample.direction, light_sample.shadow_distance, RT_OMM_RAY_FLAGS(diffuse_bounces), ps.rng_state)) {
 			// Evaluate BRDF (diffuse + specular separately for specular_amount control).
 			vec3 brdf_diffuse, brdf_specular;
 			evalCombinedBRDFSeparate(N, light_sample.direction, V, brdf_mat, brdf_diffuse, brdf_specular);

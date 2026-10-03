@@ -656,18 +656,6 @@ bool RenderRaytracing::_flush_slot_writes(RTViewportState *p_state, bool p_from_
 	RD *rd = RD::get_singleton();
 	RTViewportState::SlotCounters &counters = p_state->slot_counters;
 	const uint32_t build = p_state->slot_build;
-	for (const RD::PartitionedInstanceWrite &write : slot_writes) {
-		uint32_t *stamp = nullptr;
-		if (write.partition == RD::PARTITION_GLOBAL) {
-			stamp = &p_state->global_touched;
-		} else if (write.partition < p_state->partition_touched.size()) {
-			stamp = &p_state->partition_touched[write.partition];
-		}
-		if (stamp && *stamp != build) {
-			*stamp = build;
-			counters.partitions_touched++;
-		}
-	}
 	counters.writes += slot_writes.size();
 	if (p_from_scratch) {
 		// A structure built from scratch holds no translation it is not given; with several chunks
@@ -707,6 +695,20 @@ bool RenderRaytracing::_flush_slot_writes(RTViewportState *p_state, bool p_from_
 	counters.stale_rewrites += stale_rewrites;
 	counters.scan_usec += scan_usec;
 	counters.dangling_last += dangling;
+	// The partitions the build changed, as the structure saw them: those its records name (its own
+	// rewrites and disables included) and those an enabled record left; each once a commit.
+	for (uint32_t partition : rd->ptlas_get_last_build_partitions(p_state->tlas)) {
+		uint32_t *stamp = nullptr;
+		if (partition == RD::PARTITION_GLOBAL) {
+			stamp = &p_state->global_touched;
+		} else if (partition < p_state->partition_touched.size()) {
+			stamp = &p_state->partition_touched[partition];
+		}
+		if (stamp && *stamp != build) {
+			*stamp = build;
+			counters.partitions_touched++;
+		}
+	}
 	return true;
 }
 
@@ -1007,6 +1009,12 @@ bool RenderRaytracing::_commit_slots(RTViewportState *p_state) {
 		slot_writes.clear();
 		counters.writes = 0;
 		counters.partitions_touched = 0;
+		// A chunk built in place before the fallback stamped its partitions with this build; the
+		// count starts again with the build from scratch (builds count from 1).
+		for (uint32_t &stamp : p_state->partition_touched) {
+			stamp = 0;
+		}
+		p_state->global_touched = 0;
 		counters.enabled = 0;
 		bool first = true;
 		for (uint32_t slot = 0; slot < p_state->slots.size(); slot++) {

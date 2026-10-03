@@ -820,6 +820,7 @@ RID RenderingDevice::ptlas_create(const PartitionedAccelerationStructureLimits &
 	acceleration_structure.limits = p_limits;
 	acceleration_structure.max_instance_count = p_limits.instance_count;
 	acceleration_structure.partition_occupancy.resize_initialized(p_limits.partition_count);
+	acceleration_structure.partition_touched_serial.resize_initialized(p_limits.partition_count + 1);
 	acceleration_structure.driver_id = driver->ptlas_create(p_limits);
 	ERR_FAIL_COND_V_MSG(!acceleration_structure.driver_id, RID(), "Failed to create the partitioned TLAS.");
 
@@ -878,6 +879,7 @@ Error RenderingDevice::ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p
 		ptlas->last_build_stale_rewrites = 0;
 		ptlas->last_build_dangling_disables = 0;
 		ptlas->last_build_scan_usec = 0;
+		ptlas->last_build_partitions.clear();
 		ptlas->invalidated = false;
 		return OK;
 	}
@@ -1007,6 +1009,17 @@ Error RenderingDevice::ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p
 	}
 	ptlas->slot_high_water = high_water;
 
+	// The partitions the build changes (D94b's counter), each listed once. A refused build leaves
+	// the last one's, as it does its counts.
+	ptlas->last_build_partitions.clear();
+	auto touch_partition = [&](uint32_t p_partition) {
+		const uint32_t index = p_partition == PARTITION_GLOBAL ? limits.partition_count : p_partition;
+		if (ptlas->partition_touched_serial[index] != serial) {
+			ptlas->partition_touched_serial[index] = serial;
+			ptlas->last_build_partitions.push_back(p_partition);
+		}
+	};
+
 	// The slots this build sends, in order: the writes, then the slots it writes again.
 	thread_local LocalVector<uint32_t> emitted;
 	emitted.clear();
@@ -1030,6 +1043,10 @@ Error RenderingDevice::ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p
 			rdd_write.blas = acceleration_structure_owner.get_or_null(write.blas)->driver_id;
 		}
 		driver->ptlas_instance_write(ptlas->slot_records.ptr() + uint64_t(write.slot) * record_size, rdd_write);
+		if (!from_scratch && ptlas->slot_blas[write.slot].is_valid()) {
+			touch_partition(ptlas->slot_partition[write.slot]); // The partition an enabled record leaves.
+		}
+		touch_partition(write.partition);
 		_ptlas_set_slot(ptlas, p_ptlas, write.slot, write.blas, write.partition);
 		emitted.push_back(write.slot);
 	}
@@ -1053,11 +1070,14 @@ Error RenderingDevice::ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p
 				// against a partition's instance limit is not specified (D94b).
 				rdd_write.partition = ptlas->slot_partition[slot] == PARTITION_GLOBAL ? 0 : ptlas->slot_partition[slot];
 				driver->ptlas_instance_write(ptlas->slot_records.ptr() + uint64_t(slot) * record_size, rdd_write);
+				touch_partition(ptlas->slot_partition[slot]);
+				touch_partition(rdd_write.partition);
 				_ptlas_set_slot(ptlas, p_ptlas, slot, RID(), rdd_write.partition);
 				ptlas->slot_written_serial[slot] = serial;
 				emitted.push_back(slot);
 				dangling_disables++;
 			} else if (ptlas->stale_blas.has(blas)) {
+				touch_partition(ptlas->slot_partition[slot]);
 				ptlas->slot_written_serial[slot] = serial;
 				emitted.push_back(slot);
 				stale_rewrites++;
@@ -1117,6 +1137,7 @@ Error RenderingDevice::ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p
 			RDD::PartitionedInstanceWrite rdd_write;
 			rdd_write.slot = slot;
 			rdd_write.partition = slot < high_water && ptlas->slot_partition[slot] != PARTITION_GLOBAL ? ptlas->slot_partition[slot] : 0; // As above, never global.
+			touch_partition(rdd_write.partition);
 			driver->ptlas_instance_write(write_ptr, rdd_write);
 			write_ptr += record_size;
 			if (slot < high_water) {
@@ -1178,6 +1199,12 @@ void RenderingDevice::ptlas_get_last_build_counts(RID p_ptlas, uint32_t &r_write
 	r_stale_rewrites = ptlas->last_build_stale_rewrites;
 	r_dangling_disables = ptlas->last_build_dangling_disables;
 	r_scan_usec = ptlas->last_build_scan_usec;
+}
+
+Span<uint32_t> RenderingDevice::ptlas_get_last_build_partitions(RID p_ptlas) {
+	AccelerationStructure *ptlas = acceleration_structure_owner.get_or_null(p_ptlas);
+	ERR_FAIL_NULL_V(ptlas, Span<uint32_t>());
+	return ptlas->last_build_partitions;
 }
 
 /******************************************/

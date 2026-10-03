@@ -679,7 +679,7 @@
 			Partitions of the partitioned TLAS that hold at least one enabled slot after this frame's commit, the global partition not included (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).
 		</constant>
 		<constant name="RENDER_INFO_RT_PARTITIONS_TOUCHED" value="15" enum="RenderInfo">
-			Partitions named by this frame's instance writes, the global partition included. The partition a slot leaves and the partitions of [constant RENDER_INFO_RT_SLOT_STALE_REWRITES] and [constant RENDER_INFO_RT_PTLAS_DANGLING_DISABLES] are not counted, so this is a lower bound on the partitions rebuilt (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).
+			Partitions whose instance records this frame's builds of the partitioned TLAS wrote, or that an enabled record left, each once, the global partition included (the slots of [constant RENDER_INFO_RT_SLOT_STALE_REWRITES] and [constant RENDER_INFO_RT_PTLAS_DANGLING_DISABLES] included). Partition translations are not counted. On a frame built from scratch, every partition the records name, those holding only the disabled records of the slots it does not fill included, so it can exceed [constant RENDER_INFO_RT_PARTITIONS_LIVE] (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).
 		</constant>
 		<constant name="RENDER_INFO_RT_PARTITION_TRANSLATIONS" value="16" enum="RenderInfo">
 			Partition translations written this frame: after the ray-tracing origin moved, for a partition a new cell took, and after a build from scratch (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).

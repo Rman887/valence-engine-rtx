@@ -1115,7 +1115,7 @@ struct RTViewportState {
 	// The translation the structure holds for each partition (D94c): its cell's origin less rt_origin,
 	// rounded to float. NaN where unknown (a new partition, a build from scratch), so it is written.
 	LocalVector<Vector3> partition_translations;
-	LocalVector<uint32_t> partition_touched; // The build that last wrote a slot of it.
+	LocalVector<uint32_t> partition_touched; // The build that last changed it, as the structure reports.
 	LocalVector<uint32_t> partition_free;
 	uint32_t partition_high_water = 0;
 	uint32_t partition_capacity = 0;

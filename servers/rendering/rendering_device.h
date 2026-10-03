@@ -1394,6 +1394,10 @@ private:
 		uint32_t last_build_stale_rewrites = 0;
 		uint32_t last_build_dangling_disables = 0;
 		uint64_t last_build_scan_usec = 0; // The stale and freed scan's time.
+		// The partitions the last build changed: those its records name, and those an enabled
+		// record left. partition_touched_serial stamps each with the build, the global partition last.
+		LocalVector<uint32_t> last_build_partitions;
+		LocalVector<uint64_t> partition_touched_serial;
 
 		struct InputBuffer {
 			RDD::BufferID driver_id;
@@ -1515,6 +1519,11 @@ public:
 	// The last build's instance writes, the slots it wrote again for a rebuilt BLAS and those it
 	// disabled for a freed one, and the time its scan for them took (D94b's counters).
 	void ptlas_get_last_build_counts(RID p_ptlas, uint32_t &r_writes, uint32_t &r_stale_rewrites, uint32_t &r_dangling_disables, uint64_t &r_scan_usec);
+	// The partitions the last build that returned OK changed, each once, PARTITION_GLOBAL for the
+	// global partition: those its records name (its own rewrites and disables, and a build from
+	// scratch's disables of the slots it does not fill, included) and, in place, those an enabled
+	// record left. Translations are not counted. Valid until the next build of the structure.
+	Span<uint32_t> ptlas_get_last_build_partitions(RID p_ptlas);
 
 	// ----- CLUSTER ACCELERATION STRUCTURES -----
 	//

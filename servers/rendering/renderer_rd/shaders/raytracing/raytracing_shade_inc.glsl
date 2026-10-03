@@ -454,8 +454,12 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		// Specular hit distance via inline ray query (only for smooth surfaces).
 		float spec_hit_dist = -1.0;
 		if (m.roughness < MAX_DENOISER_SPECULAR_HIT_THRESHOLD) {
-			vec3 spec_dir = reflect(-V, N);
-			vec3 spec_origin = offset_ray_origin(h.hit_pos, spec_dir);
+			// The ray leaves the surface as the bounce ray does: a direction under the geometry plane
+			// is mirrored above it, and the origin is offset along the normal. The reflected direction
+			// has almost no normal component at grazing angles, so offsetting along it left the origin
+			// on the surface and a cull-disabled one hit itself.
+			vec3 spec_dir = mirrorDirectionAcrossPlane(reflect(-V, N), h.geometry_normal);
+			vec3 spec_origin = offset_ray_origin(h.hit_pos, h.geometry_normal);
 
 			rayQueryEXT spec_rq;
 			// The closest hit: terminating on the first one would record whichever surface

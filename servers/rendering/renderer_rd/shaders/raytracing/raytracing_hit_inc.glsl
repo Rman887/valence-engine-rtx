@@ -306,6 +306,25 @@ TBNResult fetch_tbn(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) 
 	return result;
 }
 
+/// The instance's own linear part. The instance transform of a compressed surface folds in its unit box (the BLAS is built in it),
+/// while the surface's normals and tangents are in its own space, so the box comes back out.
+mat3 rt_instance_basis(GeometryData geom, mat3 object_to_world) {
+	if ((geom.flags & FLAG_COMPRESSED) != 0u) {
+		object_to_world[0] /= geom.aabb_size_x;
+		object_to_world[1] /= geom.aabb_size_y;
+		object_to_world[2] /= geom.aabb_size_z;
+	}
+	return object_to_world;
+}
+
+/// The normal matrix of a basis: its inverse transpose up to a positive factor (the cofactor
+/// matrix signed by the determinant), so normals stay perpendicular under non-uniform scale
+/// without inverting a basis that may be nearly flat. Tangents take it too, as in the raster.
+mat3 rt_normal_basis(mat3 basis) {
+	mat3 cofactor = mat3(cross(basis[1], basis[2]), cross(basis[2], basis[0]), cross(basis[0], basis[1]));
+	return dot(basis[0], cofactor[0]) < 0.0 ? -cofactor : cofactor;
+}
+
 // ============================================================================
 // VERTEX ATTRIBUTE FETCHING (requires hitAttributeEXT vec2 attribs to be declared)
 // ============================================================================

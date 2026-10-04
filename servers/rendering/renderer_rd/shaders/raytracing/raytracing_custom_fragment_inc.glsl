@@ -46,9 +46,11 @@ global_time = scene_data_block.data.time;
 mat4 rt_world_to_object_decomp = rt_aabb_xform * mat4(gl_WorldToObjectEXT);
 
 vertex = (rt_world_to_object_decomp * vec4(rt_hit_pos, 1.0)).xyz;
-normal = mat3(rt_world_to_object_decomp) * rt_normal;
-tangent = mat3(rt_world_to_object_decomp) * rt_tangent;
-binormal = mat3(rt_world_to_object_decomp) * rt_bitangent;
+// The frame went to world space through the normal matrix, so it comes back through its inverse.
+mat3 rt_model_basis = mat3(read_model_matrix);
+normal = normalize(transpose(rt_model_basis) * rt_normal);
+tangent = normalize(transpose(rt_model_basis) * rt_tangent);
+binormal = normalize(transpose(rt_model_basis) * rt_bitangent);
 uv_interp = rt_uv;
 uv2_interp = rt_uv;
 color_interp = rt_color;
@@ -63,9 +65,10 @@ rt_frag_coord = vec4(gl_LaunchIDEXT.xy, 0.0, 1.0);
 // Post-vertex transform: object-space -> view-space (mirrors rasterizer post-vertex).
 mat4 rt_modelview = read_view_matrix * read_model_matrix;
 vertex = (rt_modelview * vec4(vertex, 1.0)).xyz;
-normal = normalize(mat3(rt_modelview) * normal);
-tangent = normalize(mat3(rt_modelview) * tangent);
-binormal = normalize(mat3(rt_modelview) * binormal);
+mat3 rt_modelview_normal = mat3(read_view_matrix) * rt_normal_basis(rt_model_basis);
+normal = normalize(rt_modelview_normal * normal);
+tangent = normalize(rt_modelview_normal * tangent);
+binormal = normalize(rt_modelview_normal * binormal);
 
 // Fragment outputs with sensible defaults.
 vec3 albedo = vec3(1.0);

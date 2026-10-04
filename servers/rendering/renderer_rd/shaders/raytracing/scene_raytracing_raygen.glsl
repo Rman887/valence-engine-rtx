@@ -894,15 +894,12 @@ void main() {
 	vec2 rt_uv = fetch_uv(geom, i0, i1, i2, bary);
 	TBNResult ah_tbn = fetch_tbn(geom, i0, i1, i2, bary);
 
-	mat3 model_rotation = mat3(gl_ObjectToWorldEXT);
-	mat3 normal_matrix = mat3(
-			normalize(model_rotation[0]),
-			normalize(model_rotation[1]),
-			normalize(model_rotation[2]));
+	mat3 basis = rt_instance_basis(geom, mat3(gl_ObjectToWorldEXT));
+	mat3 normal_matrix = rt_normal_basis(basis);
 
 	vec3 rt_normal = normalize(normal_matrix * ah_tbn.normal);
 	vec3 rt_tangent = normalize(normal_matrix * ah_tbn.tangent);
-	vec3 rt_bitangent = cross(rt_normal, rt_tangent) * ah_tbn.bitangent_sign;
+	vec3 rt_bitangent = cross(rt_normal, rt_tangent) * ah_tbn.bitangent_sign * (determinant(basis) < 0.0 ? -1.0 : 1.0);
 
 	bool rt_front_face = (gl_HitKindEXT == gl_HitKindFrontFacingTriangleEXT);
 	if (!rt_front_face) {

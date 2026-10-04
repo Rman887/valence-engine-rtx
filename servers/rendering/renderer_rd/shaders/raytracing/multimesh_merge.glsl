@@ -127,12 +127,18 @@ void main() {
 		}
 
 		if (push.has_tbn != 0u) {
+			// The element's normal matrix: its inverse transpose up to a positive factor (the cofactor
+			// matrix signed by the determinant), so a non-uniformly scaled element keeps its normals.
+			mat3 normal_rot = mat3(cross(rot[1], rot[2]), cross(rot[2], rot[0]), cross(rot[0], rot[1]));
+			if (dot(rot[0], normal_rot[0]) < 0.0) {
+				normal_rot = -normal_rot;
+			}
 			SrcUintBuf src_u = SrcUintBuf(packUint2x32(uvec2(push.src_vtx_lo, push.src_vtx_hi)));
 			uint tbn_src = push.src_tbn_base_words + vtx * push.src_tbn_stride_words;
 			uint n_packed = src_u.v[tbn_src];
 
 			vec2 n_oct = vec2(float(n_packed & 0xFFFFu), float(n_packed >> 16u)) / 65535.0 * 2.0 - 1.0;
-			vec3 rn = normalize(rot * oct_to_vec3(n_oct));
+			vec3 rn = normalize(normal_rot * oct_to_vec3(n_oct));
 			vec2 rn_oct = vec3_to_oct(rn);
 			uint rn_packed = uint(rn_oct.x * 32767.5 + 32767.5) | (uint(rn_oct.y * 32767.5 + 32767.5) << 16u);
 
@@ -145,7 +151,7 @@ void main() {
 				vec2 t_raw = vec2(float(t_packed & 0xFFFFu), float(t_packed >> 16u)) / 65535.0 * 2.0 - 1.0;
 				float bitan_sign = sign(t_raw.y);
 				vec2 t_oct = vec2(t_raw.x, abs(t_raw.y) * 2.0 - 1.0);
-				vec3 rt = normalize(rot * oct_to_vec3(t_oct));
+				vec3 rt = normalize(normal_rot * oct_to_vec3(t_oct));
 				vec2 rt_oct = vec3_to_oct(rt);
 				float t_raw_y = (abs(rt_oct.y) * 0.5 + 0.5) * bitan_sign;
 				uint rt_packed = uint(rt_oct.x * 32767.5 + 32767.5) | (uint(t_raw_y * 32767.5 + 32767.5) << 16u);

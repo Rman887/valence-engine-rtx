@@ -121,11 +121,10 @@ HitData compute_hit_data() {
 	h.uv = attrs.uv;
 	h.color = attrs.color;
 
-	mat3 model_rotation = mat3(gl_ObjectToWorldEXT);
-	mat3 normal_matrix = mat3(
-			normalize(model_rotation[0]),
-			normalize(model_rotation[1]),
-			normalize(model_rotation[2]));
+	mat3 basis = rt_instance_basis(geom, mat3(gl_ObjectToWorldEXT));
+	mat3 normal_matrix = rt_normal_basis(basis);
+	// A mirrored instance turns the frame's handedness, which the cross products below drop.
+	float handedness = determinant(basis) < 0.0 ? -1.0 : 1.0;
 
 #ifdef ENABLE_INTERSECTION_SHADERS
 	if ((geom.flags & FLAG_PROCEDURAL) != 0u) {
@@ -134,7 +133,7 @@ HitData compute_hit_data() {
 		vec3 obj_tangent = normalize(unpackSnorm4x8(hit_attribs.packed_tangent).xyz);
 		h.geometry_normal = normalize(normal_matrix * obj_normal);
 		h.tangent = normalize(normal_matrix * obj_tangent);
-		h.bitangent = cross(h.geometry_normal, h.tangent);
+		h.bitangent = cross(h.geometry_normal, h.tangent) * handedness;
 
 		h.is_front_face = (dot(h.geometry_normal, -gl_WorldRayDirectionEXT) > 0.0);
 		if (!h.is_front_face) {
@@ -147,7 +146,7 @@ HitData compute_hit_data() {
 		// UV / TBN from FETCH_UV | FETCH_TBN or FETCH_ALL).
 		h.geometry_normal = normalize(normal_matrix * attrs.normal);
 		h.tangent = normalize(normal_matrix * attrs.tangent);
-		h.bitangent = cross(h.geometry_normal, h.tangent) * attrs.bitangent_sign;
+		h.bitangent = cross(h.geometry_normal, h.tangent) * attrs.bitangent_sign * handedness;
 
 		h.is_front_face = (gl_HitKindEXT == gl_HitKindFrontFacingTriangleEXT);
 		if (!h.is_front_face) {

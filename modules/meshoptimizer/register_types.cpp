@@ -100,7 +100,8 @@ static int _cluster_lod_output(void *p_context, clodGroup p_group, const clodClu
 static bool _build_cluster_lod(const float *p_vertex_positions, size_t p_vertex_count, size_t p_vertex_positions_stride, const float *p_vertex_attributes, size_t p_vertex_attributes_stride, const float *p_attribute_weights, size_t p_attribute_count, unsigned int p_attribute_protect_mask, const unsigned int *p_indices, size_t p_index_count, LocalVector<RenderingServer::MeshClusterLodCluster> &r_clusters, LocalVector<RenderingServer::MeshClusterLodGroup> &r_groups, LocalVector<unsigned int> &r_indices) {
 	// The ray-tracing defaults, with the clusterizer's D80 limits so LOD 0 is the flat
 	// clustering, the NVIDIA sample's group size and error merge, and clusters optimized for
-	// locality within (a reorder of each cluster's triangles alone).
+	// locality within (a reorder of each cluster's triangles alone). The attribute error is
+	// clamped to the position error's scale, stated here since the flag is still experimental.
 	clodConfig config = clodDefaultConfigRT(RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES);
 	config.max_vertices = RenderingServerTypes::MESH_CLUSTER_MAX_VERTICES;
 	config.min_triangles = RenderingServerTypes::MESH_CLUSTER_MIN_TRIANGLES;
@@ -110,6 +111,7 @@ static bool _build_cluster_lod(const float *p_vertex_positions, size_t p_vertex_
 	config.optimize_clusters = true;
 	config.optimize_clusters_level = 1;
 	config.simplify_error_merge_previous = RenderingServerTypes::MESH_CLUSTER_LOD_ERROR_MERGE_PREVIOUS;
+	config.simplify_error_clamped = true;
 
 	clodMesh mesh = {};
 	mesh.indices = p_indices;
@@ -130,8 +132,8 @@ static bool _build_cluster_lod(const float *p_vertex_positions, size_t p_vertex_
 	out.clusters = &r_clusters;
 	out.groups = &r_groups;
 	out.indices = &r_indices;
-	const size_t cluster_count = clodBuild(config, mesh, &out, _cluster_lod_output);
-	return out.ok && cluster_count > 0 && cluster_count == r_clusters.size();
+	clodBuild(config, mesh, &out, _cluster_lod_output);
+	return out.ok && !r_clusters.is_empty();
 }
 
 void initialize_meshoptimizer_module(ModuleInitializationLevel p_level) {

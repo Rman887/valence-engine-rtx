@@ -436,8 +436,9 @@ bool lights_sample_light(
 		r_sample.shadow_distance = ls.max_distance;
 		r_sample.leg_distance = 1e30;
 
+		// Behind the receiver only a thin surface's transmission (D103) takes it.
 		float NdotL = dot(N, L);
-		if (NdotL <= 0.0) {
+		if (NdotL <= 0.0 && !hasDiffuseTransmission(material)) {
 			return false;
 		}
 

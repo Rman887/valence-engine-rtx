@@ -431,7 +431,7 @@ bool sky_sample_direct(vec3 N, vec3 V, MaterialProperties p_material, inout uint
 	vec3 sky_dir = oct_to_vec3(uv * 2.0 - 1.0);
 	float pdf = sky_leaf_pdf(weight, sky_dir);
 	vec3 L = sky_dir * sky_world_to_sky();
-	if (dot(N, L) <= 0.0 || !(pdf > 0.0)) {
+	if ((dot(N, L) <= 0.0 && !hasDiffuseTransmission(p_material)) || !(pdf > 0.0)) {
 		return false;
 	}
 	r_sample.direction = L;

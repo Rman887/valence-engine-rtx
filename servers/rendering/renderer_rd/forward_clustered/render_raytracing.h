@@ -127,7 +127,9 @@ struct alignas(16) RT_MaterialData {
 	float specular; // Dielectric specular [0..1], default 0.5 -> F0 = 0.04.
 	uint64_t uniform_address; // BDA for custom shader uniform buffer (0 = none).
 	float alpha_threshold; // The alpha test's cutoff: opaque where alpha >= it (default 0.5).
-	uint32_t _pad[3];
+	uint32_t backlight_rgba8; // With RT_MAT_FLAG_DIFFUSE_TRANSMISSION: BaseMaterial3D's backlight colour, sRGB, RGBA8.
+	uint32_t backlight_texture_idx; // Its backlight texture, read linear as the raster reads it (0 = none).
+	uint32_t _pad;
 };
 static_assert(sizeof(RT_MaterialData) == 112, "RT_MaterialData must be 112 bytes for std430");
 
@@ -251,6 +253,7 @@ enum {
 	RT_MAT_FLAG_POINT_FILTER = 4u,
 	RT_MAT_FLAG_EMISSION_MULTIPLY = 8u, // BaseMaterial3D emission_operator Multiply; Add otherwise.
 	RT_MAT_FLAG_EMISSIVE_CONSTANT = 16u, // Emits a non-zero constant radiance with no texture: an emissive mesh light (D50).
+	RT_MAT_FLAG_DIFFUSE_TRANSMISSION = 32u, // BaseMaterial3D backlight: a thin diffuse-transmission lobe (D103).
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).

@@ -53,7 +53,7 @@
 
 struct PathPayload {
 	uint packed_rt[3]; // 12 bytes - radiance+throughput interleaved as fp16
-	uint packed_bounces_flags; //  4 bytes - [flags:8][unused:8][diffuse:8][total:8]
+	uint packed_bounces_flags; //  4 bytes - [flags:8][unused:7][back offset:1, D103][diffuse:8][total:8]
 	uint rng_state; //  4 bytes - the sampler's state (D52): the PCG chain, or the Sobol index and dimension
 	float hit_t; //  4 bytes - ray distance, used by raygen to rebuild origin
 	uint oct_offset_nrm; //  4 bytes - packUnorm2x16(vec3_to_oct(offset normal))
@@ -154,6 +154,17 @@ uint inc_diffuse_bounce(uint packed) {
 	return packed + 0x101u;
 } // +1 to both total and diffuse
 
+// The next ray leaves from the back of the surface (bit 16, D103): a thin surface's diffuse
+// transmission. The origin is offset along -offset_normal, while offset_normal stays the receiver
+// the light selection judged, so the next vertex's chance-hit and miss densities read it unchanged.
+const uint BACK_OFFSET_FLAG = (1u << 16);
+uint set_back_offset(uint packed, bool back) {
+	return back ? (packed | BACK_OFFSET_FLAG) : (packed & ~BACK_OFFSET_FLAG);
+}
+bool is_back_offset(uint packed) {
+	return (packed & BACK_OFFSET_FLAG) != 0u;
+}
+
 // Sample 0 flag (bit 24) - only write DLSS RR outputs on first sample
 const uint SAMPLE_ZERO_FLAG = (1u << 24);
 uint set_sample_zero(uint packed) {
@@ -251,14 +262,15 @@ const uint FLAG_CLUSTER_GEOMETRY = 8u;
 #define RT_SOBOL_DIM_BITS 12u
 #define RT_SOBOL_DIM_MASK 0xFFFu
 #define RT_SOBOL_INDEX_MASK 0xFFFFFu
-// Each bounce owns a block of dimensions (worst case 39 draws: the two strategy choices, up to 16 light
+// Each bounce owns a block of dimensions (worst case 40 draws: the two strategy choices, up to 16 light
 // picks and 16 acceptances, the cone pair, the transmission and lobe choices, the direction pair, the
-// roulette),
+// roulette, a thin surface's transmission choice, D103),
 // so a draw keeps its dimension across frames whatever the blocks before it consumed; 8 bounces
 // use 512 of the 4096 available.
 #define RT_SOBOL_DIMS_PER_BOUNCE 64u
 #define RT_SOBOL_DIM_SCATTER 40u // The transmission, lobe and direction draws inside a bounce's block.
 #define RT_SOBOL_DIM_ROULETTE 43u // The Russian roulette draw (D73), after the scatter's three (a fourth scatter draw must move it; the u suffix keeps it out of #if).
+#define RT_SOBOL_DIM_DIFFUSE_TRANSMISSION 44u // A thin surface's transmission choice (D103), apart so the scatter's three keep their dimensions.
 
 // Both in raytracing_common_inc.glsl, which every stage includes after this file, after its
 // ray-tracing extensions are enabled and where the specialization constant is declared.

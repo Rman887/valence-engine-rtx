@@ -483,12 +483,14 @@ void light_tree_reservoir_offer(LightTreeCandidate c, float w, inout float w_sum
 /// units the shader lights with: its luminance under the windowed attenuation and the spot cone,
 /// times the cosine at the receiver raised by the light's angular size and floored (a sphere light
 /// on the horizon still delivers). Exactly zero only beyond the range and outside the cone, where
-/// the sample would carry nothing.
-float light_tree_analytic_target(RTLightData light, vec3 hit_pos, vec3 N) {
+/// the sample would carry nothing. A thin surface's receiver (p_two_sided, D103) takes every kind
+/// from either side: the receiver's cosine is its absolute value.
+float light_tree_analytic_target(RTLightData light, vec3 hit_pos, vec3 N, bool p_two_sided) {
 	float lum = abs(dot(light.emission, vec3(0.2126, 0.7152, 0.0722)));
 	if (light.type == RT_LIGHT_TYPE_DIRECTIONAL) {
 		vec3 L = -normalize(light.position);
-		return dot(N, L) > 0.0 ? lum * dot(N, L) : 0.0;
+		float cos_r = p_two_sided ? abs(dot(N, L)) : dot(N, L);
+		return cos_r > 0.0 ? lum * cos_r : 0.0;
 	}
 	vec3 to_l = light.position - hit_pos;
 	float dist_sq = dot(to_l, to_l);
@@ -525,7 +527,8 @@ float light_tree_analytic_target(RTLightData light, vec3 hit_pos, vec3 N) {
 	ls.distance_sq = dist_sq;
 	ls.max_distance = dist;
 	float atten = lights_get_attenuation(ls, light.inv_max_range, light.attenuation) * spot_atten;
-	float above = max(dot(N, L) + light.radius / max(dist, light.radius), RT_LIGHT_TREE_RECEIVER_FLOOR);
+	float n_dot = dot(N, L);
+	float above = max((p_two_sided ? abs(n_dot) : n_dot) + light.radius / max(dist, light.radius), RT_LIGHT_TREE_RECEIVER_FLOOR);
 	return lum * atten * above;
 }
 
@@ -537,18 +540,20 @@ float light_tree_analytic_target(RTLightData light, vec3 hit_pos, vec3 N) {
 /// decay, inside the quartic window to its range) times the cosine raised by the angular
 /// size and floored. An inverse-square stand-in for that curve cost the matrix 2.4 dB: the studio's
 /// lights decay linearly. A spot leaf keeps the full target: its cone's zero is not in the node.
-float light_tree_leaf_target(RTLightTreeNode n, vec3 hit_pos, vec3 N) {
+/// A thin surface's receiver (p_two_sided, D103) takes light from either side.
+float light_tree_leaf_target(RTLightTreeNode n, vec3 hit_pos, vec3 N, bool p_two_sided) {
 	vec3 to_c = n.center - hit_pos;
 	float d2 = dot(to_c, to_c);
 	float r2 = n.radius * n.radius;
 	float d = sqrt(d2);
+	float n_dot = p_two_sided ? abs(dot(N, to_c)) : dot(N, to_c);
 	if ((n.child & RT_LIGHT_TREE_EMISSIVE_BIT) != 0u) {
-		float above = max(dot(N, to_c) + n.radius, 1e-3 * n.radius);
+		float above = max(n_dot + n.radius, 1e-3 * n.radius);
 		float denominator = max(d, n.radius) * max(d2, r2);
 		return (above > 0.0 && denominator > 0.0) ? n.power * above / denominator : 0.0;
 	}
 	float dist = max(d, 1e-4);
-	float above = max(dot(N, to_c) / dist + n.radius / max(dist, n.radius), RT_LIGHT_TREE_RECEIVER_FLOOR);
+	float above = max(n_dot / dist + n.radius / max(dist, n.radius), RT_LIGHT_TREE_RECEIVER_FLOOR);
 	float atten = min(pow(dist, -n.decay), 1.0);
 	if (n.max_range > 0.0) {
 		float nd = dist / n.max_range;
@@ -563,18 +568,18 @@ float light_tree_leaf_target(RTLightTreeNode n, vec3 hit_pos, vec3 N) {
 /// The resampling target of a candidate: its unshadowed contribution estimate at the hit, in one
 /// unit for every kind (an irradiance), against which the proposal's probability is corrected.
 /// Any positive function is unbiased; the sky's is its own importance, so the proposal stands.
-float light_tree_target(LightTreeCandidate c, LightTreeTop t, vec3 hit_pos, vec3 N) {
+float light_tree_target(LightTreeCandidate c, LightTreeTop t, vec3 hit_pos, vec3 N, bool p_two_sided) {
 	if (c.kind == RT_LIGHT_TREE_KIND_SKY) {
 		return t.sky;
 	}
 	if (c.kind == RT_LIGHT_TREE_KIND_DIRECTIONAL) {
-		return light_tree_analytic_target(rt_lights[c.index], hit_pos, N);
+		return light_tree_analytic_target(rt_lights[c.index], hit_pos, N, p_two_sided);
 	}
 	if ((c.encoded & RT_LIGHT_TREE_EMISSIVE_BIT) != 0u) {
 		// The entry's power at unit distance is the leaf's; the proximity is D51's target.
-		return c.power * emissive_proximity(rt_emissive[c.index], hit_pos, N);
+		return c.power * emissive_proximity(rt_emissive[c.index], hit_pos, N, p_two_sided);
 	}
-	return light_tree_analytic_target(rt_lights[c.index], hit_pos, N);
+	return light_tree_analytic_target(rt_lights[c.index], hit_pos, N, p_two_sided);
 }
 
 /// One light sample by the tree: `candidates` draws through the proposal (the top-level split
@@ -620,6 +625,7 @@ bool light_tree_sample_direct(
 		return false;
 	}
 	candidates = clamp(candidates, 1u, uint(RT_LIGHT_TREE_MAX_CANDIDATES));
+	bool two_sided = hasDiffuseTransmission(material);
 	float u_res = min(rand(rng_state), 0.99999994);
 	LightTreeCandidate selected;
 	selected.kind = RT_LIGHT_TREE_KIND_LEAF;
@@ -642,7 +648,7 @@ bool light_tree_sample_direct(
 		LightTreeCandidate c;
 		if (light_tree_draw_top(u_top, t, N_select, c)) {
 			if (c.p > 0.0) {
-				light_tree_reservoir_offer(c, light_tree_target(c, t, hit_pos, N) / c.p, w_sum, u_res, selected, w_selected);
+				light_tree_reservoir_offer(c, light_tree_target(c, t, hit_pos, N, two_sided) / c.p, w_sum, u_res, selected, w_selected);
 			}
 		} else if (t.cut_count > 0u && t.root > 0.0) {
 			tree_pending++;
@@ -676,7 +682,7 @@ bool light_tree_sample_direct(
 				// on the matrix: the correction is what the target buys). A spot leaf and a light under
 				// an inner node keep the light's own contribution estimate.
 				bool leaf_slot = (n.child & RT_LIGHT_TREE_LEAF_BIT) != 0u && n.cos_theta_o <= -1.0;
-				float w = (leaf_slot ? light_tree_leaf_target(n, hit_pos, N) : light_tree_target(c, t, hit_pos, N)) / c.p;
+				float w = (leaf_slot ? light_tree_leaf_target(n, hit_pos, N, two_sided) : light_tree_target(c, t, hit_pos, N, two_sided)) / c.p;
 				light_tree_reservoir_offer(c, w, w_sum, u_res, selected, w_selected);
 			}
 			if (tree_pending > 0u) {

@@ -215,6 +215,7 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	m.ior = max(emission_ior.a, 1.0);
 	m.absorption = max(absorption.rgb, vec3(0.0));
 	m.scattering = clamp(scattering.rgb, vec3(0.0), vec3(1.0));
+	m.diffuse_transmission = vec3(0.0); // The G-buffer carries no backlight (D103).
 
 #ifdef RT_DEBUG_ENABLED
 	int vis_mode = int(get_rt_param(RT_PARAM_VIS_MODE));
@@ -355,7 +356,7 @@ void main() {
 					break;
 				}
 				vec3 hit_pos = ray_origin + ray_dir * ps.hit_t;
-				ray_origin = offset_ray_origin(hit_pos, ps.offset_normal, ps.hit_t);
+				ray_origin = offset_ray_origin(hit_pos, is_back_offset(ps.packed_bounces_flags) ? -ps.offset_normal : ps.offset_normal, ps.hit_t);
 				ray_dir = ps.next_ray_dir;
 				continue;
 			}
@@ -372,7 +373,7 @@ void main() {
 			}
 			// Reconstruct the next ray origin from the current ray + hit distance, apply bias
 			vec3 hit_pos = ray_origin + ray_dir * ps.hit_t;
-			ray_origin = offset_ray_origin(hit_pos, ps.offset_normal, ps.hit_t);
+			ray_origin = offset_ray_origin(hit_pos, is_back_offset(ps.packed_bounces_flags) ? -ps.offset_normal : ps.offset_normal, ps.hit_t);
 			ray_dir = ps.next_ray_dir;
 		}
 
@@ -714,6 +715,7 @@ void main() {
 	m.ior = max(ior, 1.0);
 	m.absorption = max(absorption, vec3(0.0));
 	m.scattering = clamp(scattering, vec3(0.0), vec3(1.0));
+	m.diffuse_transmission = vec3(0.0);
 
 	// Apply normal map if it was written.
 	if (normal_map != vec3(0.5, 0.5, 1.0)) {
@@ -781,6 +783,17 @@ void main() {
 	m.ior = 1.5;
 	m.absorption = vec3(0.0);
 	m.scattering = vec3(0.0);
+	// Back lighting (D103) as the raster weighs it: its BACKLIGHT (the sRGB colour decoded, plus the
+	// texture read linear) times the diffuse albedo, as the albedo of the thin diffuse-transmission lobe.
+	m.diffuse_transmission = vec3(0.0);
+	if ((mat.flags & 32u) != 0u) {
+		vec3 c = unpackUnorm4x8(mat.backlight_rgba8).rgb;
+		vec3 backlight = mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), greaterThan(c, vec3(0.04045)));
+		if (mat.backlight_texture_idx != 0u) {
+			backlight += sample_material_texture(mat.backlight_texture_idx, uv, mat.flags).rgb;
+		}
+		m.diffuse_transmission = clamp(backlight * albedo * (1.0 - metalness), vec3(0.0), vec3(1.0));
+	}
 
 #ifdef RT_DEBUG_ENABLED
 	{

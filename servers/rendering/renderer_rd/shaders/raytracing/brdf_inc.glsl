@@ -276,7 +276,13 @@ struct MaterialProperties {
 	float dielectricF0; // Base reflectance for dielectrics (e.g. 0.04 for default 4% reflectance).
 	float transmissivness;
 	float opacity;
+	float3 diffuseTransmission; // Albedo of a thin diffuse-transmission lobe on the other side of N (D103); 0 = none.
 };
+
+// A thin surface that passes light to its other side (D103): light below N is evaluated, not rejected.
+bool hasDiffuseTransmission(MaterialProperties material) {
+	return any(greaterThan(material.diffuseTransmission, float3(0.0f, 0.0f, 0.0f)));
+}
 
 // Data needed to evaluate BRDF (surface and material properties at given point + configuration of light and normal vectors)
 struct BrdfData {
@@ -1081,8 +1087,12 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 	outSpecular = float3(0.0f, 0.0f, 0.0f);
 	// Prepare data needed for BRDF evaluation (uses shading normal N for all BRDF math).
 	const BrdfData data = prepareBRDFData(N, L, V, material);
-	// Ignore L rays "below" the hemisphere
+	// Ignore L rays "below" the hemisphere, except through a thin surface's transmission lobe
+	// (D103): Lambertian about -N, its albedo the transmission's.
 	if (data.Lbackfacing) {
+		if (hasDiffuseTransmission(material)) {
+			outDiffuse = material.diffuseTransmission * (ONE_OVER_PI * max(-dot(N, L), 0.0f));
+		}
 		return;
 	}
 
@@ -1111,6 +1121,22 @@ float brdfSpecularProbability(float3 specularF0, float3 diffuseReflectance) {
 	return clamp(specularLum / (specularLum + diffuseLum), 0.01f, 0.99f);
 }
 
+// The probability with which the scatter in shade_and_bounce takes a thin surface's diffuse
+// transmission (D103) before choosing between the reflection lobes: the transmission's luminance
+// against the reflection albedos', 0 without transmission (no random number drawn) and 1 when the
+// surface reflects nothing.
+float diffuseTransmissionProbability(float3 specularF0, float3 diffuseReflectance, float3 diffuseTransmission) {
+	float transmissionLum = luminance(diffuseTransmission);
+	if (transmissionLum <= 0.0f) {
+		return 0.0f;
+	}
+	float reflectionLum = luminance(specularF0) + luminance(diffuseReflectance);
+	if (reflectionLum < 0.0001f) {
+		return 1.0f;
+	}
+	return clamp(transmissionLum / (transmissionLum + reflectionLum), 0.01f, 0.99f);
+}
+
 // The density (per solid angle) with which the scatter in shade_and_bounce produces L from V: the
 // lobe probability above times the cosine density of the diffuse lobe and the reflection density
 // of the specular sampler (specularPdf). A zero-roughness specular lobe is a delta and adds no
@@ -1118,6 +1144,12 @@ float brdfSpecularProbability(float3 specularF0, float3 diffuseReflectance) {
 // weighs its samples against this (D50), so it must describe the sampler exactly.
 float brdf_pdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	const BrdfData data = prepareBRDFData(N, L, V, material);
+	// A thin surface's transmission (D103) takes its share first: cosine about -N below, the
+	// reflection lobes the rest above.
+	float transmissionProbability = diffuseTransmissionProbability(data.specularF0, data.diffuseReflectance, material.diffuseTransmission);
+	if (!data.Vbackfacing && data.Lbackfacing && transmissionProbability > 0.0f) {
+		return transmissionProbability * diffusePdf(max(-dot(N, L), 0.0f));
+	}
 	if (data.Vbackfacing || data.Lbackfacing) {
 		return 0.0f;
 	}
@@ -1128,6 +1160,9 @@ float brdf_pdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	}
 	if (specularProbability > 0.0f && data.alpha > 0.0f) {
 		pdf += specularProbability * specularPdf(data.alpha, data.alphaSquared, data.NdotH, data.NdotV, data.LdotH);
+	}
+	if (transmissionProbability > 0.0f) {
+		pdf *= 1.0f - transmissionProbability;
 	}
 	return pdf;
 }

@@ -13,6 +13,7 @@ struct MaterialResult {
 	float ior; // Refractive index of the medium behind the surface, for the refracted direction and the interface's Fresnel.
 	vec3 absorption; // Per-metre extinction of the medium behind a front face, per channel; 0 = no medium (D49).
 	vec3 scattering; // The medium's single-scatter colour, 0..1: what a segment in it adds of the sun and sky (D49).
+	vec3 diffuse_transmission; // Albedo of a thin diffuse-transmission lobe, 0..1: what a leaf passes to its other side, BACKLIGHT times the diffuse albedo (D103).
 };
 
 /// Sensible default for a mid-grey diffuse surface.
@@ -29,5 +30,6 @@ MaterialResult default_material_result(vec3 geometry_normal) {
 	r.ior = 1.5;
 	r.absorption = vec3(0.0);
 	r.scattering = vec3(0.0);
+	r.diffuse_transmission = vec3(0.0);
 	return r;
 }

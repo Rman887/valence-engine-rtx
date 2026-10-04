@@ -97,7 +97,7 @@ struct MaterialData {
 	float metallic;
 	float roughness;
 	float ao_strength;
-	uint flags; // Bit 0: has_normal_map, Bit 1: has_emission_tex, Bit 2: point_filter, Bit 3: emission_multiply, Bit 4: emissive_constant (an emissive mesh light, D50)
+	uint flags; // Bit 0: has_normal_map, Bit 1: has_emission_tex, Bit 2: point_filter, Bit 3: emission_multiply, Bit 4: emissive_constant (an emissive mesh light, D50), Bit 5: diffuse_transmission (backlight, D103)
 
 	vec2 uv1_scale; // UV1 scale (default 1,1)
 	vec2 uv1_offset; // UV1 offset (default 0,0)
@@ -106,5 +106,7 @@ struct MaterialData {
 	float specular; // Dielectric specular [0..1], default 0.5 -> F0 = 0.04.
 	uint64_t uniform_address; // BDA for custom shader uniform buffer (0 = none)
 	float alpha_threshold; // The alpha test's cutoff: opaque where alpha >= it (default 0.5).
-	uint _pad[3];
+	uint backlight_rgba8; // With flag bit 5: the backlight colour, sRGB, RGBA8 (D103).
+	uint backlight_texture_idx; // Its backlight texture, sampled linear (0 = none).
+	uint _pad;
 };

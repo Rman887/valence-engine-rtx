@@ -7347,6 +7347,8 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.normal_map_depth = 1.0f;
 	mat.uniform_address = 0;
 	mat.alpha_threshold = 0.5f;
+	mat.backlight_rgba8 = 0;
+	mat.backlight_texture_idx = 0;
 	bool omm_custom = false;
 	RID omm_custom_alpha_rd; // An opted-in custom shader's hint_alpha texture, with a real bindless slot.
 
@@ -7646,6 +7648,24 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		Vector3 o = uv1_offset_var;
 		mat.uv1_offset[0] = o.x;
 		mat.uv1_offset[1] = o.y;
+	}
+
+	// Back lighting (D103): BaseMaterial3D declares backlight only while the feature is enabled, and its
+	// fragment writes BACKLIGHT = backlight.rgb + texture_backlight.rgb, the colour a source_color (kept
+	// sRGB here, decoded in the hit shader) and the texture hinted black but not as a colour, so read
+	// linear. The raster's light pass weighs it by the diffuse albedo; the trace takes the same product
+	// as the albedo of a thin diffuse-transmission lobe. A custom shader's BACKLIGHT is not carried.
+	if (!mat_data->is_custom_shader && shader_declares("backlight")) {
+		Variant backlight_var = material_storage->material_get_param(p_material_rid, "backlight");
+		Color backlight = backlight_var.get_type() == Variant::COLOR ? (Color)backlight_var : Color(0, 0, 0);
+		RID backlight_rd = get_material_texture("texture_backlight");
+		if (backlight_rd.is_valid()) {
+			mat.backlight_texture_idx = bindless_block->add_texture(backlight_rd);
+		}
+		if (mat.backlight_texture_idx != 0 || backlight.r > 0.0f || backlight.g > 0.0f || backlight.b > 0.0f) {
+			mat.backlight_rgba8 = backlight.clamp().to_abgr32();
+			mat.flags |= RT_MAT_FLAG_DIFFUSE_TRANSMISSION;
+		}
 	}
 
 	// The alpha test's cutoff, from the material's own uniform when its shader declares one
@@ -8565,6 +8585,11 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					if (!is_alpha) {
 						inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
 					}
+					if (mat_data->data.flags & RT_MAT_FLAG_DIFFUSE_TRANSMISSION) {
+						// A thin transmissive instance (D103) is traced as cull_disabled: its transmitted rays leave by its back.
+						inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT;
+						inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT;
+					}
 				}
 
 				PendingMMSurface pending;
@@ -8730,6 +8755,11 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				bool is_alpha = surf->shader && (surf->shader->uses_alpha_clip || surf->shader->uses_blend_alpha || surf->shader->uses_alpha);
 				if (!is_alpha) {
 					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
+				}
+				if (mat_data->data.flags & RT_MAT_FLAG_DIFFUSE_TRANSMISSION) {
+					// A thin transmissive instance (D103) is traced as cull_disabled: its transmitted rays leave by its back.
+					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT;
+					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT;
 				}
 			}
 			const uint8_t inst_mask = RT_INSTANCE_MASK_GEOMETRY | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0);

@@ -129,11 +129,13 @@ uint emissive_search_cdf(float u, uint count) {
 /// thousandth of its radius rather than excluded: the sphere is the rest pose's box, and a skinned
 /// or blend-shaped emitter can pose triangles outside it, so a target of zero there would lose
 /// their light. Any positive function of the entry is a valid resampling target; this one is the
-/// unshadowed irradiance up to the emitter's own facing.
-float emissive_proximity(RTEmissiveInstance e, vec3 hit_pos, vec3 N) {
+/// unshadowed irradiance up to the emitter's own facing. A thin surface's receiver (p_two_sided,
+/// D103) takes light from either side.
+float emissive_proximity(RTEmissiveInstance e, vec3 hit_pos, vec3 N, bool p_two_sided) {
 	vec3 to_c = vec3(e.center_x, e.center_y, e.center_z) - hit_pos;
 	float d_sq = dot(to_c, to_c);
-	float above = max(dot(N, to_c) + e.radius, 1e-3 * e.radius);
+	float n_dot = dot(N, to_c);
+	float above = max((p_two_sided ? abs(n_dot) : n_dot) + e.radius, 1e-3 * e.radius);
 	if (above <= 0.0 || e.pdf <= 0.0) {
 		return 0.0;
 	}
@@ -182,7 +184,7 @@ bool emissive_sample_direct(
 		float u_sel = (float(i) + rand(rng_state)) / float(candidates);
 		uint idx = emissive_search_cdf(u_sel, count);
 		RTEmissiveInstance c = rt_emissive[idx];
-		float w = emissive_proximity(c, hit_pos, N);
+		float w = emissive_proximity(c, hit_pos, N, hasDiffuseTransmission(material));
 		if (w <= 0.0) {
 			continue;
 		}
@@ -278,7 +280,7 @@ bool emissive_sample_instance(
 	if ((e.flags & RT_EMISSIVE_FLAG_TWO_SIDED) != 0u) {
 		cos_l = abs(cos_l);
 	}
-	if (cos_l <= 0.0 || dot(N, L) <= 0.0) {
+	if (cos_l <= 0.0 || (dot(N, L) <= 0.0 && !hasDiffuseTransmission(material))) {
 		return false;
 	}
 

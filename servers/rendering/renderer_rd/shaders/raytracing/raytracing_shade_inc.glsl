@@ -256,6 +256,7 @@ void debug_visualize(
 		dbg_mat.emissive = vec3(0.0);
 		dbg_mat.transmissivness = 0.0;
 		dbg_mat.opacity = 1.0;
+		dbg_mat.diffuseTransmission = vec3(0.0);
 
 		vec3 dbg_dir;
 		vec3 dbg_weight;
@@ -343,8 +344,10 @@ vec3 shade_previous_origin(HitData h, vec3 ray_dir, float hit_t) {
 void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	PathState ps = path_unpack(payload);
 	// Every exit below packs the payload, and the raygen reads hit_t for the camera segment's
-	// length before it checks for termination, so the distance is recorded once, here.
+	// length before it checks for termination, so the distance is recorded once, here. The
+	// previous vertex's back offset (D103) is spent: only a transmission below sets it again.
 	ps.hit_t = hit_t;
+	ps.packed_bounces_flags = set_back_offset(ps.packed_bounces_flags, false);
 
 	vec3 V = -ray_dir;
 
@@ -412,6 +415,14 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	brdf_mat.emissive = m.emissive;
 	brdf_mat.transmissivness = 0.0;
 	brdf_mat.opacity = 1.0;
+	// A thin surface's diffuse transmission (D103), RTXPT's split: the diffuse reflection keeps
+	// what the transmission's strongest channel leaves; the transmission's albedo is BACKLIGHT times
+	// the diffuse albedo, as the raster weighs it.
+	brdf_mat.diffuseTransmission = m.diffuse_transmission;
+	float diffuse_transmit_max = max(m.diffuse_transmission.r, max(m.diffuse_transmission.g, m.diffuse_transmission.b));
+	if (diffuse_transmit_max > 0.0) {
+		brdf_mat.baseColor *= 1.0 - diffuse_transmit_max;
+	}
 
 	// Transmission: the surface is a dielectric interface. TRANSMISSION is the
 	// fraction (per channel) of the unreflected light that continues through
@@ -443,7 +454,9 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
 
 		// The transmitted radiance is demodulated as diffuse: the guide carries the transmitted fraction on top of the diffuse remainder.
-		vec3 diffuse_albedo = DLSSRR_encodeDiffuseAlbedo(DLSSRR_computeDiffuseAlbedo(brdf_mat.baseColor + m.transmission, m.metalness));
+		// A thin surface's diffuse transmission (D103) is diffuse light too, as RTXPT's estimate adds
+		// it; T already carries (1 - metallic).
+		vec3 diffuse_albedo = DLSSRR_encodeDiffuseAlbedo(DLSSRR_computeDiffuseAlbedo(brdf_mat.baseColor + m.transmission, m.metalness) + m.diffuse_transmission);
 		imageStore(dlss_rr_diffuse_albedo, pixel, vec4(diffuse_albedo, 1.0));
 
 		vec3 specular_albedo = DLSSRR_computeSpecularAlbedo(m.albedo, m.metalness, brdf_mat.dielectricF0, m.roughness, NdotV);
@@ -555,7 +568,19 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		} else {
 			have_sample = lights_sample_direct(hit_pos_offset, N, brdf_mat, ps.rng_state, is_indirect, rt_light_count, light_sample);
 		}
-		if (have_sample && lights_trace_shadow_ray(hit_pos_offset, light_sample.direction, light_sample.shadow_distance, RT_OMM_RAY_FLAGS(diffuse_bounces), ps.rng_state)) {
+		// A sample a thin surface takes through its transmission (D103) leaves from the other side,
+		// aimed at the point the light was sampled at from the front origin, so it ends where the
+		// front ray would; the BRDF keeps the sample's own direction.
+		vec3 shadow_origin = hit_pos_offset;
+		vec3 shadow_dir = light_sample.direction;
+		float shadow_distance = light_sample.shadow_distance;
+		if (diffuse_transmit_max > 0.0 && dot(N, light_sample.direction) < 0.0) {
+			shadow_origin = offset_ray_origin(h.hit_pos, -h.geometry_normal, hit_t);
+			vec3 to_light = hit_pos_offset + light_sample.direction * light_sample.shadow_distance - shadow_origin;
+			shadow_distance = length(to_light);
+			shadow_dir = to_light / max(shadow_distance, 1e-6);
+		}
+		if (have_sample && lights_trace_shadow_ray(shadow_origin, shadow_dir, shadow_distance, RT_OMM_RAY_FLAGS(diffuse_bounces), ps.rng_state)) {
 			// Evaluate BRDF (diffuse + specular separately for specular_amount control).
 			vec3 brdf_diffuse, brdf_specular;
 			evalCombinedBRDFSeparate(N, light_sample.direction, V, brdf_mat, brdf_diffuse, brdf_specular);
@@ -619,8 +644,20 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// =================================================================
 	// BRDF importance sampling for next bounce
 	// =================================================================
-	int brdfType;
-	float brdfProbability = brdfSpecularProbability(specularF0, diffuseReflectance);
+	// A thin surface's diffuse transmission (D103) is chosen first, with the probability brdf_pdf
+	// gives it, on a dimension of its own so the lobe and direction draws keep theirs; a surface
+	// without it draws nothing here.
+	float diffuse_transmit_p = diffuse_transmit_max > 0.0 ? diffuseTransmissionProbability(specularF0, diffuseReflectance, m.diffuse_transmission) : 0.0;
+	bool diffuse_transmitted = false;
+	if (diffuse_transmit_p > 0.0) {
+		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_DIFFUSE_TRANSMISSION);
+		diffuse_transmitted = rand(ps.rng_state) < diffuse_transmit_p;
+		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER + (transmit_p > 0.0 ? 1u : 0u));
+		ps.throughput /= diffuse_transmitted ? diffuse_transmit_p : (1.0 - diffuse_transmit_p);
+	}
+
+	int brdfType = DIFFUSE_TYPE;
+	float brdfProbability = diffuse_transmitted ? 0.0 : brdfSpecularProbability(specularF0, diffuseReflectance);
 	if (brdfProbability >= 1.0) {
 		brdfType = SPECULAR_TYPE;
 	} else if (brdfProbability <= 0.0) {
@@ -638,7 +675,16 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	vec2 u = rand2(ps.rng_state);
 	vec3 next_dir;
 	vec3 brdf_weight;
-	if (!evalIndirectCombinedBRDF(u, N, h.geometry_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
+	if (diffuse_transmitted) {
+		// Lambertian about -N: the cosine cancels its density, leaving the albedo. A direction the
+		// shading normal tilts back above the geometry plane is mirrored under it.
+		next_dir = rotatePoint(getRotationFromZAxis(-N), sampleHemisphere(u));
+		float above = dot(next_dir, h.geometry_normal);
+		if (above > 0.0) {
+			next_dir = normalize(next_dir - 2.0 * above * h.geometry_normal);
+		}
+		brdf_weight = m.diffuse_transmission;
+	} else if (!evalIndirectCombinedBRDF(u, N, h.geometry_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
 		// Two failure modes:
 		//   1) Sample weight is zero (no contribution). Terminate.
 		//   2) Sampled direction is below the geometry plane. Recover by
@@ -698,8 +744,13 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		ps.bsdf_pdf = RT_BSDF_PDF_DELTA;
 	} else {
 		float pdf = brdf_pdf(N, next_dir, V, brdf_mat);
-		// A direction the density cannot own (the below-hemisphere recovery) is one light
-		// sampling rejects too, so the BSDF strategy keeps the whole weight.
+		// A direction the density cannot own (the below-hemisphere recovery; on a thin surface, a
+		// direction on the side of N the chosen lobe does not sample: a transmitted one mirrored back
+		// above N, a reflected one in the wedge between N and the geometry plane) is one light
+		// sampling does not produce this way, so the BSDF strategy keeps the whole weight.
+		if (diffuse_transmit_p > 0.0 && diffuse_transmitted != (dot(N, next_dir) < 0.0)) {
+			pdf = 0.0;
+		}
 		ps.bsdf_pdf = pdf > 0.0 ? pdf : RT_BSDF_PDF_DELTA;
 	}
 
@@ -707,6 +758,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// the raygen loop continues with the reconstructed origin and next_ray_dir.
 	ps.hit_t = hit_t;
 	ps.offset_normal = h.geometry_normal;
+	ps.packed_bounces_flags = set_back_offset(ps.packed_bounces_flags, diffuse_transmitted);
 	ps.next_ray_dir = next_dir;
 	path_pack(payload, ps);
 }

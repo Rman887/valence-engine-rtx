@@ -325,6 +325,9 @@ struct RTLodCachedLevel {
 	uint64_t arena_offset = 0;
 	uint64_t arena_size = 0;
 	uint32_t last_used_frame = 0;
+	// The build budget (D97): the frame its build was last refused and the frame it began waiting.
+	uint64_t budget_frame = UINT64_MAX;
+	uint64_t budget_wait_since = 0;
 };
 
 // CLAS residency (D92): a streamed surface's groups, the unit its CLAS are loaded and unloaded in.
@@ -757,6 +760,8 @@ struct RTClusterArenaChunk {
 struct RTClusterCompactionResult {
 	uint64_t ticket = 0;
 	PackedByteArray sizes;
+	uint64_t held_since = 0; // frames_drawn the build budget (D97) first held it back, 0 when never.
+	uint64_t held_frame = UINT64_MAX; // frames_drawn it was last held: a later viewport's step passes it on.
 };
 
 // A region whose surface is gone but whose chunk the frames in flight may still trace: freed
@@ -802,6 +807,11 @@ struct RTCacheEntry {
 	uint32_t cached_rid_version = 0;
 	uint8_t failed_attempts = 0;
 	uint64_t size_bytes = 0;
+	// The build budget (D97): the frame (frames_drawn) its population was last decided, the
+	// answer, and the frame it began waiting, 0 while it is not.
+	uint64_t budget_frame = UINT64_MAX;
+	uint64_t budget_wait_since = 0;
+	bool budget_admitted = false;
 };
 
 /// BLAS cache entry for a surface driven by a per-frame-deformed vertex buffer.
@@ -1016,6 +1026,9 @@ struct RTOmmEntry {
 	LocalVector<int32_t> indices; // Its host copy, which a merged MultiMesh repeats per element.
 	LocalVector<RD::MicromapUsage> index_usages; // The primitives' references per level, special indices left out.
 	RID static_blas; // The surface's BLAS with the micromap, for its static instances.
+	// The build budget (D97): the frame the static BLAS was last refused and the frame it began waiting.
+	uint64_t budget_frame = UINT64_MAX;
+	uint64_t budget_wait_since = 0;
 	// On the cluster path (OMMd): the surface's LOD 0 CLAS again, each carrying the micromap, and a
 	// cluster BLAS over them, staged then compacted as the surface's own; `blas` is the handle.
 	RTSurfaceData *cluster_surface = nullptr;
@@ -1039,6 +1052,7 @@ struct RTOmmReadback {
 	uint64_t ticket = 0;
 	bool stats = false;
 	PackedByteArray data;
+	uint64_t held_since = 0; // frames_drawn the build budget (D97) first held its bake back, 0 when never.
 };
 
 struct RTMaterialCacheEntry {
@@ -1295,13 +1309,102 @@ class RenderRaytracing {
 	// Cluster builds recorded this frame, for the render-info counters (they never enter dirty_blas_list).
 	uint32_t cluster_blas_builds = 0;
 	uint32_t cluster_triangles_built = 0;
-	// The deformed cluster path's counters this frame: a layout's first build is a build, every
-	// later rebuild is counted as the refit it replaces.
+	// The deformed cluster path's counters this frame: every rebuild is a build (D97), a cluster BLAS
+	// is never refit.
 	uint32_t deformed_cluster_builds = 0;
 	uint32_t deformed_cluster_triangles_built = 0;
-	uint32_t deformed_cluster_refits = 0;
-	uint32_t deformed_cluster_triangles_refit = 0;
 	uint32_t deformed_cluster_expiry_rebuilds_total = 0; // Unchanged surfaces rebuilt for their region's reuse, over the run.
+	// Builds the counters above miss (D97): compactions, stream loads, opacity micromap bakes, the
+	// selection's per-instance BLAS and cached levels. Reset with them, before prepare_frame.
+	uint32_t frame_extra_builds = 0;
+	uint32_t frame_extra_triangles = 0;
+
+	// The acceleration-structure build budget (D97, docs/r1-build-queue.md). A frame's deferrable
+	// builds are admitted within a triangle and a build count: prepare_frame's stand-ins (stream
+	// loads, opacity micromap bakes, compactions) spend what the previous frame left, the pre-pass
+	// admits new surfaces and merges' first bakes by priority from the rest, and the walk's and the
+	// flush's stand-ins (an opacity micromap BLAS, a cached level) take what remains. Costs are
+	// triangles; a reference to an existing CLAS counts as RT_BUILD_BUDGET_CLUSTER_TRIANGLES.
+	static constexpr uint64_t RT_BUILD_BUDGET_CLUSTER_TRIANGLES = 8;
+	struct BuildBudget {
+		bool enabled = false;
+		uint64_t triangles_per_frame = 0;
+		uint32_t builds_per_frame = 0;
+		uint32_t max_wait_frames = 0;
+		uint64_t frame = UINT64_MAX; // frames_drawn of the frame being accounted.
+		uint64_t prepass_frame = UINT64_MAX;
+		uint64_t carry_triangles = 0;
+		uint32_t carry_builds = 0;
+		uint64_t left_triangles = 0;
+		uint32_t left_builds = 0;
+		bool walk_overdue_taken = false; // The walk's one overdue item past the limits this frame.
+		bool compaction_overdue_taken = false; // The compactions' one overdue item past the limits this frame.
+		// This frame's figures, for the render-info counters.
+		uint64_t spent_triangles = 0;
+		uint32_t spent_builds = 0;
+		uint32_t built = 0; // Builds recorded for admitted items: the rest of the frame's are forced.
+		uint32_t deferred = 0; // Admissions refused.
+		uint32_t waiting = 0; // New surfaces and merges the frame's decisions left waiting.
+		uint32_t held = 0; // Compactions and micromap bakes put back for a later frame.
+		// Over the run, and since the last verbose report.
+		uint64_t admitted_total = 0;
+		uint64_t deferred_total = 0;
+		LocalVector<uint32_t> waits; // Frames each item admitted after a wait had waited, at most RT_BUILD_BUDGET_WAITS_CAP.
+		uint64_t prepass_usec_total = 0;
+		uint64_t prepass_usec_max = 0;
+		uint32_t merges_admitted_after_wait = 0; // Since the last report, with the longest of their waits.
+		uint32_t merge_wait_max = 0;
+		enum CandidateKind : uint8_t {
+			CANDIDATE_SURFACE,
+			CANDIDATE_MERGE,
+		};
+		struct Candidate {
+			RTCacheEntry *entry = nullptr; // A surface's.
+			uint64_t merge_key = 0; // A merge's: MultiMesh local index << 32 | surface index.
+			uint64_t merge_id = 0; // The MultiMesh's RID id.
+			uint64_t cost = 0;
+			uint64_t wait_since = 0;
+			float priority = 0.0f;
+			uint32_t order = 0;
+			CandidateKind kind = CANDIDATE_SURFACE;
+			bool overdue = false; // Waited build_budget_max_wait_frames: admitted regardless.
+			// Overdue first, oldest first; surfaces before merges; the larger projected size; walk order.
+			bool operator<(const Candidate &p_other) const {
+				if (overdue != p_other.overdue) {
+					return overdue;
+				}
+				if (overdue && wait_since != p_other.wait_since) {
+					return wait_since < p_other.wait_since;
+				}
+				if (kind != p_other.kind) {
+					return kind < p_other.kind;
+				}
+				if (priority != p_other.priority) {
+					return priority > p_other.priority;
+				}
+				return order < p_other.order;
+			}
+		};
+		// Frame-local, cleared and refilled by each pre-pass with their capacity kept.
+		LocalVector<Candidate> candidates;
+		AHashMap<RTCacheEntry *, uint32_t> candidate_surfaces; // Into candidates.
+		AHashMap<uint64_t, uint32_t> candidate_merges;
+		AHashMap<uint64_t, bool> merges_waiting; // This frame's; true when the merge waits, false when admitted.
+		struct MergeWait {
+			uint64_t mm_id = 0; // The MultiMesh's RID id: a recycled local index starts a new wait.
+			uint64_t since = 0;
+			uint64_t seen = 0;
+		};
+		AHashMap<uint64_t, MergeWait> merge_waits;
+		LocalVector<uint64_t> stale_merges;
+	} build_budget;
+	static constexpr uint32_t RT_BUILD_BUDGET_WAITS_CAP = 65536;
+	// An admission: refused, within the limits, or past them (a forced item).
+	enum BuildBudgetTake : uint8_t {
+		BUILD_BUDGET_REFUSED,
+		BUILD_BUDGET_ADMITTED,
+		BUILD_BUDGET_ADMITTED_PAST,
+	};
 	RTDeformedClusterBatch deformed_cluster_batch;
 	// The static cluster arena (D81) and the compactions in flight: a surface's sizes readback
 	// is keyed by a ticket so a result whose surface went in the meantime is dropped.
@@ -1494,6 +1597,7 @@ class RenderRaytracing {
 		// Geometry residency (D93c): the wants the upload cap deferred, the bytes of blobs and staged
 		// positions each step with a load uploaded since the last report, and the gathers' time.
 		uint64_t deferred_upload = 0;
+		uint64_t deferred_build_budget = 0; // Wants the build budget (D97) held back.
 		uint64_t uploaded_bytes = 0;
 		LocalVector<uint32_t> upload_frames; // KB.
 		uint64_t gather_usec = 0; // Gathers' preparation and placement on the render thread, over the run.
@@ -1813,7 +1917,34 @@ class RenderRaytracing {
 	bool _materialize_surface(RTSurfaceData *p_surf_data, void *p_mesh_surface, bool p_held, bool p_capped = false);
 	void _release_materialized(RTSurfaceData *p_surf_data);
 	void _sweep_materialized();
-	bool _plan_merged_mm(RID p_mm_rid, RID p_mm_gpu_buffer, void *p_mesh_surface, uint32_t p_mm_count, uint32_t p_surface_index, uint32_t p_surface_counter, bool &r_bakes);
+	bool _plan_merged_mm(RID p_mm_rid, RID p_mm_gpu_buffer, void *p_mesh_surface, uint32_t p_mm_count, uint32_t p_surface_index, uint32_t p_surface_counter, bool &r_bakes, bool *r_first = nullptr);
+	// The build budget (D97).
+	void _build_budget_begin_frame();
+	// A GeometryInstanceForwardClustered's traced surfaces (D97), passed untyped as process_surface's surface is.
+	static void _build_budget_stamp(const void *p_instance, uint32_t p_surface_index, uint64_t p_frames_drawn);
+	static bool _build_budget_traced(const void *p_instance, uint32_t p_surface_index, uint64_t p_frames_drawn);
+	bool _build_budget_fits(uint64_t p_cost, bool p_carry) const;
+	void _build_budget_spend(uint64_t p_cost, bool p_carry);
+	BuildBudgetTake _build_budget_take(uint64_t p_cost, bool p_carry, bool p_force);
+	bool _build_budget_take_walk(uint64_t p_cost, uint64_t &r_budget_frame, uint64_t &r_wait_since);
+	void _build_budget_note_wait(uint64_t p_since);
+	void _build_budget_consider_surface(RID p_mesh, uint32_t p_surface_index, void *p_mesh_surface, float p_priority, bool p_traced);
+	void _build_budget_prepass(const RenderDataRD *p_render_data, uint32_t p_rt_flags);
+	bool _build_budget_admit_surface(RTCacheEntry *p_entry, void *p_mesh_surface);
+	_FORCE_INLINE_ bool _build_budget_merge_waits(RID p_mm_rid, uint32_t p_surface_index) const {
+		if (!build_budget.enabled) {
+			return false;
+		}
+		const bool *waits = build_budget.merges_waiting.getptr((uint64_t(p_mm_rid.get_local_index()) << 32) | p_surface_index);
+		return waits != nullptr && *waits;
+	}
+	_FORCE_INLINE_ bool _build_budget_merge_admitted(RID p_mm_rid, uint32_t p_surface_index) const {
+		if (!build_budget.enabled) {
+			return false;
+		}
+		const bool *waits = build_budget.merges_waiting.getptr((uint64_t(p_mm_rid.get_local_index()) << 32) | p_surface_index);
+		return waits != nullptr && !*waits;
+	}
 	// With p_omm (D96 OMMd), the LOD 0 clusters alone, each CLAS carrying the micromap: no hierarchy, no streaming.
 	bool _populate_surface_cluster_blas(void *p_mesh_surface, RID p_vertex_buffer, RID p_index_buffer, uint32_t p_cache_key, RTSurfaceData *r_surf_data, bool p_blobs_only = false, const RTOmmEntry *p_omm = nullptr);
 	// The clusters of a surface as the static and deformed paths both lay them out: from the

@@ -262,12 +262,26 @@ void RenderRaytracing::_omm_process() {
 	LocalVector<RTOmmReadback> readbacks;
 	readbacks = omm_readbacks;
 	omm_readbacks.clear();
-	for (const RTOmmReadback &readback : readbacks) {
+	LocalVector<RTOmmReadback> held; // By the build budget (D97), ahead of what arrives meanwhile.
+	bool overdue_taken = false; // One overdue bake a frame goes past the limits.
+	for (RTOmmReadback &readback : readbacks) {
 		RTOmmEntry **found = omm_pending.getptr(readback.ticket);
 		if (found == nullptr) {
 			continue; // Released while in flight.
 		}
 		RTOmmEntry *entry = *found;
+		if (!readback.stats && build_budget.enabled) {
+			// The bake and its micromap from the last frame's remainder: the plain BLAS meanwhile.
+			const uint64_t since = readback.held_since != 0 ? readback.held_since : frames_drawn;
+			const BuildBudgetTake take = _build_budget_take(entry->primitive_count, true, !overdue_taken && frames_drawn - since >= build_budget.max_wait_frames);
+			if (take == BUILD_BUDGET_REFUSED) {
+				readback.held_since = since;
+				held.push_back(readback);
+				continue;
+			}
+			overdue_taken = overdue_taken || take == BUILD_BUDGET_ADMITTED_PAST;
+			_build_budget_note_wait(readback.held_since);
+		}
 		omm_pending.erase(readback.ticket);
 		entry->ticket = 0;
 		if (readback.stats) {
@@ -282,6 +296,13 @@ void RenderRaytracing::_omm_process() {
 		} else {
 			_omm_bake(entry, readback.data);
 		}
+	}
+	if (!held.is_empty()) {
+		build_budget.held += held.size();
+		for (const RTOmmReadback &readback : omm_readbacks) {
+			held.push_back(readback);
+		}
+		omm_readbacks = held;
 	}
 
 	// Micromaps unused for the MultiMesh cache's time to live go, with the BLASes that carry them.
@@ -705,6 +726,8 @@ void RenderRaytracing::_omm_bake(RTOmmEntry *p_entry, const PackedByteArray &p_s
 	p_entry->special_primitives = special;
 	p_entry->micromap_bytes = rd->micromap_get_size(p_entry->micromap);
 	p_entry->state = RTOmmEntry::STATE_BUILT;
+	frame_extra_builds++; // The micromap: a build with no BLAS triangles (D97).
+	build_budget.built += build_budget.enabled ? 1 : 0;
 	omm_stats.baked++;
 	omm_stats.micromap_bytes += p_entry->micromap_bytes;
 	omm_stats.descriptors += p_entry->descriptors;
@@ -735,6 +758,11 @@ RID RenderRaytracing::_omm_surface_blas(RTOmmEntry *p_entry, void *p_mesh_surfac
 	}
 
 	// A second BLAS over the surface's own buffers, as its plain one is built, carrying the micromap.
+	// The build budget (D97) may hold it back, its wait kept on the entry: the plain BLAS stands in
+	// meanwhile.
+	if (!_build_budget_take_walk(p_entry->primitive_count, p_entry->budget_frame, p_entry->budget_wait_since)) {
+		return RID();
+	}
 	RTSurfaceData meta;
 	RID vertex_buffer, attribute_buffer, index_buffer;
 	_fill_surface_geometry_data(p_mesh_surface, false, &meta, &vertex_buffer, &attribute_buffer, &index_buffer);
@@ -751,6 +779,7 @@ RID RenderRaytracing::_omm_surface_blas(RTOmmEntry *p_entry, void *p_mesh_surfac
 	rd->set_resource_name(p_entry->static_blas, "RT BLAS OMM [" + itos(p_entry->serial) + "]");
 	r_dirty_blas_list.push_back(p_entry->static_blas);
 	omm_stats.blases++;
+	build_budget.built += build_budget.enabled ? 1 : 0;
 	return p_entry->static_blas;
 }
 
@@ -764,7 +793,11 @@ RID RenderRaytracing::_omm_surface_cluster_blas(RTOmmEntry *p_entry, void *p_mes
 
 	// The surface's LOD 0 clusters again, over its own buffers as its population reads them, each CLAS
 	// carrying the micromap. The cluster IDs are the plain population's, so the hits read the same
-	// triangles through the instance's row.
+	// triangles through the instance's row. The build budget (D97) may hold it back: the plain BLAS
+	// stands in meanwhile, its wait kept on the entry.
+	if (!_build_budget_take_walk(p_entry->primitive_count, p_entry->budget_frame, p_entry->budget_wait_since)) {
+		return RID();
+	}
 	RD *rd = RD::get_singleton();
 	RTSurfaceData *surface = memnew(RTSurfaceData);
 	RID vertex_buffer, attribute_buffer, index_buffer;
@@ -783,6 +816,7 @@ RID RenderRaytracing::_omm_surface_cluster_blas(RTOmmEntry *p_entry, void *p_mes
 	}
 	p_entry->cluster_surface = surface;
 	omm_stats.blases++;
+	build_budget.built += build_budget.enabled ? 1 : 0;
 	return surface->blas;
 }
 

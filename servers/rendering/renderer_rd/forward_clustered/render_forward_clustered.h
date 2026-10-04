@@ -590,6 +590,13 @@ protected:
 		RTProceduralState *rt_procedural = nullptr;
 		/// Its PTLAS slot ranges (D94b), released when it is freed.
 		mutable RTSlotOwner rt_slots;
+		/// The surfaces a walk traced (D97), by surface index, one bit each (index 63 and above
+		/// share bit 63): those of the frame rt_traced_frame and those of the frame before it. A
+		/// miss on a surface its instance traced the frame before is a rebuild under the trace,
+		/// never held back by the build budget. They survive a mesh-to-mesh set_base, as the slots do.
+		mutable uint64_t rt_traced_frame = UINT64_MAX;
+		mutable uint64_t rt_traced_mask = 0;
+		mutable uint64_t rt_traced_prev_mask = 0;
 
 		// lightmap
 		RID lightmap_instance;

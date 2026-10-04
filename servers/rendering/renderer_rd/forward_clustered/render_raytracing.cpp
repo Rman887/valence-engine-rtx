@@ -76,6 +76,15 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 	// A surface its mesh drops releases its RT cache entry at once (D81), not at the slot's reuse.
 	RendererRD::MeshStorage::get_singleton()->set_surface_freed_callback(&RenderRaytracing::_mesh_surface_freed);
 
+	// The build budget (D97): deferrable builds admitted within a frame's triangles and builds.
+	build_budget.enabled = GLOBAL_GET("rendering/pathtracing/build_budget");
+	if (build_budget.enabled) {
+		build_budget.triangles_per_frame = uint64_t(MAX(int64_t(1024), int64_t(GLOBAL_GET("rendering/pathtracing/build_budget_triangles_per_frame"))));
+		build_budget.builds_per_frame = uint32_t(MAX(1, int(GLOBAL_GET("rendering/pathtracing/build_budget_builds_per_frame"))));
+		build_budget.max_wait_frames = uint32_t(MAX(1, int(GLOBAL_GET("rendering/pathtracing/build_budget_max_wait_frames"))));
+		print_line(vformat("RT: acceleration-structure build budget on: %d triangles and %d builds a frame, first in line after %d frames' wait (D97).", build_budget.triangles_per_frame, build_budget.builds_per_frame, build_budget.max_wait_frames));
+	}
+
 	cluster_blas_enabled = RD::get_singleton()->has_feature(RD::SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE);
 	if (cluster_blas_enabled) {
 		cluster_compaction_enabled = GLOBAL_GET("rendering/pathtracing/cluster_blas_compaction");
@@ -911,6 +920,8 @@ RTMergedMMEntry *RenderRaytracing::_access_merged_mm_slot(RID &r_handle) {
 // ---------------------------------------------------------------------------
 
 void RenderRaytracing::prepare_frame() {
+	// The build budget's frame (D97): its stand-ins below spend what the last frame left.
+	_build_budget_begin_frame();
 	// Sizes read back since the last frame move their CLAS into the arena before the TLAS
 	// instances of this frame take each surface's handle (D81).
 	_process_cluster_compactions();
@@ -1062,6 +1073,394 @@ void RenderRaytracing::prepare_frame() {
 }
 
 // ---------------------------------------------------------------------------
+// The acceleration-structure build budget (D97)
+// ---------------------------------------------------------------------------
+
+// A new surface's cost before it is populated: its triangles at full detail (a hierarchy's coarser
+// levels and a streamed surface's fallback cut are not counted apart).
+static uint64_t _build_budget_surface_cost(void *p_mesh_surface) {
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	const uint32_t index_count = mesh_storage->mesh_surface_get_rt_index_count(p_mesh_surface);
+	const uint32_t vertex_count = mesh_storage->mesh_surface_get_rt_vertex_count(p_mesh_surface);
+	return MAX(uint64_t(index_count > 0 ? index_count / 3 : vertex_count / 3), uint64_t(1));
+}
+
+// The surfaces a walk traced (D97): one bit a surface index, the frame's and the frame before's
+// kept apart, so a stamp written this frame never counts as traced the frame before. Surface
+// indices 63 and above share bit 63, which errs toward forcing: such a surface is held back only
+// when no surface of its instance from index 63 up was traced the frame before.
+static _FORCE_INLINE_ uint64_t _build_budget_surface_bit(uint32_t p_surface_index) {
+	return uint64_t(1) << MIN(p_surface_index, 63u);
+}
+
+void RenderRaytracing::_build_budget_stamp(const void *p_instance, uint32_t p_surface_index, uint64_t p_frames_drawn) {
+	const RenderForwardClustered::GeometryInstanceForwardClustered *p_inst = static_cast<const RenderForwardClustered::GeometryInstanceForwardClustered *>(p_instance);
+	if (p_inst->rt_traced_frame != p_frames_drawn) {
+		p_inst->rt_traced_prev_mask = (p_inst->rt_traced_frame != UINT64_MAX && p_inst->rt_traced_frame + 1 == p_frames_drawn) ? p_inst->rt_traced_mask : 0;
+		p_inst->rt_traced_mask = 0;
+		p_inst->rt_traced_frame = p_frames_drawn;
+	}
+	p_inst->rt_traced_mask |= _build_budget_surface_bit(p_surface_index);
+}
+
+bool RenderRaytracing::_build_budget_traced(const void *p_instance, uint32_t p_surface_index, uint64_t p_frames_drawn) {
+	const RenderForwardClustered::GeometryInstanceForwardClustered *p_inst = static_cast<const RenderForwardClustered::GeometryInstanceForwardClustered *>(p_instance);
+	uint64_t previous = 0;
+	if (p_inst->rt_traced_frame == p_frames_drawn) {
+		previous = p_inst->rt_traced_prev_mask;
+	} else if (p_inst->rt_traced_frame != UINT64_MAX && p_inst->rt_traced_frame + 1 == p_frames_drawn) {
+		previous = p_inst->rt_traced_mask;
+	}
+	return (previous & _build_budget_surface_bit(p_surface_index)) != 0;
+}
+
+// An instance's projected size: its bounding sphere's radius over its distance, at most 1.
+static float _build_budget_priority(const AABB &p_aabb, const Vector3 &p_camera) {
+	const real_t radius = p_aabb.size.length() * 0.5;
+	if (!(radius > 0.0)) {
+		return 0.0f;
+	}
+	const real_t distance = p_camera.distance_to(p_aabb.get_center());
+	return float(radius / MAX(distance, radius));
+}
+
+// Once a frame, from the first prepare_frame: what the last frame left is what prepare_frame's
+// stand-ins may spend, and the frame's own budget starts whole, so no frame admits more than
+// the budget, the items forced past it aside (one overdue item a queue, the pre-pass's first, an
+// item larger than the whole budget in a frame nothing else spent).
+void RenderRaytracing::_build_budget_begin_frame() {
+	BuildBudget &budget = build_budget;
+	if (!budget.enabled) {
+		return;
+	}
+	const uint64_t frames_drawn = RD::get_singleton()->get_frames_drawn();
+	if (budget.frame == frames_drawn) {
+		return;
+	}
+	const bool first = budget.frame == UINT64_MAX;
+	budget.carry_triangles = first ? budget.triangles_per_frame : budget.left_triangles;
+	budget.carry_builds = first ? budget.builds_per_frame : budget.left_builds;
+	budget.left_triangles = budget.triangles_per_frame;
+	budget.left_builds = budget.builds_per_frame;
+	budget.frame = frames_drawn;
+	budget.walk_overdue_taken = false;
+	budget.compaction_overdue_taken = false;
+	budget.spent_triangles = 0;
+	budget.spent_builds = 0;
+	budget.built = 0;
+	budget.deferred = 0;
+	budget.waiting = 0;
+	budget.held = 0;
+	if (frames_drawn % 300 == 0 && OS::get_singleton()->is_stdout_verbose()) {
+		uint32_t wait_p50 = 0, wait_max = 0;
+		if (!budget.waits.is_empty()) {
+			budget.waits.sort();
+			wait_p50 = budget.waits[budget.waits.size() / 2];
+			wait_max = budget.waits[budget.waits.size() - 1];
+		}
+		print_verbose(vformat("RT: build budget (D97): %d triangles and %d builds a frame; over the run %d admitted and %d refusals; since the last report %d items admitted after a wait, waited p50 %d, max %d frames (first in line at %d), %d of them merges, which waited %d frames at most; %d merges waiting now; the pre-pass took %d us at most in a frame since the last report, %d us over the run.", budget.triangles_per_frame, budget.builds_per_frame, budget.admitted_total, budget.deferred_total, budget.waits.size(), wait_p50, wait_max, budget.max_wait_frames, budget.merges_admitted_after_wait, budget.merge_wait_max, budget.merge_waits.size(), budget.prepass_usec_max, budget.prepass_usec_total));
+		budget.waits.clear();
+		budget.prepass_usec_max = 0;
+		budget.merges_admitted_after_wait = 0;
+		budget.merge_wait_max = 0;
+	}
+}
+
+// Whether an item fits the last frame's remainder (p_carry, prepare_frame's stand-ins) or this
+// frame's, with no side effect. An untouched pool takes anything: an item larger than the whole
+// budget goes alone in a frame nothing else spent, so no queue holds such an item back for good.
+bool RenderRaytracing::_build_budget_fits(uint64_t p_cost, bool p_carry) const {
+	const BuildBudget &budget = build_budget;
+	const uint64_t triangles = p_carry ? budget.carry_triangles : budget.left_triangles;
+	const uint32_t builds = p_carry ? budget.carry_builds : budget.left_builds;
+	return builds > 0 && (p_cost <= triangles || triangles == budget.triangles_per_frame);
+}
+
+void RenderRaytracing::_build_budget_spend(uint64_t p_cost, bool p_carry) {
+	BuildBudget &budget = build_budget;
+	if (p_carry) {
+		budget.carry_triangles -= MIN(p_cost, budget.carry_triangles);
+		budget.carry_builds -= MIN(1u, budget.carry_builds);
+	}
+	budget.left_triangles -= MIN(p_cost, budget.left_triangles);
+	budget.left_builds -= MIN(1u, budget.left_builds);
+	budget.spent_triangles += p_cost;
+	budget.spent_builds++;
+	budget.admitted_total++;
+}
+
+// One item's admission, one build and p_cost triangles: within the limits, or past them when
+// p_force (an overdue item, the pre-pass's first), which the result says so the caller spends its
+// one overdue slot only when it was used. A refusal is counted here.
+RenderRaytracing::BuildBudgetTake RenderRaytracing::_build_budget_take(uint64_t p_cost, bool p_carry, bool p_force) {
+	BuildBudget &budget = build_budget;
+	if (!budget.enabled) {
+		return BUILD_BUDGET_ADMITTED;
+	}
+	const bool fits = _build_budget_fits(p_cost, p_carry);
+	if (!fits && !p_force) {
+		budget.deferred++;
+		budget.deferred_total++;
+		return BUILD_BUDGET_REFUSED;
+	}
+	_build_budget_spend(p_cost, p_carry);
+	return fits ? BUILD_BUDGET_ADMITTED : BUILD_BUDGET_ADMITTED_PAST;
+}
+
+// An item the walk or the selection's flush decides (a new surface it did not see in the pre-pass,
+// a static micromap BLAS, a cached level), from this frame's remainder. Its wait is kept on the
+// item: it carries over only from a refusal the frame before, and once it reaches the max wait the
+// item is forced, one such item past the limits a frame.
+bool RenderRaytracing::_build_budget_take_walk(uint64_t p_cost, uint64_t &r_budget_frame, uint64_t &r_wait_since) {
+	BuildBudget &budget = build_budget;
+	if (!budget.enabled) {
+		return true;
+	}
+	const uint64_t frames_drawn = RD::get_singleton()->get_frames_drawn();
+	if (r_budget_frame == UINT64_MAX || r_budget_frame + 1 < frames_drawn) {
+		r_wait_since = 0;
+	}
+	const uint64_t since = r_wait_since;
+	const bool overdue = since != 0 && frames_drawn - since >= budget.max_wait_frames;
+	const BuildBudgetTake take = _build_budget_take(p_cost, false, overdue && !budget.walk_overdue_taken);
+	budget.walk_overdue_taken = budget.walk_overdue_taken || take == BUILD_BUDGET_ADMITTED_PAST;
+	r_budget_frame = frames_drawn;
+	if (take == BUILD_BUDGET_REFUSED) {
+		r_wait_since = since != 0 ? since : frames_drawn;
+		return false;
+	}
+	_build_budget_note_wait(since);
+	r_wait_since = 0;
+	return true;
+}
+
+void RenderRaytracing::_build_budget_note_wait(uint64_t p_since) {
+	if (p_since != 0 && build_budget.waits.size() < RT_BUILD_BUDGET_WAITS_CAP) {
+		const uint64_t frames_drawn = RD::get_singleton()->get_frames_drawn();
+		build_budget.waits.push_back(uint32_t(MIN(frames_drawn - p_since, uint64_t(UINT32_MAX))));
+	}
+}
+
+// A surface the walk will populate unless it waits: one whose cache entry misses and holds no BLAS
+// the trace already takes (a rebuild under one is forced, as is any miss of a surface its instance
+// traced the frame before). Its wait carries over only from a decision made the frame before.
+void RenderRaytracing::_build_budget_consider_surface(RID p_mesh, uint32_t p_surface_index, void *p_mesh_surface, float p_priority, bool p_traced) {
+	if (p_traced) {
+		return; // Its instance traced it the frame before: whatever it misses is forced.
+	}
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	BuildBudget &budget = build_budget;
+	const uint32_t cache_key = (p_mesh.get_local_index() << 8) | (p_surface_index & 0xFF);
+	const uint32_t mesh_version = get_rid_version(p_mesh);
+	RTCacheEntry *entry = get_surface_cache_entry(cache_key);
+	const bool needs_refresh = !entry->ptr || entry->cached_rid_version != mesh_version || entry->cached_counter != mesh_storage->mesh_surface_get_rt_invalidation_counter(p_mesh_surface);
+	if (!needs_refresh && entry->ptr->blas.is_valid()) {
+		return;
+	}
+	if (entry->ptr && entry->cached_rid_version == mesh_version && entry->ptr->blas.is_valid()) {
+		return; // Forced: the trace takes its BLAS, which no longer matches its buffers.
+	}
+	uint32_t *found = budget.candidate_surfaces.getptr(entry);
+	if (found != nullptr) {
+		budget.candidates[*found].priority = MAX(budget.candidates[*found].priority, p_priority);
+		return;
+	}
+	const uint64_t frames_drawn = RD::get_singleton()->get_frames_drawn();
+	if (entry->budget_frame == UINT64_MAX || entry->budget_frame + 1 < frames_drawn) {
+		entry->budget_wait_since = 0;
+	}
+	BuildBudget::Candidate candidate;
+	candidate.entry = entry;
+	candidate.cost = _build_budget_surface_cost(p_mesh_surface);
+	candidate.wait_since = entry->budget_wait_since;
+	candidate.priority = p_priority;
+	candidate.order = budget.candidates.size();
+	candidate.kind = BuildBudget::CANDIDATE_SURFACE;
+	budget.candidate_surfaces.insert(entry, budget.candidates.size());
+	budget.candidates.push_back(candidate);
+}
+
+// Once a frame, before the first walk: the new surfaces and merges' first bakes the walk would
+// build, admitted in order (overdue first, oldest first; surfaces before merges; by projected
+// size; in walk order). It populates nothing: a surface that waits is stamped, and the walk's
+// process_surface returns no surface for it, so the walk drops the instance where it drops a
+// failed population, before its slot, material row, micromap request or selection candidate. With
+// everything admitted the walk is the walk without the budget. A surface its instance traced the
+// frame before is never listed: whatever it misses (a swapped mesh, a rebuilt part) is forced.
+void RenderRaytracing::_build_budget_prepass(const RenderDataRD *p_render_data, uint32_t p_rt_flags) {
+	BuildBudget &budget = build_budget;
+	const uint64_t frames_drawn = RD::get_singleton()->get_frames_drawn();
+	if (!budget.enabled || budget.prepass_frame == frames_drawn) {
+		return;
+	}
+	budget.prepass_frame = frames_drawn;
+	const uint64_t start_usec = OS::get_singleton()->get_ticks_usec();
+	budget.candidates.clear();
+	budget.candidate_surfaces.clear();
+	budget.candidate_merges.clear();
+	budget.merges_waiting.clear();
+
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
+	SceneShaderRaytracing *rt_shader = SceneShaderRaytracing::get_singleton();
+	const Vector3 camera = p_render_data->scene_data->cam_transform.origin;
+	const PagedArray<RenderGeometryInstance *> &rt_instances = *p_render_data->rt_instances;
+	for (uint32_t i = 0; i < (uint32_t)rt_instances.size(); i++) {
+		const RenderForwardClustered::GeometryInstanceForwardClustered *inst =
+				static_cast<const RenderForwardClustered::GeometryInstanceForwardClustered *>(rt_instances[i]);
+		if (!inst || !inst->data || inst->rt_procedural) {
+			continue; // A procedural AABB BLAS builds when it is dirty, as before.
+		}
+		const float priority = _build_budget_priority(inst->transformed_aabb, camera);
+		const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = inst->surface_caches;
+		if (inst->data->base_type == RSE::INSTANCE_MULTIMESH) {
+			const RID mm_rid = inst->data->base;
+			if (mesh_storage->multimesh_get_transform_format(mm_rid) != RSE::MULTIMESH_TRANSFORM_3D) {
+				continue;
+			}
+			const uint32_t mm_count = mesh_storage->multimesh_get_instances_to_draw(mm_rid);
+			if (mm_count == 0) {
+				continue;
+			}
+			const RID mm_gpu_buffer = mesh_storage->multimesh_get_gpu_buffer(mm_rid);
+			const RID mesh = mesh_storage->multimesh_get_mesh(mm_rid);
+			for (; surf; surf = surf->next) {
+				if (surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) {
+					continue;
+				}
+				// The walk skips a surface whose hit group still compiles before anything is built;
+				// read without side effects from the material cache, an uncached material left to the
+				// walk, which decides such a surface from what the frame has left.
+				RID material_rid;
+				if (inst->data->material_override.is_valid()) {
+					material_rid = inst->data->material_override;
+				} else if (surf->surface_index < inst->data->surface_materials.size() && inst->data->surface_materials[surf->surface_index].is_valid()) {
+					material_rid = inst->data->surface_materials[surf->surface_index];
+				} else if (mesh.is_valid() && mesh_storage->owns_mesh(mesh)) {
+					material_rid = mesh_storage->mesh_surface_get_material(mesh, surf->surface_index);
+				}
+				if (material_rid.is_valid()) {
+					const RTMaterialCacheEntry *material = get_material_cache_entry(get_rid_index(material_rid));
+					if (!material->ptr || material->cached_rid_version != get_rid_version(material_rid) || material->cached_counter != material_storage->material_get_rt_invalidation_counter(material_rid)) {
+						continue;
+					}
+					if (material->ptr->rt_sbt_offset > 0 && !rt_shader->is_hg_ready_in_bundle(material->ptr->rt_sbt_offset, p_rt_flags)) {
+						continue;
+					}
+				}
+				void *mesh_surface = surf->surface;
+				bool bakes = false;
+				bool first = false;
+				const bool merges = _plan_merged_mm(mm_rid, mm_gpu_buffer, mesh_surface, mm_count, surf->surface_index, mesh_storage->mesh_surface_get_rt_invalidation_counter(mesh_surface), bakes, &first);
+				if (merges && bakes && first) {
+					// A merge with no entry yet: its expanded instances stand in while it waits. A
+					// rebake of an existing entry is forced.
+					const uint64_t key = (uint64_t(mm_rid.get_local_index()) << 32) | surf->surface_index;
+					uint32_t *found = budget.candidate_merges.getptr(key);
+					if (found != nullptr) {
+						budget.candidates[*found].priority = MAX(budget.candidates[*found].priority, priority);
+					} else {
+						const BuildBudget::MergeWait *wait = budget.merge_waits.getptr(key);
+						BuildBudget::Candidate candidate;
+						candidate.merge_key = key;
+						candidate.merge_id = mm_rid.get_id();
+						candidate.cost = uint64_t(mm_count) * _build_budget_surface_cost(mesh_surface);
+						candidate.wait_since = (wait != nullptr && wait->mm_id == candidate.merge_id && wait->seen + 1 == frames_drawn) ? wait->since : 0;
+						candidate.priority = priority;
+						candidate.order = budget.candidates.size();
+						candidate.kind = BuildBudget::CANDIDATE_MERGE;
+						budget.candidate_merges.insert(key, budget.candidates.size());
+						budget.candidates.push_back(candidate);
+					}
+				}
+				// The expanded path populates the surface, and so does a streamed surface's merge (D93d).
+				if ((!merges || mesh_storage->mesh_surface_is_geometry_streamed(mesh_surface)) && mesh.is_valid()) {
+					_build_budget_consider_surface(mesh, surf->surface_index, mesh_surface, priority, _build_budget_traced(inst, surf->surface_index, frames_drawn));
+				}
+			}
+			continue;
+		}
+		for (; surf; surf = surf->next) {
+			if (surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) {
+				continue;
+			}
+			if (inst->mesh_instance.is_valid() && mesh_storage->mesh_instance_get_vertex_buffer(inst->mesh_instance, surf->surface_index).is_valid()) {
+				continue; // Deformed: forced.
+			}
+			_build_budget_consider_surface(inst->data->base, surf->surface_index, surf->surface, priority, _build_budget_traced(inst, surf->surface_index, frames_drawn));
+		}
+	}
+
+	for (BuildBudget::Candidate &candidate : budget.candidates) {
+		candidate.overdue = candidate.wait_since != 0 && frames_drawn - candidate.wait_since >= budget.max_wait_frames;
+	}
+	budget.candidates.sort();
+	bool admitted_any = false;
+	for (const BuildBudget::Candidate &candidate : budget.candidates) {
+		// The frame's first item goes whatever its size, so one larger than the budget still
+		// progresses, and an overdue one is first in line: past the limits one at a time, so a
+		// burst that waited is never let through at once.
+		const bool admitted = _build_budget_take(candidate.cost, false, !admitted_any) != BUILD_BUDGET_REFUSED;
+		admitted_any = admitted_any || admitted;
+		if (admitted) {
+			_build_budget_note_wait(candidate.wait_since);
+			if (candidate.kind == BuildBudget::CANDIDATE_MERGE && candidate.wait_since != 0) {
+				budget.merges_admitted_after_wait++;
+				budget.merge_wait_max = MAX(budget.merge_wait_max, uint32_t(MIN(frames_drawn - candidate.wait_since, uint64_t(UINT32_MAX))));
+			}
+		} else {
+			budget.waiting++;
+		}
+		const uint64_t since = admitted ? 0 : (candidate.wait_since != 0 ? candidate.wait_since : frames_drawn);
+		if (candidate.kind == BuildBudget::CANDIDATE_SURFACE) {
+			candidate.entry->budget_frame = frames_drawn;
+			candidate.entry->budget_admitted = admitted;
+			candidate.entry->budget_wait_since = since;
+			continue;
+		}
+		budget.merges_waiting.insert(candidate.merge_key, !admitted);
+		if (admitted) {
+			budget.merge_waits.erase(candidate.merge_key);
+		} else {
+			BuildBudget::MergeWait wait;
+			wait.mm_id = candidate.merge_id;
+			wait.since = since;
+			wait.seen = frames_drawn;
+			budget.merge_waits.insert(candidate.merge_key, wait);
+		}
+	}
+	// A merge no longer asked for stops waiting.
+	budget.stale_merges.clear();
+	for (const KeyValue<uint64_t, BuildBudget::MergeWait> &E : budget.merge_waits) {
+		if (E.value.seen != frames_drawn) {
+			budget.stale_merges.push_back(E.key);
+		}
+	}
+	for (const uint64_t key : budget.stale_merges) {
+		budget.merge_waits.erase(key);
+	}
+
+	const uint64_t usec = OS::get_singleton()->get_ticks_usec() - start_usec;
+	budget.prepass_usec_total += usec;
+	budget.prepass_usec_max = MAX(budget.prepass_usec_max, usec);
+}
+
+// A surface the walk populates: as the pre-pass decided this frame, or, one it did not see (a
+// later viewport's, a waiting merge's expanded instances, a MultiMesh whose material was not cached
+// yet), from what the frame has left, in walk order.
+bool RenderRaytracing::_build_budget_admit_surface(RTCacheEntry *p_entry, void *p_mesh_surface) {
+	const uint64_t frames_drawn = RD::get_singleton()->get_frames_drawn();
+	if (p_entry->budget_frame == frames_drawn) {
+		return p_entry->budget_admitted;
+	}
+	p_entry->budget_admitted = _build_budget_take_walk(_build_budget_surface_cost(p_mesh_surface), p_entry->budget_frame, p_entry->budget_wait_since);
+	if (!p_entry->budget_admitted) {
+		build_budget.waiting++;
+	}
+	return p_entry->budget_admitted;
+}
+
+// ---------------------------------------------------------------------------
 // Surface processing
 // ---------------------------------------------------------------------------
 
@@ -1101,6 +1500,16 @@ RTSurfaceData *RenderRaytracing::process_surface(
 
 	cache_misses++;
 
+	// The build budget (D97): a new surface waits until it is admitted, with no surface for the walk
+	// to trace (its entry may still hold an earlier mesh's freed BLAS). A rebuild under a BLAS the
+	// trace takes is forced, as is any miss of a surface its instance traced the frame before (its
+	// mesh swapped, a part rebuilt, a merge grown past its cap and expanded): it never leaves the
+	// trace for the budget.
+	const bool budgeted = build_budget.enabled && !(entry->ptr && entry->cached_rid_version == mesh_version && entry->ptr->blas.is_valid()) && !_build_budget_traced(surf->owner, surf->surface_index, RD::get_singleton()->get_frames_drawn());
+	if (budgeted && !_build_budget_admit_surface(entry, p_mesh_surface)) {
+		return nullptr;
+	}
+
 	// Allocate or reuse entry
 	if (!entry->ptr) {
 		entry->ptr = memnew(RTSurfaceData);
@@ -1114,6 +1523,9 @@ RTSurfaceData *RenderRaytracing::process_surface(
 	RTSurfaceData *surf_data = entry->ptr;
 
 	_populate_surface_blas(p_mesh_surface, RID(), false, false, false, cache_key, surf_data, r_dirty_blas_list);
+	if (budgeted && surf_data->blas.is_valid()) {
+		build_budget.built++;
+	}
 
 	surf->cached_final_transform_valid = false;
 
@@ -2807,15 +3219,15 @@ void RenderRaytracing::_flush_deformed_cluster_batch() {
 				const uint32_t triangles = entry->ptr ? entry->ptr->geometry.primitive_count : 0;
 				switch (entry->cluster_frame_kind) {
 					case RTDeformedCacheEntry::CLUSTER_QUEUED_FIRST_BUILD:
+					case RTDeformedCacheEntry::CLUSTER_QUEUED_CHANGED:
+						// A cluster BLAS is rebuilt, never refit: a change is a build (D97).
 						deformed_cluster_builds++;
 						deformed_cluster_triangles_built += triangles;
 						break;
-					case RTDeformedCacheEntry::CLUSTER_QUEUED_CHANGED:
-						deformed_cluster_refits++;
-						deformed_cluster_triangles_refit += triangles;
-						break;
 					case RTDeformedCacheEntry::CLUSTER_QUEUED_EXPIRY:
 						deformed_cluster_expiry_rebuilds_total++;
+						deformed_cluster_builds++; // And so is a rebuild for the region's reuse (D97).
+						deformed_cluster_triangles_built += triangles;
 						break;
 					default:
 						break;
@@ -2892,6 +3304,7 @@ void RenderRaytracing::_process_cluster_compactions() {
 	if (cluster_compaction_results.is_empty()) {
 		return;
 	}
+	const uint64_t frames_drawn = rd->get_frames_drawn();
 	const RD::ClusterAccelerationStructureCapabilities &caps = rd->get_cluster_acceleration_structure_capabilities();
 	const uint64_t base_alignment = MAX(caps.cluster_byte_alignment, caps.cluster_bottom_level_byte_alignment);
 
@@ -2900,10 +3313,34 @@ void RenderRaytracing::_process_cluster_compactions() {
 	LocalVector<RTClusterCompactionResult> results;
 	results = cluster_compaction_results;
 	cluster_compaction_results.clear();
-	for (const RTClusterCompactionResult &result : results) {
+	LocalVector<RTClusterCompactionResult> held; // By the build budget (D97), ahead of what arrives meanwhile.
+	uint32_t newly_held = 0;
+	for (RTClusterCompactionResult &result : results) {
 		RTSurfaceData **found = cluster_compaction_pending.getptr(result.ticket);
 		if (found == nullptr) {
 			continue; // The surface was released while its sizes were in flight.
+		}
+		// The build budget (D97): the move and the BLAS over the moved CLAS, the surface tracing its
+		// staging meanwhile. Not a surface with a hierarchy: a held compaction would hold its cached
+		// levels (D90) and a streamed surface's level-0 pin (D92), so it is forced.
+		const bool budgeted = build_budget.enabled && (*found)->cluster_lod_table_offset == UINT32_MAX;
+		if (budgeted) {
+			if (result.held_frame == frames_drawn) {
+				held.push_back(result); // Held by an earlier viewport's step this frame: decided once a frame.
+				continue;
+			}
+			// One overdue item a frame goes past the limits.
+			const uint64_t since = result.held_since != 0 ? result.held_since : frames_drawn;
+			const BuildBudgetTake take = _build_budget_take(uint64_t((*found)->cluster_built_count + 1) * RT_BUILD_BUDGET_CLUSTER_TRIANGLES, true, !build_budget.compaction_overdue_taken && frames_drawn - since >= build_budget.max_wait_frames);
+			if (take == BUILD_BUDGET_REFUSED) {
+				result.held_since = since;
+				result.held_frame = frames_drawn;
+				held.push_back(result);
+				newly_held++;
+				continue;
+			}
+			build_budget.compaction_overdue_taken = build_budget.compaction_overdue_taken || take == BUILD_BUDGET_ADMITTED_PAST;
+			_build_budget_note_wait(result.held_since);
 		}
 		RTSurfaceData *surf = *found;
 		cluster_compaction_pending.erase(result.ticket);
@@ -3044,9 +3481,18 @@ void RenderRaytracing::_process_cluster_compactions() {
 		surf->blas_size = region_size;
 
 		cluster_compactions_total++;
+		frame_extra_builds++; // A move and a BLAS over existing CLAS: a build, no new triangles (D97).
+		build_budget.built += budgeted ? 1 : 0;
 		cluster_bytes_staged_total += staged_bytes;
 		cluster_bytes_compacted_total += region_size;
 		print_verbose(vformat("RT: cluster BLAS [%d] compacted: %d clusters, %d KB staged -> %d KB (chunk %d at %d KB; arena %d chunks, %d / %d KB live).", surf->cluster_cache_key, cluster_count, staged_bytes / 1024, region_size / 1024, chunk_index, region_offset / 1024, cluster_arena.size(), cluster_arena_live_bytes / 1024, cluster_arena_reserved_bytes / 1024));
+	}
+	if (!held.is_empty()) {
+		build_budget.held += newly_held;
+		for (const RTClusterCompactionResult &result : cluster_compaction_results) {
+			held.push_back(result);
+		}
+		cluster_compaction_results = held;
 	}
 }
 
@@ -3208,6 +3654,10 @@ void RenderRaytracing::release_mesh_surface(RID p_mesh, uint32_t p_surface) {
 	if (entry->ptr) {
 		_release_surface_data(entry->ptr);
 	}
+	// Its wait for the build budget (D97) goes with it: the slot's next surface starts afresh.
+	entry->budget_frame = UINT64_MAX;
+	entry->budget_wait_since = 0;
+	entry->budget_admitted = false;
 }
 
 void RenderRaytracing::_mesh_surface_freed(RID p_mesh, uint32_t p_surface) {
@@ -5172,6 +5622,7 @@ void RenderRaytracing::_process_lod_stream() {
 		// here is what one frame uploads.
 		uint64_t uploaded = 0;
 		bool room_exhausted = false;
+		bool overdue_taken = false;
 		LocalVector<RTLodStreamLoad::Item> items[2]; // Per position format: float, then 16-bit.
 		for (const Want &want : wants) {
 			RTLodStream *stream = want.surface->cluster_lod_stream;
@@ -5195,6 +5646,26 @@ void RenderRaytracing::_process_lod_stream() {
 			if (upload > 0 && uploaded > 0 && uploaded + upload > cluster_lod_stream_upload_cap) {
 				lod_stream_stats.deferred_upload++;
 				continue;
+			}
+			// The build budget (D97): the group's CLAS from the last frame's remainder, checked here
+			// and spent below once the memory check has passed. The coarser resident cut stands in,
+			// and the group is asked for again.
+			uint32_t group_triangles = 0;
+			bool budget_past = false;
+			if (build_budget.enabled) {
+				for (uint32_t c = group.first_cluster; c < group.first_cluster + group.cluster_count; c++) {
+					group_triangles += stream->cluster_packed[c] & 0xFFFF;
+				}
+				if (!_build_budget_fits(group_triangles, true)) {
+					// One overdue group a frame goes past the limits.
+					budget_past = !overdue_taken && group.requested != 0 && frames_drawn - group.requested >= build_budget.max_wait_frames;
+					if (!budget_past) {
+						build_budget.deferred++;
+						build_budget.deferred_total++;
+						lod_stream_stats.deferred_build_budget++;
+						continue;
+					}
+				}
 			}
 			const uint64_t estimate = (group.bytes > 0 ? group.bytes : _align_up(uint64_t(group.cluster_count) * cluster_lod_stream_cluster_worst, base_alignment)) + group.blob_bytes;
 			const bool pinned = _lod_stream_pinned(stream, frames_drawn, min_age);
@@ -5229,6 +5700,20 @@ void RenderRaytracing::_process_lod_stream() {
 			}
 			builds_left -= group.cluster_count;
 			uploaded += upload;
+			if (build_budget.enabled) {
+				_build_budget_spend(group_triangles, true);
+				overdue_taken = overdue_taken || budget_past;
+				build_budget.built++;
+			}
+#ifdef TOOLS_ENABLED
+			if (!build_budget.enabled) {
+				for (uint32_t c = group.first_cluster; c < group.first_cluster + group.cluster_count; c++) {
+					group_triangles += stream->cluster_packed[c] & 0xFFFF;
+				}
+			}
+			frame_extra_builds++; // Its CLAS, counted in the frame that admits it (D97).
+			frame_extra_triangles += group_triangles;
+#endif
 			RTLodStreamLoad::Item item;
 			item.surface = want.surface;
 			item.group = want.group;
@@ -5279,7 +5764,7 @@ void RenderRaytracing::_process_lod_stream() {
 			p50 = lod_stream_stats.latency[lod_stream_stats.latency.size() / 2];
 			latency_max = lod_stream_stats.latency[lod_stream_stats.latency.size() - 1];
 		}
-		print_verbose(vformat("RT: CLAS streaming (D92): %d surfaces (%d pinned), %d of %d streamed groups resident (%d of %d roots, groups refined into nothing), %d KB resident (%d KB pinned, peak %d KB, budget %d KB), %d KB persistent, %d KB loading; over the run %d requests (%d for roots), %d loads (%d clusters), deferred %d for the build cap, %d for the budget and %d cached-level asks without room, %d evictions, %d failed, %d requests and %d use reports past their lists, %d and %d past the frame's read; request to resident p50 %d, max %d frames over %d loads since the last report; %d resident groups with a parent not resident.", cluster_lod_stream_surfaces.size(), pinned_surfaces, resident_groups, streamed_groups, resident_roots, root_groups, resident_total / 1024, pinned_bytes / 1024, lod_stream_stats.peak_bytes / 1024, cluster_lod_stream_budget / 1024, persistent_bytes / 1024, loading_bytes / 1024, lod_stream_stats.requests, lod_stream_stats.root_requests, lod_stream_stats.loads, lod_stream_stats.loaded_clusters, lod_stream_stats.deferred_cap, lod_stream_stats.deferred_budget, lod_stream_stats.deferred_soft, lod_stream_stats.evictions, lod_stream_stats.failed, lod_stream_stats.request_overflow, lod_stream_stats.touch_overflow, lod_stream_stats.request_unread, lod_stream_stats.touch_unread, p50, latency_max, lod_stream_stats.latency.size(), open));
+		print_verbose(vformat("RT: CLAS streaming (D92): %d surfaces (%d pinned), %d of %d streamed groups resident (%d of %d roots, groups refined into nothing), %d KB resident (%d KB pinned, peak %d KB, budget %d KB), %d KB persistent, %d KB loading; over the run %d requests (%d for roots), %d loads (%d clusters), deferred %d for the build cap, %d for the build budget (D97), %d for the budget and %d cached-level asks without room, %d evictions, %d failed, %d requests and %d use reports past their lists, %d and %d past the frame's read; request to resident p50 %d, max %d frames over %d loads since the last report; %d resident groups with a parent not resident.", cluster_lod_stream_surfaces.size(), pinned_surfaces, resident_groups, streamed_groups, resident_roots, root_groups, resident_total / 1024, pinned_bytes / 1024, lod_stream_stats.peak_bytes / 1024, cluster_lod_stream_budget / 1024, persistent_bytes / 1024, loading_bytes / 1024, lod_stream_stats.requests, lod_stream_stats.root_requests, lod_stream_stats.loads, lod_stream_stats.loaded_clusters, lod_stream_stats.deferred_cap, lod_stream_stats.deferred_build_budget, lod_stream_stats.deferred_budget, lod_stream_stats.deferred_soft, lod_stream_stats.evictions, lod_stream_stats.failed, lod_stream_stats.request_overflow, lod_stream_stats.touch_overflow, lod_stream_stats.request_unread, lod_stream_stats.touch_unread, p50, latency_max, lod_stream_stats.latency.size(), open));
 		if (open > 0) {
 			ERR_PRINT(vformat("RT: CLAS streaming (D92): %d resident groups have a parent that is not; the traced cut may have holes.", open));
 		}
@@ -5688,6 +6173,17 @@ bool RenderRaytracing::_prepare_lod_cached_level(RTSurfaceData *p_surf_data, uin
 	if (p_depth < p_surf_data->cluster_lod_cache.size() && p_surf_data->cluster_lod_cache[p_depth].blas.is_valid()) {
 		return true; // Already kept, or prepared earlier this frame.
 	}
+	if (build_budget.enabled) {
+		// The build budget (D97), the wait kept on the level's depth: the instance's own selection
+		// stands in meanwhile.
+		if (p_surf_data->cluster_lod_cache.size() < p_surf_data->cluster_lod_levels.size()) {
+			p_surf_data->cluster_lod_cache.resize(p_surf_data->cluster_lod_levels.size());
+		}
+		RTLodCachedLevel &waiting = p_surf_data->cluster_lod_cache[p_depth];
+		if (!_build_budget_take_walk(uint64_t(count) * RT_BUILD_BUDGET_CLUSTER_TRIANGLES, waiting.budget_frame, waiting.budget_wait_since)) {
+			return false;
+		}
+	}
 	RD *rd = RD::get_singleton();
 	const RD::ClusterAccelerationStructureCapabilities &caps = rd->get_cluster_acceleration_structure_capabilities();
 	RD::ClusterAccelerationStructureInput input;
@@ -5728,6 +6224,7 @@ bool RenderRaytracing::_prepare_lod_cached_level(RTSurfaceData *p_surf_data, uin
 	build.surface = p_surf_data;
 	build.depth = p_depth;
 	batch.cache_builds.push_back(build);
+	build_budget.built += build_budget.enabled ? 1 : 0;
 	return true;
 }
 
@@ -6506,6 +7003,11 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 	}
 	const uint64_t frames_drawn = RD::get_singleton()->get_frames_drawn();
 	if (_record_lod_batch(p_render_data, p_state)) {
+		// Every static instance's BLAS over its selection and every cached level is a build (D97).
+		for (uint32_t e = 0; e < batch.entries.size(); e++) {
+			frame_extra_builds += batch.entries[e] != nullptr ? 1 : 0;
+		}
+		frame_extra_builds += batch.cache_builds.size();
 		// The deformed items' CLAS live in this flush's region from now (D87); the counters take
 		// what the batch would have counted, as _flush_deformed_cluster_batch does.
 		for (uint32_t e = 0; e < batch.deformed_entries.size(); e++) {
@@ -6518,12 +7020,11 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 			const uint32_t triangles = entry->ptr ? entry->ptr->geometry.primitive_count : 0;
 			switch (entry->cluster_frame_kind) {
 				case RTDeformedCacheEntry::CLUSTER_QUEUED_FIRST_BUILD:
+				case RTDeformedCacheEntry::CLUSTER_QUEUED_CHANGED:
+				case RTDeformedCacheEntry::CLUSTER_QUEUED_EXPIRY:
+					// A cluster BLAS is rebuilt, never refit: every kind is a build (D97).
 					deformed_cluster_builds++;
 					deformed_cluster_triangles_built += triangles;
-					break;
-				case RTDeformedCacheEntry::CLUSTER_QUEUED_CHANGED:
-					deformed_cluster_refits++;
-					deformed_cluster_triangles_refit += triangles;
 					break;
 				default:
 					break;
@@ -7294,10 +7795,14 @@ void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {
 // False when the surface does not merge: no instance buffer, a compressed format (positions are
 // UNORM16x4, not float3), no triangles, or more merged triangles than the cap. r_bakes when the
 // call would bake: on the frame's first touch, with no entry yet, a structure or surface change,
-// moved transforms or a BLAS never built.
-bool RenderRaytracing::_plan_merged_mm(RID p_mm_rid, RID p_mm_gpu_buffer, void *p_mesh_surface, uint32_t p_mm_count, uint32_t p_surface_index, uint32_t p_surface_counter, bool &r_bakes) {
+// moved transforms or a BLAS never built. r_first, when asked, when the merge has no entry yet: a
+// first build the build budget (D97) may hold back while the expanded path stands in.
+bool RenderRaytracing::_plan_merged_mm(RID p_mm_rid, RID p_mm_gpu_buffer, void *p_mesh_surface, uint32_t p_mm_count, uint32_t p_surface_index, uint32_t p_surface_counter, bool &r_bakes, bool *r_first) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	r_bakes = false;
+	if (r_first) {
+		*r_first = false;
+	}
 	if (p_mm_gpu_buffer.is_null() || (mesh_storage->mesh_surface_get_format(p_mesh_surface) & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES)) {
 		return false;
 	}
@@ -7315,12 +7820,15 @@ bool RenderRaytracing::_plan_merged_mm(RID p_mm_rid, RID p_mm_gpu_buffer, void *
 	}
 	if (!entry) {
 		r_bakes = true;
+		if (r_first) {
+			*r_first = true;
+		}
 		return true;
 	}
 	const bool first_touch = entry->last_used_frame != RSG::rasterizer->get_frame_number();
 	const bool built = entry->blas_built_once && entry->last_mm_count == p_mm_count && entry->last_surface_counter == p_surface_counter;
 	r_bakes = first_touch && (!built || entry->cached_mm_last_change != mesh_storage->multimesh_get_last_change(p_mm_rid));
-	return true;
+	return true; // An existing entry's rebake is forced (D97): r_first stays false.
 }
 
 bool RenderRaytracing::_build_merged_mm_blas(
@@ -7767,6 +8275,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		return nullptr;
 	}
 
+	frame_extra_builds = 0; // prepare_frame's compactions, loads and bakes count into them (D97).
+	frame_extra_triangles = 0;
 	prepare_frame();
 	_sweep_materialized();
 	state->has_procedural_instances = false;
@@ -7821,8 +8331,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	cluster_triangles_built = 0;
 	deformed_cluster_builds = 0;
 	deformed_cluster_triangles_built = 0;
-	deformed_cluster_refits = 0;
-	deformed_cluster_triangles_refit = 0;
 	// Instances left out of this TLAS because their custom hit group is still compiling.
 	uint32_t rt_instances_compiling = 0;
 	const bool collect_render_info = (p_render_data->render_info != nullptr);
@@ -7850,6 +8358,11 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		bool omm_eligible = false; // An alpha-tested standard material, or a custom shader with render_mode opacity_micromap, on a surface whose geometry is resident (D96).
 	};
 	LocalVector<PendingMMSurface> pending_mm_surfaces;
+
+	// The build budget (D97): this frame's new surfaces and merges admitted or left waiting, once,
+	// before the first viewport's walk, which publishes the frame's budget counters.
+	const bool build_budget_publishes = build_budget.enabled && build_budget.prepass_frame != RD::get_singleton()->get_frames_drawn();
+	_build_budget_prepass(p_render_data, p_rt_flags);
 
 	const PagedArray<RenderGeometryInstance *> &rt_instances = *p_render_data->rt_instances;
 	for (uint32_t i = 0; i < (uint32_t)rt_instances.size(); i++) {
@@ -8065,7 +8578,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 						WARN_PRINT_ONCE("RT: the G-buffer primary rasterizes a MultiMesh of a surface whose geometry streams at its fallback level (D93d), coarser than the traced surface; the traced primary is the look.");
 					}
 					bool bakes = false;
-					const bool merges = _plan_merged_mm(mm_rid, mm_gpu_buffer, mesh_surface, mm_count, mm_surf->surface_index, surface_counter, bakes);
+					const bool merges = !_build_budget_merge_waits(mm_rid, mm_surf->surface_index) && _plan_merged_mm(mm_rid, mm_gpu_buffer, mesh_surface, mm_count, mm_surf->surface_index, surface_counter, bakes);
 					pending.source = process_surface(mm_surf, mesh_surface, surface_counter, instance_transform, dirty_blas_list);
 					if (pending.source && pending.source->geometry_streamed && ((merges && bakes) || (mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT))) {
 						_materialize_surface(pending.source, mesh_surface, false, true);
@@ -8391,6 +8904,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			}
 #endif
 
+			if (build_budget.enabled) {
+				_build_budget_stamp(inst, surf->surface_index, RD::get_singleton()->get_frames_drawn()); // Its next miss is forced (D97).
+			}
 			if (ptlas_slots_enabled) {
 				// Its slot keeps what it holds unless the instance or its rows changed (D94b).
 				const uint32_t range = _slot_range_acquire(state, inst->rt_slots, surf->surface_index, 1);
@@ -8471,12 +8987,20 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			_omm_attach_merged(pending.mm_rid, pending.surface_index, mm_omm_agreed[(uint64_t(pending.mm_rid.get_local_index()) << 32) | pending.surface_index]);
 		}
 		RTSurfaceData merged_sd;
-		bool use_merged = pending.mm_gpu_buffer.is_valid() &&
+		// A merge the build budget (D97) left waiting traces its expanded instances meanwhile.
+		bool use_merged = pending.mm_gpu_buffer.is_valid() && !_build_budget_merge_waits(pending.mm_rid, pending.surface_index) &&
 				_build_merged_mm_blas(pending.mm_rid, pending.mm_gpu_buffer, pending.mesh_surface,
 						pending.mm_count, pending.surface_index, pending.surface_counter, pending.mm_aabb, pending.source,
 						compute_list, dirty_blas_list, dirty_blas_update_list, &merged_sd);
 
 		if (use_merged) {
+			if (build_budget.enabled) {
+				// The merge's surface: expanded the next frame (past its cap), its base surface is forced (D97).
+				_build_budget_stamp(pending.mm_surf->owner, pending.surface_index, RD::get_singleton()->get_frames_drawn());
+			}
+			if (_build_budget_merge_admitted(pending.mm_rid, pending.surface_index)) {
+				build_budget.built += dirty_blas_list.size() - mm_slot_build_size;
+			}
 #ifdef TOOLS_ENABLED
 			if (collect_render_info) {
 				tlas_instance_count++;
@@ -8525,6 +9049,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					pending.surface_counter, pending.instance_transform, dirty_blas_list);
 			if (!surf_data || !surf_data->blas.is_valid()) {
 				continue;
+			}
+			if (build_budget.enabled) {
+				_build_budget_stamp(pending.mm_surf->owner, pending.surface_index, RD::get_singleton()->get_frames_drawn()); // D97.
 			}
 
 			// Slot-resident (D94b): one slot per element. A range whose key is unchanged is skipped
@@ -8700,10 +9227,19 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_OBJECTS_IN_FRAME] += tlas_instance_count;
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME] += tlas_primitive_count;
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_TLAS_INSTANCES] += tlas_instance_count;
-		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_BLAS_BUILDS] += rt_blas_builds + cluster_blas_builds + deformed_cluster_builds;
-		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_BLAS_REFITS] += rt_blas_refits + deformed_cluster_refits;
-		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_TRIANGLES_BUILT] += rt_triangles_built + cluster_triangles_built + deformed_cluster_triangles_built;
-		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_TRIANGLES_REFIT] += rt_triangles_refit + deformed_cluster_triangles_refit;
+		const uint32_t frame_builds = rt_blas_builds + cluster_blas_builds + deformed_cluster_builds + frame_extra_builds;
+		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_BLAS_BUILDS] += frame_builds;
+		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_BLAS_REFITS] += rt_blas_refits;
+		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_TRIANGLES_BUILT] += rt_triangles_built + cluster_triangles_built + deformed_cluster_triangles_built + frame_extra_triangles;
+		if (build_budget_publishes) {
+			// The build budget's frame (D97): what it admitted is deferrable work, the rest forced.
+			int *info = p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE];
+			info[RSE::VIEWPORT_RENDER_INFO_RT_BUILDS_FORCED] += frame_builds > build_budget.built ? int(frame_builds - build_budget.built) : 0;
+			info[RSE::VIEWPORT_RENDER_INFO_RT_BUILDS_DEFERRED] += int(build_budget.deferred);
+			info[RSE::VIEWPORT_RENDER_INFO_RT_BUILD_QUEUE_DEPTH] += int(build_budget.waiting + build_budget.held);
+			info[RSE::VIEWPORT_RENDER_INFO_RT_BUILD_BUDGET_TRIANGLES] += int(MIN(build_budget.spent_triangles, uint64_t(INT32_MAX)));
+		}
+		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_TRIANGLES_REFIT] += rt_triangles_refit;
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_INSTANCES_COMPILING] += rt_instances_compiling;
 	}
 #endif

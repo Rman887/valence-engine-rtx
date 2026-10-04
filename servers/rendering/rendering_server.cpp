@@ -3292,6 +3292,10 @@ void RenderingServer::_bind_methods() {
 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_RENDER_INFO_RT_SLOTS_GLOBAL_OVERFLOW);
 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_RENDER_INFO_RT_PTLAS_FROM_SCRATCH);
 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_RENDER_INFO_RT_PTLAS_DANGLING_DISABLES);
+	BIND_ENUM_CONSTANT(RSE::VIEWPORT_RENDER_INFO_RT_BUILDS_FORCED);
+	BIND_ENUM_CONSTANT(RSE::VIEWPORT_RENDER_INFO_RT_BUILDS_DEFERRED);
+	BIND_ENUM_CONSTANT(RSE::VIEWPORT_RENDER_INFO_RT_BUILD_QUEUE_DEPTH);
+	BIND_ENUM_CONSTANT(RSE::VIEWPORT_RENDER_INFO_RT_BUILD_BUDGET_TRIANGLES);
 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_RENDER_INFO_MAX);
 
 	BIND_ENUM_CONSTANT(RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE);
@@ -4172,6 +4176,10 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/cluster_lod_stream_upload_mb_per_frame", PROPERTY_HINT_RANGE, "1,4096,1"), 32);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/cluster_lod_stream_fallback_ratio", PROPERTY_HINT_RANGE, "0,1,0.001"), 0.125);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_stream_geometry_ram_check", false);
+	GLOBAL_DEF_RST("rendering/pathtracing/build_budget", false);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/build_budget_triangles_per_frame", PROPERTY_HINT_RANGE, "1024,1073741824,1"), 262144);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/build_budget_builds_per_frame", PROPERTY_HINT_RANGE, "1,1048576,1"), 64);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/build_budget_max_wait_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 30);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/deformed_mesh_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 60);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_blas_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,18000,1"), 3600);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_merged_blas_max_triangles", PROPERTY_HINT_RANGE, "256,1048576,1"), 65536);

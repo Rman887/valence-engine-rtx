@@ -98,6 +98,8 @@ struct alignas(16) RT_GeometryData {
 	// With RT_GEOM_FLAG_CLUSTER_GEOMETRY (D93): the surface's first cluster geometry record, in words
 	// into the LOD table.
 	uint32_t cluster_record_base;
+	// _pad[RT_GEOMETRY_LAYERS_WORD]: the instance's visual layers, stamped on the frame's copy of the
+	// row, never the cached one (D104); the hit shaders test a decal's cull mask against them.
 	uint32_t _pad[4];
 };
 static_assert(sizeof(RT_GeometryData) == 128, "RT_GeometryData must be 128 bytes for std430");
@@ -107,6 +109,11 @@ struct RT_InstanceMotionData {
 	float prev_object_to_world[12]; // Previous object-to-world (mat3x4, transposed 3x4).
 };
 static_assert(sizeof(RT_InstanceMotionData) == 48, "RT_InstanceMotionData must be 48 bytes");
+
+enum : uint32_t {
+	RT_GEOMETRY_LAYERS_WORD = 0, // Must match the word raytracing_decals_inc.glsl reads.
+	RT_GEOMETRY_LAYERS_MASK = (1u << 20) - 1, // The scene's layers; the editor's (20 and up) never enter the trace.
+};
 
 // Must match GLSL MaterialData (std430, 112 bytes).
 struct alignas(16) RT_MaterialData {
@@ -185,6 +192,45 @@ enum {
 	RT_EMISSIVE_MAX = 1024,
 	RT_EMISSIVE_FLAG_TWO_SIDED = 1u,
 	RT_EMISSIVE_FLAG_FLIP_FACING = 2u, // The instance flips the winding: its lit face winds clockwise as seen (Godot front faces).
+};
+
+// A decal as the hit shaders apply it (D104): the raster's DecalData with its transforms in trace
+// space instead of view space. Must match GLSL RTDecalData (std430, 224 bytes) in raytracing_decals_inc.glsl.
+struct alignas(16) RT_DecalData {
+	float xform[12]; // Trace space to the decal's UV space (x and z in [0, 1], y in [-1, 1]), three rows.
+	float albedo_rect[4]; // Decal atlas rects, position then size; all zero for a missing texture.
+	float normal_rect[4];
+	float orm_rect[4];
+	float emission_rect[4];
+	float modulate[4]; // Linear, alpha times the distance fade.
+	float normal_xform[12]; // The decal's world basis, orthonormalized, three rows (xyz used).
+	float normal[3]; // The decal's up axis in world space, for the normal fade.
+	uint32_t mask; // The decal's cull mask, against the instance's layers.
+	float emission_energy; // Times the distance fade.
+	float albedo_mix;
+	float upper_fade;
+	float lower_fade;
+	float normal_fade;
+	uint32_t order; // The raster's sort rank (camera distance minus the sorting offset): lower is nearer, applied later.
+	float _pad[2];
+};
+static_assert(sizeof(RT_DecalData) == 224, "RT_DecalData must be 224 bytes for std430");
+
+// A node of the decals' bounding volume hierarchy (D104), built per frame on the CPU over the decals'
+// trace-space boxes. Must match GLSL RTDecalNode (std430, 32 bytes) in raytracing_decals_inc.glsl.
+struct alignas(16) RT_DecalNode {
+	float aabb_min[3];
+	uint32_t child; // An inner node: the right child (the left is the next node); a leaf: RT_DECAL_LEAF_BIT | first record.
+	float aabb_max[3];
+	uint32_t count; // A leaf's record count, 0 for an inner node.
+};
+static_assert(sizeof(RT_DecalNode) == 32, "RT_DecalNode must be 32 bytes for std430");
+
+enum : uint32_t {
+	RT_DECALS_MAX = 4096, // The decal buffer's capacity; past it the farthest decals are dropped.
+	RT_DECAL_LEAF_SIZE = 4, // Must not exceed what RT_DECAL_STACK_SIZE in raytracing_decals_inc.glsl allows for the depth.
+	RT_DECAL_NODES_MAX = 2 * RT_DECALS_MAX - 1,
+	RT_DECAL_LEAF_BIT = 0x80000000u, // Must match RT_DECAL_LEAF_BIT in raytracing_decals_inc.glsl.
 };
 
 // A node of the light tree (D55): a bounding sphere, an orientation cone, the summed power and the
@@ -1185,6 +1231,8 @@ struct RTViewportState {
 	RID emissive_buffer; // The emissive mesh lights of the frame (D50), RT_EMISSIVE_MAX entries.
 	RID light_tree_buffer; // The light tree (D55): a header, the nodes, each emissive entry's cut slot, the cut's nodes and the leaf list (D56), each emissive entry's leaf position and the leaves' alias tables per cut (D60, D61); rebuilt per frame while the Environment asks for it.
 	uint32_t emissive_count_logged = 0; // The last count printed for this viewport.
+	RID decal_buffer; // The decals the hit shaders apply (D104), RT_DECALS_MAX entries; made with the first decal.
+	RID decal_node_buffer; // Their bounding volume hierarchy, RT_DECAL_NODES_MAX nodes.
 	RID params_buffer;
 	// The sky's sampling table (D54), rebuilt by `RenderRaytracing::update_sky_light` when the
 	// sky or its rendered radiance changes; zero (no sky light) until then.
@@ -1731,6 +1779,20 @@ class RenderRaytracing {
 	LocalVector<Pair<uint32_t, const RTSlotEmissive *>> emissive_slot_records; ///< The emissive slots in slot order (D94b).
 	LocalVector<RT_EmissiveInstance> emissive_scratch;
 	LocalVector<RT_LightData> light_scratch; ///< The frame's light list before upload.
+	// The decals' gather and hierarchy (D104): each decal's record in rank order, its trace-space box,
+	// the build's index permutation, and the records and nodes in leaf order as uploaded.
+	struct DecalCandidate {
+		RID instance;
+		float depth; // Camera distance minus the sorting offset, the raster's sort key.
+		bool operator<(const DecalCandidate &p_other) const { return depth < p_other.depth; }
+	};
+	LocalVector<DecalCandidate> decal_candidates;
+	LocalVector<RT_DecalData> decal_records;
+	LocalVector<AABB> decal_bounds;
+	LocalVector<uint32_t> decal_order;
+	LocalVector<RT_DecalData> decal_leaf_records;
+	LocalVector<RT_DecalNode> decal_nodes;
+	uint32_t _build_decal_node(uint32_t p_first, uint32_t p_count); // One node of the decals' hierarchy over decal_order[p_first, p_first + p_count), its index.
 	// The light tree's build scratch (D55): a leaf per positional light and per emissive entry,
 	// the nodes in depth-first order, each emissive entry's cut slot, the cut's nodes and the leaf
 	// list (D56), uploaded as one buffer.
@@ -1822,6 +1884,11 @@ class RenderRaytracing {
 	uint64_t _surface_row_generation(RTSurfaceData *p_surf_data);
 	uint64_t _material_row_generation(RTMaterialData *p_mat_data);
 	uint64_t _local_row_generation(uint32_t p_range, const RT_GeometryData &p_row);
+	// A cached row's generation with the instance's layers folded in (D104): its slot's row carries
+	// them, so a change of layers alone re-emits it. Injective while generations stay under 2^44.
+	static _FORCE_INLINE_ uint64_t _layer_row_generation(uint64_t p_generation, uint32_t p_layers) {
+		return (p_generation << 20) | (p_layers & RT_GEOMETRY_LAYERS_MASK);
+	}
 	static void _slot_relative_transform(const Transform3D &p_transform, const Vector3 &p_origin, float *r_rows);
 	// A cell's origin (D94c): its corner on x and z, at y = 0, computed in double.
 	_FORCE_INLINE_ Vector3 _slot_cell_origin(const Vector3i &p_cell) const {
@@ -2159,6 +2226,8 @@ public:
 	RTViewportState *build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_primary_from_gbuffer = false);
 	uint32_t gather_lights(const RenderDataRD *p_render_data, RT_LightData *r_light_data, uint32_t p_max_lights, const Vector3 &p_origin, float &r_score_sum, uint32_t &r_directional_count);
 	uint32_t gather_emissive(const RenderDataRD *p_render_data, const RTViewportState *p_state, RT_EmissiveInstance *r_emissive_data, uint32_t p_max_emissive, float &r_score_sum);
+	// The decals the hit shaders apply (D104): gathered from the trace's cull, uploaded with their hierarchy; returns the count.
+	uint32_t gather_decals(RTViewportState *p_state, const RenderDataRD *p_render_data);
 	uint32_t build_light_tree(const RT_LightData *p_lights, uint32_t p_light_count, uint32_t p_directional_count, const RT_EmissiveInstance *p_emissive, uint32_t p_emissive_count, float p_exposure, uint32_t p_cut_size, uint32_t p_cut_indirect_size, bool p_power_pick);
 	RID update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_primary_from_gbuffer);
 	void update_sky_light(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags);

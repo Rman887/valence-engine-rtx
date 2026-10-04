@@ -13,7 +13,7 @@
 // ============================================================================
 // RT_PARAMS INDICES - Must match RT_PARAM_* in scene_shader_raytracing.h
 // ============================================================================
-// rt_params is a vec4[5] uniform buffer (20 floats total)
+// rt_params is a vec4[6] uniform buffer (24 floats total)
 // Access: rt_params[idx >> 2][idx & 3] or get_rt_param(idx)
 #define RT_PARAM_VIS_MODE 0 // rt_params[0].x - Debug visualization mode (0 = disabled)
 #define RT_PARAM_SAMPLE_COUNT 1 // rt_params[0].y - Samples per pixel
@@ -38,6 +38,7 @@
 #define RT_PARAM_SKY_SURFACE_SCORE 17 // rt_params[4].y - The analytic and emissive lights' summed score the sky's share is judged against (D54)
 #define RT_PARAM_DIRECTIONAL_COUNT 18 // rt_params[4].z - The directional lights at the head of the light buffer, the light tree's top-level entries (D55)
 #define RT_PARAM_MAX_DIFFUSE_BOUNCES 19 // rt_params[4].w - The diffuse bounce limit, Environment.pathtracing_max_diffuse_bounces (D74)
+#define RT_PARAM_DECAL_COUNT 20 // rt_params[5].x - The decals the hit shaders apply (D104), 0 to skip the walk
 
 // ============================================================================
 // PATHTRACING PAYLOAD (52 bytes, fp16/unorm-packed)

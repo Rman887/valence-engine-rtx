@@ -826,6 +826,11 @@ public:
 		return di->transform;
 	}
 
+	_FORCE_INLINE_ float decal_instance_get_sorting_offset(RID p_decal_instance) const {
+		DecalInstance *di = decal_instance_owner.get_or_null(p_decal_instance);
+		return di->sorting_offset;
+	}
+
 	_FORCE_INLINE_ ForwardID decal_instance_get_forward_id(RID p_decal_instance) {
 		DecalInstance *di = decal_instance_owner.get_or_null(p_decal_instance);
 		return di->forward_id;

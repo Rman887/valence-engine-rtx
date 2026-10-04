@@ -3363,6 +3363,9 @@ void RendererSceneCull::_scene_cull(CullData &cull_data, InstanceCullResult &cul
 						uint32_t base_type = idata.flags & InstanceData::FLAG_BASE_TYPE_MASK;
 						if (base_type == RSE::INSTANCE_LIGHT) {
 							cull_result.rt_light_instances.push_back(RID::from_uint64(idata.instance_data_rid));
+						} else if (base_type == RSE::INSTANCE_DECAL) {
+							// Decals in the hit shaders (D104): a reflection or a bounce reaches decals the camera does not see.
+							cull_result.rt_decal_instances.push_back(RID::from_uint64(idata.instance_data_rid));
 						} else if ((base_type == RSE::INSTANCE_MESH || base_type == RSE::INSTANCE_MULTIMESH) &&
 								!(idata.flags & InstanceData::FLAG_CAST_SHADOWS_ONLY)) {
 							cull_result.rt_geometry_instances.push_back(idata.instance_geometry);
@@ -3831,7 +3834,7 @@ void RendererSceneCull::_render_scene(const RendererSceneRender::CameraData *p_c
 	}
 
 	RENDER_TIMESTAMP("Render 3D Scene");
-	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, &sdfgi_update_data, r_render_info, &scene_cull_result.rt_geometry_instances, &scene_cull_result.rt_light_instances);
+	scene_render->render_scene(p_render_buffers, p_camera_data, prev_camera_data, scene_cull_result.geometry_instances, scene_cull_result.light_instances, scene_cull_result.reflections, scene_cull_result.voxel_gi_instances, scene_cull_result.decals, scene_cull_result.lightmaps, scene_cull_result.fog_volumes, p_environment, camera_attributes, p_compositor, p_shadow_atlas, occluders_tex, p_reflection_probe.is_valid() ? RID() : scenario->reflection_atlas, p_reflection_probe, p_reflection_probe_pass, p_screen_mesh_lod_threshold, render_shadow_data, max_shadows_used, render_sdfgi_data, cull.sdfgi.region_count, p_window_output_max_value, &sdfgi_update_data, r_render_info, &scene_cull_result.rt_geometry_instances, &scene_cull_result.rt_light_instances, &scene_cull_result.rt_decal_instances);
 
 	if (p_viewport.is_valid()) {
 		RSG::viewport->viewport_set_prev_camera_data(p_viewport, p_camera_data);

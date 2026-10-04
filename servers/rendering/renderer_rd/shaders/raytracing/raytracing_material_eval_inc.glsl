@@ -8,6 +8,7 @@ struct MaterialResult {
 	float metalness;
 	float specular; // Dielectric specular reflectance control [0..1], default 0.5 -> F0 = 0.04.
 	vec3 emissive;
+	vec3 decal_emissive; // Decals' emission (D104), which no light sample reaches, so it is added at full weight; with the exposure normalisation.
 	vec3 normal; // Final shading normal (world space, after normal mapping).
 	vec3 transmission; // Fraction of the unreflected light that continues through the surface, per channel; 0 = opaque.
 	float ior; // Refractive index of the medium behind the surface, for the refracted direction and the interface's Fresnel.
@@ -25,6 +26,7 @@ MaterialResult default_material_result(vec3 geometry_normal) {
 	r.metalness = 0.0;
 	r.specular = 0.5;
 	r.emissive = vec3(0.0);
+	r.decal_emissive = vec3(0.0);
 	r.normal = geometry_normal;
 	r.transmission = vec3(0.0);
 	r.ior = 1.5;

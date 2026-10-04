@@ -210,6 +210,7 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	m.metalness = geo_normal_metallic.a;
 	m.specular = albedo_specular.a;
 	m.emissive = emission_ior.rgb;
+	m.decal_emissive = vec3(0.0); // The raster's decals are in the G-buffer's emission, which the camera ray sees at full weight.
 	m.normal = normalize(normal_roughness.xyz);
 	m.transmission = clamp(transmission_flags.rgb, vec3(0.0), vec3(1.0));
 	m.ior = max(emission_ior.a, 1.0);
@@ -673,6 +674,7 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 #include "raytracing_light_tree_inc.glsl"
 #include "raytracing_material_eval_inc.glsl"
 #include "raytracing_closest_hit_common_inc.glsl"
+#include "raytracing_decals_inc.glsl"
 // clang-format on
 
 // ============================================================================
@@ -710,6 +712,7 @@ void main() {
 	m.metalness = metallic;
 	m.specular = specular;
 	m.emissive = emission * scene_data_block.data.emissive_exposure_normalization;
+	m.decal_emissive = vec3(0.0);
 	m.normal = normalize(mat3(inv_view_matrix) * normal); // view space -> world space
 	m.transmission = clamp(transmission, vec3(0.0), vec3(1.0));
 	m.ior = max(ior, 1.0);
@@ -725,6 +728,9 @@ void main() {
 		m.normal = apply_normal_map(h, ts_normal, normal_map_depth);
 	}
 
+	// Decals over the evaluated material (D104).
+	apply_decals(h, m);
+
 #ifdef RT_DEBUG_ENABLED
 	{
 		int VIS_MODE = int(get_rt_param(RT_PARAM_VIS_MODE));
@@ -733,7 +739,7 @@ void main() {
 			float NdotV = max(dot(m.normal, V), 0.0001);
 			vec3 orm = vec3(1.0, m.roughness, m.metalness);
 			debug_visualize(VIS_MODE, h.geometry_normal, m.normal, normal_map,
-					h.tangent, h.bitangent, h.uv, m.albedo, orm, m.metalness, m.roughness, m.specular, m.emissive, V, NdotV, gl_HitTEXT, h.is_front_face);
+					h.tangent, h.bitangent, h.uv, m.albedo, orm, m.metalness, m.roughness, m.specular, m.emissive + m.decal_emissive, V, NdotV, gl_HitTEXT, h.is_front_face);
 			return;
 		}
 	}
@@ -778,11 +784,16 @@ void main() {
 	m.metalness = metalness;
 	m.specular = mat.specular;
 	m.emissive = emissive;
+	m.decal_emissive = vec3(0.0);
 	m.normal = final_normal;
 	m.transmission = vec3(0.0);
 	m.ior = 1.5;
 	m.absorption = vec3(0.0);
 	m.scattering = vec3(0.0);
+
+	// Decals over the evaluated material (D104), before the back lighting reads the albedo, as in the raster.
+	apply_decals(h, m);
+
 	// Back lighting (D103) as the raster weighs it: its BACKLIGHT (the sRGB colour decoded, plus the
 	// texture read linear) times the diffuse albedo, as the albedo of the thin diffuse-transmission lobe.
 	m.diffuse_transmission = vec3(0.0);
@@ -792,7 +803,7 @@ void main() {
 		if (mat.backlight_texture_idx != 0u) {
 			backlight += sample_material_texture(mat.backlight_texture_idx, uv, mat.flags).rgb;
 		}
-		m.diffuse_transmission = clamp(backlight * albedo * (1.0 - metalness), vec3(0.0), vec3(1.0));
+		m.diffuse_transmission = clamp(backlight * m.albedo * (1.0 - m.metalness), vec3(0.0), vec3(1.0));
 	}
 
 #ifdef RT_DEBUG_ENABLED
@@ -801,8 +812,8 @@ void main() {
 		if (VIS_MODE != 0) {
 			vec3 V = -gl_WorldRayDirectionEXT;
 			float NdotV = max(dot(m.normal, V), 0.0001);
-			debug_visualize(VIS_MODE, h.geometry_normal, final_normal, tangent_space_normal,
-					h.tangent, h.bitangent, uv, albedo, orm, metalness, roughness, mat.specular, emissive, V, NdotV, gl_HitTEXT, h.is_front_face);
+			debug_visualize(VIS_MODE, h.geometry_normal, m.normal, tangent_space_normal,
+					h.tangent, h.bitangent, uv, m.albedo, orm, m.metalness, m.roughness, mat.specular, m.emissive + m.decal_emissive, V, NdotV, gl_HitTEXT, h.is_front_face);
 			return;
 		}
 	}

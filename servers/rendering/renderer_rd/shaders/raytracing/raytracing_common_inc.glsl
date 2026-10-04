@@ -67,7 +67,7 @@ layout(set = 0, binding = 14, std430) readonly buffer GlobalShaderUniformData {
 global_shader_uniforms;
 
 layout(set = 0, binding = 6, std140) uniform RaytracingParams {
-	vec4 rt_params[5];
+	vec4 rt_params[6];
 	mat4 prev_vp_unjittered;
 	mat4 curr_vp_unjittered;
 	// World-space anchor the trace is relative to (camera-relative tracing).

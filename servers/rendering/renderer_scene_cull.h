@@ -898,6 +898,7 @@ public:
 		// Used for path tracing TLAS and light gathering only (not rasterized).
 		PagedArray<RenderGeometryInstance *> rt_geometry_instances;
 		PagedArray<RID> rt_light_instances;
+		PagedArray<RID> rt_decal_instances; // The decals in the trace's cull volume (D104).
 
 		struct DirectionalShadow {
 			PagedArray<RenderGeometryInstance *> cascade_geometry_instances[RendererSceneRender::MAX_DIRECTIONAL_LIGHT_CASCADES];
@@ -918,6 +919,7 @@ public:
 			fog_volumes.clear();
 			rt_geometry_instances.clear();
 			rt_light_instances.clear();
+			rt_decal_instances.clear();
 			for (int i = 0; i < RendererSceneRender::MAX_DIRECTIONAL_LIGHTS; i++) {
 				for (int j = 0; j < RendererSceneRender::MAX_DIRECTIONAL_LIGHT_CASCADES; j++) {
 					directional_shadows[i].cascade_geometry_instances[j].clear();
@@ -945,6 +947,7 @@ public:
 			fog_volumes.reset();
 			rt_geometry_instances.reset();
 			rt_light_instances.reset();
+			rt_decal_instances.reset();
 			for (int i = 0; i < RendererSceneRender::MAX_DIRECTIONAL_LIGHTS; i++) {
 				for (int j = 0; j < RendererSceneRender::MAX_DIRECTIONAL_LIGHT_CASCADES; j++) {
 					directional_shadows[i].cascade_geometry_instances[j].reset();
@@ -972,6 +975,7 @@ public:
 			fog_volumes.merge_unordered(p_cull_result.fog_volumes);
 			rt_geometry_instances.merge_unordered(p_cull_result.rt_geometry_instances);
 			rt_light_instances.merge_unordered(p_cull_result.rt_light_instances);
+			rt_decal_instances.merge_unordered(p_cull_result.rt_decal_instances);
 
 			for (int i = 0; i < RendererSceneRender::MAX_DIRECTIONAL_LIGHTS; i++) {
 				for (int j = 0; j < RendererSceneRender::MAX_DIRECTIONAL_LIGHT_CASCADES; j++) {
@@ -1000,6 +1004,7 @@ public:
 			fog_volumes.set_page_pool(p_rid_pool);
 			rt_geometry_instances.set_page_pool(p_geometry_instance_pool);
 			rt_light_instances.set_page_pool(p_rid_pool);
+			rt_decal_instances.set_page_pool(p_rid_pool);
 			for (int i = 0; i < RendererSceneRender::MAX_DIRECTIONAL_LIGHTS; i++) {
 				for (int j = 0; j < RendererSceneRender::MAX_DIRECTIONAL_LIGHT_CASCADES; j++) {
 					directional_shadows[i].cascade_geometry_instances[j].set_page_pool(p_geometry_instance_pool);

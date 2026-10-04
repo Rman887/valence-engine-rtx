@@ -391,7 +391,8 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		}
 		emissive_weight = emissive_mis_weight(ps.bsdf_pdf, pdf_light);
 	}
-	vec3 emitted = ps.throughput * m.emissive * emissive_weight;
+	// A decal's emission (D104) is not in the emissive list, so the BSDF ray is its only estimator.
+	vec3 emitted = ps.throughput * m.emissive * emissive_weight + ps.throughput * m.decal_emissive;
 	if (is_scattered(ps.packed_bounces_flags)) {
 		// An emitter found after a scatter is indirect light; the one the camera sees, through
 		// any delta interfaces, is the image (D53).

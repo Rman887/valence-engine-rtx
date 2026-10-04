@@ -101,4 +101,5 @@ public:
 	/* RT-extra: AABB-culled instances/lights outside frustum for TLAS and light gathering. */
 	const PagedArray<RenderGeometryInstance *> *rt_instances = nullptr;
 	const PagedArray<RID> *rt_lights = nullptr;
+	const PagedArray<RID> *rt_decals = nullptr; // The decals in the trace's cull volume (D104), not only the camera's frustum.
 };

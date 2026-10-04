@@ -1019,7 +1019,7 @@ RSE::PathtracingDenoiser RendererEnvironmentStorage::environment_get_pathtracing
 
 RSE::PathtracingPrimarySurface RendererEnvironmentStorage::environment_get_pathtracing_primary_surface(RID p_env) const {
 	Environment *env = environment_owner.get_or_null(p_env);
-	ERR_FAIL_NULL_V(env, RSE::PT_PRIMARY_SURFACE_GBUFFER);
+	ERR_FAIL_NULL_V(env, RSE::PT_PRIMARY_SURFACE_TRACED);
 	return env->pathtracing_primary_surface;
 }
 

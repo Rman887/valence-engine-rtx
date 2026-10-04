@@ -6169,10 +6169,10 @@
 			Uses NVIDIA DLSS Ray Reconstruction to denoise the path-traced image. DLSS Ray Reconstruction is a neural temporal denoiser that accumulates information across frames to produce a clean, high-quality result at low sample counts. Requires an NVIDIA RTX GPU and the Streamline plugin to be active.
 		</constant>
 		<constant name="PT_PRIMARY_SURFACE_GBUFFER" value="0" enum="PathtracingPrimarySurface">
-			The visible surface comes from a rasterized G-buffer; the path tracer starts from it.
+			The visible surface comes from a rasterized G-buffer; the path tracer starts from it. An A/B comparison path for the traced primary ray.
 		</constant>
 		<constant name="PT_PRIMARY_SURFACE_TRACED" value="1" enum="PathtracingPrimarySurface">
-			The visible surface comes from tracing the primary ray. A reference view for the G-buffer path.
+			The visible surface comes from tracing the primary ray. The default.
 		</constant>
 		<constant name="PT_SAMPLER_HASH" value="0" enum="PathtracingSampler">
 			Independent hashed random numbers: white noise, the default.

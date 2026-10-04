@@ -178,7 +178,7 @@ private:
 		int pathtracing_samples_per_pixel = 1;
 		int pathtracing_max_bounces = 3;
 		RSE::PathtracingDenoiser pathtracing_denoiser = RSE::PT_DENOISER_NONE;
-		RSE::PathtracingPrimarySurface pathtracing_primary_surface = RSE::PT_PRIMARY_SURFACE_GBUFFER;
+		RSE::PathtracingPrimarySurface pathtracing_primary_surface = RSE::PT_PRIMARY_SURFACE_TRACED;
 		bool pathtracing_emissive_lights = true;
 		int pathtracing_emissive_candidates = 8;
 		RSE::PathtracingSampler pathtracing_sampler = RSE::PT_SAMPLER_HASH;

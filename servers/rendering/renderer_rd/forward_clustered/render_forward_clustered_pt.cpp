@@ -118,7 +118,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 	}
 
 	// The primary surface (Environment.pathtracing_primary_surface): a G-buffer pass finds the
-	// visible surface and the trace starts from it; the traced primary ray is the reference view.
+	// visible surface and the trace starts from it, as a comparison path for the traced primary ray (the default).
 	// MSAA has no meaning under path tracing and the G-buffer pass draws into the single-sample
 	// depth buffer, so a viewport with MSAA on falls back to the traced primary ray.
 	const bool gbuffer_requested = environment_get_pathtracing_primary_surface(p_render_data->environment) == RSE::PT_PRIMARY_SURFACE_GBUFFER;

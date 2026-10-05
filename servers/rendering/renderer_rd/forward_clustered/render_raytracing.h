@@ -784,6 +784,7 @@ struct RTLodSelectBatch {
 	uint32_t clas_total_vertices = 0;
 	LocalVector<RID> clas_source_buffers;
 	LocalVector<RID> clas_index_buffers_seen;
+	LocalVector<RID> clas_template_buffers; // The templates the deformed items' instantiations read (D108).
 	RID args_buffer;
 	uint32_t args_capacity = 0; // Bytes.
 	LocalVector<uint8_t> args_host;
@@ -934,8 +935,8 @@ struct RTDeformedCacheEntry {
 	RID cluster_index_buffer; // The mesh's index buffer the infos read, listed as a source at each rebuild.
 	// The cluster LOD hierarchy on the GPU (D87): the entry's region of the shared LOD table
 	// (each cluster's group and the group it refines, the groups' bounds and errors, and every
-	// level's CLAS build info, since a deformed hierarchy has no CLAS until a frame builds the
-	// selected ones), the count over every level (a selection's bound, the BLAS storage's size)
+	// level's CLAS info, a build info or, templated, an instantiation info (D108), since a deformed
+	// hierarchy has no CLAS until a frame makes the selected ones), the count over every level (a selection's bound, the BLAS storage's size)
 	// and the build's totals. While the region exists the selection, not the batch above,
 	// rebuilds the entry on every frame it is traced.
 	uint32_t cluster_lod_table_offset = UINT32_MAX; // Words; UINT32_MAX without a hierarchy.
@@ -1579,10 +1580,14 @@ class RenderRaytracing {
 	// words, first fit, merged on free, grown by copy), the instance slots and the frame's batch.
 	bool cluster_lod_select_enabled = false;
 	// Deformed surfaces select too (D87), rendering/pathtracing/cluster_lod_deformed with the two
-	// above and cluster_blas_deformed; their selected CLAS are built each frame into explicit slots
-	// of this size (the worst case of one cluster under the D80 limits) in a region of the deformed
-	// batch's pool.
+	// above and cluster_blas_deformed; their selected CLAS are built, or instantiated from templates
+	// (D108), each frame into explicit slots of this size (the worst case of one cluster under the D80
+	// limits, of a build or an instantiation) in a region of the deformed batch's pool.
 	bool cluster_lod_deformed_enabled = false;
+	// The deformed selection instantiates its CLAS from per-level templates (D108), decided once: the
+	// table holds every hierarchy's instantiation infos then, and a hierarchy without templates is
+	// traced at LOD 0. Off where the device has no templates or sizes an instantiation at 0 bytes.
+	bool cluster_lod_deformed_templated = false;
 	uint64_t cluster_lod_clas_slot_size = 0;
 	uint32_t cluster_lod_clas_ceiling_clusters = 0; // RT_LOD_CLAS_REGION_CEILING in slots, less the region's alignment.
 	float cluster_lod_pixel_error = 1.0f;
@@ -2169,7 +2174,7 @@ class RenderRaytracing {
 	static void _on_lod_tree_check_read(const PackedByteArray &p_bytes, uint32_t p_entry_count, uint32_t p_blas_infos_offset, uint32_t p_stride, uint32_t p_instances_offset, uint32_t p_check_offset);
 	// The deformed entries on the selection (D87): the entry's region of the LOD table, made with
 	// its layout and released with its storage, and its record in the frame's batch.
-	bool _populate_deformed_cluster_lod(void *p_mesh_surface, const RTClusterLayout &p_layout, const LocalVector<uint8_t> &p_infos, uint32_t p_cache_key, RTDeformedCacheEntry &r_entry);
+	bool _populate_deformed_cluster_lod(void *p_mesh_surface, const RTClusterLayout &p_layout, const LocalVector<uint8_t> &p_infos, uint32_t p_info_size, uint32_t p_cache_key, RTDeformedCacheEntry &r_entry);
 	void _release_deformed_cluster_lod(RTDeformedCacheEntry &p_entry);
 	void _queue_lod_deformed_instance(RTDeformedCacheEntry &p_entry, const Transform3D &p_transform, uint32_t p_slot);
 	uint32_t *_lod_instance_record(const Transform3D &p_transform, uint32_t p_cluster_count, uint32_t p_table_offset);

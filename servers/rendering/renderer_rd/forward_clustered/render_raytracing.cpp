@@ -134,6 +134,22 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 			slot_input.max_total_vertex_count = max_vertices;
 			uint64_t slot_size = 0, slot_scratch = 0;
 			RD::get_singleton()->cluster_acceleration_structure_get_build_sizes(slot_input, slot_size, slot_scratch);
+			// With templates (D108) the selection instantiates the CLAS instead: the slot holds the
+			// worst case of an instantiation too, under the instantiation's flags and the templates'.
+			if (deformed_cluster_templates_enabled && slot_size > 0) {
+				RD::ClusterAccelerationStructureInput instantiate_input = slot_input;
+				instantiate_input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_INSTANTIATE_TRIANGLE_CLUSTER;
+				uint64_t fast_build_size = 0, fast_trace_size = 0;
+				RD::get_singleton()->cluster_acceleration_structure_get_build_sizes(instantiate_input, fast_build_size, slot_scratch);
+				instantiate_input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+				RD::get_singleton()->cluster_acceleration_structure_get_build_sizes(instantiate_input, fast_trace_size, slot_scratch);
+				cluster_lod_deformed_templated = fast_build_size > 0 && fast_trace_size > 0;
+				if (cluster_lod_deformed_templated) {
+					slot_size = MAX(slot_size, MAX(fast_build_size, fast_trace_size));
+				} else {
+					WARN_PRINT("RT: the driver sized an instantiated cluster acceleration structure at 0 bytes; the deformed selection builds its CLAS each frame (D87).");
+				}
+			}
 			cluster_lod_clas_slot_size = _align_up(slot_size, uint64_t(MAX(caps.cluster_byte_alignment, 1u)));
 			const uint64_t region_alignment = MAX(caps.cluster_byte_alignment, caps.cluster_bottom_level_byte_alignment);
 			cluster_lod_clas_ceiling_clusters = slot_size > 0 && RT_LOD_CLAS_REGION_CEILING > region_alignment ? uint32_t(MIN((RT_LOD_CLAS_REGION_CEILING - region_alignment) / cluster_lod_clas_slot_size, uint64_t(UINT32_MAX))) : 0;
@@ -183,7 +199,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 			RD::get_singleton()->set_resource_name(position_fetch_check_buffer, "RT position fetch check");
 		}
 		// One line on the console (the setting is off by default): the harness reads it as proof the path is active.
-		print_line(vformat("RT: static BLAS built from clusters of up to %d triangles and %d vertices (D79), compaction %s, deformed meshes %s, cluster LOD selection %s, deformed selection %s, CLAS streaming %s.", caps.max_triangles_per_cluster, caps.max_vertices_per_cluster, cluster_compaction_enabled ? "on" : "off", cluster_deformed_enabled ? (deformed_cluster_templates_enabled ? "instantiated from cluster templates (D107)" : "rebuilt from clusters (D82)") : "refit as triangle BLAS", cluster_lod_select_enabled ? vformat("on at %.2f px (D86), traversal %s (D91), BLAS sharing %s", cluster_lod_pixel_error, cluster_lod_traversal_enabled ? "on" : "off", cluster_lod_share_enabled ? vformat("on within %d levels (D89), cached levels %s (D90)", cluster_lod_share_tolerance, cluster_lod_cache_enabled ? "on" : "off") : String("off (D89)")) : "off", cluster_lod_deformed_enabled ? vformat("on, %d byte slots (D87)", cluster_lod_clas_slot_size) : "off", cluster_lod_stream_enabled ? vformat("on within %d MB, %d clusters a frame, unused %d frames before unloading, %d bytes a CLAS at worst (D92)", cluster_lod_stream_budget / (1024 * 1024), cluster_lod_stream_builds_per_frame, cluster_lod_stream_min_age, cluster_lod_stream_cluster_worst) : "off"));
+		print_line(vformat("RT: static BLAS built from clusters of up to %d triangles and %d vertices (D79), compaction %s, deformed meshes %s, cluster LOD selection %s, deformed selection %s, CLAS streaming %s.", caps.max_triangles_per_cluster, caps.max_vertices_per_cluster, cluster_compaction_enabled ? "on" : "off", cluster_deformed_enabled ? (deformed_cluster_templates_enabled ? "instantiated from cluster templates (D107)" : "rebuilt from clusters (D82)") : "refit as triangle BLAS", cluster_lod_select_enabled ? vformat("on at %.2f px (D86), traversal %s (D91), BLAS sharing %s", cluster_lod_pixel_error, cluster_lod_traversal_enabled ? "on" : "off", cluster_lod_share_enabled ? vformat("on within %d levels (D89), cached levels %s (D90)", cluster_lod_share_tolerance, cluster_lod_cache_enabled ? "on" : "off") : String("off (D89)")) : "off", cluster_lod_deformed_enabled ? vformat("on, %d byte slots (D87)%s", cluster_lod_clas_slot_size, cluster_lod_deformed_templated ? ", instantiated from templates (D108)" : "") : "off", cluster_lod_stream_enabled ? vformat("on within %d MB, %d clusters a frame, unused %d frames before unloading, %d bytes a CLAS at worst (D92)", cluster_lod_stream_budget / (1024 * 1024), cluster_lod_stream_builds_per_frame, cluster_lod_stream_min_age, cluster_lod_stream_cluster_worst) : "off"));
 		if (cluster_lod_stream_geometry_enabled) {
 			print_line(vformat("RT: geometry residency on: cluster builds allow data access, hits fetch CLAS positions (D93), blobs load with their groups within %d MB of uploads a frame (D93c).", cluster_lod_stream_upload_cap / (1024 * 1024)));
 		}
@@ -2653,7 +2669,9 @@ RTDeformedClusterTemplate *RenderRaytracing::_deformed_cluster_template_acquire(
 	r_key = key;
 	RTDeformedClusterTemplate *found = deformed_cluster_templates.getptr(key);
 	if (found) {
-		if (found->index_buffer != p_index_buffer || found->surface_counter != p_surface_counter || found->cluster_count != p_cluster_count) {
+		// A request for fewer clusters is the same version's LOD 0, the first of a per-level set (D108),
+		// as after a failed selection flush took the hierarchies off.
+		if (found->index_buffer != p_index_buffer || found->surface_counter != p_surface_counter || found->cluster_count < p_cluster_count) {
 			return nullptr; // A colliding key, or another layout of the same version: built per frame, as D82.
 		}
 		found->refs++;
@@ -2856,15 +2874,35 @@ bool RenderRaytracing::_populate_deformed_cluster_layout(void *p_mesh_surface, u
 	// A micromap (D96 OMMd) is baked over the LOD 0 triangles: its CLAS are LOD 0's alone, as the batch builds them.
 	uint64_t omm_address = 0, omm_index_address = 0;
 	const bool omm = p_omm && _omm_cluster_addresses(p_omm, primitive_count, omm_address, omm_index_address);
-	const bool lod = !omm && layout.levels > 1 && cluster_lod_deformed_enabled && cluster_lod_clas_slot_size > 0;
-	const uint32_t infos_count = lod ? layout.triangles.size() : cluster_count;
+	bool lod = !omm && layout.levels > 1 && cluster_lod_deformed_enabled && cluster_lod_clas_slot_size > 0;
 	_release_deformed_cluster_lod(r_entry);
 	r_entry.cluster_omm = false; // Set with the layout below.
 
-	// The entry's storage holds the BLAS alone, at an explicit address the size query bounds for
-	// this cluster count; its CLAS are built into the frame's region, by the batch with implicit
-	// destinations (_flush_deformed_cluster_batch, as the static path builds its own, D81) or by
-	// the selection into explicit slots (D87).
+	// The surface's templates where the entry needs nothing they cannot carry, a micromap being the
+	// entry's own (OMMd): one a LOD 0 cluster for the batch (D107), or with the hierarchy one a cluster
+	// of every level (D108), whose first LOD 0 count serve the batch too. They belong to this version
+	// of the surface (an index-region update keeps the buffer and bumps the counter), and are held
+	// from here, so that every failure below releases them with the layout. A hierarchy whose
+	// templates cannot be had is traced at LOD 0, since the selection instantiates every entry's CLAS
+	// when the device has templates.
+	RTDeformedClusterTemplate *cluster_template = nullptr;
+	if (!omm && index_buffer.is_valid() && (lod ? cluster_lod_deformed_templated : deformed_cluster_templates_enabled)) {
+		uint64_t template_key = 0;
+		cluster_template = _deformed_cluster_template_acquire(index_buffer, p_surface_counter, r_entry.owned_vb_full, layout, lod ? layout.triangles.size() : cluster_count, geom.index_buffer_address, geom.index_format, geom.vertex_buffer_address, geom.position_stride, template_key);
+		if (cluster_template) {
+			r_entry.cluster_templated = true;
+			r_entry.cluster_template_key = template_key;
+		}
+	}
+	if (lod && cluster_lod_deformed_templated && !cluster_template) {
+		lod = false; // The selection instantiates every hierarchy's CLAS: LOD 0 through the batch instead.
+	}
+	const uint32_t infos_count = lod ? layout.triangles.size() : cluster_count;
+
+	// The entry's storage holds the BLAS, at an explicit address the size query bounds for this
+	// cluster count, and, templated, the batch's LOD 0 CLAS after it (D107); its other CLAS are built
+	// into the frame's region, by the batch with implicit destinations (_flush_deformed_cluster_batch,
+	// as the static path builds its own, D81) or by the selection into explicit slots (D87, D108).
 	RD::ClusterAccelerationStructureInput blas_input;
 	blas_input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
 	blas_input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
@@ -2876,21 +2914,8 @@ bool RenderRaytracing::_populate_deformed_cluster_layout(void *p_mesh_surface, u
 	rd->cluster_acceleration_structure_get_build_sizes(blas_input, blas_size, blas_scratch);
 	if (blas_size == 0) {
 		print_verbose(vformat("RT: deformed surface [%d] on the triangle BLAS path: the driver sized the BLAS at 0 bytes.", p_cache_key));
+		_release_deformed_blas(r_entry); // Its templates, if it took them; it has no BLAS yet.
 		return false;
-	}
-
-	// The mesh surface's templates (D107) where the entry needs nothing they cannot carry: a
-	// micromap is the entry's own (OMMd) and a hierarchy's CLAS are the selection's (D87). They
-	// belong to this version of the surface (an index-region update keeps the buffer and bumps
-	// the counter), and are held from here, so that every failure below releases them with the layout.
-	RTDeformedClusterTemplate *cluster_template = nullptr;
-	if (deformed_cluster_templates_enabled && !omm && !lod && index_buffer.is_valid()) {
-		uint64_t template_key = 0;
-		cluster_template = _deformed_cluster_template_acquire(index_buffer, p_surface_counter, r_entry.owned_vb_full, layout, cluster_count, geom.index_buffer_address, geom.index_format, geom.vertex_buffer_address, geom.position_stride, template_key);
-		if (cluster_template) {
-			r_entry.cluster_templated = true;
-			r_entry.cluster_template_key = template_key;
-		}
 	}
 
 	const uint64_t base_alignment = MAX(caps.cluster_byte_alignment, caps.cluster_bottom_level_byte_alignment);
@@ -2927,50 +2952,52 @@ bool RenderRaytracing::_populate_deformed_cluster_layout(void *p_mesh_surface, u
 		return false;
 	}
 
-	// The CLAS build infos, written once: the positions from the entry's owned vertex buffer, the
-	// indices from the mesh's shared index buffer, each cluster's ID its first triangle (the
-	// coarse levels' past the drawn range, D85). The batch keeps LOD 0's, the table every level's.
+	// The CLAS infos, written once: the batch keeps LOD 0's, the table every level's. Templated, the
+	// instantiation of each cluster's template from the entry's positions (D107, D108); else its build
+	// info, the positions from the entry's owned vertex buffer, the indices from the mesh's shared
+	// index buffer, each cluster's ID its first triangle (the coarse levels' past the drawn range, D85),
+	// which the templates carry too.
 	const uint32_t index_size = geom.index_format == RT_INDEX_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t);
-	const uint32_t clas_info_stride = caps.triangle_build_info_size;
+	const uint32_t clas_info_stride = cluster_template ? caps.instantiate_info_size : caps.triangle_build_info_size;
 	LocalVector<uint8_t> all_infos;
 	all_infos.resize(uint64_t(clas_info_stride) * infos_count);
 	uint32_t first_triangle = 0;
-	for (uint32_t c = 0; c < infos_count; c++) {
-		const uint32_t triangle_count = layout.triangles[c];
-		RD::ClusterTriangleBuildInfo info;
-		info.cluster_id = first_triangle;
-		info.triangle_count = triangle_count;
-		info.vertex_count = layout.vertices[c];
-		info.index_type = geom.index_format == RT_INDEX_FORMAT_UINT16 ? RD::ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT16 : RD::ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT32;
-		info.index_address = geom.index_buffer_address + uint64_t(first_triangle) * 3u * index_size;
-		info.index_stride = index_size;
-		info.vertex_address = geom.vertex_buffer_address;
-		info.vertex_stride = geom.position_stride;
-		if (omm) {
-			info.opacity_micromap_address = omm_address;
-			info.opacity_micromap_index_address = omm_index_address + uint64_t(first_triangle) * sizeof(int32_t);
-			info.opacity_micromap_index_type = RD::ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT32;
-			info.opacity_micromap_index_stride = sizeof(int32_t);
-		}
-		rd->cluster_triangle_build_info_write(all_infos.ptr() + uint64_t(c) * clas_info_stride, info);
-		first_triangle += triangle_count;
-	}
 	if (cluster_template) {
-		// Instantiations of the templates into the entry's own CLAS, from its own positions (D107).
-		const uint32_t instantiate_info_stride = caps.instantiate_info_size;
-		r_entry.cluster_infos.resize(uint64_t(instantiate_info_stride) * cluster_count);
-		for (uint32_t c = 0; c < cluster_count; c++) {
+		for (uint32_t c = 0; c < infos_count; c++) {
 			RD::ClusterInstantiateInfo info;
 			info.template_address = cluster_template->base_address + uint64_t(c) * cluster_template->stride;
 			info.vertex_address = geom.vertex_buffer_address;
 			info.vertex_stride = geom.position_stride;
-			rd->cluster_instantiate_info_write(r_entry.cluster_infos.ptr() + uint64_t(c) * instantiate_info_stride, info);
+			rd->cluster_instantiate_info_write(all_infos.ptr() + uint64_t(c) * clas_info_stride, info);
 		}
+	} else {
+		for (uint32_t c = 0; c < infos_count; c++) {
+			const uint32_t triangle_count = layout.triangles[c];
+			RD::ClusterTriangleBuildInfo info;
+			info.cluster_id = first_triangle;
+			info.triangle_count = triangle_count;
+			info.vertex_count = layout.vertices[c];
+			info.index_type = geom.index_format == RT_INDEX_FORMAT_UINT16 ? RD::ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT16 : RD::ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT32;
+			info.index_address = geom.index_buffer_address + uint64_t(first_triangle) * 3u * index_size;
+			info.index_stride = index_size;
+			info.vertex_address = geom.vertex_buffer_address;
+			info.vertex_stride = geom.position_stride;
+			if (omm) {
+				info.opacity_micromap_address = omm_address;
+				info.opacity_micromap_index_address = omm_index_address + uint64_t(first_triangle) * sizeof(int32_t);
+				info.opacity_micromap_index_type = RD::ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT32;
+				info.opacity_micromap_index_stride = sizeof(int32_t);
+			}
+			rd->cluster_triangle_build_info_write(all_infos.ptr() + uint64_t(c) * clas_info_stride, info);
+			first_triangle += triangle_count;
+		}
+	}
+	r_entry.cluster_infos.resize(uint64_t(clas_info_stride) * cluster_count);
+	memcpy(r_entry.cluster_infos.ptr(), all_infos.ptr(), r_entry.cluster_infos.size());
+	if (cluster_template) {
+		// The batch instantiates its LOD 0 CLAS into the entry's own storage (D107).
 		r_entry.cluster_clas_address = base_address + _align_up(blas_size, base_alignment);
 		r_entry.cluster_clas_stride = uint32_t(clas_stride);
-	} else {
-		r_entry.cluster_infos.resize(uint64_t(clas_info_stride) * cluster_count);
-		memcpy(r_entry.cluster_infos.ptr(), all_infos.ptr(), r_entry.cluster_infos.size());
 	}
 
 	surf_data->blas = blas;
@@ -2986,13 +3013,13 @@ bool RenderRaytracing::_populate_deformed_cluster_layout(void *p_mesh_surface, u
 	r_entry.cluster_built_frame = 0;
 	r_entry.cluster_lod_last = false;
 	if (lod) {
-		_populate_deformed_cluster_lod(p_mesh_surface, layout, all_infos, p_cache_key, r_entry);
+		_populate_deformed_cluster_lod(p_mesh_surface, layout, all_infos, clas_info_stride, p_cache_key, r_entry);
 	}
 	if (r_omm_attached) {
 		*r_omm_attached = omm;
 	}
 	if (layout.levels > 1) {
-		print_verbose(vformat("RT: deformed cluster BLAS [%d]: %d triangles in %d clusters at LOD 0 of %d over %d levels, of at most %d triangles and %d vertices, %d KB BLAS storage, %s.", p_cache_key, primitive_count, cluster_count, layout.triangles.size(), layout.levels, layout.max_triangles, layout.max_vertices, storage_size / 1024, r_entry.cluster_lod_table_offset != UINT32_MAX ? vformat("selecting from %d words of the LOD table", r_entry.cluster_lod_table_words) : "LOD 0 traced"));
+		print_verbose(vformat("RT: deformed cluster BLAS [%d]: %d triangles in %d clusters at LOD 0 of %d over %d levels, of at most %d triangles and %d vertices, %d KB BLAS storage, %s.", p_cache_key, primitive_count, cluster_count, layout.triangles.size(), layout.levels, layout.max_triangles, layout.max_vertices, storage_size / 1024, r_entry.cluster_lod_table_offset != UINT32_MAX ? vformat("selecting from %d words of the LOD table%s", r_entry.cluster_lod_table_words, cluster_template ? ", instantiated from templates (D108)" : "") : "LOD 0 traced"));
 	} else {
 		print_verbose(vformat("RT: deformed cluster BLAS [%d]: %d triangles in %d %s of at most %d triangles and %d vertices, %d KB BLAS storage%s.", p_cache_key, primitive_count, cluster_count, layout.from_table ? "clusters" : "runs", layout.max_triangles, layout.max_vertices, storage_size / 1024, cluster_template ? vformat(" with its CLAS, instantiated from templates (D107, %d bytes a CLAS at worst)", clas_stride) : String()));
 	}
@@ -3000,13 +3027,14 @@ bool RenderRaytracing::_populate_deformed_cluster_layout(void *p_mesh_surface, u
 }
 
 // The entry's hierarchy as the selection reads it (D87): its region of the LOD table, laid out
-// as a static surface's (the address words zero, since its CLAS are built each frame; each
+// as a static surface's (the address words zero, since its CLAS are made each frame; each
 // cluster's group and refined group; the groups' spheres and errors) with every level's CLAS
-// build info after them, which the selection copies to the frame's build for the clusters it
-// picks. On failure the entry keeps no region and the batch traces its LOD 0 clusters.
-bool RenderRaytracing::_populate_deformed_cluster_lod(void *p_mesh_surface, const RTClusterLayout &p_layout, const LocalVector<uint8_t> &p_infos, uint32_t p_cache_key, RTDeformedCacheEntry &r_entry) {
+// info after them, a build info or, templated, an instantiation info (D108), which the selection
+// copies to the frame's build for the clusters it picks. On failure the entry keeps no region
+// and the batch traces its LOD 0 clusters.
+bool RenderRaytracing::_populate_deformed_cluster_lod(void *p_mesh_surface, const RTClusterLayout &p_layout, const LocalVector<uint8_t> &p_infos, uint32_t p_info_size, uint32_t p_cache_key, RTDeformedCacheEntry &r_entry) {
 	RD *rd = RD::get_singleton();
-	const uint32_t info_size = rd->get_cluster_acceleration_structure_capabilities().triangle_build_info_size;
+	const uint32_t info_size = p_info_size; // A build info, or an instantiation info when templated (D108).
 	const uint32_t info_words = info_size / sizeof(uint32_t);
 	const Vector<uint8_t> &table_bytes = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_cluster_data(p_mesh_surface);
 	const uint32_t cluster_count = p_layout.triangles.size();
@@ -3583,6 +3611,13 @@ void RenderRaytracing::_flush_deformed_cluster_batch() {
 						}
 						break;
 					case RTDeformedCacheEntry::CLUSTER_QUEUED_EXPIRY:
+						if (entry->cluster_templated) {
+							// LOD 0 again after a selection (D108): instantiated in place, an update.
+							deformed_cluster_updates++;
+							deformed_cluster_triangles_updated += triangles;
+							deformed_cluster_clusters_instantiated_total += entry->cluster_count;
+							break;
+						}
 						deformed_cluster_expiry_rebuilds_total++;
 						deformed_cluster_builds++; // And so is a rebuild for the region's reuse (D97).
 						deformed_cluster_triangles_built += triangles;
@@ -6305,9 +6340,10 @@ void RenderRaytracing::_lod_record_tree(const Transform3D &p_transform, const RT
 	batch.tree_count++;
 }
 
-// A deformed entry on the selection (D87): its record flags the CLAS build, names its build infos
-// in the table and its first slot of the frame's region (the flush turns that into the
-// destination base), and the build takes its storage, its owned vertex buffer and its index buffer.
+// A deformed entry on the selection (D87): its record flags the CLAS build, names its CLAS infos
+// in the table (build infos, or instantiation infos when templated, D108) and its first slot of the
+// frame's region (the flush turns that into the destination base), and the build takes its storage,
+// its owned vertex buffer, its index buffer and its templates.
 void RenderRaytracing::_queue_lod_deformed_instance(RTDeformedCacheEntry &p_entry, const Transform3D &p_transform, uint32_t p_slot) {
 	RTLodSelectBatch &batch = lod_batch;
 	const uint32_t cluster_count = p_entry.cluster_lod_count;
@@ -6327,6 +6363,13 @@ void RenderRaytracing::_queue_lod_deformed_instance(RTDeformedCacheEntry &p_entr
 
 	batch.storage_buffers.push_back(p_entry.cluster_storage); // Its own; nothing to dedupe.
 	batch.clas_source_buffers.push_back(p_entry.owned_vb_full);
+	if (p_entry.cluster_templated) {
+		// The templates its instantiations read (D108); a few meshes, many instances.
+		const RTDeformedClusterTemplate *cluster_template = deformed_cluster_templates.getptr(p_entry.cluster_template_key);
+		if (cluster_template && !batch.clas_template_buffers.has(cluster_template->storage)) {
+			batch.clas_template_buffers.push_back(cluster_template->storage);
+		}
+	}
 	if (p_entry.cluster_index_buffer.is_valid() && !batch.clas_index_buffers_seen.has(p_entry.cluster_index_buffer)) {
 		batch.clas_index_buffers_seen.push_back(p_entry.cluster_index_buffer); // A few meshes, many instances.
 		batch.clas_source_buffers.push_back(p_entry.cluster_index_buffer);
@@ -6840,8 +6883,9 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 	const uint32_t blas_info_stride = caps.bottom_level_build_info_size;
 	ERR_FAIL_COND_V_MSG(blas_info_stride % sizeof(uint32_t) != 0 || blas_info_stride < 16, false, "RT: the driver's bottom-level build info is not a whole number of words.");
 
-	const uint32_t clas_info_stride = caps.triangle_build_info_size;
-	ERR_FAIL_COND_V_MSG(clas_info_stride % sizeof(uint32_t) != 0 || clas_info_stride == 0, false, "RT: the driver's triangle cluster build info is not a whole number of words.");
+	// The deformed items' infos as the table holds them: instantiations of their templates (D108), else builds (D87).
+	const uint32_t clas_info_stride = cluster_lod_deformed_templated ? caps.instantiate_info_size : caps.triangle_build_info_size;
+	ERR_FAIL_COND_V_MSG(clas_info_stride % sizeof(uint32_t) != 0 || clas_info_stride == 0, false, "RT: the driver's cluster build or instantiation info is not a whole number of words.");
 	const uint32_t clas_bound = batch.clas_bound;
 
 	// The frame's arguments, 16-byte sections: the build infos (their counts the selection's
@@ -7184,7 +7228,8 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 	}
 
 	// The deformed items' CLAS (D87): every cluster the selection picked for them, built into the
-	// slots the selection assigned, as many as it counted.
+	// slots the selection assigned, as many as it counted; instantiated from the clusters' templates
+	// (D108), built first if new. The slots are the pool's region, never rewritten in place.
 	if (clas_bound > 0) {
 		uint32_t max_triangles = 0, max_vertices = 0;
 		_deformed_cluster_maxima(caps, max_triangles, max_vertices);
@@ -7192,7 +7237,17 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		source_buffers.resize(batch.clas_source_buffers.size());
 		memcpy(source_buffers.ptrw(), batch.clas_source_buffers.ptr(), sizeof(RID) * batch.clas_source_buffers.size());
 		RD::ClusterAccelerationStructureBuild build;
-		build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER;
+		if (cluster_lod_deformed_templated) {
+			if (!_build_deformed_cluster_templates()) {
+				return false;
+			}
+			build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_INSTANTIATE_TRIANGLE_CLUSTER;
+			for (const RID &template_buffer : batch.clas_template_buffers) {
+				build.source_acceleration_structure_buffers.push_back(template_buffer);
+			}
+		} else {
+			build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER;
+		}
 		build.input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
 		build.input.max_acceleration_structure_count = clas_bound;
 		build.input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT);
@@ -7305,7 +7360,7 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		for (uint32_t e = 0; e < entry_count; e++) {
 			lod0_total += batch.lod0_clusters[e];
 		}
-		print_verbose(vformat("RT: cluster LOD selection: %d instances (%d deformed, %d past the region ceiling; %d more tracing a shared build, %d the LOD 0 BLAS, %d a cached level), %d cached levels built (%d live, %d KB, %d over the run), %d clusters at LOD 0, %d over every level, %d selected a frame queue ago (%d instances then, %d CLAS built of %d), %.2f px, threshold %s, %d KB of arguments, %d KB of the LOD table live, %d KB CLAS region.", cache_first, batch.deformed_count, batch.deformed_routed, batch.shared_count, batch.lod0_count, batch.cached_count, entry_count - cache_first, cluster_lod_cache_live, cluster_lod_cache_bytes / 1024, cluster_lod_cache_builds_total, lod0_total, cluster_total - batch.cache_list_clusters, lod_counts_selected, lod_counts_entries, lod_counts_clas, clas_bound, lod_frame_pixel_error, String::num_scientific(threshold), args_size / 1024, uint64_t(cluster_lod_table_live_words) * sizeof(uint32_t) / 1024, uint64_t(clas_bound) * cluster_lod_clas_slot_size / 1024));
+		print_verbose(vformat("RT: cluster LOD selection: %d instances (%d deformed, %d past the region ceiling; %d more tracing a shared build, %d the LOD 0 BLAS, %d a cached level), %d cached levels built (%d live, %d KB, %d over the run), %d clusters at LOD 0, %d over every level, %d selected a frame queue ago (%d instances then, %d CLAS %s of %d, counted on the device), %.2f px, threshold %s, %d KB of arguments, %d KB of the LOD table live, %d KB CLAS region.", cache_first, batch.deformed_count, batch.deformed_routed, batch.shared_count, batch.lod0_count, batch.cached_count, entry_count - cache_first, cluster_lod_cache_live, cluster_lod_cache_bytes / 1024, cluster_lod_cache_builds_total, lod0_total, cluster_total - batch.cache_list_clusters, lod_counts_selected, lod_counts_entries, lod_counts_clas, cluster_lod_deformed_templated ? "instantiated" : "built", clas_bound, lod_frame_pixel_error, String::num_scientific(threshold), args_size / 1024, uint64_t(cluster_lod_table_live_words) * sizeof(uint32_t) / 1024, uint64_t(clas_bound) * cluster_lod_clas_slot_size / 1024));
 		if (cluster_lod_traversal_enabled) {
 			uint64_t queue_capacity = 0;
 			for (uint32_t l = 0; l < tree_levels; l++) {
@@ -7381,11 +7436,23 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 				case RTDeformedCacheEntry::CLUSTER_QUEUED_FIRST_BUILD:
 				case RTDeformedCacheEntry::CLUSTER_QUEUED_CHANGED:
 				case RTDeformedCacheEntry::CLUSTER_QUEUED_EXPIRY:
+					if (entry->cluster_templated && entry->cluster_frame_kind != RTDeformedCacheEntry::CLUSTER_QUEUED_FIRST_BUILD) {
+						// Instantiated and the BLAS assembled over them (D108): the per-frame update a
+						// triangle BLAS's refit is, counted as one.
+						deformed_cluster_updates++;
+						deformed_cluster_triangles_updated += triangles;
+						break;
+					}
 					// A cluster BLAS is rebuilt, never refit: every kind is a build (D97).
 					deformed_cluster_builds++;
 					deformed_cluster_triangles_built += triangles;
 					break;
 				default:
+					if (entry->cluster_templated) {
+						// Unchanged, its selection instantiated again all the same (D108): an update.
+						deformed_cluster_updates++;
+						deformed_cluster_triangles_updated += triangles;
+					}
 					break;
 			}
 			entry->cluster_frame_kind = RTDeformedCacheEntry::CLUSTER_QUEUED_NONE;
@@ -7472,6 +7539,7 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 	batch.clas_total_vertices = 0;
 	batch.clas_source_buffers.clear();
 	batch.clas_index_buffers_seen.clear();
+	batch.clas_template_buffers.clear();
 }
 
 void RenderRaytracing::_on_position_fetch_check_read(const PackedByteArray &p_bytes) {
@@ -9245,9 +9313,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				RTDeformedCacheEntry *deformed = deformed_pool.get_or_null(surf->rt_deformed_handle);
 				if (deformed && deformed->cluster_count > 0) {
 					const uint64_t frames_drawn = RD::get_singleton()->get_frames_drawn();
-					// A templated entry (D107) is rewritten only on the frames it is queued, by this
-					// frame's flush or an earlier viewport's; the others are rebuilt every frame (D82).
-					if (!deformed->cluster_templated || deformed->cluster_frame_kind != RTDeformedCacheEntry::CLUSTER_QUEUED_NONE || deformed->cluster_built_frame == frames_drawn) {
+					// A templated entry (D107) is rewritten only on the frames something rebuilds it: queued
+					// for this frame's batch, pending this frame's selection (D108, or its LOD 0 rebuild
+					// through the batch, queued below), or built by an earlier viewport; the others are
+					// rebuilt every frame (D82). The slot is re-emitted on those frames, so a failed flush
+					// can drop the instance.
+					if (!deformed->cluster_templated || deformed->cluster_lod_pending || deformed->cluster_frame_kind != RTDeformedCacheEntry::CLUSTER_QUEUED_NONE || deformed->cluster_built_frame == frames_drawn) {
 						slot_rebuilt = true;
 					}
 					deformed->cluster_pushed_frame = frames_drawn;

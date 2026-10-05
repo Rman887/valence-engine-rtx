@@ -4168,6 +4168,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_select", true);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_share", true);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/cluster_lod_share_tolerance", PROPERTY_HINT_RANGE, "0,16,1"), 2);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/cluster_lod_slot_budget_mb", PROPERTY_HINT_RANGE, "0,4096,1"), 64);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_cache", true);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/cluster_lod_cache_budget_mb", PROPERTY_HINT_RANGE, "0,4096,1"), 32);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_traversal", true);

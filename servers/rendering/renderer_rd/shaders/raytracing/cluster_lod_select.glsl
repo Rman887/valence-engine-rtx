@@ -32,6 +32,14 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // their instantiations to the build and their bottom-level build infos to the compacted list, whose
 // count the deformed BLAS build reads. A last pass stores the digests.
 //
+// A static instance (D113) is a persistent item too, with no CLAS of its own: its digest takes the
+// selected clusters' CLAS addresses with their cluster indices (so a group the stream (D92) or the compaction moved since
+// changes it, as a different cut does), its kept digest is its slot's (word 29, held with the slot),
+// and the commit, a thread per item over the static range (entry_first and persistent_count name a
+// range, the compact words its section), appends only its bottom-level build info and BLAS address
+// to the static compacted list, whose count the static BLAS build reads. A skipped item keeps the
+// BLAS in its slot, built over the same CLAS.
+//
 // A cached level (D90) is an item with no instance: it takes the clusters of one depth's discrete
 // level, depth standing for the error (a cluster is taken when its group is at that depth or
 // deeper, or terminal, and the group it was simplified from is above it), the whole surface at
@@ -57,13 +65,15 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // four, the uniform scale, the cluster count, the surface's word offset in TableBuf, the reference
 // list's word offset in FrameBuf, the flags, the word offset of the instance's build infos in
 // TableBuf, the destination base address as lo and hi), the CLAS count, then the reference lists,
-// the CLAS destinations and the CLAS build infos (instantiation infos when templated, D108), and for
-// persistent items (D109) their cluster lists and the compacted BLAS count, infos and addresses.
+// the CLAS destinations and the CLAS build infos (instantiation infos when templated, D108), for
+// persistent deformed items (D109) their cluster lists and the compacted BLAS count, infos and
+// addresses, and for the static items (D113) their own compacted BLAS count, infos and addresses.
 // TableBuf holds every hierarchy's region: per cluster its CLAS address (lo, hi; zero for a
 // deformed hierarchy), then per cluster its group and the group it refines (-1 at LOD 0), then per
 // group eight words (center, radius, error, depth, first cluster, cluster count), then, for a
 // deformed hierarchy, per cluster its build or instantiation info, its traversal tree, and the
-// last selection's digest (count and two hashes, D109).
+// last selection's digest (count and two hashes, D109); and the static instances' kept digests,
+// three words each in blocks of their own (D113).
 //
 // CLAS residency (D92): an item whose record's word 23 is non-zero is a streamed surface's, and
 // word 23 the word offset of its per-group state in TableBuf (STATE_WORDS a group: the frame it
@@ -85,7 +95,7 @@ layout(set = 0, binding = 0) buffer FrameBuf {
 }
 frame;
 // Written only in the streamed items' per-group state (D92), by atomics, and in the persistent
-// deformed items' digests (D109).
+// items' kept digests (D109, D113).
 layout(set = 0, binding = 1) restrict buffer TableBuf {
 	uint v[];
 }
@@ -121,7 +131,7 @@ layout(push_constant, std430) uniform PC {
 	uint frame_index; // The frame's number, for the streamed items' state (D92).
 	uint stream_requests; // Words into FrameBuf: the request count, an atomic, then from 4 on the requests (table offset, group), STREAM_REQUEST_CAP of them (D92).
 	uint stream_touches; // Words into FrameBuf: the use report count, then from 4 on the reports, STREAM_TOUCH_CAP of them.
-	uint persistent_count; // The persistent deformed items, the first of the frame's items (D109).
+	uint persistent_count; // The persistent deformed items, the first of the frame's items (D109); for the commit and the digests, the items of the range from entry_first (D113).
 	uint compact_counts; // Words into FrameBuf: the compacted BLAS count, the updates and their triangles.
 	uint compact_infos; // Words into FrameBuf: the compacted bottom-level build infos.
 	uint compact_dst; // Words into FrameBuf: the compacted BLAS addresses (lo, hi).
@@ -253,14 +263,15 @@ uint digest_hash_b(uint p_x) {
 // destination its build gets and the build info it is made from.
 void select_cluster(uint p_entry, uint p_inst, uint p_cluster, uint p_table_offset, uint p_list_offset, uint p_instance_flags) {
 	uint slot = atomicAdd(frame.v[pc.blas_infos_offset + p_entry * pc.blas_info_stride], 1u);
-	if (((p_instance_flags & INSTANCE_FLAG_LEVEL) != 0u && slot >= frame.v[p_inst + 18u]) || ((p_instance_flags & INSTANCE_FLAG_PERSISTENT) != 0u && slot >= frame.v[p_inst + 25u])) {
+	bool persistent_deformed = (p_instance_flags & (INSTANCE_FLAG_PERSISTENT | INSTANCE_FLAG_DEFORMED)) == (INSTANCE_FLAG_PERSISTENT | INSTANCE_FLAG_DEFORMED);
+	if (((p_instance_flags & INSTANCE_FLAG_LEVEL) != 0u && slot >= frame.v[p_inst + 18u]) || (persistent_deformed && slot >= frame.v[p_inst + 25u])) {
 		// Past the slot's count, or a persistent item's slots (D109, which its layout bounded):
 		// taken back so the build stays in its slot, and counted.
 		atomicAdd(frame.v[pc.blas_infos_offset + p_entry * pc.blas_info_stride], 0xFFFFFFFFu);
 		atomicAdd(frame.v[pc.clas_count_offset + ((p_instance_flags & INSTANCE_FLAG_LEVEL) != 0u ? 1u : 2u)], 1u);
 		return;
 	}
-	if ((p_instance_flags & INSTANCE_FLAG_PERSISTENT) != 0u) {
+	if (persistent_deformed) {
 		// Its own slot (D109): the address for the BLAS's list, the cluster for the commit, the digest.
 		uint carry = 0u;
 		uint dst_lo = uaddCarry(frame.v[p_inst + 18u], slot * frame.v[p_inst + 24u], carry);
@@ -272,8 +283,16 @@ void select_cluster(uint p_entry, uint p_inst, uint p_cluster, uint p_table_offs
 		return;
 	}
 	if ((p_instance_flags & INSTANCE_FLAG_DEFORMED) == 0u) {
-		frame.v[p_list_offset + slot * 2u] = table.v[p_table_offset + p_cluster * 2u];
-		frame.v[p_list_offset + slot * 2u + 1u] = table.v[p_table_offset + p_cluster * 2u + 1u];
+		uint lo = table.v[p_table_offset + p_cluster * 2u];
+		uint hi = table.v[p_table_offset + p_cluster * 2u + 1u];
+		frame.v[p_list_offset + slot * 2u] = lo;
+		frame.v[p_list_offset + slot * 2u + 1u] = hi;
+		if ((p_instance_flags & INSTANCE_FLAG_PERSISTENT) != 0u) {
+			// A static item's digest (D113) over the cluster and its CLAS address (where it lives), each
+			// accumulator fed its own projection of the three.
+			atomicAdd(frame.v[p_inst + 26u], digest_hash_a(lo ^ digest_hash_b(hi ^ p_cluster)));
+			atomicXor(frame.v[p_inst + 27u], digest_hash_b(hi ^ digest_hash_a(lo + p_cluster)));
+		}
 		return;
 	}
 	// The CLAS the build makes for this cluster: the slot's address in the instance's range (a
@@ -502,13 +521,14 @@ void cluster_main() {
 	}
 }
 
-// The commit (D109): one thread per slot of each persistent deformed item, the items along y. An
-// item whose selection's count and digest equal the ones its table region kept, and that the CPU did
-// not force, is skipped whole; the others instantiate every selected slot and assemble their BLAS.
+// The commit (D109): one thread per slot of each persistent deformed item, the items along y, or one
+// thread per static item (D113), from entry_first. An item whose selection's count and digest equal
+// the ones its table region kept, and that the CPU did not force, is skipped whole; the others
+// instantiate every selected slot (a deformed item) and assemble their BLAS.
 void commit_main() {
-	uint entry = gl_GlobalInvocationID.y;
+	uint entry = pc.entry_first + gl_GlobalInvocationID.y;
 	uint slot = gl_GlobalInvocationID.x;
-	if (entry >= pc.persistent_count) {
+	if (gl_GlobalInvocationID.y >= pc.persistent_count) {
 		return;
 	}
 	uint inst = pc.instances_offset + entry * INSTANCE_WORDS;
@@ -522,7 +542,7 @@ void commit_main() {
 	if (!changed) {
 		return;
 	}
-	if (slot < count) {
+	if (slot < count && (instance_flags & INSTANCE_FLAG_DEFORMED) != 0u) {
 		uint k = atomicAdd(frame.v[pc.clas_count_offset], 1u);
 		uint carry = 0u;
 		frame.v[pc.clas_dst_offset + k * 2u] = uaddCarry(frame.v[inst + 18u], slot * frame.v[inst + 24u], carry);
@@ -550,10 +570,11 @@ void commit_main() {
 	}
 }
 
-// The digests (D109), one thread per persistent deformed item, after the commit read the old ones.
+// The digests (D109), one thread per persistent item from entry_first (D113), after the commit read
+// the old ones.
 void digest_main() {
-	uint entry = gl_GlobalInvocationID.x;
-	if (entry >= pc.persistent_count) {
+	uint entry = pc.entry_first + gl_GlobalInvocationID.x;
+	if (gl_GlobalInvocationID.x >= pc.persistent_count) {
 		return;
 	}
 	uint inst = pc.instances_offset + entry * INSTANCE_WORDS;

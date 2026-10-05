@@ -548,20 +548,29 @@ struct RTLodInstanceEntry {
 	uint32_t last_used_frame = 0;
 	uint64_t pushed_frame = 0; // frames_drawn when it last entered the TLAS; a second viewport in the frame traces frame_blas.
 	RID frame_blas; // What it traced at pushed_frame: its own BLAS, or the one it shares (D89).
-	uint32_t last_built_frame = 0; // An instance tracing another's build gives its slot back on the TTL (D89).
+	uint32_t last_built_frame = 0; // An instance tracing another's build keeps its slot under the slot budget (D113).
 	RID blas;
 	uint64_t blas_address = 0;
 	int32_t arena_chunk = -1;
 	uint64_t arena_offset = 0;
 	uint64_t arena_size = 0;
+	// Its last selection's digest in the LOD table (D113): the count and two hashes of the selected
+	// CLAS addresses the BLAS in its slot was built over, held with the slot. A slot not yet built
+	// over a selection (new, or last built where the frame could not keep digests) is forced.
+	uint32_t digest_offset = UINT32_MAX;
+	bool built = false;
 };
 
 struct RTDeformedCacheEntry;
 
 // The selection's instance record, in words. Must match INSTANCE_WORDS in cluster_lod_select.glsl.
 // Words 24 to 35 are a persistent deformed item's (D109): its slot stride and count, its digest, its
-// cluster list, its kept digest in the table, its triangles and its BLAS address.
+// cluster list, its kept digest in the table, its triangles and its BLAS address. A persistent static
+// item (D113) takes the digest, the kept digest and the BLAS address.
 static constexpr uint32_t RT_LOD_INSTANCE_WORDS = 36;
+// A static instance's kept digest (D113), in words, and the slots one table allocation holds.
+static constexpr uint32_t RT_LOD_DIGEST_WORDS = 3;
+static constexpr uint32_t RT_LOD_DIGEST_BLOCK = 256;
 
 // CLAS residency's lists (D92): the requests and the use reports one frame's selection may append,
 // and the frames between two reports of one group's use. Must match STREAM_* in cluster_lod_select.glsl.
@@ -794,6 +803,8 @@ struct RTLodSelectBatch {
 	// The persistent deformed items (D109): their storage, each once, and their largest slot count.
 	LocalVector<RID> deformed_storage_buffers;
 	uint32_t deformed_max_capacity = 0;
+	uint32_t static_first_builds = 0; // The static items queued with no build over a selection in their slot (D113).
+	bool static_persistent = false; // The record kept the static items' digests (D113).
 	RID args_buffer;
 	uint32_t args_capacity = 0; // Bytes.
 	LocalVector<uint8_t> args_host;
@@ -1624,6 +1635,25 @@ class RenderRaytracing {
 	uint64_t lod_deformed_updates_total = 0;
 	uint64_t lod_deformed_instances_total = 0;
 	uint32_t deformed_cut_bound_failures_total = 0;
+	// The persistent static selection (D113): the rebuilds the device counted (first builds excluded,
+	// the CPU counts those), read back a frame queue later and published by the next flush as builds;
+	// the free digest slots, taken from the LOD table RT_LOD_DIGEST_BLOCK at a time and never given back.
+	uint32_t lod_static_rebuilds_read = 0;
+	uint64_t lod_static_rebuilds_total = 0;
+	uint64_t lod_static_instances_total = 0;
+	LocalVector<uint32_t> lod_digest_free;
+	// The static instances' own slots (D113), kept while an instance traces another's build under
+	// rendering/pathtracing/cluster_lod_slot_budget_mb, least recently built freed first: the bytes
+	// live, the budget, the evictions over the run and the eviction's grow-only scratch.
+	uint64_t cluster_lod_slot_bytes = 0;
+	uint64_t cluster_lod_slot_budget = 0;
+	uint64_t cluster_lod_slot_evictions_total = 0;
+	struct RTLodSlotEvictCandidate {
+		uint32_t last_built = 0;
+		RTLodInstanceEntry *entry = nullptr;
+		bool operator<(const RTLodSlotEvictCandidate &p_other) const { return last_built < p_other.last_built; }
+	};
+	LocalVector<RTLodSlotEvictCandidate> cluster_lod_slot_evict_scratch;
 	uint64_t cluster_lod_clas_slot_size = 0;
 	uint32_t cluster_lod_clas_ceiling_clusters = 0; // RT_LOD_CLAS_REGION_CEILING in slots, less the region's alignment.
 	float cluster_lod_pixel_error = 1.0f;
@@ -2232,6 +2262,7 @@ class RenderRaytracing {
 	// flush to publish (tools builds, where the counters are), and the clusters past an item's slots,
 	// which a sound cut bound never gives.
 	static void _on_lod_deformed_counts_read(const PackedByteArray &p_bytes, uint32_t p_instances);
+	static void _on_lod_static_counts_read(const PackedByteArray &p_bytes, uint32_t p_instances);
 	// The deformed entries on the selection (D87): the entry's region of the LOD table, made with
 	// its layout and released with its storage, and its record in the frame's batch.
 	bool _populate_deformed_cluster_lod(void *p_mesh_surface, const RTClusterLayout &p_layout, const LocalVector<uint8_t> &p_infos, uint32_t p_info_size, uint32_t p_cache_key, RTDeformedCacheEntry &r_entry);

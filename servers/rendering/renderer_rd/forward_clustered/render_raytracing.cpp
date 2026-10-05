@@ -98,6 +98,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		cluster_lod_share_tolerance = uint32_t(CLAMP(int(GLOBAL_GET("rendering/pathtracing/cluster_lod_share_tolerance")), 0, 16));
 		cluster_lod_cache_enabled = cluster_lod_share_enabled && GLOBAL_GET("rendering/pathtracing/cluster_lod_cache");
 		cluster_lod_cache_budget = uint64_t(MAX(0, int(GLOBAL_GET("rendering/pathtracing/cluster_lod_cache_budget_mb")))) * 1024 * 1024;
+		cluster_lod_slot_budget = uint64_t(MAX(0, int(GLOBAL_GET("rendering/pathtracing/cluster_lod_slot_budget_mb")))) * 1024 * 1024;
 		cluster_lod_traversal_enabled = cluster_lod_select_enabled && GLOBAL_GET("rendering/pathtracing/cluster_lod_traversal");
 		cluster_lod_max_instances = uint32_t(MIN(RD::get_singleton()->limit_get(RD::LIMIT_MAX_COMPUTE_WORKGROUP_COUNT_Y), uint64_t(UINT32_MAX)));
 		const RD::ClusterAccelerationStructureCapabilities &caps = RD::get_singleton()->get_cluster_acceleration_structure_capabilities();
@@ -721,6 +722,7 @@ void RenderRaytracing::cleanup_caches() {
 	cluster_lod_table_capacity = 0;
 	cluster_lod_table_live_words = 0;
 	cluster_lod_table_free.clear();
+	lod_digest_free.clear(); // The static instances' digest slots (D113), in the table's blocks.
 
 	// The cluster arena (D81): every region went with its surface above; a result still in
 	// flight has no surface to land on.
@@ -1032,24 +1034,47 @@ void RenderRaytracing::prepare_frame() {
 		}
 	}
 
-	// TTL-evict stale cluster LOD instance slots (D86), on the deformed entries' TTL.
+	// The cluster LOD instance slots (D86): an instance no longer drawn gives its entry back on the
+	// deformed entries' TTL. One still drawn keeps its slot and its digest while it traces another's
+	// build (D89, D90), so a return to its own build with the same selection builds nothing (D113),
+	// under the slot budget: past it the least recently built go first, down to seven eighths of it,
+	// never one built this frame or the frame before (a stand-in another instance traces, or the next
+	// frame's most likely own build): the budget is soft over that working set. A freed slot's
+	// handle and arena region go past the frames in flight, as any slot's.
 	{
 		static const uint32_t LOD_SLOT_TTL = (uint32_t)GLOBAL_GET("rendering/pathtracing/deformed_mesh_cache_ttl_frames");
 		LocalVector<RID> live = lod_pool.get_owned_list();
+		LocalVector<RTLodSlotEvictCandidate> &slot_candidates = cluster_lod_slot_evict_scratch;
+		slot_candidates.clear();
+		uint64_t slot_protected_bytes = 0;
 		for (uint32_t i = 0; i < live.size(); i++) {
 			RTLodInstanceEntry *e = lod_pool.get_or_null(live[i]);
 			if (!e) {
 				continue;
 			}
 			if (e->last_used_frame == 0 || current_frame - e->last_used_frame <= LOD_SLOT_TTL) {
-				// An instance that has traced another's build for as long (D89) gives its slot back.
-				if (e->blas.is_valid() && current_frame - e->last_built_frame > LOD_SLOT_TTL) {
-					_release_lod_entry(*e);
+				if (e->blas.is_valid()) {
+					if (current_frame - e->last_built_frame <= 1) {
+						slot_protected_bytes += e->arena_size;
+					} else {
+						slot_candidates.push_back({ e->last_built_frame, e });
+					}
 				}
 				continue;
 			}
 			_release_lod_entry(*e);
 			lod_pool.free(live[i]);
+		}
+		if (cluster_lod_slot_bytes > cluster_lod_slot_budget) {
+			const uint64_t low_water = cluster_lod_slot_budget - cluster_lod_slot_budget / 8;
+			if (slot_protected_bytes > low_water && cluster_lod_slot_budget > 0) {
+				WARN_PRINT_ONCE(vformat("RT: the cluster LOD slots built in the last two frames take %d KB, past the low-water mark of rendering/pathtracing/cluster_lod_slot_budget_mb (%d KB), so eviction cannot get under it; they are kept (D113).", slot_protected_bytes / 1024, low_water / 1024));
+			}
+			slot_candidates.sort();
+			for (uint32_t i = 0; i < slot_candidates.size() && cluster_lod_slot_bytes > low_water; i++) {
+				_release_lod_entry(*slot_candidates[i].entry);
+				cluster_lod_slot_evictions_total++;
+			}
 		}
 		// The cached levels (D90) stay while they fit the memory budget (D112); past it, the least
 		// recently traced go first, down to seven eighths of it, never one traced this frame or the
@@ -6299,10 +6324,17 @@ void RenderRaytracing::_release_lod_entry(RTLodInstanceEntry &p_entry) {
 	p_entry.frame_blas = RID();
 	if (p_entry.arena_chunk >= 0) {
 		_cluster_arena_retire(uint32_t(p_entry.arena_chunk), p_entry.arena_offset, p_entry.arena_size);
+		cluster_lod_slot_bytes -= p_entry.arena_size;
 		p_entry.arena_chunk = -1;
 		p_entry.arena_offset = 0;
 		p_entry.arena_size = 0;
 	}
+	if (p_entry.digest_offset != UINT32_MAX) {
+		// A frame in flight may still store a digest there; the next owner's first build is forced.
+		lod_digest_free.push_back(p_entry.digest_offset);
+		p_entry.digest_offset = UINT32_MAX;
+	}
+	p_entry.built = false;
 	p_entry.ptr = nullptr;
 	p_entry.generation = 0;
 }
@@ -6313,7 +6345,12 @@ bool RenderRaytracing::_prepare_lod_entry(RTLodInstanceEntry &p_entry, RTSurface
 	if (p_entry.ptr == p_surf_data && p_entry.generation == p_surf_data->cluster_lod_generation && p_entry.blas.is_valid()) {
 		return true;
 	}
+	// A re-prepare keeps its own digest slot (D113): a frame in flight may still store its last
+	// digest there, so it never passes to another entry here, and this one's next build is forced.
+	const uint32_t kept_digest = p_entry.digest_offset;
+	p_entry.digest_offset = UINT32_MAX;
 	_release_lod_entry(p_entry);
+	p_entry.digest_offset = kept_digest;
 	RD *rd = RD::get_singleton();
 	const RD::ClusterAccelerationStructureCapabilities &caps = rd->get_cluster_acceleration_structure_capabilities();
 	const uint64_t base_alignment = MAX(caps.cluster_byte_alignment, caps.cluster_bottom_level_byte_alignment);
@@ -6333,14 +6370,34 @@ bool RenderRaytracing::_prepare_lod_entry(RTLodInstanceEntry &p_entry, RTSurface
 	p_entry.arena_chunk = int32_t(chunk_index);
 	p_entry.arena_offset = offset;
 	p_entry.arena_size = size;
+	cluster_lod_slot_bytes += size;
 	p_entry.ptr = p_surf_data;
 	p_entry.generation = p_surf_data->cluster_lod_generation;
+	// Its kept digest (D113), its own or from a block of the LOD table; a fresh slot is forced, so
+	// what the digest slot held before is never compared.
+	if (p_entry.digest_offset == UINT32_MAX) {
+		if (lod_digest_free.is_empty()) {
+			uint32_t block = 0;
+			if (!_cluster_lod_table_allocate(RT_LOD_DIGEST_WORDS * RT_LOD_DIGEST_BLOCK, block)) {
+				_release_lod_entry(p_entry);
+				return false;
+			}
+			for (uint32_t i = RT_LOD_DIGEST_BLOCK; i-- > 0;) {
+				lod_digest_free.push_back(block + i * RT_LOD_DIGEST_WORDS);
+			}
+		}
+		p_entry.digest_offset = lod_digest_free[lod_digest_free.size() - 1];
+		lod_digest_free.resize(lod_digest_free.size() - 1);
+	}
+	p_entry.built = false;
 	return true;
 }
 
 // Appends the instance to the frame's batch: its record for the shader (the object-to-trace
 // transform as rows, the largest axis scale the metric scales the spheres and errors by, the
-// counts and offsets), and the buffers its build touches, each once.
+// counts and offsets), and the buffers its build touches, each once. It is a persistent item
+// (D113): its BLAS is rebuilt only where its selection's digest differs from the one its slot was
+// built over, or forced where its slot holds no build over a selection.
 void RenderRaytracing::_queue_lod_instance(RTLodInstanceEntry &p_entry, const Transform3D &p_transform, uint32_t p_slot) {
 	RTLodSelectBatch &batch = lod_batch;
 	const RTSurfaceData *surf = p_entry.ptr;
@@ -6353,10 +6410,15 @@ void RenderRaytracing::_queue_lod_instance(RTLodInstanceEntry &p_entry, const Tr
 	batch.lod0_clusters.push_back(surf->cluster_lod0_count);
 
 	uint32_t *w = _lod_instance_record(p_transform, cluster_count, surf->cluster_lod_table_offset);
-	w[16] = 0;
+	const bool first = !p_entry.built;
+	w[16] = 8 | (first ? 16 | 32 : 0); // PERSISTENT, and FORCE and FIRST with no build in its slot (D113).
 	w[17] = 0;
 	w[18] = 0;
 	w[19] = 0;
+	w[29] = p_entry.digest_offset;
+	w[32] = uint32_t(p_entry.blas_address & 0xFFFFFFFFULL);
+	w[33] = uint32_t(p_entry.blas_address >> 32);
+	batch.static_first_builds += first ? 1 : 0;
 	if (surf->cluster_lod_stream) {
 		w[23] = surf->cluster_lod_stream->state_offset; // Its groups' state (D92).
 		batch.stream_items++;
@@ -7023,6 +7085,16 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 	for (uint32_t e = 0; e < persistent_count; e++) {
 		ERR_FAIL_COND_V_MSG(e >= entry_count || batch.entries[e] != nullptr || batch.deformed_entries[e] == nullptr || (batch.instance_words[e * RT_LOD_INSTANCE_WORDS + 16] & 8u) == 0, false, "RT: the cluster LOD batch's deformed items are not its first, all persistent.");
 	}
+	// The static items (D113), after the deformed ones and before the cached levels, persistent too
+	// when every item between is static (untemplated deformed items, D87, queue among them and the
+	// range is built whole as before); else their records lose the flag and their slots count as not
+	// built over a selection, so the next frame that keeps digests forces them.
+	const uint32_t cache_first = batch.cache_max_clusters > 0 ? batch.cache_first : entry_count;
+	const uint32_t static_count = cache_first - persistent_count;
+	bool static_persistent = static_count > 0;
+	for (uint32_t e = persistent_count; e < cache_first && static_persistent; e++) {
+		static_persistent = batch.entries[e] != nullptr;
+	}
 
 	// The frame's arguments, 16-byte sections: the build infos (their counts the selection's
 	// atomics), the slot addresses, the instance records, the CLAS count (D87), the reference
@@ -7068,7 +7140,12 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 	const uint64_t compact_counts_offset = _align_up(cluster_lists_offset + sizeof(uint32_t) * (persistent_count > 0 ? clas_bound : 0), 16);
 	const uint64_t compact_infos_offset = compact_counts_offset + 16;
 	const uint64_t compact_dst_offset = _align_up(compact_infos_offset + uint64_t(blas_info_stride) * persistent_count, 16);
-	const uint64_t queue_rest_offset = _align_up(compact_dst_offset + sizeof(uint64_t) * persistent_count, 16);
+	// The static items' compacted BLAS count with the rebuilds, their build infos and addresses (D113).
+	const uint32_t static_compact_items = static_persistent ? static_count : 0;
+	const uint64_t static_counts_offset = _align_up(compact_dst_offset + sizeof(uint64_t) * persistent_count, 16);
+	const uint64_t static_infos_offset = static_counts_offset + 16;
+	const uint64_t static_dst_offset = _align_up(static_infos_offset + uint64_t(blas_info_stride) * static_compact_items, 16);
+	const uint64_t queue_rest_offset = _align_up(static_dst_offset + sizeof(uint64_t) * static_compact_items, 16);
 	const uint64_t group_queue_offset = _align_up(queue_rest_offset + sizeof(uint32_t) * 2 * queue_rest_items, 16);
 	// CLAS residency (D92): the requests and the use reports, each a count (zeroed apart from the
 	// upload) and its capped list, each read back as a prefix sized from the recent counts.
@@ -7159,8 +7236,10 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 			rd->cluster_bottom_level_build_info_write(args + blas_infos_offset + uint64_t(e) * blas_info_stride, blas_info);
 			dst[e] = batch.blas_addresses[e];
 			record[15] = uint32_t(lists_offset / sizeof(uint32_t)) + first_cluster * 2;
-			if ((record[16] & 8u) != 0) { // INSTANCE_FLAG_PERSISTENT (D109): its own slots; its cluster list.
+			if ((record[16] & 9u) == 9u) { // INSTANCE_FLAG_PERSISTENT and DEFORMED (D109): its own slots; its cluster list.
 				record[28] += uint32_t(cluster_lists_offset / sizeof(uint32_t));
+			} else if ((record[16] & 1u) == 0 && !static_persistent) {
+				record[16] &= ~(8u | 16u | 32u); // A static item built as before (D113).
 			} else if ((record[16] & 1u) != 0) { // INSTANCE_FLAG_DEFORMED.
 				const uint64_t dst_base = region_base_address + uint64_t(record[18]) * cluster_lod_clas_slot_size;
 				record[18] = uint32_t(dst_base & 0xFFFFFFFFULL);
@@ -7173,6 +7252,10 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 	if (persistent_count > 0) {
 		const uint32_t compact_init[4] = { 0, 0, 0, 0 };
 		rd->buffer_update(args_buffer, uint32_t(compact_counts_offset), sizeof(compact_init), compact_init);
+	}
+	if (static_persistent) {
+		const uint32_t static_init[4] = { 0, 0, 0, 0 };
+		rd->buffer_update(args_buffer, uint32_t(static_counts_offset), sizeof(static_init), static_init);
 	}
 	if (stream) {
 		const uint32_t stream_init[4] = { 0, 0, 0, 0 };
@@ -7362,20 +7445,37 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 			rd->compute_list_end();
 			rd->free_rid(cluster_set);
 		}
-		if (persistent_count > 0) {
-			// The commit, then the digests it compared against (D109), after every selection pass.
+		const uint32_t digest_count = static_persistent ? cache_first : persistent_count;
+		if (digest_count > 0) {
+			// The commit, then the digests it compared against (D109), after every selection pass: the
+			// deformed items a thread per slot, the static ones a thread each (D113), entry_first and
+			// persistent_count naming each range and the compact words its section.
 			compute_list = rd->compute_list_begin();
 			rd->compute_list_bind_compute_pipeline(compute_list, lod_select_shader.pipeline);
 			rd->compute_list_bind_uniform_set(compute_list, uniform_set, 0);
-			SelectPC commit_pc = pc;
-			commit_pc.flags |= 16u; // FLAG_COMMIT.
-			rd->compute_list_set_push_constant(compute_list, &commit_pc, sizeof(SelectPC));
-			rd->compute_list_dispatch_threads(compute_list, MAX(batch.deformed_max_capacity, 1u), persistent_count, 1);
+			if (persistent_count > 0) {
+				SelectPC commit_pc = pc;
+				commit_pc.flags |= 16u; // FLAG_COMMIT.
+				rd->compute_list_set_push_constant(compute_list, &commit_pc, sizeof(SelectPC));
+				rd->compute_list_dispatch_threads(compute_list, MAX(batch.deformed_max_capacity, 1u), persistent_count, 1);
+			}
+			if (static_persistent) {
+				SelectPC commit_pc = pc;
+				commit_pc.flags |= 16u; // FLAG_COMMIT.
+				commit_pc.entry_first = persistent_count;
+				commit_pc.persistent_count = static_count;
+				commit_pc.compact_counts = uint32_t(static_counts_offset / sizeof(uint32_t));
+				commit_pc.compact_infos = uint32_t(static_infos_offset / sizeof(uint32_t));
+				commit_pc.compact_dst = uint32_t(static_dst_offset / sizeof(uint32_t));
+				rd->compute_list_set_push_constant(compute_list, &commit_pc, sizeof(SelectPC));
+				rd->compute_list_dispatch_threads(compute_list, 1, static_count, 1);
+			}
 			rd->compute_list_add_barrier(compute_list);
 			SelectPC digest_pc = pc;
 			digest_pc.flags |= 32u; // FLAG_DIGEST.
+			digest_pc.persistent_count = digest_count;
 			rd->compute_list_set_push_constant(compute_list, &digest_pc, sizeof(SelectPC));
-			rd->compute_list_dispatch_threads(compute_list, persistent_count, 1, 1);
+			rd->compute_list_dispatch_threads(compute_list, digest_count, 1, 1);
 			rd->compute_list_end();
 		}
 		rd->free_rid(uniform_set);
@@ -7516,10 +7616,11 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		}
 	}
 
-	// Every instance's cluster BLAS over its list, into its slot, fast-build as it is rebuilt every
-	// frame; then the cached levels built this frame (D90), the items after them, fast-trace as
-	// they are traced from then on, each over its level's exact count.
-	const uint32_t cache_first = batch.cache_max_clusters > 0 ? batch.cache_first : entry_count;
+	// Every static instance's cluster BLAS over its list, into its slot, fast-build: the ones the
+	// commit compacted (D113), as many as it counted, their handles all listed so a rewrite is ordered
+	// after the last frame's trace (a skipped one keeps its BLAS); then the cached levels built this
+	// frame (D90), the items after them, fast-trace as they are traced from then on, each over its
+	// level's exact count.
 	{
 		if (cluster_lod_stream_enabled) {
 			// A streamed surface's loaded groups (D92) live in any chunk: every live chunk is a source.
@@ -7558,11 +7659,18 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 			build.input.max_cluster_count_per_acceleration_structure = pass == 0 ? MIN(batch.max_clusters, frame_total) : batch.cache_max_clusters;
 			build.dst_storage_buffers = storage_buffers;
 			build.dst_addresses_buffer = args_buffer;
-			build.dst_addresses_offset = blas_dst_offset + sizeof(uint64_t) * first;
 			build.dst_addresses_stride = sizeof(uint64_t);
 			build.src_infos_buffer = args_buffer;
-			build.src_infos_offset = blas_infos_offset + uint64_t(blas_info_stride) * first;
 			build.src_infos_stride = blas_info_stride;
+			if (pass == 0 && static_persistent) {
+				build.dst_addresses_offset = static_dst_offset;
+				build.src_infos_offset = static_infos_offset;
+				build.src_infos_count_buffer = args_buffer;
+				build.src_infos_count_offset = static_counts_offset;
+			} else {
+				build.dst_addresses_offset = blas_dst_offset + sizeof(uint64_t) * first;
+				build.src_infos_offset = blas_infos_offset + uint64_t(blas_info_stride) * first;
+			}
 			build.source_acceleration_structure_buffers = source_buffers; // The CLAS each BLAS references, read through its list.
 			build.dst_acceleration_structures = blas_handles;
 			if (rd->cluster_acceleration_structure_build(build) != OK) {
@@ -7570,6 +7678,14 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 			}
 		}
 	}
+
+#ifdef TOOLS_ENABLED
+	// The static rebuilds the device counted (D113), for the build counter a frame queue later.
+	if (static_persistent) {
+		rd->buffer_get_data_async(args_buffer, callable_mp_static(&RenderRaytracing::_on_lod_static_counts_read).bind(static_count), uint32_t(static_counts_offset), 16);
+	}
+#endif
+	batch.static_persistent = static_persistent;
 
 	// A cached level's slot is sized for the count the CPU made of its level (D90), which the
 	// shader holds to; on a verbose run, what it counted and what it left out are read back.
@@ -7619,6 +7735,10 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		if (cluster_lod_deformed_templated) {
 			print_verbose(vformat("RT: persistent deformed selection (D109): %d of %d selections re-instantiated over the run (the device's counts, a frame queue late), %d hierarchies whose cuts LOD 0 does not bound.", lod_deformed_updates_total, lod_deformed_instances_total, deformed_cut_bound_failures_total));
 		}
+#ifdef TOOLS_ENABLED
+		// The device's counts are read back in tools builds only.
+		print_verbose(vformat("RT: persistent static selection (D113): %d of %d selections rebuilt over the run (the device's counts, a frame queue late; first builds apart), %d first builds this frame, %s; slots %d KB live of %d KB, %d evicted over the run.", lod_static_rebuilds_total, lod_static_instances_total, batch.static_first_builds, static_persistent ? "digests kept" : "built whole, untemplated deformed items among them", cluster_lod_slot_bytes / 1024, cluster_lod_slot_budget / 1024, cluster_lod_slot_evictions_total));
+#endif
 		if (!lod_select_gpu_us.is_empty()) {
 			LocalVector<float> sorted(lod_select_gpu_us);
 			sorted.sort();
@@ -7640,6 +7760,18 @@ void RenderRaytracing::_on_lod_deformed_counts_read(const PackedByteArray &p_byt
 	singleton->lod_deformed_triangles_read += words[2];
 	singleton->lod_deformed_updates_total += words[1];
 	singleton->lod_deformed_instances_total += p_instances;
+}
+
+void RenderRaytracing::_on_lod_static_counts_read(const PackedByteArray &p_bytes, uint32_t p_instances) {
+	// As _on_lod_deformed_counts_read (D113): the compacted count, then the rebuilds of a slot already
+	// built over a selection, which the next flush publishes as builds.
+	if (singleton == nullptr || p_bytes.size() < int64_t(2 * sizeof(uint32_t))) {
+		return;
+	}
+	const uint32_t *words = reinterpret_cast<const uint32_t *>(p_bytes.ptr());
+	singleton->lod_static_rebuilds_read += words[1];
+	singleton->lod_static_rebuilds_total += words[1];
+	singleton->lod_static_instances_total += p_instances;
 }
 
 void RenderRaytracing::_on_lod_tree_check_read(const PackedByteArray &p_bytes, uint32_t p_entry_count, uint32_t p_blas_infos_offset, uint32_t p_stride, uint32_t p_instances_offset, uint32_t p_check_offset) {
@@ -7681,16 +7813,19 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 		return;
 	}
 	const uint64_t frames_drawn = RD::get_singleton()->get_frames_drawn();
-	// The persistent selection's updates the device counted a frame queue ago (D109), published now.
-	deformed_cluster_updates += lod_deformed_updates_read;
-	deformed_cluster_triangles_updated += uint32_t(MIN(lod_deformed_triangles_read, uint64_t(UINT32_MAX)));
-	lod_deformed_updates_read = 0;
-	lod_deformed_triangles_read = 0;
 	if (_record_lod_batch(p_render_data, p_state)) {
-		// Every static instance's BLAS over its selection and every cached level is a build (D97).
+		// A static instance's BLAS over its selection is a build (D97): with digests kept (D113) its
+		// first, here, and its rebuilds as the device counts them, published a frame queue later;
+		// else every one. Its slot holds a build over a selection whose digest is kept only then.
+		uint32_t static_items = 0;
 		for (uint32_t e = 0; e < batch.entries.size(); e++) {
-			frame_extra_builds += batch.entries[e] != nullptr ? 1 : 0;
+			if (batch.entries[e] != nullptr) {
+				batch.entries[e]->built = batch.static_persistent;
+				static_items++;
+			}
 		}
+		frame_extra_builds += batch.static_persistent ? batch.static_first_builds : static_items;
+		// Every cached level is a build (D97).
 		frame_extra_builds += batch.cache_builds.size();
 		for (const RTLodSelectBatch::CacheBuild &build : batch.cache_builds) {
 			cluster_lod_cache_rebuilds_total += build.rebuild ? 1 : 0; // Recorded now (D112).
@@ -7744,6 +7879,7 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 		for (uint32_t e = 0; e < batch.entries.size(); e++) {
 			const uint32_t slot = batch.slots[e];
 			if (batch.entries[e] != nullptr) {
+				batch.entries[e]->built = false; // Its slot holds no build over a kept digest.
 				if (slot < blass.size() && batch.entries[e]->ptr) {
 					blass[slot] = batch.entries[e]->ptr->blas;
 				}
@@ -7811,6 +7947,8 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 	batch.clas_template_buffers.clear();
 	batch.deformed_storage_buffers.clear();
 	batch.deformed_max_capacity = 0;
+	batch.static_first_builds = 0;
+	batch.static_persistent = false;
 }
 
 void RenderRaytracing::_on_position_fetch_check_read(const PackedByteArray &p_bytes) {
@@ -9062,6 +9200,15 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	deformed_cluster_triangles_built = 0;
 	deformed_cluster_updates = 0;
 	deformed_cluster_triangles_updated = 0;
+	// The counts the device made a frame queue ago and the readbacks delivered since the last frame:
+	// the persistent deformed selection's updates (D109) and the static selection's rebuilds (D113),
+	// published in this frame whatever its batch holds, so a frame with no selection holds none back.
+	deformed_cluster_updates += lod_deformed_updates_read;
+	deformed_cluster_triangles_updated += uint32_t(MIN(lod_deformed_triangles_read, uint64_t(UINT32_MAX)));
+	frame_extra_builds += lod_static_rebuilds_read;
+	lod_deformed_updates_read = 0;
+	lod_deformed_triangles_read = 0;
+	lod_static_rebuilds_read = 0;
 	// Instances left out of this TLAS because their custom hit group is still compiling.
 	uint32_t rt_instances_compiling = 0;
 	const bool collect_render_info = (p_render_data->render_info != nullptr);

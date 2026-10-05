@@ -5585,6 +5585,14 @@ void RenderingDeviceDriverD3D12::cluster_bottom_level_build_info_write(uint8_t *
 	ERR_FAIL_MSG("Ray tracing is not currently supported by the D3D12 driver.");
 }
 
+void RenderingDeviceDriverD3D12::cluster_triangle_template_build_info_write(uint8_t *r_driver_info, const ClusterTriangleBuildInfo &p_info) {
+	ERR_FAIL_MSG("Ray tracing is not currently supported by the D3D12 driver.");
+}
+
+void RenderingDeviceDriverD3D12::cluster_instantiate_info_write(uint8_t *r_driver_info, const ClusterInstantiateInfo &p_info) {
+	ERR_FAIL_MSG("Ray tracing is not currently supported by the D3D12 driver.");
+}
+
 RDD::AccelerationStructureID RenderingDeviceDriverD3D12::cluster_blas_create(BufferID p_buffer, uint64_t p_offset) {
 	ERR_FAIL_V_MSG(AccelerationStructureID(), "Ray tracing is not currently supported by the D3D12 driver.");
 }

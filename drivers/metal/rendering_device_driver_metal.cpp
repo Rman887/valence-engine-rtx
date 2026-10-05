@@ -2312,6 +2312,14 @@ void RenderingDeviceDriverMetal::cluster_bottom_level_build_info_write(uint8_t *
 	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
 }
 
+void RenderingDeviceDriverMetal::cluster_triangle_template_build_info_write(uint8_t *r_driver_info, const ClusterTriangleBuildInfo &p_info) {
+	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+}
+
+void RenderingDeviceDriverMetal::cluster_instantiate_info_write(uint8_t *r_driver_info, const ClusterInstantiateInfo &p_info) {
+	ERR_FAIL_MSG("Ray tracing is not currently supported by the Metal driver.");
+}
+
 RDD::AccelerationStructureID RenderingDeviceDriverMetal::cluster_blas_create(BufferID p_buffer, uint64_t p_offset) {
 	ERR_FAIL_V_MSG(AccelerationStructureID(), "Ray tracing is not currently supported by the Metal driver.");
 }

@@ -851,6 +851,8 @@ public:
 	virtual void cluster_acceleration_structure_get_build_sizes(const ClusterAccelerationStructureInput &p_input, uint64_t &r_acceleration_structure_size, uint64_t &r_scratch_size) = 0;
 	virtual void cluster_triangle_build_info_write(uint8_t *r_driver_info, const ClusterTriangleBuildInfo &p_info) = 0;
 	virtual void cluster_bottom_level_build_info_write(uint8_t *r_driver_info, const ClusterBottomLevelBuildInfo &p_info) = 0;
+	virtual void cluster_triangle_template_build_info_write(uint8_t *r_driver_info, const ClusterTriangleBuildInfo &p_info) = 0;
+	virtual void cluster_instantiate_info_write(uint8_t *r_driver_info, const ClusterInstantiateInfo &p_info) = 0;
 	// A BLAS handle over a cluster BLAS the caller builds at p_offset inside p_buffer, for TLAS instances
 	// and barriers (its barrier covers the buffer). Owns neither the buffer nor a driver object;
 	// freeing it releases the handle alone.

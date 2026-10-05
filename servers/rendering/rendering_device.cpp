@@ -1357,6 +1357,14 @@ void RenderingDevice::cluster_bottom_level_build_info_write(uint8_t *r_driver_in
 	driver->cluster_bottom_level_build_info_write(r_driver_info, p_info);
 }
 
+void RenderingDevice::cluster_triangle_template_build_info_write(uint8_t *r_driver_info, const ClusterTriangleBuildInfo &p_info) {
+	driver->cluster_triangle_template_build_info_write(r_driver_info, p_info);
+}
+
+void RenderingDevice::cluster_instantiate_info_write(uint8_t *r_driver_info, const ClusterInstantiateInfo &p_info) {
+	driver->cluster_instantiate_info_write(r_driver_info, p_info);
+}
+
 Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAccelerationStructureBuild &p_build) {
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
 	ERR_FAIL_COND_V_MSG(!has_feature(SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE), ERR_UNAVAILABLE, "The current rendering device has no cluster acceleration structure support.");
@@ -1461,6 +1469,12 @@ Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAcceler
 				break;
 			case ClusterAccelerationStructureInput::CLUSTER_OP_MOVE_OBJECTS:
 				info_size = caps.move_info_size;
+				break;
+			case ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER_TEMPLATE:
+				info_size = caps.triangle_template_build_info_size;
+				break;
+			case ClusterAccelerationStructureInput::CLUSTER_OP_INSTANTIATE_TRIANGLE_CLUSTER:
+				info_size = caps.instantiate_info_size;
 				break;
 		}
 		ERR_FAIL_COND_V_MSG(p_build.src_infos_stride < info_size, ERR_INVALID_PARAMETER, "The build info stride must hold one driver build info.");

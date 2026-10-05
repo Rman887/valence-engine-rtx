@@ -959,6 +959,11 @@ public:
 		uint32_t triangle_build_info_size = 0; // Bytes per ClusterTriangleBuildInfo the driver writes.
 		uint32_t bottom_level_build_info_size = 0; // Bytes per ClusterBottomLevelBuildInfo the driver writes.
 		uint32_t move_info_size = 0; // Bytes per CLUSTER_OP_MOVE_OBJECTS info: one device address, the structure to move.
+		// Cluster templates (D107): the alignment of each template's destination address, and the
+		// bytes per template build info and per instantiation info the driver writes.
+		uint32_t cluster_template_byte_alignment = 0;
+		uint32_t triangle_template_build_info_size = 0;
+		uint32_t instantiate_info_size = 0;
 		bool position_fetch = false; // VK_KHR_ray_tracing_position_fetch enabled: ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT is valid (D93).
 	};
 
@@ -969,6 +974,14 @@ public:
 			// Copies built structures to new addresses (compaction); a cluster BLAS references its
 			// CLAS by address, so it is rebuilt after they move rather than moved.
 			CLUSTER_OP_MOVE_OBJECTS,
+			// A cluster template (D107): a CLAS's triangles and indices without fixed positions,
+			// built once; ClusterTriangleBuildInfo infos, written by cluster_triangle_template_build_info_write().
+			CLUSTER_OP_BUILD_TRIANGLE_CLUSTER_TEMPLATE,
+			// CLAS from templates and new positions (D107), cheaper than CLUSTER_OP_BUILD_TRIANGLE_CLUSTER;
+			// ClusterInstantiateInfo infos. Both template operations take the triangle fields below. A
+			// template's vertex address is optional, the positions a hint; it is built with no
+			// instantiation bounding box.
+			CLUSTER_OP_INSTANTIATE_TRIANGLE_CLUSTER,
 		};
 
 		enum MoveType {
@@ -1041,6 +1054,17 @@ public:
 		uint64_t opacity_micromap_index_address = 0;
 		IndexType opacity_micromap_index_type = CLUSTER_INDEX_TYPE_UINT32;
 		uint32_t opacity_micromap_index_stride = 0;
+	};
+
+	// One CLAS instantiation's arguments (D107): a template built by CLUSTER_OP_BUILD_TRIANGLE_CLUSTER_TEMPLATE
+	// and the vertex buffer its indices address, the offsets added to its cluster ID and geometry index
+	// (24 bits).
+	struct ClusterInstantiateInfo {
+		uint32_t cluster_id_offset = 0;
+		uint32_t geometry_index_offset = 0;
+		uint64_t template_address = 0;
+		uint64_t vertex_address = 0;
+		uint32_t vertex_stride = 0;
 	};
 
 	// One cluster BLAS build's arguments: a strided array of CLAS device addresses.

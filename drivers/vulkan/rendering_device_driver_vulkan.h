@@ -762,6 +762,8 @@ public:
 	virtual void cluster_acceleration_structure_get_build_sizes(const ClusterAccelerationStructureInput &p_input, uint64_t &r_acceleration_structure_size, uint64_t &r_scratch_size) override final;
 	virtual void cluster_triangle_build_info_write(uint8_t *r_driver_info, const ClusterTriangleBuildInfo &p_info) override final;
 	virtual void cluster_bottom_level_build_info_write(uint8_t *r_driver_info, const ClusterBottomLevelBuildInfo &p_info) override final;
+	virtual void cluster_triangle_template_build_info_write(uint8_t *r_driver_info, const ClusterTriangleBuildInfo &p_info) override final;
+	virtual void cluster_instantiate_info_write(uint8_t *r_driver_info, const ClusterInstantiateInfo &p_info) override final;
 	virtual AccelerationStructureID cluster_blas_create(BufferID p_buffer, uint64_t p_offset) override final;
 
 	// ----- PARTITIONED TOP-LEVEL ACCELERATION STRUCTURE -----

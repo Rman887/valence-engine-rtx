@@ -1603,7 +1603,9 @@ public:
 		// is ordered after theirs. The caller keeps each alive while a CLAS built over it may be traced.
 		Vector<RID> source_micromaps;
 		// The cluster BLAS handles (cluster_blas_create) a bottom-level build writes: listing them
-		// makes each usable by a TLAS and gives the TLAS build's read the barrier it needs.
+		// makes each usable by a TLAS and gives the TLAS build's read the barrier it needs. A build
+		// that rewrites in place the CLAS a cluster BLAS references (D107) lists that BLAS too: the
+		// lists that traced it declared its handle, not the CLAS, so its tracker orders the rewrite after them.
 		Vector<RID> dst_acceleration_structures;
 	};
 
@@ -1611,6 +1613,9 @@ public:
 	void cluster_acceleration_structure_get_build_sizes(const ClusterAccelerationStructureInput &p_input, uint64_t &r_acceleration_structure_size, uint64_t &r_scratch_size);
 	void cluster_triangle_build_info_write(uint8_t *r_driver_info, const ClusterTriangleBuildInfo &p_info);
 	void cluster_bottom_level_build_info_write(uint8_t *r_driver_info, const ClusterBottomLevelBuildInfo &p_info);
+	// Cluster templates (D107): a template's build info, and a CLAS instantiation's from a built template.
+	void cluster_triangle_template_build_info_write(uint8_t *r_driver_info, const ClusterTriangleBuildInfo &p_info);
+	void cluster_instantiate_info_write(uint8_t *r_driver_info, const ClusterInstantiateInfo &p_info);
 	Error cluster_acceleration_structure_build(const ClusterAccelerationStructureBuild &p_build);
 	// A BLAS over the cluster BLAS to be built at p_offset in p_storage_buffer, usable as an
 	// instance's blas once a build listing it in dst_acceleration_structures is recorded. Its

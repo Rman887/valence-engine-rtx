@@ -1416,6 +1416,9 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			cluster_acceleration_structure_capabilities.bottom_level_build_info_size = sizeof(VkClusterAccelerationStructureBuildClustersBottomLevelInfoNV);
 			cluster_acceleration_structure_capabilities.move_info_size = sizeof(VkClusterAccelerationStructureMoveObjectsInfoNV);
 			cluster_acceleration_structure_capabilities.cluster_scratch_byte_alignment = cluster_acceleration_structure_properties.clusterScratchByteAlignment;
+			cluster_acceleration_structure_capabilities.cluster_template_byte_alignment = cluster_acceleration_structure_properties.clusterTemplateByteAlignment;
+			cluster_acceleration_structure_capabilities.triangle_template_build_info_size = sizeof(VkClusterAccelerationStructureBuildTriangleClusterTemplateInfoNV);
+			cluster_acceleration_structure_capabilities.instantiate_info_size = sizeof(VkClusterAccelerationStructureInstantiateClusterInfoNV);
 
 			print_verbose("- Vulkan Cluster Acceleration Structure supported");
 			print_verbose("  max vertices per cluster: " + itos(cluster_acceleration_structure_capabilities.max_vertices_per_cluster));
@@ -6997,7 +7000,9 @@ void RenderingDeviceDriverVulkan::_cluster_acceleration_structure_input(const Cl
 	r_vk_input.flags = p_input.flags;
 	r_vk_input.opMode = VkClusterAccelerationStructureOpModeNV(p_input.op_mode);
 	switch (p_input.op_type) {
-		case ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER: {
+		case ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER:
+		case ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER_TEMPLATE:
+		case ClusterAccelerationStructureInput::CLUSTER_OP_INSTANTIATE_TRIANGLE_CLUSTER: {
 			r_triangles = {};
 			r_triangles.sType = VK_STRUCTURE_TYPE_CLUSTER_ACCELERATION_STRUCTURE_TRIANGLE_CLUSTER_INPUT_NV;
 			r_triangles.vertexFormat = RD_TO_VK_FORMAT[p_input.vertex_format];
@@ -7008,7 +7013,17 @@ void RenderingDeviceDriverVulkan::_cluster_acceleration_structure_input(const Cl
 			r_triangles.maxTotalTriangleCount = p_input.max_total_triangle_count;
 			r_triangles.maxTotalVertexCount = p_input.max_total_vertex_count;
 			r_triangles.minPositionTruncateBitCount = p_input.min_position_truncate_bit_count;
-			r_vk_input.opType = VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_BUILD_TRIANGLE_CLUSTER_NV;
+			switch (p_input.op_type) {
+				case ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER_TEMPLATE:
+					r_vk_input.opType = VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_BUILD_TRIANGLE_CLUSTER_TEMPLATE_NV;
+					break;
+				case ClusterAccelerationStructureInput::CLUSTER_OP_INSTANTIATE_TRIANGLE_CLUSTER:
+					r_vk_input.opType = VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_INSTANTIATE_TRIANGLE_CLUSTER_NV;
+					break;
+				default:
+					r_vk_input.opType = VK_CLUSTER_ACCELERATION_STRUCTURE_OP_TYPE_BUILD_TRIANGLE_CLUSTER_NV;
+					break;
+			}
 			r_vk_input.opInput.pTriangleClusters = &r_triangles;
 		} break;
 		case ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL: {
@@ -7052,10 +7067,11 @@ void RenderingDeviceDriverVulkan::cluster_acceleration_structure_get_build_sizes
 #endif
 }
 
-void RenderingDeviceDriverVulkan::cluster_triangle_build_info_write(uint8_t *r_driver_info, const ClusterTriangleBuildInfo &p_info) {
 #if VULKAN_RAYTRACING_ENABLED
-	VkClusterAccelerationStructureBuildTriangleClusterInfoNV *vk_info = (VkClusterAccelerationStructureBuildTriangleClusterInfoNV *)r_driver_info;
-	*vk_info = {};
+// The fields a triangle cluster's build info and a template's build info share (D107).
+template <typename T>
+static void _cluster_triangle_info_fields(T *vk_info, const RDD::ClusterTriangleBuildInfo &p_info) {
+	using ClusterTriangleBuildInfo = RDD::ClusterTriangleBuildInfo;
 	vk_info->clusterID = p_info.cluster_id;
 	vk_info->triangleCount = p_info.triangle_count;
 	vk_info->vertexCount = p_info.vertex_count;
@@ -7074,10 +7090,10 @@ void RenderingDeviceDriverVulkan::cluster_triangle_build_info_write(uint8_t *r_d
 	vk_info->baseGeometryIndexAndGeometryFlags.geometryIndex = p_info.geometry_index;
 	// The cluster geometry bits are not the KHR geometry bits (cull-disable takes bit 0 there).
 	uint32_t geometry_flags = 0;
-	if (p_info.geometry_flags.has_flag(ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT)) {
+	if (p_info.geometry_flags.has_flag(RDD::ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT)) {
 		geometry_flags |= VK_CLUSTER_ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT_NV;
 	}
-	if (p_info.geometry_flags.has_flag(ACCELERATION_STRUCTURE_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT)) {
+	if (p_info.geometry_flags.has_flag(RDD::ACCELERATION_STRUCTURE_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT)) {
 		geometry_flags |= VK_CLUSTER_ACCELERATION_STRUCTURE_GEOMETRY_NO_DUPLICATE_ANYHIT_INVOCATION_BIT_NV;
 	}
 	vk_info->baseGeometryIndexAndGeometryFlags.geometryFlags = geometry_flags;
@@ -7102,6 +7118,35 @@ void RenderingDeviceDriverVulkan::cluster_triangle_build_info_write(uint8_t *r_d
 		vk_info->opacityMicromapArray = p_info.opacity_micromap_address;
 		vk_info->opacityMicromapIndexBuffer = p_info.opacity_micromap_index_address;
 	}
+}
+#endif
+
+void RenderingDeviceDriverVulkan::cluster_triangle_build_info_write(uint8_t *r_driver_info, const ClusterTriangleBuildInfo &p_info) {
+#if VULKAN_RAYTRACING_ENABLED
+	VkClusterAccelerationStructureBuildTriangleClusterInfoNV *vk_info = (VkClusterAccelerationStructureBuildTriangleClusterInfoNV *)r_driver_info;
+	*vk_info = {};
+	_cluster_triangle_info_fields(vk_info, p_info);
+#endif
+}
+
+void RenderingDeviceDriverVulkan::cluster_triangle_template_build_info_write(uint8_t *r_driver_info, const ClusterTriangleBuildInfo &p_info) {
+#if VULKAN_RAYTRACING_ENABLED
+	VkClusterAccelerationStructureBuildTriangleClusterTemplateInfoNV *vk_info = (VkClusterAccelerationStructureBuildTriangleClusterTemplateInfoNV *)r_driver_info;
+	*vk_info = {};
+	_cluster_triangle_info_fields(vk_info, p_info);
+#endif
+}
+
+void RenderingDeviceDriverVulkan::cluster_instantiate_info_write(uint8_t *r_driver_info, const ClusterInstantiateInfo &p_info) {
+#if VULKAN_RAYTRACING_ENABLED
+	ERR_FAIL_COND_MSG(p_info.geometry_index_offset >= (1u << 24), "A cluster instantiation's geometry index offset must fit in 24 bits.");
+	VkClusterAccelerationStructureInstantiateClusterInfoNV *vk_info = (VkClusterAccelerationStructureInstantiateClusterInfoNV *)r_driver_info;
+	*vk_info = {};
+	vk_info->clusterIdOffset = p_info.cluster_id_offset;
+	vk_info->geometryIndexOffset = p_info.geometry_index_offset;
+	vk_info->clusterTemplateAddress = p_info.template_address;
+	vk_info->vertexBuffer.startAddress = p_info.vertex_address;
+	vk_info->vertexBuffer.strideInBytes = p_info.vertex_stride;
 #endif
 }
 

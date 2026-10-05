@@ -38,6 +38,7 @@
 #include "scene/resources/3d/importer_mesh.h"
 #include "scene/resources/mesh.h"
 #include "scene/resources/surface_tool.h"
+#include "servers/rendering/rendering_server.h"
 
 static Error _parse_material_library(const String &p_path, HashMap<String, Ref<StandardMaterial3D>> &material_map, List<String> *r_missing_deps) {
 	Ref<FileAccess> f = FileAccess::open(p_path, FileAccess::READ);
@@ -634,6 +635,16 @@ int ResourceImporterOBJ::get_format_version() const {
 	return 1;
 }
 
+// The mesh is saved with cluster tables that follow the project's cluster settings, which the
+// import records in its metadata.
+String ResourceImporterOBJ::get_import_settings_string() const {
+	return RenderingServer::mesh_get_cluster_import_settings();
+}
+
+bool ResourceImporterOBJ::are_import_settings_valid(const String &p_path, const Dictionary &p_meta) const {
+	return RenderingServer::mesh_has_cluster_import_settings(String(p_meta.get("mesh_clusters", String())));
+}
+
 int ResourceImporterOBJ::get_preset_count() const {
 	return 0;
 }
@@ -700,6 +711,13 @@ Error ResourceImporterOBJ::import(ResourceUID::ID p_source_id, const String &p_s
 	ERR_FAIL_COND_V_MSG(err != OK, err, "Cannot save Mesh to file '" + save_path + "'.");
 
 	r_gen_files->push_back(save_path);
+
+	const String mesh_clusters = get_import_settings_string();
+	if (r_metadata && !mesh_clusters.is_empty()) {
+		Dictionary meta;
+		meta["mesh_clusters"] = mesh_clusters;
+		*r_metadata = meta;
+	}
 
 	return OK;
 }

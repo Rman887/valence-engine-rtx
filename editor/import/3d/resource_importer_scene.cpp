@@ -60,6 +60,7 @@
 #include "scene/resources/packed_scene.h"
 #include "scene/resources/physics_material.h"
 #include "scene/resources/resource_format_text.h"
+#include "servers/rendering/rendering_server.h"
 
 void EditorSceneFormatImporter::get_extensions(List<String> *r_extensions) const {
 	Vector<String> arr;
@@ -286,6 +287,16 @@ String ResourceImporterScene::get_resource_type() const {
 
 int ResourceImporterScene::get_format_version() const {
 	return 1;
+}
+
+// The meshes are saved with cluster tables that follow the project's cluster settings, which the
+// import records in its metadata; an animation library saves no mesh.
+String ResourceImporterScene::get_import_settings_string() const {
+	return _scene_import_type == "AnimationLibrary" ? String() : RenderingServer::mesh_get_cluster_import_settings();
+}
+
+bool ResourceImporterScene::are_import_settings_valid(const String &p_path, const Dictionary &p_meta) const {
+	return _scene_import_type == "AnimationLibrary" || RenderingServer::mesh_has_cluster_import_settings(String(p_meta.get("mesh_clusters", String())));
 }
 
 bool ResourceImporterScene::get_option_visibility(const String &p_path, const String &p_option, const HashMap<StringName, Variant> &p_options) const {
@@ -3462,6 +3473,13 @@ Error ResourceImporterScene::import(ResourceUID::ID p_source_id, const String &p
 	}
 
 	memdelete(scene);
+
+	const String mesh_clusters = get_import_settings_string();
+	if (r_metadata && !mesh_clusters.is_empty()) {
+		Dictionary meta;
+		meta["mesh_clusters"] = mesh_clusters;
+		*r_metadata = meta;
+	}
 
 	//this is not the time to reimport, wait until import process is done, import file is saved, etc.
 	//EditorNode::get_singleton()->reload_scene(p_source_file);

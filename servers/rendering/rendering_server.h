@@ -254,6 +254,14 @@ public:
 	// fails; the caller then falls back to mesh_surface_build_clusters. Normals and UVs, when
 	// their arrays match the positions, steer the simplification.
 	static Vector<uint8_t> mesh_surface_build_cluster_lod(const Vector<Vector3> &p_positions, const Vector<Vector3> &p_normals, const Vector<Vector2> &p_uvs, Vector<int> &r_indices);
+	// What the cluster tables of surfaces created now depend on: the builders present, the
+	// cluster_blas and cluster_lod switches mesh_create_surface_data_from_arrays reads, and the
+	// table versions. Empty when no table is built. Importers that save meshes record it with
+	// each import and reimport when the recorded one lacks a part of it; a switch turned off
+	// since reimports nothing. A builder change that alters the tables (the cluster limits, the
+	// meshoptimizer configuration) must bump the table version to reach existing imports.
+	static String mesh_get_cluster_import_settings();
+	static bool mesh_has_cluster_import_settings(const String &p_imported);
 	Array mesh_create_arrays_from_surface_data(const RenderingServerTypes::SurfaceData &p_data) const;
 	Array mesh_surface_get_arrays(RID p_mesh, int p_surface) const;
 	TypedArray<Array> mesh_surface_get_blend_shape_arrays(RID p_mesh, int p_surface) const;

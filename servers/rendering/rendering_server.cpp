@@ -1442,6 +1442,32 @@ RenderingServer::BuildClustersBoundFunc RenderingServer::build_clusters_bound_fu
 RenderingServer::BuildClustersFunc RenderingServer::build_clusters_func = nullptr;
 RenderingServer::BuildClusterLodFunc RenderingServer::build_cluster_lod_func = nullptr;
 
+String RenderingServer::mesh_get_cluster_import_settings() {
+	// Mirrors the conditions in mesh_create_surface_data_from_arrays.
+	if (build_clusters_func == nullptr || build_clusters_bound_func == nullptr || !GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
+		return String();
+	}
+	String settings = vformat("clusters v%d", RenderingServerTypes::MESH_CLUSTER_DATA_VERSION);
+	if (build_cluster_lod_func != nullptr && GLOBAL_GET("rendering/pathtracing/cluster_lod")) {
+		settings += vformat(", lod v%d", RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION);
+	}
+	return settings;
+}
+
+bool RenderingServer::mesh_has_cluster_import_settings(const String &p_imported) {
+	const String current = mesh_get_cluster_import_settings();
+	if (current.is_empty()) {
+		return true;
+	}
+	const Vector<String> imported = p_imported.split(", ");
+	for (const String &part : current.split(", ")) {
+		if (!imported.has(part)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 Vector<uint8_t> RenderingServer::mesh_surface_build_clusters(const Vector<Vector3> &p_positions, Vector<int> &r_indices) {
 	Vector<uint8_t> cluster_data;
 	if (build_clusters_func == nullptr || build_clusters_bound_func == nullptr) {

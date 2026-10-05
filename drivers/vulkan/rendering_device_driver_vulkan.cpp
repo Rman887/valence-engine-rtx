@@ -1189,14 +1189,14 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			partitioned_acceleration_structure_capabilities.supported = acceleration_structure_features.accelerationStructure && partitioned_acceleration_structure_features.partitionedAccelerationStructure;
 		}
 		if (GLOBAL_GET("rendering/pathtracing/partitioned_tlas") && !partitioned_acceleration_structure_capabilities.supported) {
-			WARN_PRINT("rendering/pathtracing/partitioned_tlas is set, but this device has no partitioned acceleration structures (VK_NV_partitioned_acceleration_structure). Using plain TLASes.");
+			print_verbose("rendering/pathtracing/partitioned_tlas is set, but this device has no partitioned acceleration structures (VK_NV_partitioned_acceleration_structure). Using plain TLASes.");
 		}
 
 		if (enabled_device_extension_names.has(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME)) {
 			opacity_micromap_capabilities.supported = acceleration_structure_features.accelerationStructure && opacity_micromap_features.micromap;
 		}
 		if (GLOBAL_GET("rendering/pathtracing/opacity_micromaps") && !opacity_micromap_capabilities.supported) {
-			WARN_PRINT("rendering/pathtracing/opacity_micromaps is set, but this device has no opacity micromaps (VK_EXT_opacity_micromap). Alpha-tested surfaces keep the any-hit test alone.");
+			print_verbose("rendering/pathtracing/opacity_micromaps is set, but this device has no opacity micromaps (VK_EXT_opacity_micromap). Alpha-tested surfaces keep the any-hit test alone.");
 		}
 	}
 

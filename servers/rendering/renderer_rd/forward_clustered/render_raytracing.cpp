@@ -115,7 +115,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 				cluster_build_data_access = RendererRD::MeshStorage::is_cluster_geometry_streaming_wanted();
 				DEV_ASSERT(cluster_build_data_access == stream_wanted);
 			} else {
-				WARN_PRINT("rendering/pathtracing/cluster_lod_stream_geometry is on but the device has no VK_KHR_ray_tracing_position_fetch; surfaces keep their geometry resident.");
+				print_verbose("rendering/pathtracing/cluster_lod_stream_geometry is on but the device has no VK_KHR_ray_tracing_position_fetch; surfaces keep their geometry resident.");
 			}
 		}
 		// The deformed selection (D87) builds each selected CLAS into its own slot: the worst case
@@ -203,13 +203,13 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 			position_fetch_check_buffer = RD::get_singleton()->storage_buffer_create(zeros.size(), zeros);
 			RD::get_singleton()->set_resource_name(position_fetch_check_buffer, "RT position fetch check");
 		}
-		// One line on the console (the setting is off by default): the harness reads it as proof the path is active.
+		// One line on the console: the harness reads it as proof the path is active.
 		print_line(vformat("RT: static BLAS built from clusters of up to %d triangles and %d vertices (D79), compaction %s, deformed meshes %s, cluster LOD selection %s, deformed selection %s, CLAS streaming %s.", caps.max_triangles_per_cluster, caps.max_vertices_per_cluster, cluster_compaction_enabled ? "on" : "off", cluster_deformed_enabled ? (deformed_cluster_templates_enabled ? "instantiated from cluster templates (D107)" : "rebuilt from clusters (D82)") : "refit as triangle BLAS", cluster_lod_select_enabled ? vformat("on at %.2f px (D86), traversal %s (D91), BLAS sharing %s", cluster_lod_pixel_error, cluster_lod_traversal_enabled ? "on" : "off", cluster_lod_share_enabled ? vformat("on within %d levels (D89), cached levels %s (D90)", cluster_lod_share_tolerance, cluster_lod_cache_enabled ? "on" : "off") : String("off (D89)")) : "off", cluster_lod_deformed_enabled ? vformat("on, %d byte slots (D87)%s", cluster_lod_clas_slot_size, cluster_lod_deformed_templated ? ", instantiated from templates (D108)" : "") : "off", cluster_lod_stream_enabled ? vformat("on within %d MB, %d clusters a frame, unused %d frames before unloading, %d bytes a CLAS at worst (D92)", cluster_lod_stream_budget / (1024 * 1024), cluster_lod_stream_builds_per_frame, cluster_lod_stream_min_age, cluster_lod_stream_cluster_worst) : "off"));
 		if (cluster_lod_stream_geometry_enabled) {
 			print_line(vformat("RT: geometry residency on: cluster builds allow data access, hits fetch CLAS positions (D93), blobs load with their groups within %d MB of uploads a frame (D93c).", cluster_lod_stream_upload_cap / (1024 * 1024)));
 		}
 	} else if (GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
-		WARN_PRINT("rendering/pathtracing/cluster_blas is on but the device has no VK_NV_cluster_acceleration_structure; static BLAS stay triangle BLAS.");
+		print_verbose("rendering/pathtracing/cluster_blas is on but the device has no VK_NV_cluster_acceleration_structure; static BLAS stay triangle BLAS.");
 	}
 
 	// Initialize merged MultiMesh BLAS compute shader.

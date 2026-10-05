@@ -4164,7 +4164,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST("rendering/pathtracing/multimesh_cache_cpu_transforms", false);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_blas_compaction", true);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_blas_deformed", true);
-	GLOBAL_DEF("rendering/pathtracing/cluster_lod", false);
+	GLOBAL_DEF("rendering/pathtracing/cluster_lod", true);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_select", true);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_share", true);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/cluster_lod_share_tolerance", PROPERTY_HINT_RANGE, "0,16,1"), 2);
@@ -4174,14 +4174,14 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_traversal", true);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_deformed", true);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/cluster_lod_pixel_error", PROPERTY_HINT_RANGE, "0,16,0.05"), 1.0);
-	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_stream", false);
+	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_stream", true);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/cluster_lod_stream_budget_mb", PROPERTY_HINT_RANGE, "16,65536,1"), 1024);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/cluster_lod_stream_builds_per_frame", PROPERTY_HINT_RANGE, "64,1048576,1"), 16384);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/cluster_lod_stream_min_age_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 30);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/cluster_lod_stream_upload_mb_per_frame", PROPERTY_HINT_RANGE, "1,4096,1"), 32);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/cluster_lod_stream_fallback_ratio", PROPERTY_HINT_RANGE, "0,1,0.001"), 0.125);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_lod_stream_geometry_ram_check", false);
-	GLOBAL_DEF_RST("rendering/pathtracing/build_budget", false);
+	GLOBAL_DEF_RST("rendering/pathtracing/build_budget", true);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/build_budget_triangles_per_frame", PROPERTY_HINT_RANGE, "1024,1073741824,1"), 262144);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/build_budget_builds_per_frame", PROPERTY_HINT_RANGE, "1,1048576,1"), 64);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/build_budget_max_wait_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 30);

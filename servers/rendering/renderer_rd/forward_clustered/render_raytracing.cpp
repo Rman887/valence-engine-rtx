@@ -97,6 +97,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		cluster_lod_share_enabled = cluster_lod_select_enabled && GLOBAL_GET("rendering/pathtracing/cluster_lod_share");
 		cluster_lod_share_tolerance = uint32_t(CLAMP(int(GLOBAL_GET("rendering/pathtracing/cluster_lod_share_tolerance")), 0, 16));
 		cluster_lod_cache_enabled = cluster_lod_share_enabled && GLOBAL_GET("rendering/pathtracing/cluster_lod_cache");
+		cluster_lod_cache_budget = uint64_t(MAX(0, int(GLOBAL_GET("rendering/pathtracing/cluster_lod_cache_budget_mb")))) * 1024 * 1024;
 		cluster_lod_traversal_enabled = cluster_lod_select_enabled && GLOBAL_GET("rendering/pathtracing/cluster_lod_traversal");
 		cluster_lod_max_instances = uint32_t(MIN(RD::get_singleton()->limit_get(RD::LIMIT_MAX_COMPUTE_WORKGROUP_COUNT_Y), uint64_t(UINT32_MAX)));
 		const RD::ClusterAccelerationStructureCapabilities &caps = RD::get_singleton()->get_cluster_acceleration_structure_capabilities();
@@ -1050,23 +1051,53 @@ void RenderRaytracing::prepare_frame() {
 			_release_lod_entry(*e);
 			lod_pool.free(live[i]);
 		}
-		// The cached levels (D90) no instance has traced for as long.
-		LocalVector<RTSurfaceData *> emptied;
-		for (RTSurfaceData *surface : cluster_lod_cached_surfaces) {
-			bool any_left = false;
-			for (RTLodCachedLevel &level : surface->cluster_lod_cache) {
-				if (level.blas.is_valid() && current_frame - level.last_used_frame > LOD_SLOT_TTL) {
-					_release_lod_cached_level(level);
+		// The cached levels (D90) stay while they fit the memory budget (D112); past it, the least
+		// recently traced go first, down to seven eighths of it, never one traced this frame or the
+		// frame before (a second viewport's TLAS may hold one of this frame's, and the next frame most
+		// likely wants last frame's again): the budget is soft over that working set. A freed level's
+		// arena region is retired and its handle freed past the frames in flight, as any cached
+		// level's. Its depth keeps the eviction, so its next build is known as a rebuild; a surface
+		// with none left leaves the set.
+		if (cluster_lod_cache_bytes > cluster_lod_cache_budget) {
+			const uint64_t low_water = cluster_lod_cache_budget - cluster_lod_cache_budget / 8;
+			LocalVector<RTLodCacheEvictCandidate> &candidates = cluster_lod_cache_evict_scratch;
+			candidates.clear();
+			uint64_t protected_bytes = 0;
+			for (RTSurfaceData *surface : cluster_lod_cached_surfaces) {
+				for (uint32_t d = 0; d < surface->cluster_lod_cache.size(); d++) {
+					const RTLodCachedLevel &level = surface->cluster_lod_cache[d];
+					if (level.blas.is_null()) {
+						continue;
+					}
+					if (current_frame - level.last_used_frame <= 1) {
+						protected_bytes += level.arena_size;
+					} else {
+						candidates.push_back({ level.last_used_frame, surface, d });
+					}
 				}
-				any_left = any_left || level.blas.is_valid();
 			}
-			if (!any_left) {
-				emptied.push_back(surface);
+			if (protected_bytes > low_water && cluster_lod_cache_budget > 0) {
+				WARN_PRINT_ONCE(vformat("RT: the cached levels traced in the last two frames take %d KB, past the low-water mark of rendering/pathtracing/cluster_lod_cache_budget_mb (%d KB), so eviction cannot get under it; they are kept (D112).", protected_bytes / 1024, low_water / 1024));
 			}
-		}
-		for (RTSurfaceData *surface : emptied) {
-			surface->cluster_lod_cache.clear();
-			cluster_lod_cached_surfaces.erase(surface);
+			candidates.sort();
+			LocalVector<RTSurfaceData *> &emptied = cluster_lod_cache_emptied_scratch;
+			emptied.clear();
+			for (uint32_t i = 0; i < candidates.size() && cluster_lod_cache_bytes > low_water; i++) {
+				RTLodCachedLevel &level = candidates[i].surface->cluster_lod_cache[candidates[i].depth];
+				_release_lod_cached_level(level);
+				level.evicted = true;
+				cluster_lod_cache_evictions_total++;
+				bool any_left = false;
+				for (const RTLodCachedLevel &other : candidates[i].surface->cluster_lod_cache) {
+					any_left = any_left || other.blas.is_valid();
+				}
+				if (!any_left) {
+					emptied.push_back(candidates[i].surface);
+				}
+			}
+			for (RTSurfaceData *surface : emptied) {
+				cluster_lod_cached_surfaces.erase(surface); // Its depths keep their evictions.
+			}
 		}
 	}
 
@@ -6711,12 +6742,19 @@ bool RenderRaytracing::_prepare_lod_cached_level(RTSurfaceData *p_surf_data, uin
 	level.arena_chunk = int32_t(chunk_index);
 	level.arena_offset = offset;
 	level.arena_size = size;
+	// Stamped as used from its build (D112), so the memory budget never frees it before its first
+	// trace: a streamed surface's level 0 pin (D92) is built before any instance traces it.
+	level.last_used_frame = RSG::rasterizer->get_frame_number();
 	cluster_lod_cached_surfaces.insert(p_surf_data);
 	cluster_lod_cache_live++;
 	cluster_lod_cache_bytes += size;
+	// A level the memory budget freed is rebuilt here (D112), counted once the batch records it.
+	print_verbose(vformat("RT: cached level [%d] depth %d: %s, %d clusters, %d bytes (%d KB of %d KB live; %d rebuilt and %d evicted over the run, D112).", p_surf_data->cluster_cache_key, p_depth, level.evicted ? "rebuilt after its eviction" : "first build", count, size, cluster_lod_cache_bytes / 1024, cluster_lod_cache_budget / 1024, cluster_lod_cache_rebuilds_total, cluster_lod_cache_evictions_total));
 	RTLodSelectBatch::CacheBuild build;
 	build.surface = p_surf_data;
 	build.depth = p_depth;
+	build.rebuild = level.evicted;
+	level.evicted = false;
 	batch.cache_builds.push_back(build);
 	build_budget.built += build_budget.enabled ? 1 : 0;
 	return true;
@@ -7654,6 +7692,9 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 			frame_extra_builds += batch.entries[e] != nullptr ? 1 : 0;
 		}
 		frame_extra_builds += batch.cache_builds.size();
+		for (const RTLodSelectBatch::CacheBuild &build : batch.cache_builds) {
+			cluster_lod_cache_rebuilds_total += build.rebuild ? 1 : 0; // Recorded now (D112).
+		}
 		// The deformed items' CLAS live in this flush's region from now (D87), or a persistent item's in
 		// its own slots (D109); the counters take what the batch would have counted, as
 		// _flush_deformed_cluster_batch does, a persistent item's updates being the device's.
@@ -7724,6 +7765,7 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 		for (const RTLodSelectBatch::CacheBuild &build : batch.cache_builds) {
 			if (build.depth < build.surface->cluster_lod_cache.size()) {
 				_release_lod_cached_level(build.surface->cluster_lod_cache[build.depth]); // Never built.
+				build.surface->cluster_lod_cache[build.depth].evicted = build.rebuild; // Still owed (D112).
 			}
 		}
 		if (batch.args_buffer.is_valid()) {

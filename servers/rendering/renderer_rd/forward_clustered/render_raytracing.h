@@ -364,9 +364,9 @@ struct RTLodLevelBound {
 // A discrete level's cluster BLAS (D90): every cluster of one depth's groups, with those of
 // terminal groups above it, the whole surface at that depth. It is built once, fast-trace, into
 // its own arena slot, and traced by any instance whose selection it covers within the tolerance;
-// never rebuilt, so no frame's build writes what an earlier frame's trace may still read. Released
-// on the slots' TTL unused or with the surface's hierarchy; none is made while the surface's
-// compaction is pending.
+// never rebuilt in place, so no frame's build writes what an earlier frame's trace may still read. Released
+// by the memory budget (D112), least recently traced first, or with the surface's hierarchy; none
+// is made while the surface's compaction is pending.
 struct RTLodCachedLevel {
 	RID blas;
 	uint64_t blas_address = 0;
@@ -374,6 +374,7 @@ struct RTLodCachedLevel {
 	uint64_t arena_offset = 0;
 	uint64_t arena_size = 0;
 	uint32_t last_used_frame = 0;
+	bool evicted = false; // Freed by the memory budget (D112): its next build is a rebuild.
 	// The build budget (D97): the frame its build was last refused and the frame it began waiting.
 	uint64_t budget_frame = UINT64_MAX;
 	uint64_t budget_wait_since = 0;
@@ -749,6 +750,7 @@ struct RTLodSelectBatch {
 	struct CacheBuild {
 		RTSurfaceData *surface = nullptr;
 		uint32_t depth = 0;
+		bool rebuild = false; // Of a level the memory budget freed (D112), counted once the batch records it.
 	};
 	LocalVector<uint32_t> cached_depths;
 	LocalVector<CacheRequest> cache_requests;
@@ -1632,12 +1634,28 @@ class RenderRaytracing {
 	bool cluster_lod_share_enabled = false;
 	uint32_t cluster_lod_share_tolerance = 2;
 	// Cached levels (D90), rendering/pathtracing/cluster_lod_cache with the sharing: the surfaces
-	// holding one, for the TTL, and the totals for the report.
+	// that have held a level, which the memory budget's eviction walks (D112), and the totals for the report.
 	bool cluster_lod_cache_enabled = false;
 	HashSet<RTSurfaceData *> cluster_lod_cached_surfaces;
 	uint32_t cluster_lod_cache_live = 0;
 	uint64_t cluster_lod_cache_bytes = 0;
 	uint64_t cluster_lod_cache_builds_total = 0;
+	// The cached levels' memory budget (D112), rendering/pathtracing/cluster_lod_cache_budget_mb: kept
+	// until together they pass it, then freed least recently traced first; the evictions and the
+	// rebuilds of evicted levels over the run.
+	uint64_t cluster_lod_cache_budget = 0;
+	uint64_t cluster_lod_cache_evictions_total = 0;
+	uint64_t cluster_lod_cache_rebuilds_total = 0;
+	// The eviction's scratch, grow-only: the levels outside the working set, oldest first, and the
+	// surfaces left with none.
+	struct RTLodCacheEvictCandidate {
+		uint32_t last_used = 0;
+		RTSurfaceData *surface = nullptr;
+		uint32_t depth = 0;
+		bool operator<(const RTLodCacheEvictCandidate &p_other) const { return last_used < p_other.last_used; }
+	};
+	LocalVector<RTLodCacheEvictCandidate> cluster_lod_cache_evict_scratch;
+	LocalVector<RTSurfaceData *> cluster_lod_cache_emptied_scratch;
 	// The traversal (D91), rendering/pathtracing/cluster_lod_traversal with the selection; a verbose
 	// run checks it against the exhaustive test of the same frame, these its tallies.
 	bool cluster_lod_traversal_enabled = false;

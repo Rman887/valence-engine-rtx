@@ -296,6 +296,14 @@ void MeshStorage::mesh_set_blend_shape_count(RID p_mesh, int p_blend_shape_count
 	mesh->blend_shape_count = p_blend_shape_count;
 }
 
+// Whether the trace builds cluster BLAS from the surfaces' tables: the device has
+// VK_NV_cluster_acceleration_structure, which the driver requests only while
+// rendering/pathtracing/cluster_blas is on. Read once: both need a restart.
+static bool _is_cluster_blas_supported() {
+	static const bool supported = RD::get_singleton()->has_feature(RD::SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE);
+	return supported;
+}
+
 // Triangle clusters at load (D80): a 3D triangle-list surface arriving without its cluster table
 // (saved or imported before the setting was on, or handed over as packed data) is clustered here
 // from its packed positions and indices, so the cluster BLAS builds from spatial clusters and not
@@ -308,8 +316,8 @@ static void _cluster_surface_at_load(RenderingServerTypes::SurfaceData &r_surfac
 	if (r_surface.cluster_data.size() || r_surface.index_count == 0 || r_surface.index_count % 3 != 0 || r_surface.vertex_count == 0 || r_surface.primitive != RSE::PRIMITIVE_TRIANGLES || !(r_surface.format & RSE::ARRAY_FORMAT_VERTEX) || (r_surface.format & RSE::ARRAY_FLAG_USE_2D_VERTICES)) {
 		return;
 	}
-	if (RenderingServer::build_clusters_func == nullptr || !GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
-		return;
+	if (RenderingServer::build_clusters_func == nullptr || !_is_cluster_blas_supported()) {
+		return; // A device without cluster BLAS traces triangle BLAS, which ignore the table.
 	}
 
 	uint32_t offsets[RSE::ARRAY_MAX];
@@ -366,13 +374,13 @@ static void _cluster_surface_at_load(RenderingServerTypes::SurfaceData &r_surfac
 	r_surface.cluster_data = cluster_data;
 }
 
-// The coarse levels of a cluster LOD hierarchy (D85): while rendering/pathtracing/cluster_blas
-// and cluster_lod are both on, and the surface's table is version 2 and describes its index
-// data, the coarse clusters' triangles are packed to the surface's index format and appended to
-// r_index_data, so the index buffer holds every level. Otherwise the buffer stays the drawn
-// range and the RT cache, which reads the buffer's length (Surface::index_total), traces LOD 0
-// from the table's first clusters. A coarse index outside the surface leaves the buffer at the
-// drawn range too.
+// The coarse levels of a cluster LOD hierarchy (D85): while the device builds cluster BLAS
+// and rendering/pathtracing/cluster_lod is on, and the surface's table is version 2 and
+// describes its index data, the coarse clusters' triangles are packed to the surface's index
+// format and appended to r_index_data, so the index buffer holds every level. Otherwise the
+// buffer stays the drawn range and the RT cache, which reads the buffer's length
+// (Surface::index_total), traces LOD 0 from the table's first clusters. A coarse index outside
+// the surface leaves the buffer at the drawn range too.
 static void _cluster_lod_index_tail(const RenderingServerTypes::SurfaceData &p_surface, bool p_is_index_16, Vector<uint8_t> &r_index_data, uint32_t &r_index_total) {
 	const Vector<uint8_t> &table_bytes = p_surface.cluster_data;
 	const uint64_t words = table_bytes.size() / sizeof(uint32_t);
@@ -383,8 +391,8 @@ static void _cluster_lod_index_tail(const RenderingServerTypes::SurfaceData &p_s
 	if (table[0] != RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION) {
 		return;
 	}
-	if (!GLOBAL_GET("rendering/pathtracing/cluster_blas") || !GLOBAL_GET("rendering/pathtracing/cluster_lod")) {
-		return;
+	if (!_is_cluster_blas_supported() || !GLOBAL_GET("rendering/pathtracing/cluster_lod")) {
+		return; // Only the cluster BLAS trace the coarse levels.
 	}
 	if (table[7] & RenderingServerTypes::MESH_CLUSTER_LOD_FLAG_STALE) {
 		return; // The coarse levels are traced no more (D86); the tail would sit unused.

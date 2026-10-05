@@ -4289,6 +4289,28 @@ void RenderForwardClustered::GeometryInstanceForwardClustered::_mark_dirty() {
 	//clear surface caches
 	GeometryInstanceSurfaceDataCache *surf = surface_caches;
 
+	// The path tracer's handles outlive the caches (D110), keyed by surface and place in its material
+	// chain: the list runs newest first, so a cache's place is the count of older caches of its surface.
+	LocalVector<GeometryInstanceSurfaceDataCache *> caches;
+	for (GeometryInstanceSurfaceDataCache *s = surface_caches; s; s = s->next) {
+		caches.push_back(s);
+	}
+	for (uint32_t i = caches.size(); i-- > 0;) {
+		GeometryInstanceSurfaceDataCache *s = caches[i];
+		uint32_t chain_index = 0;
+		for (uint32_t j = i + 1; j < caches.size(); j++) {
+			chain_index += caches[j]->surface == s->surface ? 1 : 0;
+		}
+		if (s->rt_deformed_handle.is_valid() || s->rt_lod_handle.is_valid()) {
+			RTKeptHandles kept;
+			kept.surface = s->surface;
+			kept.chain_index = chain_index;
+			kept.deformed = s->rt_deformed_handle;
+			kept.lod = s->rt_lod_handle;
+			rt_handles_kept.push_back(kept);
+		}
+	}
+
 	while (surf) {
 		GeometryInstanceSurfaceDataCache *next = surf->next;
 		RenderForwardClustered::get_singleton()->geometry_instance_surface_alloc.free(surf);
@@ -4419,6 +4441,24 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 	sdcache->surface = mesh_storage->mesh_get_surface(p_mesh, p_surface);
 	sdcache->primitive = mesh_storage->mesh_surface_get_primitive(sdcache->surface);
 	sdcache->surface_index = p_surface;
+	// The path tracer's handles the cache in this place of this surface's material chain held before
+	// the rebuild (D110); the deformed one only while the instance still deforms its mesh, since a
+	// surface traced rigid never reads it and keeping it would hold its static opacity micromap off.
+	if (!ginstance->rt_handles_kept.is_empty()) {
+		uint32_t chain_index = 0;
+		for (GeometryInstanceSurfaceDataCache *s = ginstance->surface_caches; s; s = s->next) {
+			chain_index += s->surface == sdcache->surface ? 1 : 0;
+		}
+		for (uint32_t i = 0; i < ginstance->rt_handles_kept.size(); i++) {
+			GeometryInstanceForwardClustered::RTKeptHandles &kept = ginstance->rt_handles_kept[i];
+			if (kept.surface == sdcache->surface && kept.chain_index == chain_index) {
+				sdcache->rt_deformed_handle = ginstance->mesh_instance.is_valid() ? kept.deformed : RID();
+				sdcache->rt_lod_handle = kept.lod;
+				ginstance->rt_handles_kept.remove_at_unordered(i);
+				break;
+			}
+		}
+	}
 
 	if (ginstance->data->dirty_dependencies) {
 		RSG::utilities->base_update_dependency(p_mesh, &ginstance->data->dependency_tracker);
@@ -4685,6 +4725,9 @@ void RenderForwardClustered::_geometry_instance_update(RenderGeometryInstance *p
 		ginstance->data->dependency_tracker.update_end();
 		ginstance->data->dirty_dependencies = false;
 	}
+
+	// Handles no rebuilt cache took back (a surface or a pass gone) idle out in the path tracer's pools (D110).
+	ginstance->rt_handles_kept.clear();
 
 	ginstance->dirty_list_element.remove_from_list();
 }

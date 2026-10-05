@@ -1635,6 +1635,7 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 			entry.cached_change_stamp != p_source.change_stamp ||
 			entry.cached_buffer_id != buffer_id;
 	bool needs_full_rebuild = !entry.ptr || !entry.blas_built_once || layout_changed ||
+			entry.cached_mesh_surface != p_mesh_surface || // A kept handle on another surface (D110).
 			entry.cached_key_version != p_source.cache_version ||
 			entry.cached_surface_counter != p_source.surface_counter ||
 			(entry.cluster_count > 0 && !cluster_deformed_enabled); // The cluster path went off (D82): a triangle BLAS from here.
@@ -1668,6 +1669,11 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 		entry.prev_pos_seeded = false;
 	}
 
+	// A kept handle on another surface or mesh instance (D110) holds positions that are not this
+	// surface's: the previous positions are seeded again, so motion vectors start at zero.
+	if (entry.cached_mesh_surface != p_mesh_surface || entry.cached_key_version != p_source.cache_version) {
+		entry.prev_pos_seeded = false;
+	}
 	// Per-frame copies run exactly once per frame, even when the same surface is visible from multiple viewports.
 	const bool first_touch_this_frame = entry.last_used_frame != current_frame;
 	if (first_touch_this_frame) {
@@ -1741,6 +1747,7 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 	entry.cached_change_stamp = p_source.change_stamp;
 	entry.cached_key_version = p_source.cache_version;
 	entry.cached_surface_counter = p_source.surface_counter;
+	entry.cached_mesh_surface = p_mesh_surface;
 	entry.cached_buffer_id = buffer_id;
 	entry.cached_vertex_count = vertex_count;
 	entry.cached_full_size = full_size;

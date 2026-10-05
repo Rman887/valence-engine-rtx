@@ -597,6 +597,20 @@ protected:
 		mutable uint64_t rt_traced_frame = UINT64_MAX;
 		mutable uint64_t rt_traced_mask = 0;
 		mutable uint64_t rt_traced_prev_mask = 0;
+		/// The path tracer's per-cache handles (a deformed entry, a cluster LOD slot), kept while
+		/// _mark_dirty rebuilds the surface caches that hold them (D110): a raster change (a light's
+		/// projector or soft shadow paired, a material) is no reason to build the surface's BLAS
+		/// again. Each is keyed by the mesh surface and the cache's place in that surface's material
+		/// chain (its material, then next passes and the overlay), so it returns to the cache it came
+		/// from, follows its surface when an earlier one is removed, and never reaches another mesh;
+		/// a handle no rebuilt cache takes back idles out as before.
+		struct RTKeptHandles {
+			void *surface = nullptr;
+			uint32_t chain_index = 0;
+			RID deformed;
+			RID lod;
+		};
+		LocalVector<RTKeptHandles> rt_handles_kept;
 
 		// lightmap
 		RID lightmap_instance;

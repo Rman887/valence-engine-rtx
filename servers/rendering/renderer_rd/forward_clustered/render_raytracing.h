@@ -889,6 +889,7 @@ struct RTDeformedCacheEntry {
 	uint32_t cached_key_version = 0;
 	uint32_t cached_surface_counter = 0;
 	uint64_t cached_buffer_id = 0; // RID id of the deformed vertex buffer at the time of build.
+	void *cached_mesh_surface = nullptr; // The surface it was built for (D110: its handle can outlive the instance's surface cache).
 	bool blas_built_once = false; // True once the BLAS has been fully built; subsequent ticks can refit.
 
 	RID owned_vb_full;

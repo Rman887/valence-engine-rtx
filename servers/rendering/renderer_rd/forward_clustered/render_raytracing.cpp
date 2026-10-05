@@ -151,6 +151,9 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 				}
 			}
 			cluster_lod_clas_slot_size = _align_up(slot_size, uint64_t(MAX(caps.cluster_byte_alignment, 1u)));
+			// Persistent items (D109) take arguments, not region, a slot: an instantiation info, a
+			// destination and a cluster index, under the same bound.
+			cluster_lod_persistent_ceiling_slots = uint32_t(MIN(RT_LOD_CLAS_REGION_CEILING / (uint64_t(caps.instantiate_info_size) + sizeof(uint64_t) + sizeof(uint32_t)), uint64_t(UINT32_MAX)));
 			const uint64_t region_alignment = MAX(caps.cluster_byte_alignment, caps.cluster_bottom_level_byte_alignment);
 			cluster_lod_clas_ceiling_clusters = slot_size > 0 && RT_LOD_CLAS_REGION_CEILING > region_alignment ? uint32_t(MIN((RT_LOD_CLAS_REGION_CEILING - region_alignment) / cluster_lod_clas_slot_size, uint64_t(UINT32_MAX))) : 0;
 			if (slot_size == 0) {
@@ -1673,6 +1676,7 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 		}
 		if (data_changed || !entry.prev_pos_seeded) {
 			rd->buffer_copy(p_source.current_vb, entry.owned_vb_full, 0, 0, full_size);
+			entry.cluster_lod_slots_stale = true; // The persistent selection's slots hold older positions (D109).
 		}
 		if (!entry.prev_pos_seeded) {
 			// Seed prev = current so motion vectors are zero on the first frame.
@@ -2900,9 +2904,10 @@ bool RenderRaytracing::_populate_deformed_cluster_layout(void *p_mesh_surface, u
 	const uint32_t infos_count = lod ? layout.triangles.size() : cluster_count;
 
 	// The entry's storage holds the BLAS, at an explicit address the size query bounds for this
-	// cluster count, and, templated, the batch's LOD 0 CLAS after it (D107); its other CLAS are built
-	// into the frame's region, by the batch with implicit destinations (_flush_deformed_cluster_batch,
-	// as the static path builds its own, D81) or by the selection into explicit slots (D87, D108).
+	// cluster count, and, templated, its CLAS slots after it: the batch's LOD 0 (D107) and the
+	// selection's picks (D109). Untemplated, its CLAS are built into the frame's region, by the batch
+	// with implicit destinations (_flush_deformed_cluster_batch, as the static path builds its own,
+	// D81) or by the selection into explicit slots (D87).
 	RD::ClusterAccelerationStructureInput blas_input;
 	blas_input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
 	blas_input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
@@ -2919,9 +2924,11 @@ bool RenderRaytracing::_populate_deformed_cluster_layout(void *p_mesh_surface, u
 	}
 
 	const uint64_t base_alignment = MAX(caps.cluster_byte_alignment, caps.cluster_bottom_level_byte_alignment);
-	// A templated entry's CLAS follow its BLAS, one worst-case instantiation apart (D107).
+	// A templated entry's CLAS follow its BLAS, one worst-case instantiation apart (D107): its LOD 0
+	// clusters, or with the hierarchy the slots its selection keeps there (D109), as many as any cut.
 	const uint64_t clas_stride = cluster_template ? _align_up(cluster_template->clas_size, uint64_t(caps.cluster_byte_alignment)) : 0;
-	const uint64_t storage_size = base_alignment + _align_up(blas_size, base_alignment) + clas_stride * cluster_count;
+	const uint32_t slot_capacity = cluster_template && lod ? _deformed_cluster_cut_capacity(p_mesh_surface, cluster_count, infos_count) : cluster_count;
+	const uint64_t storage_size = base_alignment + _align_up(blas_size, base_alignment) + clas_stride * slot_capacity;
 	if (storage_size > UINT32_MAX) {
 		_release_deformed_cluster_storage(r_entry);
 		ERR_FAIL_V_MSG(false, "RT: a deformed cluster BLAS's storage exceeds 4 GB.");
@@ -2995,10 +3002,12 @@ bool RenderRaytracing::_populate_deformed_cluster_layout(void *p_mesh_surface, u
 	r_entry.cluster_infos.resize(uint64_t(clas_info_stride) * cluster_count);
 	memcpy(r_entry.cluster_infos.ptr(), all_infos.ptr(), r_entry.cluster_infos.size());
 	if (cluster_template) {
-		// The batch instantiates its LOD 0 CLAS into the entry's own storage (D107).
+		// The batch instantiates its LOD 0 CLAS into the entry's own storage (D107), and the
+		// selection its picks into the same slots (D109).
 		r_entry.cluster_clas_address = base_address + _align_up(blas_size, base_alignment);
 		r_entry.cluster_clas_stride = uint32_t(clas_stride);
 	}
+	r_entry.cluster_lod_slot_capacity = slot_capacity;
 
 	surf_data->blas = blas;
 	surf_data->blas_size = storage_size;
@@ -3019,11 +3028,52 @@ bool RenderRaytracing::_populate_deformed_cluster_layout(void *p_mesh_surface, u
 		*r_omm_attached = omm;
 	}
 	if (layout.levels > 1) {
-		print_verbose(vformat("RT: deformed cluster BLAS [%d]: %d triangles in %d clusters at LOD 0 of %d over %d levels, of at most %d triangles and %d vertices, %d KB BLAS storage, %s.", p_cache_key, primitive_count, cluster_count, layout.triangles.size(), layout.levels, layout.max_triangles, layout.max_vertices, storage_size / 1024, r_entry.cluster_lod_table_offset != UINT32_MAX ? vformat("selecting from %d words of the LOD table%s", r_entry.cluster_lod_table_words, cluster_template ? ", instantiated from templates (D108)" : "") : "LOD 0 traced"));
+		print_verbose(vformat("RT: deformed cluster BLAS [%d]: %d triangles in %d clusters at LOD 0 of %d over %d levels, of at most %d triangles and %d vertices, %d KB BLAS storage, %s.", p_cache_key, primitive_count, cluster_count, layout.triangles.size(), layout.levels, layout.max_triangles, layout.max_vertices, storage_size / 1024, r_entry.cluster_lod_table_offset != UINT32_MAX ? vformat("selecting from %d words of the LOD table%s", r_entry.cluster_lod_table_words, cluster_template ? vformat(", instantiated from templates (D108) into %d slots of its own (D109, %s)", slot_capacity, slot_capacity == cluster_count ? "every cut within LOD 0" : "a cut can pass LOD 0") : "") : "LOD 0 traced"));
 	} else {
 		print_verbose(vformat("RT: deformed cluster BLAS [%d]: %d triangles in %d %s of at most %d triangles and %d vertices, %d KB BLAS storage%s.", p_cache_key, primitive_count, cluster_count, layout.from_table ? "clusters" : "runs", layout.max_triangles, layout.max_vertices, storage_size / 1024, cluster_template ? vformat(" with its CLAS, instantiated from templates (D107, %d bytes a CLAS at worst)", clas_stride) : String()));
 	}
 	return true;
+}
+
+// A cut of a hierarchy (D85) replaces whole groups: a coarser cluster is taken only where the group it
+// was simplified from is not, so a cut can be turned into LOD 0 by putting back, coarsest first, the
+// group each taken cluster replaces, and that never shrinks it where no group is replaced by more
+// clusters than it has. Where that holds, LOD 0's count bounds every cut (D109).
+uint32_t RenderRaytracing::_deformed_cluster_cut_capacity(void *p_mesh_surface, uint32_t p_lod0_clusters, uint32_t p_all_clusters) {
+	const Vector<uint8_t> &table_bytes = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_cluster_data(p_mesh_surface);
+	if (table_bytes.size() < int64_t(RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS * sizeof(uint32_t))) {
+		return p_all_clusters;
+	}
+	const uint32_t *table = reinterpret_cast<const uint32_t *>(table_bytes.ptr());
+	const uint32_t cluster_count = table[1];
+	const uint32_t group_count = table[2];
+	if (table[0] != RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION || cluster_count != p_all_clusters || group_count == 0 ||
+			uint64_t(table_bytes.size()) < sizeof(uint32_t) * (RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS + uint64_t(RenderingServerTypes::MESH_CLUSTER_LOD_CLUSTER_WORDS) * cluster_count)) {
+		return p_all_clusters;
+	}
+	const uint32_t *cluster_words = table + RenderingServerTypes::MESH_CLUSTER_LOD_HEADER_WORDS;
+	LocalVector<uint32_t> members;
+	LocalVector<uint32_t> replacements;
+	members.resize_initialized(group_count);
+	replacements.resize_initialized(group_count);
+	for (uint32_t c = 0; c < cluster_count; c++) {
+		const uint32_t *w = cluster_words + uint64_t(c) * RenderingServerTypes::MESH_CLUSTER_LOD_CLUSTER_WORDS;
+		const int32_t refined = int32_t(w[2]);
+		if (w[1] >= group_count || refined >= int32_t(group_count)) {
+			return p_all_clusters;
+		}
+		members[w[1]]++;
+		if (refined >= 0) {
+			replacements[refined]++;
+		}
+	}
+	for (uint32_t g = 0; g < group_count; g++) {
+		if (replacements[g] > members[g]) {
+			deformed_cut_bound_failures_total++;
+			return p_all_clusters;
+		}
+	}
+	return p_lod0_clusters;
 }
 
 // The entry's hierarchy as the selection reads it (D87): its region of the LOD table, laid out
@@ -3065,7 +3115,9 @@ bool RenderRaytracing::_populate_deformed_cluster_lod(void *p_mesh_surface, cons
 		tree_words.clear();
 		WARN_PRINT_ONCE(vformat("RT: deformed cluster BLAS [%d]: the hierarchy's groups do not own contiguous runs of its clusters; its selection tests every cluster.", p_cache_key));
 	}
-	const uint64_t words64 = uint64_t(cluster_count) * 4 + uint64_t(group_count) * GROUP_WORDS + uint64_t(cluster_count) * info_words + tree_words.size();
+	// Then the last selection's digest (D109): its count and two hashes, zero until the first selection.
+	const uint32_t DIGEST_WORDS = 3;
+	const uint64_t words64 = uint64_t(cluster_count) * 4 + uint64_t(group_count) * GROUP_WORDS + uint64_t(cluster_count) * info_words + tree_words.size() + DIGEST_WORDS;
 	ERR_FAIL_COND_V_MSG(words64 > UINT32_MAX / 4, false, "RT: a deformed cluster LOD hierarchy's region exceeds the table's reach.");
 	const uint32_t words = uint32_t(words64);
 	uint32_t offset = 0;
@@ -3105,10 +3157,13 @@ bool RenderRaytracing::_populate_deformed_cluster_lod(void *p_mesh_surface, cons
 		r_entry.cluster_lod_tree.group_count = group_count;
 		r_entry.cluster_lod_tree.level_nodes = tree_levels;
 	}
+	const uint32_t digest_offset = tree_offset + tree_words.size();
+	memset(host.ptr() + digest_offset, 0, DIGEST_WORDS * sizeof(uint32_t));
 	rd->buffer_update(cluster_lod_table, offset * sizeof(uint32_t), uint32_t(words * sizeof(uint32_t)), host.ptr());
 	r_entry.cluster_lod_table_offset = offset;
 	r_entry.cluster_lod_table_words = words;
 	r_entry.cluster_lod_infos_offset = offset + infos_offset;
+	r_entry.cluster_lod_digest_offset = offset + digest_offset;
 	r_entry.cluster_lod_count = cluster_count;
 	r_entry.cluster_lod_total_triangles = p_layout.total_triangles;
 	r_entry.cluster_lod_total_vertices = p_layout.total_vertices;
@@ -3126,6 +3181,7 @@ void RenderRaytracing::_release_deformed_cluster_lod(RTDeformedCacheEntry &p_ent
 	p_entry.cluster_lod_table_offset = UINT32_MAX;
 	p_entry.cluster_lod_table_words = 0;
 	p_entry.cluster_lod_infos_offset = 0;
+	p_entry.cluster_lod_digest_offset = UINT32_MAX;
 	p_entry.cluster_lod_tree = RTLodTree();
 	p_entry.cluster_lod_count = 0;
 	p_entry.cluster_lod_total_triangles = 0;
@@ -6340,10 +6396,13 @@ void RenderRaytracing::_lod_record_tree(const Transform3D &p_transform, const RT
 	batch.tree_count++;
 }
 
-// A deformed entry on the selection (D87): its record flags the CLAS build, names its CLAS infos
-// in the table (build infos, or instantiation infos when templated, D108) and its first slot of the
-// frame's region (the flush turns that into the destination base), and the build takes its storage,
-// its owned vertex buffer, its index buffer and its templates.
+// A deformed entry on the selection (D87): its record flags the CLAS build and names its CLAS infos
+// in the table (build infos, or instantiation infos when templated, D108). Templated, it is a
+// persistent item (D109): its own slots (base, stride, count), its cluster list, its kept digest,
+// its triangles and its BLAS address, forced where its slots may not hold its last selection over
+// the current positions; else its first slot of the frame's region (the flush turns that into the
+// destination base). The builds take its storage, its owned vertex buffer, its index buffer and
+// its templates.
 void RenderRaytracing::_queue_lod_deformed_instance(RTDeformedCacheEntry &p_entry, const Transform3D &p_transform, uint32_t p_slot) {
 	RTLodSelectBatch &batch = lod_batch;
 	const uint32_t cluster_count = p_entry.cluster_lod_count;
@@ -6359,9 +6418,32 @@ void RenderRaytracing::_queue_lod_deformed_instance(RTDeformedCacheEntry &p_entr
 	w[17] = p_entry.cluster_lod_infos_offset;
 	w[18] = batch.clas_bound; // The first slot; the flush writes the destination base over 18 and 19.
 	w[19] = 0;
+	const bool persistent = cluster_lod_deformed_templated && p_entry.cluster_templated && p_entry.cluster_lod_digest_offset != UINT32_MAX;
+	uint32_t slots = cluster_count;
+	if (persistent) {
+		// Its own slots (D109): forced where its slots do not hold its last selection over the
+		// current positions, that is a new layout, a skinning change, or the batch's LOD 0 rebuild
+		// since; a first build counted by the CPU, the updates by the device.
+		const bool first = p_entry.cluster_lod_pending_kind == RTDeformedCacheEntry::CLUSTER_QUEUED_FIRST_BUILD;
+		const bool force = first || p_entry.cluster_lod_pending_kind == RTDeformedCacheEntry::CLUSTER_QUEUED_CHANGED || !p_entry.cluster_lod_last || p_entry.cluster_lod_slots_stale;
+		slots = p_entry.cluster_lod_slot_capacity;
+		w[16] = 1 | 8 | (force ? 16 : 0) | (first ? 32 : 0); // DEFORMED, PERSISTENT, FORCE, FIRST.
+		w[18] = uint32_t(p_entry.cluster_clas_address & 0xFFFFFFFFULL);
+		w[19] = uint32_t(p_entry.cluster_clas_address >> 32);
+		w[24] = p_entry.cluster_clas_stride;
+		w[25] = slots;
+		w[28] = batch.clas_bound; // Its cluster list's first word; the flush adds the section's offset.
+		w[29] = p_entry.cluster_lod_digest_offset;
+		w[30] = p_entry.ptr ? p_entry.ptr->geometry.primitive_count : 0;
+		w[32] = uint32_t(p_entry.cluster_blas_address & 0xFFFFFFFFULL);
+		w[33] = uint32_t(p_entry.cluster_blas_address >> 32);
+		batch.deformed_storage_buffers.push_back(p_entry.cluster_storage); // Its own build's, not the static one's.
+		batch.deformed_max_capacity = MAX(batch.deformed_max_capacity, slots);
+	} else {
+		batch.storage_buffers.push_back(p_entry.cluster_storage); // Its own; nothing to dedupe.
+	}
 	_lod_record_tree(p_transform, p_entry.cluster_lod_tree);
 
-	batch.storage_buffers.push_back(p_entry.cluster_storage); // Its own; nothing to dedupe.
 	batch.clas_source_buffers.push_back(p_entry.owned_vb_full);
 	if (p_entry.cluster_templated) {
 		// The templates its instantiations read (D108); a few meshes, many instances.
@@ -6375,7 +6457,7 @@ void RenderRaytracing::_queue_lod_deformed_instance(RTDeformedCacheEntry &p_entr
 		batch.clas_source_buffers.push_back(p_entry.cluster_index_buffer);
 	}
 	batch.deformed_count++;
-	batch.clas_bound += cluster_count;
+	batch.clas_bound += slots;
 	batch.clas_total_triangles += p_entry.cluster_lod_total_triangles;
 	batch.clas_total_vertices += p_entry.cluster_lod_total_vertices;
 	p_entry.cluster_frame_kind = p_entry.cluster_lod_pending_kind;
@@ -6887,6 +6969,12 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 	const uint32_t clas_info_stride = cluster_lod_deformed_templated ? caps.instantiate_info_size : caps.triangle_build_info_size;
 	ERR_FAIL_COND_V_MSG(clas_info_stride % sizeof(uint32_t) != 0 || clas_info_stride == 0, false, "RT: the driver's cluster build or instantiation info is not a whole number of words.");
 	const uint32_t clas_bound = batch.clas_bound;
+	// The persistent deformed items (D109): templated, the first items of the frame (queued in the
+	// walk, before the static ones and the cached levels), with their own instantiation and BLAS build.
+	const uint32_t persistent_count = cluster_lod_deformed_templated ? batch.deformed_count : 0;
+	for (uint32_t e = 0; e < persistent_count; e++) {
+		ERR_FAIL_COND_V_MSG(e >= entry_count || batch.entries[e] != nullptr || batch.deformed_entries[e] == nullptr || (batch.instance_words[e * RT_LOD_INSTANCE_WORDS + 16] & 8u) == 0, false, "RT: the cluster LOD batch's deformed items are not its first, all persistent.");
+	}
 
 	// The frame's arguments, 16-byte sections: the build infos (their counts the selection's
 	// atomics), the slot addresses, the instance records, the CLAS count (D87), the reference
@@ -6926,7 +7014,13 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 	const uint64_t lists_offset = _align_up(queue_offset + sizeof(uint32_t) * 2 * tree_items, 16);
 	const uint64_t clas_dst_offset = _align_up(lists_offset + sizeof(uint64_t) * cluster_total, 16);
 	const uint64_t clas_infos_offset = _align_up(clas_dst_offset + sizeof(uint64_t) * clas_bound, 16);
-	const uint64_t queue_rest_offset = _align_up(clas_infos_offset + uint64_t(clas_info_stride) * clas_bound, 16);
+	// The persistent items' cluster lists, the compacted BLAS count with the updates and their
+	// triangles, the compacted build infos and BLAS addresses (D109).
+	const uint64_t cluster_lists_offset = _align_up(clas_infos_offset + uint64_t(clas_info_stride) * clas_bound, 16);
+	const uint64_t compact_counts_offset = _align_up(cluster_lists_offset + sizeof(uint32_t) * (persistent_count > 0 ? clas_bound : 0), 16);
+	const uint64_t compact_infos_offset = compact_counts_offset + 16;
+	const uint64_t compact_dst_offset = _align_up(compact_infos_offset + uint64_t(blas_info_stride) * persistent_count, 16);
+	const uint64_t queue_rest_offset = _align_up(compact_dst_offset + sizeof(uint64_t) * persistent_count, 16);
 	const uint64_t group_queue_offset = _align_up(queue_rest_offset + sizeof(uint32_t) * 2 * queue_rest_items, 16);
 	// CLAS residency (D92): the requests and the use reports, each a count (zeroed apart from the
 	// upload) and its capped list, each read back as a prefix sized from the recent counts.
@@ -6956,11 +7050,11 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		ERR_FAIL_COND_V_MSG(batch.dispatch_buffer.is_null(), false, "RT: the cluster LOD traversal's dispatch buffer could not be created.");
 		rd->set_resource_name(batch.dispatch_buffer, "RT cluster LOD traversal dispatch");
 	}
-	// The deformed items' CLAS go to a region of the deformed batch's pool (D82's reuse rule),
-	// each item's clusters in a contiguous range of slots.
+	// The untemplated deformed items' CLAS go to a region of the deformed batch's pool (D82's reuse
+	// rule), each item's clusters in a contiguous range of slots; persistent items (D109) take none.
 	int32_t region_index = -1;
 	uint64_t region_base_address = 0;
-	if (clas_bound > 0) {
+	if (clas_bound > 0 && persistent_count == 0) {
 		const uint64_t region_alignment = MAX(caps.cluster_byte_alignment, caps.cluster_bottom_level_byte_alignment);
 		const uint64_t region_alloc = region_alignment + uint64_t(clas_bound) * cluster_lod_clas_slot_size;
 		ERR_FAIL_COND_V_MSG(region_alloc > UINT32_MAX, false, "RT: the cluster LOD selection's CLAS region exceeds 4 GB.");
@@ -7017,7 +7111,9 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 			rd->cluster_bottom_level_build_info_write(args + blas_infos_offset + uint64_t(e) * blas_info_stride, blas_info);
 			dst[e] = batch.blas_addresses[e];
 			record[15] = uint32_t(lists_offset / sizeof(uint32_t)) + first_cluster * 2;
-			if ((record[16] & 1u) != 0) { // INSTANCE_FLAG_DEFORMED.
+			if ((record[16] & 8u) != 0) { // INSTANCE_FLAG_PERSISTENT (D109): its own slots; its cluster list.
+				record[28] += uint32_t(cluster_lists_offset / sizeof(uint32_t));
+			} else if ((record[16] & 1u) != 0) { // INSTANCE_FLAG_DEFORMED.
 				const uint64_t dst_base = region_base_address + uint64_t(record[18]) * cluster_lod_clas_slot_size;
 				record[18] = uint32_t(dst_base & 0xFFFFFFFFULL);
 				record[19] = uint32_t(dst_base >> 32);
@@ -7026,6 +7122,10 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		reinterpret_cast<uint32_t *>(args + tree_counts_offset)[0] = queued;
 	}
 	rd->buffer_update(args_buffer, 0, uint32_t(lists_offset), args);
+	if (persistent_count > 0) {
+		const uint32_t compact_init[4] = { 0, 0, 0, 0 };
+		rd->buffer_update(args_buffer, uint32_t(compact_counts_offset), sizeof(compact_init), compact_init);
+	}
 	if (stream) {
 		const uint32_t stream_init[4] = { 0, 0, 0, 0 };
 		rd->buffer_update(args_buffer, uint32_t(stream_requests_offset), sizeof(stream_init), stream_init);
@@ -7063,7 +7163,10 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		uint32_t frame_index;
 		uint32_t stream_requests;
 		uint32_t stream_touches;
-		uint32_t pad[4];
+		uint32_t persistent_count; // D109.
+		uint32_t compact_counts;
+		uint32_t compact_infos;
+		uint32_t compact_dst;
 	} pc;
 	pc.camera[0] = float(view.camera.x);
 	pc.camera[1] = float(view.camera.y);
@@ -7091,10 +7194,10 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 	pc.frame_index = uint32_t(rd->get_frames_drawn());
 	pc.stream_requests = uint32_t(stream_requests_offset / sizeof(uint32_t));
 	pc.stream_touches = uint32_t(stream_touches_offset / sizeof(uint32_t));
-	pc.pad[0] = 0;
-	pc.pad[1] = 0;
-	pc.pad[2] = 0;
-	pc.pad[3] = 0;
+	pc.persistent_count = persistent_count;
+	pc.compact_counts = uint32_t(compact_counts_offset / sizeof(uint32_t));
+	pc.compact_infos = uint32_t(compact_infos_offset / sizeof(uint32_t));
+	pc.compact_dst = uint32_t(compact_dst_offset / sizeof(uint32_t));
 	// The verbose check (D91): the exhaustive test counts the tree items' clusters in the same frame,
 	// for the readback to compare with what the traversal appended; on the first flushes and every
 	// thirtieth.
@@ -7211,6 +7314,22 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 			rd->compute_list_end();
 			rd->free_rid(cluster_set);
 		}
+		if (persistent_count > 0) {
+			// The commit, then the digests it compared against (D109), after every selection pass.
+			compute_list = rd->compute_list_begin();
+			rd->compute_list_bind_compute_pipeline(compute_list, lod_select_shader.pipeline);
+			rd->compute_list_bind_uniform_set(compute_list, uniform_set, 0);
+			SelectPC commit_pc = pc;
+			commit_pc.flags |= 16u; // FLAG_COMMIT.
+			rd->compute_list_set_push_constant(compute_list, &commit_pc, sizeof(SelectPC));
+			rd->compute_list_dispatch_threads(compute_list, MAX(batch.deformed_max_capacity, 1u), persistent_count, 1);
+			rd->compute_list_add_barrier(compute_list);
+			SelectPC digest_pc = pc;
+			digest_pc.flags |= 32u; // FLAG_DIGEST.
+			rd->compute_list_set_push_constant(compute_list, &digest_pc, sizeof(SelectPC));
+			rd->compute_list_dispatch_threads(compute_list, persistent_count, 1, 1);
+			rd->compute_list_end();
+		}
 		rd->free_rid(uniform_set);
 	}
 	if (select_timer) {
@@ -7227,10 +7346,88 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		rd->buffer_get_data_async(args_buffer, callable_mp_static(&RenderRaytracing::_on_lod_stream_read).bind(rd->get_frames_drawn(), 1u), uint32_t(stream_touches_offset), 16 + uint32_t(sizeof(uint32_t)) * 2 * touch_read);
 	}
 
+	// The persistent items' CLAS (D109): the commit's instantiations, as many as it counted, into the
+	// items' own slots, rewritten in place where the last frame's trace read them through the BLAS:
+	// their handles are listed, so their trackers, which the tracing lists declared, order the rewrite
+	// after those reads (as D107's batch); then their BLAS over the compacted list, as many as it
+	// counted. A skipped item keeps both.
+	if (persistent_count > 0) {
+		if (!_build_deformed_cluster_templates()) {
+			return false;
+		}
+		uint32_t max_triangles = 0, max_vertices = 0;
+		_deformed_cluster_maxima(caps, max_triangles, max_vertices);
+		Vector<RID> source_buffers, storage_buffers, template_buffers, blas_handles;
+		source_buffers.resize(batch.clas_source_buffers.size());
+		memcpy(source_buffers.ptrw(), batch.clas_source_buffers.ptr(), sizeof(RID) * batch.clas_source_buffers.size());
+		storage_buffers.resize(batch.deformed_storage_buffers.size());
+		memcpy(storage_buffers.ptrw(), batch.deformed_storage_buffers.ptr(), sizeof(RID) * batch.deformed_storage_buffers.size());
+		template_buffers.resize(batch.clas_template_buffers.size());
+		memcpy(template_buffers.ptrw(), batch.clas_template_buffers.ptr(), sizeof(RID) * batch.clas_template_buffers.size());
+		blas_handles.resize(persistent_count);
+		memcpy(blas_handles.ptrw(), batch.blas_handles.ptr(), sizeof(RID) * persistent_count);
+		{
+			RD::ClusterAccelerationStructureBuild build;
+			build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_INSTANTIATE_TRIANGLE_CLUSTER;
+			build.input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
+			build.input.max_acceleration_structure_count = clas_bound;
+			build.input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT);
+			build.input.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
+			build.input.max_cluster_triangle_count = max_triangles;
+			build.input.max_cluster_vertex_count = max_vertices;
+			build.input.max_total_triangle_count = batch.clas_total_triangles;
+			build.input.max_total_vertex_count = batch.clas_total_vertices;
+			build.dst_storage_buffers = storage_buffers;
+			build.dst_addresses_buffer = args_buffer;
+			build.dst_addresses_offset = clas_dst_offset;
+			build.dst_addresses_stride = sizeof(uint64_t);
+			build.src_infos_buffer = args_buffer;
+			build.src_infos_offset = clas_infos_offset;
+			build.src_infos_stride = clas_info_stride;
+			build.src_infos_count_buffer = args_buffer;
+			build.src_infos_count_offset = clas_count_offset;
+			build.source_buffers = source_buffers;
+			build.source_acceleration_structure_buffers = template_buffers;
+			build.dst_acceleration_structures = blas_handles;
+			if (rd->cluster_acceleration_structure_build(build) != OK) {
+				return false;
+			}
+		}
+		{
+			RD::ClusterAccelerationStructureBuild build;
+			build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
+			build.input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
+			build.input.max_acceleration_structure_count = persistent_count;
+			build.input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT);
+			build.input.max_total_cluster_count = clas_bound;
+			build.input.max_cluster_count_per_acceleration_structure = MAX(batch.deformed_max_capacity, 1u);
+			build.dst_storage_buffers = storage_buffers;
+			build.dst_addresses_buffer = args_buffer;
+			build.dst_addresses_offset = compact_dst_offset;
+			build.dst_addresses_stride = sizeof(uint64_t);
+			build.src_infos_buffer = args_buffer;
+			build.src_infos_offset = compact_infos_offset;
+			build.src_infos_stride = blas_info_stride;
+			build.src_infos_count_buffer = args_buffer;
+			build.src_infos_count_offset = compact_counts_offset;
+			build.source_acceleration_structure_buffers = storage_buffers; // Their CLAS, in their own storage.
+			build.dst_acceleration_structures = blas_handles;
+			if (rd->cluster_acceleration_structure_build(build) != OK) {
+				return false;
+			}
+		}
+#ifdef TOOLS_ENABLED
+		// The updates the device counted, for the counters a frame queue later (they are published in
+		// tools builds only), and the clusters past an item's slots, which a sound cut bound never gives.
+		rd->buffer_get_data_async(args_buffer, callable_mp_static(&RenderRaytracing::_on_lod_deformed_counts_read).bind(persistent_count), uint32_t(compact_counts_offset), 16);
+		rd->buffer_get_data_async(args_buffer, callable_mp_static(&RenderRaytracing::_on_lod_cache_overflow_read), uint32_t(clas_count_offset + sizeof(uint32_t)), 2 * sizeof(uint32_t));
+#endif
+	}
+
 	// The deformed items' CLAS (D87): every cluster the selection picked for them, built into the
 	// slots the selection assigned, as many as it counted; instantiated from the clusters' templates
 	// (D108), built first if new. The slots are the pool's region, never rewritten in place.
-	if (clas_bound > 0) {
+	if (clas_bound > 0 && persistent_count == 0) {
 		uint32_t max_triangles = 0, max_vertices = 0;
 		_deformed_cluster_maxima(caps, max_triangles, max_vertices);
 		Vector<RID> source_buffers;
@@ -7286,16 +7483,17 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		}
 		Vector<RID> storage_buffers, source_buffers;
 		storage_buffers.resize(batch.storage_buffers.size());
-		source_buffers.resize(batch.source_buffers.size() + (clas_bound > 0 ? 1 : 0));
+		source_buffers.resize(batch.source_buffers.size() + (region_index >= 0 ? 1 : 0));
 		memcpy(storage_buffers.ptrw(), batch.storage_buffers.ptr(), sizeof(RID) * batch.storage_buffers.size());
 		memcpy(source_buffers.ptrw(), batch.source_buffers.ptr(), sizeof(RID) * batch.source_buffers.size());
-		if (clas_bound > 0) {
+		if (region_index >= 0) {
 			source_buffers.write[batch.source_buffers.size()] = deformed_cluster_batch.regions[region_index].buffer;
 		}
 		const uint32_t frame_total = cluster_total - batch.cache_list_clusters;
 		for (int pass = 0; pass < 2; pass++) {
-			const uint32_t first = pass == 0 ? 0 : cache_first;
-			const uint32_t count = pass == 0 ? cache_first : entry_count - cache_first;
+			// The persistent items' BLAS were built above (D109); the rest as before.
+			const uint32_t first = pass == 0 ? persistent_count : cache_first;
+			const uint32_t count = pass == 0 ? cache_first - persistent_count : entry_count - cache_first;
 			if (count == 0) {
 				continue;
 			}
@@ -7334,7 +7532,9 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 			expected.write[i] = int32_t(batch.cache_builds[i].surface->cluster_lod_levels[batch.cache_builds[i].depth].cut_clusters);
 		}
 		rd->buffer_get_data_async(args_buffer, callable_mp_static(&RenderRaytracing::_on_lod_cache_counts_read).bind(blas_info_stride, expected), uint32_t(blas_infos_offset + uint64_t(blas_info_stride) * cache_first), uint32_t(blas_info_stride * (entry_count - cache_first)));
-		rd->buffer_get_data_async(args_buffer, callable_mp_static(&RenderRaytracing::_on_lod_cache_overflow_read), uint32_t(clas_count_offset + sizeof(uint32_t)), sizeof(uint32_t));
+		if (persistent_count == 0) { // Else read with the persistent items' counts, above.
+			rd->buffer_get_data_async(args_buffer, callable_mp_static(&RenderRaytracing::_on_lod_cache_overflow_read), uint32_t(clas_count_offset + sizeof(uint32_t)), 2 * sizeof(uint32_t));
+		}
 	}
 
 	// The traversal's check (D91): the items' records, their appended counts and the exhaustive
@@ -7360,13 +7560,16 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		for (uint32_t e = 0; e < entry_count; e++) {
 			lod0_total += batch.lod0_clusters[e];
 		}
-		print_verbose(vformat("RT: cluster LOD selection: %d instances (%d deformed, %d past the region ceiling; %d more tracing a shared build, %d the LOD 0 BLAS, %d a cached level), %d cached levels built (%d live, %d KB, %d over the run), %d clusters at LOD 0, %d over every level, %d selected a frame queue ago (%d instances then, %d CLAS %s of %d, counted on the device), %.2f px, threshold %s, %d KB of arguments, %d KB of the LOD table live, %d KB CLAS region.", cache_first, batch.deformed_count, batch.deformed_routed, batch.shared_count, batch.lod0_count, batch.cached_count, entry_count - cache_first, cluster_lod_cache_live, cluster_lod_cache_bytes / 1024, cluster_lod_cache_builds_total, lod0_total, cluster_total - batch.cache_list_clusters, lod_counts_selected, lod_counts_entries, lod_counts_clas, cluster_lod_deformed_templated ? "instantiated" : "built", clas_bound, lod_frame_pixel_error, String::num_scientific(threshold), args_size / 1024, uint64_t(cluster_lod_table_live_words) * sizeof(uint32_t) / 1024, uint64_t(clas_bound) * cluster_lod_clas_slot_size / 1024));
+		print_verbose(vformat("RT: cluster LOD selection: %d instances (%d deformed, %d past the region ceiling; %d more tracing a shared build, %d the LOD 0 BLAS, %d a cached level), %d cached levels built (%d live, %d KB, %d over the run), %d clusters at LOD 0, %d over every level, %d selected a frame queue ago (%d instances then, %d CLAS %s of %d, counted on the device), %.2f px, threshold %s, %d KB of arguments, %d KB of the LOD table live, %d KB CLAS region (none for persistent items, D109).", cache_first, batch.deformed_count, batch.deformed_routed, batch.shared_count, batch.lod0_count, batch.cached_count, entry_count - cache_first, cluster_lod_cache_live, cluster_lod_cache_bytes / 1024, cluster_lod_cache_builds_total, lod0_total, cluster_total - batch.cache_list_clusters, lod_counts_selected, lod_counts_entries, lod_counts_clas, cluster_lod_deformed_templated ? "instantiated" : "built", clas_bound, lod_frame_pixel_error, String::num_scientific(threshold), args_size / 1024, uint64_t(cluster_lod_table_live_words) * sizeof(uint32_t) / 1024, region_index >= 0 ? uint64_t(clas_bound) * cluster_lod_clas_slot_size / 1024 : 0));
 		if (cluster_lod_traversal_enabled) {
 			uint64_t queue_capacity = 0;
 			for (uint32_t l = 0; l < tree_levels; l++) {
 				queue_capacity += batch.tree_level_capacity[l];
 			}
 			print_verbose(vformat("RT: cluster LOD traversal (D91): %d of %d items walked their tree in %d levels (queues for %d nodes), the others tested every cluster over %d threads each; %d frames checked against the exhaustive test, %d items mismatched.", tree_items, entry_count, tree_levels, queue_capacity, flat_max_clusters, lod_tree_checks, lod_tree_mismatches));
+		}
+		if (cluster_lod_deformed_templated) {
+			print_verbose(vformat("RT: persistent deformed selection (D109): %d of %d selections re-instantiated over the run (the device's counts, a frame queue late), %d hierarchies whose cuts LOD 0 does not bound.", lod_deformed_updates_total, lod_deformed_instances_total, deformed_cut_bound_failures_total));
 		}
 		if (!lod_select_gpu_us.is_empty()) {
 			LocalVector<float> sorted(lod_select_gpu_us);
@@ -7375,6 +7578,20 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		}
 	}
 	return true;
+}
+
+void RenderRaytracing::_on_lod_deformed_counts_read(const PackedByteArray &p_bytes, uint32_t p_instances) {
+	// Called by RenderingDevice on the render thread as it begins a later frame, a frame queue after
+	// the selection (D109): the compacted count, the updates (first builds excluded) and their
+	// triangles, which the next flush publishes.
+	if (singleton == nullptr || p_bytes.size() < int64_t(3 * sizeof(uint32_t))) {
+		return;
+	}
+	const uint32_t *words = reinterpret_cast<const uint32_t *>(p_bytes.ptr());
+	singleton->lod_deformed_updates_read += words[1];
+	singleton->lod_deformed_triangles_read += words[2];
+	singleton->lod_deformed_updates_total += words[1];
+	singleton->lod_deformed_instances_total += p_instances;
 }
 
 void RenderRaytracing::_on_lod_tree_check_read(const PackedByteArray &p_bytes, uint32_t p_entry_count, uint32_t p_blas_infos_offset, uint32_t p_stride, uint32_t p_instances_offset, uint32_t p_check_offset) {
@@ -7416,14 +7633,20 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 		return;
 	}
 	const uint64_t frames_drawn = RD::get_singleton()->get_frames_drawn();
+	// The persistent selection's updates the device counted a frame queue ago (D109), published now.
+	deformed_cluster_updates += lod_deformed_updates_read;
+	deformed_cluster_triangles_updated += uint32_t(MIN(lod_deformed_triangles_read, uint64_t(UINT32_MAX)));
+	lod_deformed_updates_read = 0;
+	lod_deformed_triangles_read = 0;
 	if (_record_lod_batch(p_render_data, p_state)) {
 		// Every static instance's BLAS over its selection and every cached level is a build (D97).
 		for (uint32_t e = 0; e < batch.entries.size(); e++) {
 			frame_extra_builds += batch.entries[e] != nullptr ? 1 : 0;
 		}
 		frame_extra_builds += batch.cache_builds.size();
-		// The deformed items' CLAS live in this flush's region from now (D87); the counters take
-		// what the batch would have counted, as _flush_deformed_cluster_batch does.
+		// The deformed items' CLAS live in this flush's region from now (D87), or a persistent item's in
+		// its own slots (D109); the counters take what the batch would have counted, as
+		// _flush_deformed_cluster_batch does, a persistent item's updates being the device's.
 		for (uint32_t e = 0; e < batch.deformed_entries.size(); e++) {
 			RTDeformedCacheEntry *entry = batch.deformed_entries[e];
 			if (entry == nullptr) {
@@ -7431,16 +7654,15 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 			}
 			entry->cluster_built_frame = frames_drawn;
 			entry->cluster_lod_last = true;
+			entry->cluster_lod_slots_stale = false; // Its slots hold this frame's positions now (D109).
 			const uint32_t triangles = entry->ptr ? entry->ptr->geometry.primitive_count : 0;
 			switch (entry->cluster_frame_kind) {
 				case RTDeformedCacheEntry::CLUSTER_QUEUED_FIRST_BUILD:
 				case RTDeformedCacheEntry::CLUSTER_QUEUED_CHANGED:
 				case RTDeformedCacheEntry::CLUSTER_QUEUED_EXPIRY:
 					if (entry->cluster_templated && entry->cluster_frame_kind != RTDeformedCacheEntry::CLUSTER_QUEUED_FIRST_BUILD) {
-						// Instantiated and the BLAS assembled over them (D108): the per-frame update a
-						// triangle BLAS's refit is, counted as one.
-						deformed_cluster_updates++;
-						deformed_cluster_triangles_updated += triangles;
+						// Instantiated, or kept, on the device (D109): its updates are the device's count,
+						// read back and published above.
 						break;
 					}
 					// A cluster BLAS is rebuilt, never refit: every kind is a build (D97).
@@ -7448,12 +7670,7 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 					deformed_cluster_triangles_built += triangles;
 					break;
 				default:
-					if (entry->cluster_templated) {
-						// Unchanged, its selection instantiated again all the same (D108): an update.
-						deformed_cluster_updates++;
-						deformed_cluster_triangles_updated += triangles;
-					}
-					break;
+					break; // Unchanged: on the device's count too, if templated (D109).
 			}
 			entry->cluster_frame_kind = RTDeformedCacheEntry::CLUSTER_QUEUED_NONE;
 		}
@@ -7540,6 +7757,8 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 	batch.clas_source_buffers.clear();
 	batch.clas_index_buffers_seen.clear();
 	batch.clas_template_buffers.clear();
+	batch.deformed_storage_buffers.clear();
+	batch.deformed_max_capacity = 0;
 }
 
 void RenderRaytracing::_on_position_fetch_check_read(const PackedByteArray &p_bytes) {
@@ -7599,6 +7818,14 @@ void RenderRaytracing::_on_lod_cache_overflow_read(const PackedByteArray &p_coun
 	memcpy(&overflow, p_count.ptr(), sizeof(overflow));
 	if (overflow > 0) {
 		ERR_PRINT(vformat("RT: the selection took %d clusters past the cached levels' slots (D90); the shader's level rule and the CPU's count differ, and those clusters were left out.", overflow));
+	}
+	// The word after it (D109): clusters past a persistent deformed item's slots.
+	uint32_t persistent_overflow = 0;
+	if (p_count.size() >= int64_t(2 * sizeof(uint32_t))) {
+		memcpy(&persistent_overflow, p_count.ptr() + sizeof(uint32_t), sizeof(persistent_overflow));
+	}
+	if (persistent_overflow > 0) {
+		ERR_PRINT(vformat("RT: the selection took %d clusters past a persistent deformed item's slots (D109); its cut bound does not hold, and those clusters were left out.", persistent_overflow));
 	}
 }
 
@@ -9334,9 +9561,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					} else if (deformed->cluster_lod_pending) {
 						deformed->cluster_lod_pending = false;
 						const bool selects = !(mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT);
-						const bool fits = uint64_t(lod_batch.clas_bound) + deformed->cluster_lod_count <= cluster_lod_clas_ceiling_clusters;
+						// Under the frame's CLAS region ceiling, or for a persistent item (D109), which takes no
+						// region, the arguments' ceiling over its slots.
+						const bool persistent = cluster_lod_deformed_templated && deformed->cluster_templated;
+						const bool fits = persistent ? uint64_t(lod_batch.clas_bound) + deformed->cluster_lod_slot_capacity <= cluster_lod_persistent_ceiling_slots : uint64_t(lod_batch.clas_bound) + deformed->cluster_lod_count <= cluster_lod_clas_ceiling_clusters;
 						if (selects && !fits) {
-							lod_batch.deformed_routed++; // Past the frame's CLAS region ceiling: LOD 0 through the batch.
+							lod_batch.deformed_routed++; // Past the frame's ceiling: LOD 0 through the batch.
 						}
 						if (selects && fits && lod_batch.entries.size() < cluster_lod_max_instances) {
 							Transform3D lod_transform = instance_transform;

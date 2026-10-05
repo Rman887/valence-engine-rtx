@@ -558,7 +558,9 @@ struct RTLodInstanceEntry {
 struct RTDeformedCacheEntry;
 
 // The selection's instance record, in words. Must match INSTANCE_WORDS in cluster_lod_select.glsl.
-static constexpr uint32_t RT_LOD_INSTANCE_WORDS = 24;
+// Words 24 to 35 are a persistent deformed item's (D109): its slot stride and count, its digest, its
+// cluster list, its kept digest in the table, its triangles and its BLAS address.
+static constexpr uint32_t RT_LOD_INSTANCE_WORDS = 36;
 
 // CLAS residency's lists (D92): the requests and the use reports one frame's selection may append,
 // and the frames between two reports of one group's use. Must match STREAM_* in cluster_lod_select.glsl.
@@ -688,7 +690,9 @@ struct RTLodStreamRead {
 // The frame's CLAS region for the deformed items (D87) stays under this many bytes: the argument
 // and region sizes are 32-bit, and a flush that cannot record turns the selection off for the
 // run, so past it the rest of the frame's deformed instances rebuild at LOD 0 through the
-// deformed batch. A VRAM budget (6d) replaces it.
+// deformed batch. A VRAM budget (6d) replaces it. Persistent items (D109) use no region: the same
+// bound applies to the arguments their slots take (an instantiation info, a destination and a
+// cluster index each).
 static constexpr uint64_t RT_LOD_CLAS_REGION_CEILING = uint64_t(1) << 30;
 
 // The cluster LOD selection of one frame (D86): every instance on the path appends itself; the
@@ -785,6 +789,9 @@ struct RTLodSelectBatch {
 	LocalVector<RID> clas_source_buffers;
 	LocalVector<RID> clas_index_buffers_seen;
 	LocalVector<RID> clas_template_buffers; // The templates the deformed items' instantiations read (D108).
+	// The persistent deformed items (D109): their storage, each once, and their largest slot count.
+	LocalVector<RID> deformed_storage_buffers;
+	uint32_t deformed_max_capacity = 0;
 	RID args_buffer;
 	uint32_t args_capacity = 0; // Bytes.
 	LocalVector<uint8_t> args_host;
@@ -947,6 +954,17 @@ struct RTDeformedCacheEntry {
 	uint32_t cluster_lod_total_triangles = 0;
 	uint32_t cluster_lod_total_vertices = 0;
 	uint64_t cluster_lod_pushed_frame = 0; // frames_drawn when the selection last built it; a second viewport in the frame reuses that build.
+	// Persistent selection slots (D109), templated: the CLAS the selection instantiates live in the
+	// entry's own storage after its BLAS, this many (its LOD 0 count where every cut is bounded by it,
+	// else the count over every level), and its region of the table keeps the last selection's digest
+	// at this word, so an unchanged selection of an unchanged surface keeps its CLAS and its BLAS.
+	uint32_t cluster_lod_slot_capacity = 0;
+	uint32_t cluster_lod_digest_offset = UINT32_MAX;
+	// The positions changed since its slots were last instantiated (D109): set where owned_vb_full is
+	// written, cleared by a selection that instantiated them, and a reason to force the next one. The
+	// frame's pending kind alone is not enough: an instance can leave the walk after the copy (its hit
+	// group still compiling, a viewport without it) and the next frame's kind no longer says CHANGED.
+	bool cluster_lod_slots_stale = true;
 	uint8_t cluster_lod_pending_kind = CLUSTER_QUEUED_NONE; // What the batch above would have queued this frame, decided at the TLAS push.
 	bool cluster_lod_pending = false; // Set by process_deformed_surface on a selecting frame, taken at the TLAS push.
 	bool cluster_lod_last = false; // The last build was a selection: the batch above rebuilds it before tracing it again.
@@ -1588,6 +1606,15 @@ class RenderRaytracing {
 	// table holds every hierarchy's instantiation infos then, and a hierarchy without templates is
 	// traced at LOD 0. Off where the device has no templates or sizes an instantiation at 0 bytes.
 	bool cluster_lod_deformed_templated = false;
+	// The persistent selection (D109): the updates and their triangles the device counted, read back a
+	// frame queue later (RenderingDevice's frame delay, 2 frames by default) and published by the next
+	// flush; the hierarchies whose cuts the LOD 0 count does not bound, over the run.
+	uint32_t cluster_lod_persistent_ceiling_slots = 0; // The slots one frame's persistent items may take (D109).
+	uint32_t lod_deformed_updates_read = 0;
+	uint64_t lod_deformed_triangles_read = 0;
+	uint64_t lod_deformed_updates_total = 0;
+	uint64_t lod_deformed_instances_total = 0;
+	uint32_t deformed_cut_bound_failures_total = 0;
 	uint64_t cluster_lod_clas_slot_size = 0;
 	uint32_t cluster_lod_clas_ceiling_clusters = 0; // RT_LOD_CLAS_REGION_CEILING in slots, less the region's alignment.
 	float cluster_lod_pixel_error = 1.0f;
@@ -2172,6 +2199,14 @@ class RenderRaytracing {
 	static void _on_lod_cache_counts_read(const PackedByteArray &p_counts, uint32_t p_stride, const PackedInt32Array &p_expected);
 	static void _on_lod_cache_overflow_read(const PackedByteArray &p_count);
 	static void _on_lod_tree_check_read(const PackedByteArray &p_bytes, uint32_t p_entry_count, uint32_t p_blas_infos_offset, uint32_t p_stride, uint32_t p_instances_offset, uint32_t p_check_offset);
+	// The slots a persistent selection needs (D109): the LOD 0 count where no group is replaced by more
+	// clusters than it has, so that no cut is larger than LOD 0, else the count over every level.
+	uint32_t _deformed_cluster_cut_capacity(void *p_mesh_surface, uint32_t p_lod0_clusters, uint32_t p_all_clusters);
+	// The persistent selection's counts (D109), on the render thread a frame queue after the frame:
+	// the instances it re-instantiated (first builds excluded) and their triangles, for the next
+	// flush to publish (tools builds, where the counters are), and the clusters past an item's slots,
+	// which a sound cut bound never gives.
+	static void _on_lod_deformed_counts_read(const PackedByteArray &p_bytes, uint32_t p_instances);
 	// The deformed entries on the selection (D87): the entry's region of the LOD table, made with
 	// its layout and released with its storage, and its record in the frame's batch.
 	bool _populate_deformed_cluster_lod(void *p_mesh_surface, const RTClusterLayout &p_layout, const LocalVector<uint8_t> &p_infos, uint32_t p_info_size, uint32_t p_cache_key, RTDeformedCacheEntry &r_entry);

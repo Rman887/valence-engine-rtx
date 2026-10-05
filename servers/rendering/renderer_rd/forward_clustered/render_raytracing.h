@@ -1427,10 +1427,16 @@ class RenderRaytracing {
 	// path off instead, every entry moving to the triangle path, as D82's failure does.
 	HashMap<uint64_t, RTDeformedClusterTemplate> deformed_cluster_templates;
 	bool deformed_cluster_templates_enabled = false;
-	// Builds the counters above miss (D97): compactions, stream loads, opacity micromap bakes, the
+	// Builds the counters above miss (D97): compactions, opacity micromap bakes, the
 	// selection's per-instance BLAS and cached levels. Reset with them, before prepare_frame.
 	uint32_t frame_extra_builds = 0;
 	uint32_t frame_extra_triangles = 0;
+	// The CLAS residency loads started this frame (D92), counted on their own (D111): groups,
+	// clusters and triangles. The build budget still admits them, so a forced build is a build
+	// the budget did not admit among the rest.
+	uint32_t frame_stream_loads = 0;
+	uint32_t frame_stream_load_clusters = 0;
+	uint32_t frame_stream_load_triangles = 0;
 
 	// The acceleration-structure build budget (D97, docs/r1-build-queue.md). A frame's deferrable
 	// builds are admitted within a triangle and a build count: prepare_frame's stand-ins (stream

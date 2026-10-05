@@ -5697,13 +5697,13 @@
 			Number of TLAS instances submitted this frame (ray tracing only).
 		</constant>
 		<constant name="VIEWPORT_RENDER_INFO_RT_BLAS_BUILDS" value="4" enum="ViewportRenderInfo">
-			Number of full BLAS builds performed this frame (ray tracing only).
+			Number of full BLAS builds performed this frame (ray tracing only). Streamed loads are counted in [constant VIEWPORT_RENDER_INFO_RT_STREAM_LOADS] instead.
 		</constant>
 		<constant name="VIEWPORT_RENDER_INFO_RT_BLAS_REFITS" value="5" enum="ViewportRenderInfo">
 			Number of BLAS refits (updates) performed this frame (ray tracing only).
 		</constant>
 		<constant name="VIEWPORT_RENDER_INFO_RT_TRIANGLES_BUILT" value="6" enum="ViewportRenderInfo">
-			Total triangles processed by full BLAS builds this frame (ray tracing only).
+			Total triangles processed by full BLAS builds this frame (ray tracing only). Streamed loads are counted in [constant VIEWPORT_RENDER_INFO_RT_STREAM_LOAD_TRIANGLES] instead.
 		</constant>
 		<constant name="VIEWPORT_RENDER_INFO_RT_TRIANGLES_REFIT" value="7" enum="ViewportRenderInfo">
 			Total triangles processed by BLAS refits this frame (ray tracing only).
@@ -5748,7 +5748,7 @@
 			Slots the partitioned TLAS disabled this frame because they still referenced a freed BLAS. This is a safety net, so any value other than 0 points to a bug (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).
 		</constant>
 		<constant name="VIEWPORT_RENDER_INFO_RT_BUILDS_FORCED" value="21" enum="ViewportRenderInfo">
-			Acceleration-structure builds this frame that the build budget did not admit and did not hold back, because they cannot wait: deformed meshes, the cluster level-of-detail selection's per-instance builds, rebuilds of a surface already traced whose geometry changed, a surface its instance traced the frame before (a swapped mesh, a rebuilt part), compactions of surfaces with a level-of-detail hierarchy, and rebakes of an existing merged MultiMesh. Counted as [constant VIEWPORT_RENDER_INFO_RT_BLAS_BUILDS] less the builds recorded for items the budget admitted (path tracing with [member ProjectSettings.rendering/pathtracing/build_budget] only, editor builds only).
+			Acceleration-structure builds this frame that the build budget did not admit and did not hold back, because they cannot wait: deformed meshes, the cluster level-of-detail selection's per-instance builds, rebuilds of a surface already traced whose geometry changed, a surface its instance traced the frame before (a swapped mesh, a rebuilt part), compactions of surfaces with a level-of-detail hierarchy, and rebakes of an existing merged MultiMesh. Counted as [constant VIEWPORT_RENDER_INFO_RT_BLAS_BUILDS] less the builds recorded for items the budget admitted, streamed loads not among either (path tracing with [member ProjectSettings.rendering/pathtracing/build_budget] only, editor builds only).
 		</constant>
 		<constant name="VIEWPORT_RENDER_INFO_RT_BUILDS_DEFERRED" value="22" enum="ViewportRenderInfo">
 			Builds the build budget refused this frame: new surfaces and merged MultiMesh bakes left out of the trace until admitted, and opacity micromap bakes and BLASes, cached cluster levels, cluster compactions and streamed cluster loads left to what stands in for them (path tracing with [member ProjectSettings.rendering/pathtracing/build_budget] only, editor builds only).
@@ -5759,7 +5759,16 @@
 		<constant name="VIEWPORT_RENDER_INFO_RT_BUILD_BUDGET_TRIANGLES" value="24" enum="ViewportRenderInfo">
 			Triangles the build budget admitted this frame, a reference to an existing cluster acceleration structure counting as 8. At most [member ProjectSettings.rendering/pathtracing/build_budget_triangles_per_frame], plus the items admitted past it: the pre-pass's first item each frame, whatever its size; one item each queue a frame that has waited [member ProjectSettings.rendering/pathtracing/build_budget_max_wait_frames]; and an item larger than the whole budget, which an untouched pool admits alone in a frame (path tracing with [member ProjectSettings.rendering/pathtracing/build_budget] only, editor builds only).
 		</constant>
-		<constant name="VIEWPORT_RENDER_INFO_MAX" value="25" enum="ViewportRenderInfo">
+		<constant name="VIEWPORT_RENDER_INFO_RT_STREAM_LOADS" value="25" enum="ViewportRenderInfo">
+			Streamed groups of clusters whose loads started this frame: their cluster acceleration structures are built now, or two frames later when [member ProjectSettings.rendering/pathtracing/cluster_lod_stream_geometry] gathers their geometry, and join the trace once their sizes are read back. Counted here and not in [constant VIEWPORT_RENDER_INFO_RT_BLAS_BUILDS] or [constant VIEWPORT_RENDER_INFO_RT_TRIANGLES_BUILT]; the build budget still admits them and counts their triangles (path tracing with [member ProjectSettings.rendering/pathtracing/cluster_lod_stream] only, editor builds only).
+		</constant>
+		<constant name="VIEWPORT_RENDER_INFO_RT_STREAM_LOAD_CLUSTERS" value="26" enum="ViewportRenderInfo">
+			Clusters in the groups whose loads started this frame. At most [member ProjectSettings.rendering/pathtracing/cluster_lod_stream_builds_per_frame] (path tracing with [member ProjectSettings.rendering/pathtracing/cluster_lod_stream] only, editor builds only).
+		</constant>
+		<constant name="VIEWPORT_RENDER_INFO_RT_STREAM_LOAD_TRIANGLES" value="27" enum="ViewportRenderInfo">
+			Triangles in the groups whose loads started this frame (path tracing with [member ProjectSettings.rendering/pathtracing/cluster_lod_stream] only, editor builds only).
+		</constant>
+		<constant name="VIEWPORT_RENDER_INFO_MAX" value="28" enum="ViewportRenderInfo">
 			Represents the size of the [enum ViewportRenderInfo] enum.
 		</constant>
 		<constant name="VIEWPORT_RENDER_INFO_TYPE_VISIBLE" value="0" enum="ViewportRenderInfoType">

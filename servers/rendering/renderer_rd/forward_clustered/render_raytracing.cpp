@@ -6168,8 +6168,11 @@ void RenderRaytracing::_process_lod_stream() {
 					group_triangles += stream->cluster_packed[c] & 0xFFFF;
 				}
 			}
-			frame_extra_builds++; // Its CLAS, counted in the frame that admits it (D97).
-			frame_extra_triangles += group_triangles;
+			// A load of its own, counted in the frame that admits it (D111), not a build: its clusters
+			// are what cluster_lod_stream_builds_per_frame bounds.
+			frame_stream_loads++;
+			frame_stream_load_clusters += group.cluster_count;
+			frame_stream_load_triangles += group_triangles;
 #endif
 			RTLodStreamLoad::Item item;
 			item.surface = want.surface;
@@ -8956,8 +8959,11 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		return nullptr;
 	}
 
-	frame_extra_builds = 0; // prepare_frame's compactions, loads and bakes count into them (D97).
+	frame_extra_builds = 0; // prepare_frame's compactions and bakes count into them (D97).
 	frame_extra_triangles = 0;
+	frame_stream_loads = 0; // And its stream loads into these (D111).
+	frame_stream_load_clusters = 0;
+	frame_stream_load_triangles = 0;
 	prepare_frame();
 	_sweep_materialized();
 	state->has_procedural_instances = false;
@@ -9941,13 +9947,22 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		if (build_budget_publishes) {
 			// The build budget's frame (D97): what it admitted is deferrable work, the rest forced.
 			int *info = p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE];
-			info[RSE::VIEWPORT_RENDER_INFO_RT_BUILDS_FORCED] += frame_builds > build_budget.built ? int(frame_builds - build_budget.built) : 0;
+			// The stream loads it admitted (D111) are not among the frame's builds.
+			const uint32_t budget_built = build_budget.built - MIN(build_budget.built, build_budget.enabled ? frame_stream_loads : 0u);
+			info[RSE::VIEWPORT_RENDER_INFO_RT_BUILDS_FORCED] += frame_builds > budget_built ? int(frame_builds - budget_built) : 0;
 			info[RSE::VIEWPORT_RENDER_INFO_RT_BUILDS_DEFERRED] += int(build_budget.deferred);
 			info[RSE::VIEWPORT_RENDER_INFO_RT_BUILD_QUEUE_DEPTH] += int(build_budget.waiting + build_budget.held);
 			info[RSE::VIEWPORT_RENDER_INFO_RT_BUILD_BUDGET_TRIANGLES] += int(MIN(build_budget.spent_triangles, uint64_t(INT32_MAX)));
 		}
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_TRIANGLES_REFIT] += rt_triangles_refit + deformed_cluster_triangles_updated;
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_INSTANCES_COMPILING] += rt_instances_compiling;
+		if (cluster_lod_stream_enabled) {
+			// The stream loads (D111): their own counters, out of the builds and the triangles built.
+			int *info = p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE];
+			info[RSE::VIEWPORT_RENDER_INFO_RT_STREAM_LOADS] += int(frame_stream_loads);
+			info[RSE::VIEWPORT_RENDER_INFO_RT_STREAM_LOAD_CLUSTERS] += int(frame_stream_load_clusters);
+			info[RSE::VIEWPORT_RENDER_INFO_RT_STREAM_LOAD_TRIANGLES] += int(frame_stream_load_triangles);
+		}
 	}
 #endif
 

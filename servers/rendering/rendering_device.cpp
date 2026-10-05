@@ -893,6 +893,7 @@ Error RenderingDevice::micromap_build(RID p_micromap, RID p_data_buffer, uint64_
 		ERR_FAIL_COND_V_MSG(!input->usage.has_flag(RDD::BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT) || !input->usage.has_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT), ERR_INVALID_PARAMETER, "The micromap's inputs must be created with BUFFER_CREATION_MICROMAP_BUILD_INPUT_READ_ONLY_BIT and BUFFER_CREATION_DEVICE_ADDRESS_BIT.");
 	}
 	ERR_FAIL_COND_V(p_data_offset >= data_buffer->size || p_triangle_offset >= triangle_buffer->size, ERR_INVALID_PARAMETER);
+	ERR_FAIL_COND_V_MSG(p_data_offset % 256 != 0 || p_triangle_offset % 256 != 0, ERR_INVALID_PARAMETER, "The micromap's data and triangle offsets must be multiples of 256.");
 	_check_transfer_worker_buffer(data_buffer);
 	_check_transfer_worker_buffer(triangle_buffer);
 

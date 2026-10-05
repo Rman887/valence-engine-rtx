@@ -2232,6 +2232,9 @@ RDD::BufferID RenderingDeviceDriverVulkan::buffer_create(uint64_t p_size, BitFie
 	// Align the size. This is specially important for BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT buffers.
 	// For the rest, it should work thanks to VMA taking care of the details. But still align just in case.
 	p_size = STEPIFY(p_size, alignment);
+	// A micromap build reads its states and triangle array at device addresses that are multiples
+	// of 256 (VUID-vkCmdBuildMicromapsEXT-pInfos-07515), which the memory requirements do not carry.
+	const VkDeviceSize min_address_alignment = p_usage.has_flag(BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT) ? 256 : 0;
 
 	const size_t original_size = p_size;
 	if (p_usage.has_flag(BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT)) {
@@ -2291,12 +2294,19 @@ RDD::BufferID RenderingDeviceDriverVulkan::buffer_create(uint64_t p_size, BitFie
 	if (!Engine::get_singleton()->is_extra_gpu_memory_tracking_enabled()) {
 		alloc_create_info.preferredFlags &= ~vma_flags_to_remove;
 		alloc_create_info.usage = vma_usage;
-		VkResult err = vmaCreateBuffer(allocator, &create_info, &alloc_create_info, &vk_buffer, &allocation, &alloc_info);
+		VkResult err = min_address_alignment ? vmaCreateBufferWithAlignment(allocator, &create_info, &alloc_create_info, min_address_alignment, &vk_buffer, &allocation, &alloc_info) : vmaCreateBuffer(allocator, &create_info, &alloc_create_info, &vk_buffer, &allocation, &alloc_info);
 		ERR_FAIL_COND_V_MSG(err, BufferID(), vformat("Can't create buffer of size: %d (VkResult error %d).", p_size, err));
 	} else {
 		VkResult err = vkCreateBuffer(vk_device, &create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_BUFFER), &vk_buffer);
 		ERR_FAIL_COND_V_MSG(err, BufferID(), vformat("Can't create buffer of size: %d (VkResult error %d).", p_size, err));
-		err = vmaAllocateMemoryForBuffer(allocator, vk_buffer, &alloc_create_info, &allocation, &alloc_info);
+		if (min_address_alignment) {
+			VkMemoryRequirements requirements = {};
+			vkGetBufferMemoryRequirements(vk_device, vk_buffer, &requirements);
+			requirements.alignment = MAX(requirements.alignment, min_address_alignment);
+			err = vmaAllocateMemory(allocator, &requirements, &alloc_create_info, &allocation, &alloc_info);
+		} else {
+			err = vmaAllocateMemoryForBuffer(allocator, vk_buffer, &alloc_create_info, &allocation, &alloc_info);
+		}
 		ERR_FAIL_COND_V_MSG(err, BufferID(), vformat("Can't allocate memory for buffer of size: %d (VkResult error %d).", p_size, err));
 		err = vmaBindBufferMemory2(allocator, allocation, 0, vk_buffer, nullptr);
 		ERR_FAIL_COND_V_MSG(err, BufferID(), vformat("Can't bind memory to buffer of size: %d (VkResult error %d).", p_size, err));

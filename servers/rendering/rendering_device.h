@@ -865,6 +865,7 @@ public:
 		// The buffer holds acceleration structures built into it by cluster_acceleration_structure_build().
 		BUFFER_CREATION_ACCELERATION_STRUCTURE_STORAGE_BIT = (1 << 4),
 		// The buffer holds an opacity micromap's states or triangle array, read by micromap_build().
+		// Its base address is a multiple of 256, as the build's input addresses must be.
 		BUFFER_CREATION_MICROMAP_BUILD_INPUT_READ_ONLY_BIT = (1 << 5),
 	};
 
@@ -1551,8 +1552,9 @@ public:
 	// rendering/pathtracing/opacity_micromaps (restart) asks for. A micromap is sized for its
 	// entries' levels and formats at creation and built once from two buffers created with
 	// BUFFER_CREATION_MICROMAP_BUILD_INPUT_READ_ONLY_BIT and BUFFER_CREATION_DEVICE_ADDRESS_BIT:
-	// the packed states and one triangle_entry_size entry per micromap triangle. A BLAS reads it
-	// through its triangles' micromap fields. Not bound to scripts.
+	// the packed states and one triangle_entry_size entry per micromap triangle, each read from
+	// an offset that is a multiple of 256. A BLAS reads it through its triangles' micromap fields.
+	// Not bound to scripts.
 
 	const OpacityMicromapCapabilities &get_opacity_micromap_capabilities() const;
 	RID micromap_create(Span<MicromapUsage> p_usages);

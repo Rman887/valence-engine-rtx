@@ -906,6 +906,8 @@ public:
 
 	// One build: the states and the triangle array (an entry per micromap triangle, written as
 	// the capabilities' triangle_entry_size bytes: the data offset, the level and the format).
+	// Both inputs are read at multiples of 256: buffer_create() aligns a buffer with
+	// BUFFER_USAGE_MICROMAP_BUILD_INPUT_READ_ONLY_BIT to 256, so the offsets must be multiples of 256.
 	struct MicromapBuild {
 		MicromapID micromap;
 		BufferID data_buffer;

@@ -202,7 +202,7 @@ layout(set = 0, binding = 15, std140) uniform Params {
 	mat3 radiance_inverse_xform;
 
 	vec3 rt_cam_offset;
-	float rt_pad;
+	float exposure_normalization;
 }
 params;
 
@@ -427,6 +427,7 @@ void main() {
 #endif
 	vec3 emission = vec3(emission_u >> 21, (emission_u << 11) >> 21, emission_u % 1024) / vec3(511.0, 511.0, 255.0);
 	emission += params.base_emission * params.base_density;
+	emission *= params.exposure_normalization;
 
 	float cell_depth_size = abs(view_pos.z - get_depth_at_pos(fog_cell_size.z, pos.z + 1));
 	//compute directional lights

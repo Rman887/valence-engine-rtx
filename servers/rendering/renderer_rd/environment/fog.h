@@ -191,7 +191,7 @@ private:
 			float radiance_inverse_xform[12];
 
 			float rt_cam_offset[3];
-			float rt_pad;
+			float exposure_normalization;
 		};
 
 		VolumetricFogProcessShaderRD process_shader;
@@ -387,6 +387,10 @@ public:
 		// queries against this TLAS, in whose frame the camera sits at rt_cam_offset.
 		RID rt_tlas;
 		Vector3 rt_cam_offset;
+
+		// The camera's exposure factor, which the lights already carry: the ambient colour and the
+		// emission are radiance too and are scaled by it here.
+		float exposure_normalization = 1.0;
 	};
 	void volumetric_fog_update(const VolumetricFogSettings &p_settings, const Projection &p_cam_projection, const Transform3D &p_cam_transform, const Transform3D &p_prev_cam_inv_transform, RID p_shadow_atlas, int p_directional_light_count, bool p_use_directional_shadows, int p_positional_light_count, int p_voxel_gi_count, const PagedArray<RID> &p_fog_volumes);
 };

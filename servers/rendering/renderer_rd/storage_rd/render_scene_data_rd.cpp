@@ -225,6 +225,10 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 
 		Color fog_color = render_scene_render->environment_get_fog_light_color(p_env).srgb_to_linear();
 		float fog_energy = render_scene_render->environment_get_fog_light_energy(p_env);
+		// The fog's light is radiance like every other source, so it carries the camera's exposure.
+		if (p_camera_attributes.is_valid()) {
+			fog_energy *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes);
+		}
 
 		ubo.fog_light_color[0] = fog_color.r * fog_energy;
 		ubo.fog_light_color[1] = fog_color.g * fog_energy;

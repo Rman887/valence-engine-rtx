@@ -11849,10 +11849,11 @@ void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDa
 	}
 	// The moments are built with the weights over the exposure normalisation (D72), which only scales
 	// them and which the trace folds into its S, so a move of the camera exposure or the
-	// background's intensity costs no rebuild, while the weights' shape (the fog's sky affect, its
-	// aerial perspective, the fog light's fixed term against the exposed levels) does once it moves
-	// by a hundredth. The normalisation is the unit, so the fog's sky affect at 1 (the default) still
-	// leaves the fog's level and colour in the moments.
+	// background's intensity costs no rebuild (the fog light carries the camera exposure as the levels
+	// do), while the weights' shape (the fog's sky affect, its aerial perspective, the fog light's
+	// colour and energy against the sky's) does once it moves by a hundredth. The normalisation is the
+	// unit, so the fog's sky affect at 1 (the default) still leaves the fog's level and colour in the
+	// moments.
 	bool mix_changed = !p_state->sky_light_mix_valid;
 	if (!mix_changed) {
 		for (int i = 0; i < 3; i++) {

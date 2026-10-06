@@ -1145,9 +1145,9 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 	params.fog_frustum_end = fog_end;
 
 	Color ambient_color = RendererSceneRenderRD::get_singleton()->environment_get_ambient_light(p_settings.env).srgb_to_linear();
-	params.ambient_color[0] = ambient_color.r;
-	params.ambient_color[1] = ambient_color.g;
-	params.ambient_color[2] = ambient_color.b;
+	params.ambient_color[0] = ambient_color.r * p_settings.exposure_normalization;
+	params.ambient_color[1] = ambient_color.g * p_settings.exposure_normalization;
+	params.ambient_color[2] = ambient_color.b * p_settings.exposure_normalization;
 	params.sky_contribution = RendererSceneRenderRD::get_singleton()->environment_get_ambient_sky_contribution(p_settings.env);
 
 	params.fog_volume_size[0] = fog->width;
@@ -1187,7 +1187,9 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 	params.rt_cam_offset[0] = p_settings.rt_cam_offset.x;
 	params.rt_cam_offset[1] = p_settings.rt_cam_offset.y;
 	params.rt_cam_offset[2] = p_settings.rt_cam_offset.z;
-	params.rt_pad = 0.0f;
+	// The emission is packed into the froxels clamped to [0, 4] and scaled after unpacking, so a
+	// small exposure factor cannot quantise it away.
+	params.exposure_normalization = p_settings.exposure_normalization;
 	params.max_voxel_gi_instances = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_gi_inject(p_settings.env) > 0.001 ? p_voxel_gi_count : 0;
 	params.temporal_frame = RSG::rasterizer->get_frame_number() % VolumetricFog::MAX_TEMPORAL_FRAMES;
 

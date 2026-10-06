@@ -1084,10 +1084,9 @@ void SkyRD::setup_sky(const RenderDataRD *p_render_data, const Size2i p_screen_s
 				if (RendererSceneRenderRD::get_singleton()->is_using_physical_light_units()) {
 					sky_light_data.energy *= light_storage->light_get_param(base, RSE::LIGHT_PARAM_INTENSITY);
 				}
-
-				if (p_render_data->camera_attributes.is_valid()) {
-					sky_light_data.energy *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
-				}
+				// No camera exposure here: the sky shader's output is multiplied by the brightness multiplier,
+				// which carries it, so a sun disc or a physical sky driven by the light would get it twice. The
+				// fog's sun scatter, added after that, takes it from the UBO's exposure_normalization.
 
 				Color linear_col = light_storage->light_get_color(base).srgb_to_linear();
 				sky_light_data.color[0] = linear_col.r;
@@ -1227,6 +1226,7 @@ void SkyRD::setup_sky(const RenderDataRD *p_render_data, const Size2i p_screen_s
 	sky_scene_state.ubo.fog_sky_affect = RendererSceneRenderRD::get_singleton()->environment_get_fog_sky_affect(p_render_data->environment);
 	sky_scene_state.ubo.volumetric_fog_sky_affect = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_sky_affect(p_render_data->environment);
 	sky_scene_state.ubo.fog_use_legacy_blending = RendererSceneRenderRD::get_singleton()->fog_use_legacy_blending_get();
+	sky_scene_state.ubo.exposure_normalization = p_render_data->camera_attributes.is_valid() ? RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes) : 1.0f;
 
 	RD::get_singleton()->buffer_update(sky_scene_state.uniform_buffer, 0, sizeof(SkySceneState::UBO), &sky_scene_state.ubo);
 }
@@ -1354,7 +1354,9 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 			}
 			sky->processing_layer = 1;
 		}
-		sky->baked_exposure = p_luminance_multiplier;
+		// Everything the radiance was rendered with, the background's energy, its intensity and the
+		// camera's exposure included, so IBL_exposure_normalization is 1 at the bake.
+		sky->baked_exposure = p_luminance_multiplier * p_brightness_multiplier;
 		sky->reflection.dirty = false;
 		sky->radiance_version++;
 

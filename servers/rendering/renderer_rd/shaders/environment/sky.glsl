@@ -79,7 +79,7 @@ layout(set = 0, binding = 2, std140) uniform SkySceneData {
 	float z_far; // 4 - 52
 	uint directional_light_count; // 4 - 56
 	bool fog_use_legacy_blending; // 4 - 60
-	uint pad1; // 4 - 64
+	float exposure_normalization; // 4 - 64
 }
 sky_scene_data;
 
@@ -165,7 +165,8 @@ vec4 fog_process(vec3 view, vec3 sky_color) {
 		vec4 sun_scatter = vec4(0.0);
 		float sun_total = 0.0;
 		for (uint i = 0; i < sky_scene_data.directional_light_count; i++) {
-			vec3 light_color = directional_lights.data[i].color_size.xyz * directional_lights.data[i].direction_energy.w;
+			// The lights carry no camera exposure (the sky body gets it from the brightness multiplier), and fog comes after that.
+			vec3 light_color = directional_lights.data[i].color_size.xyz * directional_lights.data[i].direction_energy.w * sky_scene_data.exposure_normalization;
 			float light_amount = pow(max(dot(view, directional_lights.data[i].direction_energy.xyz), 0.0), 8.0) * M_PI;
 			fog_color += light_color * light_amount * sky_scene_data.fog_sun_scatter;
 		}

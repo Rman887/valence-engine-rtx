@@ -83,8 +83,8 @@ float sky_share_objective(vec4 p_moments, float p_surface, float p_irradiance) {
 }
 
 /// The moments' unit: the exposure normalisation the frame's weights of the delivered luminance
-/// are divided by in the table (the camera exposure and the background's intensity over the sky's
-/// baked exposure), never 0 while the sky renders.
+/// are divided by in the table (the camera exposure, the background's energy and its intensity over
+/// what the sky was baked with, so 1 at the bake), never 0 while the sky renders.
 float sky_moments_unit() {
 	return scene_data_block.data.IBL_exposure_normalization;
 }

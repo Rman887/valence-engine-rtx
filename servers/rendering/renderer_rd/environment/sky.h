@@ -159,7 +159,7 @@ public:
 			float z_far; // 4 - 340
 			uint32_t directional_light_count; // 4 - 344
 			uint32_t fog_use_legacy_blending; // 4 - 348
-			uint32_t pad1; // 4 - 352
+			float exposure_normalization; // 4 - 352
 		};
 
 		UBO ubo;
@@ -269,7 +269,7 @@ public:
 		bool dirty = false;
 		int processing_layer = 0;
 		Sky *dirty_list = nullptr;
-		float baked_exposure = 1.0;
+		float baked_exposure = 0.0; // 0 until the first bake, which IBL_exposure_normalization reads as 1.
 		uint64_t radiance_version = 0; // Counts the renders into the octmap's sharpest layer (D54) and its first roughness layer, the fog's level (D64).
 
 		// State to track when radiance octmap needs updating.

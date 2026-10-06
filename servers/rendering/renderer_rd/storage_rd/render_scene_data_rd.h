@@ -99,6 +99,8 @@ public:
 	virtual Projection get_view_projection(uint32_t p_view) const override;
 
 	RID create_uniform_buffer();
+	// The sky octmap's ratio of the frame's exposure to the one it was baked with, as update_ubo() last set it.
+	float get_ibl_exposure_normalization() const { return ubo_data.ubo.IBL_exposure_normalization; }
 	void update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw p_debug_mode, RID p_env, RID p_reflection_probe_instance, RID p_camera_attributes, bool p_pancake_shadows, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, float p_luminance_multiplier, bool p_opaque_render_buffers, bool p_apply_alpha_multiplier);
 	virtual RID get_uniform_buffer() const override;
 

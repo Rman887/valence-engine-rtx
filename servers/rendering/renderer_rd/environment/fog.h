@@ -184,7 +184,8 @@ private:
 			float temporal_blend;
 
 			float sky_border_size[2];
-			float pad[2];
+			float sky_exposure_normalization; // The ratio of the frame's exposure to the one the sky was baked with.
+			float pad;
 
 			float cam_rotation[12];
 			float to_prev_view[16];
@@ -391,6 +392,8 @@ public:
 		// The camera's exposure factor, which the lights already carry: the ambient colour and the
 		// emission are radiance too and are scaled by it here.
 		float exposure_normalization = 1.0;
+		// The sky octmap holds the exposure it was baked with (the scene UBO's IBL_exposure_normalization).
+		float sky_exposure_normalization = 1.0;
 	};
 	void volumetric_fog_update(const VolumetricFogSettings &p_settings, const Projection &p_cam_projection, const Transform3D &p_cam_transform, const Transform3D &p_prev_cam_inv_transform, RID p_shadow_atlas, int p_directional_light_count, bool p_use_directional_shadows, int p_positional_light_count, int p_voxel_gi_count, const PagedArray<RID> &p_fog_volumes);
 };

@@ -1144,10 +1144,11 @@ vec3 fog_sample_radiance(vec3 vertex, float mip_level) {
 	float cube_lod = vec3_to_oct_lod(dFdx(cube_view), dFdy(cube_view), scene_data_block.data.radiance_pixel_size);
 	vec3 sky_sample_a = textureLod(sampler2DArray(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(cube_uv, roughness_lod), cube_lod).rgb;
 	vec3 sky_sample_b = textureLod(sampler2DArray(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), vec3(cube_uv, roughness_lod + 1), cube_lod).rgb;
-	return mix(sky_sample_a, sky_sample_b, blend);
+	// The octmap holds the exposure it was baked with; the ratio brings it to the frame's.
+	return mix(sky_sample_a, sky_sample_b, blend) * scene_data_block.data.IBL_exposure_normalization;
 #else
 	float roughness_lod = mip_level * MAX_ROUGHNESS_LOD;
-	return textureLod(sampler2D(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), cube_uv, roughness_lod).rgb;
+	return textureLod(sampler2D(radiance_octmap, DEFAULT_SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP), cube_uv, roughness_lod).rgb * scene_data_block.data.IBL_exposure_normalization;
 #endif
 }
 

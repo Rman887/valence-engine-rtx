@@ -194,7 +194,8 @@ layout(set = 0, binding = 15, std140) uniform Params {
 	float temporal_blend;
 
 	vec2 sky_border_size;
-	vec2 pad;
+	float sky_exposure_normalization;
+	float pad;
 
 	mat3x4 cam_rotation;
 	mat4 to_prev_view;
@@ -496,6 +497,8 @@ void main() {
 				isotropic = textureLod(sampler2D(sky_texture, linear_sampler_with_mipmaps), vec3_to_oct_with_border(vec3(0.0, 1.0, 0.0), params.sky_border_size), mip_bias).rgb;
 				anisotropic = textureLod(sampler2D(sky_texture, linear_sampler_with_mipmaps), vec3_to_oct_with_border(scatter_direction, params.sky_border_size), mip_bias).rgb;
 #endif //USE_RADIANCE_OCTMAP_ARRAY
+				isotropic *= params.sky_exposure_normalization;
+				anisotropic *= params.sky_exposure_normalization;
 			}
 
 			total_light += mix(params.ambient_color, mix(isotropic, anisotropic, abs(params.phase_g)), params.sky_contribution) * params.ambient_inject;

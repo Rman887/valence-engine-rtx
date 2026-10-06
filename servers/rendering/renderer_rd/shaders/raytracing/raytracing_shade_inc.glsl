@@ -54,8 +54,9 @@ vec3 fog_sample_radiance(vec3 vertex, float mip_level) {
 			1.0 - scene_data_block.data.radiance_border_size * 2.0);
 	vec2 cube_uv = vec3_to_oct_with_border(cube_view, border);
 	// mip_level is a normalized roughness (0..1); radiance_octmap_sample maps it
-	// onto the prefiltered roughness array layers.
-	return radiance_octmap_sample(cube_uv, mip_level);
+	// onto the prefiltered roughness array layers. The octmap holds the exposure it was baked
+	// with, so the aerial perspective takes the ratio to the frame's, as sky_radiance does.
+	return radiance_octmap_sample(cube_uv, mip_level) * scene_data_block.data.IBL_exposure_normalization;
 }
 
 #include "../fog_inc.glsl"

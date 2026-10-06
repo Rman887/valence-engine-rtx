@@ -225,7 +225,7 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 			{
 				RENDER_TIMESTAMP("Update Volumetric Fog");
 				bool directional_shadows = RendererRD::LightStorage::get_singleton()->has_directional_shadows(pt_directional_light_count);
-				_update_volumetric_fog(rb, p_render_data->environment, p_render_data->camera_attributes, p_render_data->scene_data->cam_projection, p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform.affine_inverse(), p_render_data->shadow_atlas, pt_directional_light_count, directional_shadows, pt_positional_light_count, p_render_data->voxel_gi_count, *p_render_data->fog_volumes, rt_state->tlas, p_render_data->scene_data->cam_transform.origin - rt_state->rt_origin);
+				_update_volumetric_fog(rb, p_render_data->environment, p_render_data->camera_attributes, p_render_data->scene_data->cam_projection, p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform.affine_inverse(), p_render_data->shadow_atlas, pt_directional_light_count, directional_shadows, pt_positional_light_count, p_render_data->voxel_gi_count, *p_render_data->fog_volumes, p_render_data->scene_data, rt_state->tlas, p_render_data->scene_data->cam_transform.origin - rt_state->rt_origin);
 			}
 			rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags, use_gbuffer);
 			// DLSS gets the same camera-relative frame the trace rendered.

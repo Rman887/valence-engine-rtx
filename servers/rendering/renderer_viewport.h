@@ -90,6 +90,10 @@ public:
 		RSE::ViewportEnvironmentMode disable_environment = RSE::VIEWPORT_ENVIRONMENT_INHERIT;
 		bool disable_3d = false;
 		bool measure_render_time = false;
+		bool measure_auto_exposure = false;
+		bool auto_exposure_read_pending = false;
+		float auto_exposure_luminance = 0.0; // Read back from the GPU frames late; 0 when none was reduced.
+		Callable auto_exposure_read_callback; // Bound to this viewport's RID while measuring.
 
 		bool snap_2d_transforms_to_pixel = false;
 		bool snap_2d_vertices_to_pixel = false;
@@ -218,6 +222,10 @@ private:
 
 	void _resize_occlusion_culling_buffer(const Size2i &p_size);
 
+	// Set while this RendererViewport exists: RenderingDevice runs reads still in flight at its finalize, after it is gone.
+	static inline RendererViewport *singleton = nullptr;
+	static void _auto_exposure_read(const PackedByteArray &p_data, RID p_viewport);
+
 public:
 	RID viewport_allocate();
 	void viewport_initialize(RID p_rid);
@@ -296,6 +304,9 @@ public:
 	float viewport_get_measured_render_time_cpu(RID p_viewport) const;
 	float viewport_get_measured_render_time_gpu(RID p_viewport) const;
 
+	void viewport_set_measure_auto_exposure(RID p_viewport, bool p_enable);
+	float viewport_get_measured_auto_exposure_luminance(RID p_viewport) const;
+
 	void viewport_set_snap_2d_transforms_to_pixel(RID p_viewport, bool p_enabled);
 	void viewport_set_snap_2d_vertices_to_pixel(RID p_viewport, bool p_enabled);
 
@@ -325,5 +336,5 @@ public:
 	void call_set_vsync_mode(DisplayServerEnums::VSyncMode p_mode, DisplayServerEnums::WindowID p_window);
 
 	RendererViewport();
-	virtual ~RendererViewport() {}
+	virtual ~RendererViewport();
 };

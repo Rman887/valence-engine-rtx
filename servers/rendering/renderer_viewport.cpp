@@ -34,6 +34,7 @@
 #include "core/config/project_settings.h"
 #include "core/error/error_macros.h"
 #include "core/math/transform_interpolator.h"
+#include "core/object/callable_mp.h"
 #include "core/object/worker_thread_pool.h"
 #include "core/os/os.h"
 #include "core/profiling/profiling.h"
@@ -337,6 +338,15 @@ void RendererViewport::_draw_3d(Viewport *p_viewport) {
 
 	float screen_mesh_lod_threshold = p_viewport->mesh_lod_threshold / float(p_viewport->size.width);
 	RSG::scene->render_camera(p_viewport->render_buffers, p_viewport->camera, p_viewport->scenario, p_viewport->self, p_viewport->internal_size, p_viewport->jitter_phase_count, screen_mesh_lod_threshold, p_viewport->shadow_atlas, xr_interface, p_viewport->window_output_max_value, &p_viewport->render_info);
+
+	if (p_viewport->measure_auto_exposure && !p_viewport->auto_exposure_read_pending) {
+		// One read in flight at a time; a frame that reduced no luminance reads 0.
+		if (RSG::scene->render_buffers_read_auto_exposure(p_viewport->render_buffers, p_viewport->auto_exposure_read_callback)) {
+			p_viewport->auto_exposure_read_pending = true;
+		} else {
+			p_viewport->auto_exposure_luminance = 0.0;
+		}
+	}
 
 	RENDER_TIMESTAMP("< Render 3D Scene");
 #endif // _3D_DISABLED
@@ -1618,6 +1628,46 @@ float RendererViewport::viewport_get_measured_render_time_gpu(RID p_viewport) co
 	return double((viewport->time_gpu_end - viewport->time_gpu_begin) / 1000) / 1000.0;
 }
 
+void RendererViewport::viewport_set_measure_auto_exposure(RID p_viewport, bool p_enable) {
+	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
+	ERR_FAIL_NULL(viewport);
+
+	viewport->measure_auto_exposure = p_enable;
+	if (p_enable) {
+		viewport->auto_exposure_read_callback = callable_mp_static(&RendererViewport::_auto_exposure_read).bind(p_viewport);
+	} else {
+		viewport->auto_exposure_read_callback = Callable();
+		viewport->auto_exposure_luminance = 0.0;
+	}
+}
+
+float RendererViewport::viewport_get_measured_auto_exposure_luminance(RID p_viewport) const {
+	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
+	ERR_FAIL_NULL_V(viewport, 0);
+
+	return viewport->auto_exposure_luminance;
+}
+
+// Called by RenderingDevice on the render thread as it begins a later frame.
+void RendererViewport::_auto_exposure_read(const PackedByteArray &p_data, RID p_viewport) {
+	if (singleton == nullptr) {
+		return; // The rendering server finished while the read was in flight.
+	}
+	// owns() first: a freed viewport's slot may hold a new one not yet initialized, which get_or_null reports.
+	if (!singleton->viewport_owner.owns(p_viewport)) {
+		return; // Freed while the read was in flight.
+	}
+	Viewport *viewport = singleton->viewport_owner.get_or_null(p_viewport);
+	if (viewport == nullptr) {
+		return;
+	}
+
+	viewport->auto_exposure_read_pending = false;
+	if (viewport->measure_auto_exposure && p_data.size() >= int(sizeof(float))) {
+		memcpy(&viewport->auto_exposure_luminance, p_data.ptr(), sizeof(float));
+	}
+}
+
 void RendererViewport::viewport_set_snap_2d_transforms_to_pixel(RID p_viewport, bool p_enabled) {
 	Viewport *viewport = viewport_owner.get_or_null(p_viewport);
 	ERR_FAIL_NULL(viewport);
@@ -1771,5 +1821,10 @@ int RendererViewport::get_num_viewports_with_motion_vectors() const {
 }
 
 RendererViewport::RendererViewport() {
+	singleton = this;
 	occlusion_rays_per_thread = GLOBAL_GET("rendering/occlusion_culling/occlusion_rays_per_thread");
+}
+
+RendererViewport::~RendererViewport() {
+	singleton = nullptr;
 }

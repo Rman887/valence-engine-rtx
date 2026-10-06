@@ -808,6 +808,8 @@ public:
 	FUNC2(viewport_set_measure_render_time, RID, bool)
 	FUNC1RC(double, viewport_get_measured_render_time_cpu, RID)
 	FUNC1RC(double, viewport_get_measured_render_time_gpu, RID)
+	FUNC2(viewport_set_measure_auto_exposure, RID, bool)
+	FUNC1RC(float, viewport_get_measured_auto_exposure_luminance, RID)
 	FUNC1RC(RID, viewport_find_from_screen_attachment, DisplayServerEnums::WindowID)
 
 	FUNC2(call_set_vsync_mode, DisplayServerEnums::VSyncMode, DisplayServerEnums::WindowID)
@@ -937,6 +939,7 @@ public:
 	FUNC8(camera_attributes_set_dof_blur, RID, bool, float, float, bool, float, float, float)
 	FUNC3(camera_attributes_set_exposure, RID, float, float)
 	FUNC6(camera_attributes_set_auto_exposure, RID, bool, float, float, float, float)
+	FUNC1RC(float, camera_attributes_get_exposure_normalization_factor, RID)
 
 	/* SCENARIO API */
 

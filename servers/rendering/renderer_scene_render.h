@@ -368,6 +368,9 @@ public:
 	virtual void set_debug_draw_mode(RSE::ViewportDebugDraw p_debug_draw) = 0;
 
 	virtual Ref<RenderSceneBuffers> render_buffers_create() = 0;
+	// Reads back the auto exposure luminance reduced this frame into p_callback (a PackedByteArray, frames later);
+	// false when nothing was reduced or the renderer has no readback.
+	virtual bool render_buffers_read_auto_exposure(const Ref<RenderSceneBuffers> &p_render_buffers, const Callable &p_callback) { return false; }
 	virtual void gi_set_use_half_resolution(bool p_enable) = 0;
 
 	virtual void screen_space_roughness_limiter_set_active(bool p_enable, float p_amount, float p_limit) = 0;

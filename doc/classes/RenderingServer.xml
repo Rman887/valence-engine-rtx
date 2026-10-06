@@ -51,6 +51,13 @@
 				[b]Note:[/b] The equivalent resource is [CameraAttributes].
 			</description>
 		</method>
+		<method name="camera_attributes_get_exposure_normalization_factor" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="camera_attributes" type="RID" />
+			<description>
+				Returns the factor the renderer folds into every light source for the given [param camera_attributes]: the exposure multiplier times the exposure normalization (the latter is [code]1.0[/code] unless [member ProjectSettings.rendering/lights_and_shadows/use_physical_light_units] is enabled). Auto exposure is not included. See [method camera_attributes_set_exposure].
+			</description>
+		</method>
 		<method name="camera_attributes_set_auto_exposure">
 			<return type="void" />
 			<param index="0" name="camera_attributes" type="RID" />
@@ -4282,6 +4289,14 @@
 				[b]Note:[/b] The equivalent node is [Viewport].
 			</description>
 		</method>
+		<method name="viewport_get_measured_auto_exposure_luminance" qualifiers="const">
+			<return type="float" />
+			<param index="0" name="viewport" type="RID" />
+			<description>
+				Returns the auto exposure luminance the tonemapper last divided the [param viewport]'s image by, read back from the GPU a few frames after it was rendered. The value is in the renderer's units, after the camera's exposure factor (see [method camera_attributes_get_exposure_normalization_factor]) and before [member CameraAttributes.auto_exposure_scale].
+				[b]Note:[/b] Requires measurements to be enabled on the specified [param viewport] using [method viewport_set_measure_auto_exposure]. Otherwise, and while the viewport's camera has auto exposure disabled, this method returns [code]0.0[/code]. A viewport that stops drawing 3D keeps the last value read while it did.
+			</description>
+		</method>
 		<method name="viewport_get_measured_render_time_cpu" qualifiers="const">
 			<return type="float" />
 			<param index="0" name="viewport" type="RID" />
@@ -4477,6 +4492,14 @@
 			<param index="1" name="transform" type="Transform2D" />
 			<description>
 				Sets the viewport's global transformation matrix.
+			</description>
+		</method>
+		<method name="viewport_set_measure_auto_exposure">
+			<return type="void" />
+			<param index="0" name="viewport" type="RID" />
+			<param index="1" name="enable" type="bool" />
+			<description>
+				If [code]true[/code], reads back the given [param viewport]'s auto exposure luminance as it renders, for [method viewport_get_measured_auto_exposure_luminance]. One read is in flight at a time.
 			</description>
 		</method>
 		<method name="viewport_set_measure_render_time">

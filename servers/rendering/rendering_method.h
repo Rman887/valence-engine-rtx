@@ -376,6 +376,7 @@ public:
 	/* Render Buffers */
 
 	virtual Ref<RenderSceneBuffers> render_buffers_create() = 0;
+	virtual bool render_buffers_read_auto_exposure(const Ref<RenderSceneBuffers> &p_render_buffers, const Callable &p_callback) = 0;
 
 	virtual void gi_set_use_half_resolution(bool p_enable) = 0;
 

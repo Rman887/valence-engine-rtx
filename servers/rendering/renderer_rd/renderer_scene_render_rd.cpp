@@ -242,6 +242,17 @@ void RendererSceneRenderRD::_debug_sdfgi_probes(Ref<RenderSceneBuffersRD> p_rend
 }
 
 ////////////////////////////////
+bool RendererSceneRenderRD::render_buffers_read_auto_exposure(const Ref<RenderSceneBuffers> &p_render_buffers, const Callable &p_callback) {
+	Ref<RenderSceneBuffersRD> rb = p_render_buffers;
+	if (rb.is_null() || rb->get_auto_exposure_frame() != RSG::rasterizer->get_frame_number()) {
+		return false;
+	}
+
+	// The 1x1 luminance the tonemap divides by this frame, reduced earlier in this frame's graph.
+	RID current = luminance->get_current_luminance_buffer(rb);
+	return current.is_valid() && RD::get_singleton()->texture_get_data_async(current, 0, p_callback) == OK;
+}
+
 Ref<RenderSceneBuffers> RendererSceneRenderRD::render_buffers_create() {
 	Ref<RenderSceneBuffersRD> rb;
 	rb.instantiate();
@@ -609,6 +620,7 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 		float auto_exposure_min_sensitivity = RSG::camera_attributes->camera_attributes_get_auto_exposure_min_sensitivity(p_render_data->camera_attributes);
 		float auto_exposure_max_sensitivity = RSG::camera_attributes->camera_attributes_get_auto_exposure_max_sensitivity(p_render_data->camera_attributes);
 		luminance->luminance_reduction(rb->get_internal_texture(), rb->get_internal_size(), luminance_buffers, auto_exposure_min_sensitivity, auto_exposure_max_sensitivity, step, set_immediate);
+		rb->set_auto_exposure_frame(RSG::rasterizer->get_frame_number());
 
 		// Swap final reduce with prev luminance.
 

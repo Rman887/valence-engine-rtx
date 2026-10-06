@@ -245,6 +245,7 @@ public:
 	virtual RD::DataFormat _render_buffers_get_preferred_color_format();
 	virtual bool _render_buffers_can_be_storage();
 	virtual Ref<RenderSceneBuffers> render_buffers_create() override;
+	virtual bool render_buffers_read_auto_exposure(const Ref<RenderSceneBuffers> &p_render_buffers, const Callable &p_callback) override;
 	virtual void gi_set_use_half_resolution(bool p_enable) override;
 
 	RID render_buffers_get_default_voxel_gi_buffer();

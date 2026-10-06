@@ -76,6 +76,7 @@ private:
 	RD::DataFormat preferred_data_format = RD::DATA_FORMAT_MAX;
 	RendererRD::VRS *vrs = nullptr;
 	uint64_t auto_exposure_version = 1;
+	uint64_t auto_exposure_frame = UINT64_MAX; // The frame the luminance buffer was last reduced in.
 	RSE::ViewportVRSMode vrs_mode = RSE::VIEWPORT_VRS_DISABLED;
 
 	// Our render target represents our final destination that we display on screen.
@@ -253,6 +254,8 @@ public:
 
 	uint64_t get_auto_exposure_version() const { return auto_exposure_version; }
 	void set_auto_exposure_version(const uint64_t p_auto_exposure_version) { auto_exposure_version = p_auto_exposure_version; }
+	uint64_t get_auto_exposure_frame() const { return auto_exposure_frame; }
+	void set_auto_exposure_frame(const uint64_t p_auto_exposure_frame) { auto_exposure_frame = p_auto_exposure_frame; }
 
 	// For our internal textures we provide some easy access methods.
 

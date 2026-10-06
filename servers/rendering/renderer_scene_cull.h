@@ -1451,6 +1451,7 @@ public:
 	/* Render Buffers */
 
 	PASS0R(Ref<RenderSceneBuffers>, render_buffers_create)
+	PASS2R(bool, render_buffers_read_auto_exposure, const Ref<RenderSceneBuffers> &, const Callable &)
 	PASS1(gi_set_use_half_resolution, bool)
 
 	/* Misc */

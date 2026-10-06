@@ -10213,6 +10213,10 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 			e *= ls->light_get_param(p_base, RSE::LIGHT_PARAM_INTENSITY);
 			if (p_type == RSE::LIGHT_OMNI) {
 				e *= 1.0f / (Math::PI * 4.0f);
+			} else if (p_type == RSE::LIGHT_AREA) {
+				// As the raster's LightStorage. The trace still samples it as an omni light, without the
+				// raster's surface-area normalization or its one-sided emission (R3).
+				e *= 1.0f / (Math::PI * 2.0f);
 			} else if (p_type == RSE::LIGHT_SPOT) {
 				e *= 1.0f / Math::PI;
 			}
@@ -10248,7 +10252,11 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		Vector3 to_light = light_pos - cam_pos;
 		float dist_sq = MAX(to_light.dot(to_light), 0.01f);
 		Color color = ls->light_get_color(base);
-		float energy = ls->light_get_param(base, RSE::LIGHT_PARAM_ENERGY);
+		// The light's power as the shader gets it (under physical light units the lumens live in the
+		// intensity, not the energy); the camera's factor is common to every light, so the order is
+		// the power's, and a negative light ranks by its magnitude.
+		const float power = compute_light_energy(base, ls->light_get_type(base));
+		float energy = Math::abs(power);
 		float lum = color.r * 0.2126f + color.g * 0.7152f + color.b * 0.0722f;
 
 		// Range factor: strongly prefer lights with a large influence radius.
@@ -10271,7 +10279,7 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		// shader's units, unlike the score above, which is a ranking with a range preference.
 		Color linear_col = color.srgb_to_linear();
 		float lum_linear = linear_col.r * 0.2126f + linear_col.g * 0.7152f + linear_col.b * 0.0722f;
-		ls_entry.share = compute_light_energy(base, ls->light_get_type(base)) * lum_linear / dist_sq;
+		ls_entry.share = power * lum_linear / dist_sq;
 		positional_lights.push_back(ls_entry);
 	};
 

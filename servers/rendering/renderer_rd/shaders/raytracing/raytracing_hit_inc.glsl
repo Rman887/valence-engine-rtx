@@ -8,6 +8,7 @@
 // ============================================================================
 struct VertexAttributes {
 	vec2 uv;
+	vec2 uv_corners[3]; // The triangle's three UVs the blend came from (D116), with FETCH_UV.
 	vec3 normal;
 	vec3 tangent;
 	float bitangent_sign;
@@ -149,16 +150,18 @@ uint rt_resolve_hit_triangle(inout GeometryData geom, out uint i0, out uint i1, 
 // ============================================================================
 // UV FETCHING
 // ============================================================================
-vec2 fetch_uv(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
+/// The triangle's three UVs; false, with zero UVs, when the surface has none.
+bool fetch_uv_vertices(in GeometryData geom, uint i0, uint i1, uint i2, out vec2 uv0, out vec2 uv1, out vec2 uv2) {
 	if (geom.uv_byte_offset == OFFSET_NONE || geom.attribute_address == 0ul) {
-		return vec2(0.0);
+		uv0 = vec2(0.0);
+		uv1 = vec2(0.0);
+		uv2 = vec2(0.0);
+		return false;
 	}
 
 	uint stride_words = geom.attribute_stride >> 2;
 	uint uv_word_off = geom.uv_byte_offset >> 2;
 	bool compressed = (geom.flags & FLAG_COMPRESSED) != 0u;
-
-	vec2 uv0, uv1, uv2;
 
 	if (compressed) {
 		Uint32Buffer attr = Uint32Buffer(geom.attribute_address);
@@ -188,7 +191,12 @@ vec2 fetch_uv(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
 		uv2 = vec2(attr_f.v[i2 * stride_floats + uv_float_off],
 				attr_f.v[i2 * stride_floats + uv_float_off + 1u]);
 	}
+	return true;
+}
 
+vec2 fetch_uv(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
+	vec2 uv0, uv1, uv2;
+	fetch_uv_vertices(geom, i0, i1, i2, uv0, uv1, uv2);
 	return bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
 }
 
@@ -338,6 +346,9 @@ mat3 rt_normal_basis(mat3 basis) {
 VertexAttributes fetch_vertex_attributes(in GeometryData geom, uint i0, uint i1, uint i2, vec2 hit_attribs, uint fetch_flags) {
 	VertexAttributes attrs;
 	attrs.uv = vec2(0.0);
+	attrs.uv_corners[0] = vec2(0.0);
+	attrs.uv_corners[1] = vec2(0.0);
+	attrs.uv_corners[2] = vec2(0.0);
 	attrs.normal = vec3(0.0, 1.0, 0.0);
 	attrs.tangent = vec3(1.0, 0.0, 0.0);
 	attrs.bitangent_sign = 1.0;
@@ -350,8 +361,8 @@ VertexAttributes fetch_vertex_attributes(in GeometryData geom, uint i0, uint i1,
 	vec3 bary = vec3(1.0 - hit_attribs.x - hit_attribs.y, hit_attribs.x, hit_attribs.y);
 
 	if ((fetch_flags & FETCH_UV) != 0u && geom.uv_byte_offset != OFFSET_NONE) {
-		attrs.uv = fetch_uv(geom, i0, i1, i2, bary);
-		attrs.has_uv = true;
+		attrs.has_uv = fetch_uv_vertices(geom, i0, i1, i2, attrs.uv_corners[0], attrs.uv_corners[1], attrs.uv_corners[2]);
+		attrs.uv = bary.x * attrs.uv_corners[0] + bary.y * attrs.uv_corners[1] + bary.z * attrs.uv_corners[2];
 	}
 
 	if ((fetch_flags & FETCH_COLOR) != 0u && geom.color_byte_offset != OFFSET_NONE) {

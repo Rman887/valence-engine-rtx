@@ -39,9 +39,13 @@
 #define RT_PARAM_DIRECTIONAL_COUNT 18 // rt_params[4].z - The directional lights at the head of the light buffer, the light tree's top-level entries (D55)
 #define RT_PARAM_MAX_DIFFUSE_BOUNCES 19 // rt_params[4].w - The diffuse bounce limit, Environment.pathtracing_max_diffuse_bounces (D74)
 #define RT_PARAM_DECAL_COUNT 20 // rt_params[5].x - The decals the hit shaders apply (D104), 0 to skip the walk
+// Texture LOD by ray cones (D116).
+// rt_params[5].y (21) is unused.
+#define RT_PARAM_TEXTURE_LOD_BIAS 22 // rt_params[5].z - The raster samplers' mipmap bias, added to every cone level
+#define RT_PARAM_TEXTURE_LOD 23 // rt_params[5].w - 1 when the hit shaders sample at the cone's level, 0 for level 0 everywhere
 
 // ============================================================================
-// PATHTRACING PAYLOAD (52 bytes, fp16/unorm-packed)
+// PATHTRACING PAYLOAD (56 bytes, fp16/unorm-packed)
 // ============================================================================
 // Radiance (r) and throughput (T) interleaved as fp16 into 3 uints:
 //   [0]=rg, [1]=bR, [2]=GB  (packHalf2x16 pairs).
@@ -68,6 +72,9 @@ struct PathPayload {
 	// weigh the emission it finds against the emissive light sampling that competes for it;
 	// RT_BSDF_PDF_DELTA for a lobe light sampling can never hit (a mirror, a refraction).
 	float bsdf_pdf; //  4 bytes
+	// The ray cone at the ray's origin (D116): its width in metres and its full spread angle in
+	// radians, as an fp16 pair. The width at a hit is width + spread * t.
+	uint packed_cone; //  4 bytes
 };
 
 const float RT_BSDF_PDF_DELTA = -1.0;
@@ -85,6 +92,8 @@ struct PathState {
 	vec3 medium_inscatter;
 	float medium_entry_height;
 	float bsdf_pdf;
+	float cone_width;
+	float cone_spread;
 };
 
 PathState path_unpack(PathPayload p) {
@@ -106,6 +115,9 @@ PathState path_unpack(PathPayload p) {
 	s.medium_inscatter = max(vec3(bi.y, gb.x, gb.y), vec3(0.0));
 	s.medium_entry_height = p.medium_entry_height;
 	s.bsdf_pdf = p.bsdf_pdf;
+	vec2 cone = unpackHalf2x16(p.packed_cone);
+	s.cone_width = cone.x;
+	s.cone_spread = cone.y;
 	return s;
 }
 
@@ -128,6 +140,7 @@ void path_pack(inout PathPayload p, PathState s) {
 	p.packed_medium[2] = packHalf2x16(vec2(i.g, i.b));
 	p.medium_entry_height = s.medium_entry_height;
 	p.bsdf_pdf = s.bsdf_pdf;
+	p.packed_cone = packHalf2x16(clamp(vec2(s.cone_width, s.cone_spread), vec2(0.0), vec2(FP16_MAX)));
 }
 
 /// A path state with no medium: the fields every fresh path (a sample's start, a shadow ray)

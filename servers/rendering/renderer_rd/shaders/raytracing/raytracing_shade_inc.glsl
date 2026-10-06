@@ -13,6 +13,10 @@
 //   tlas, payload, scene_data_block, geometries[], materials[], bindless_textures[],
 //   SAMPLER_* (12 material samplers), rt_params, DLSS-RR images (ifdef DLSS_RR_ENABLED)
 
+// clang-format off
+#include "raytracing_texture_lod_inc.glsl"
+// clang-format on
+
 // ============================================================================
 // HIT DATA
 // ============================================================================
@@ -27,6 +31,7 @@ struct HitData {
 	bool is_front_face;
 	uint geometry_idx;
 	uint primitive_id; // The triangle hit; 0 for a G-buffer surface, which never weighs its emission (D50).
+	float texture_lod; // The ray cone's texture-independent level (D116), RT_TEXTURE_LOD_BASE when unknown.
 };
 
 // ============================================================================
@@ -144,7 +149,8 @@ void debug_visualize(
 		vec3 V,
 		float NdotV,
 		float hit_t,
-		bool is_front_face) {
+		bool is_front_face,
+		float texture_lod) {
 	PathState ps = path_unpack(payload);
 
 	if (vis_mode == 1) {
@@ -288,6 +294,15 @@ void debug_visualize(
 		} else {
 			ps.radiance = vec3(1.0, 0.0, 0.0);
 		}
+	} else if (vis_mode == RT_VIS_MODE_TEXTURE_LOD) {
+		// The level a 1024 x 1024 texture reads at the primary hit (D116), darkened on odd levels so
+		// whole levels show as bands; grey where the level is unknown and every texture reads its base.
+		if (texture_lod <= RT_TEXTURE_LOD_BASE) {
+			ps.radiance = vec3(0.25);
+		} else {
+			float level = texture_lod + 10.0;
+			ps.radiance = rt_texture_lod_ramp(level) * ((int(floor(level)) & 1) != 0 ? 0.7 : 1.0);
+		}
 	}
 
 	ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
@@ -349,6 +364,8 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// previous vertex's back offset (D103) is spent: only a transmission below sets it again.
 	ps.hit_t = hit_t;
 	ps.packed_bounces_flags = set_back_offset(ps.packed_bounces_flags, false);
+	// The ray cone moves to the hit (D116), which is the next ray's origin on every exit.
+	ps.cone_width += ps.cone_spread * hit_t;
 
 	vec3 V = -ray_dir;
 
@@ -754,6 +771,19 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			pdf = 0.0;
 		}
 		ps.bsdf_pdf = pdf > 0.0 ? pdf : RT_BSDF_PDF_DELTA;
+	}
+
+	// A non-delta lobe widens the ray cone by the density of the direction it drew (D116); a mirror,
+	// like a refraction above, keeps the spread. Only a cone the hit shaders read is widened.
+	if (rt_texture_lod_enabled() && !(brdfType == SPECULAR_TYPE && brdf_mat.roughness * brdf_mat.roughness <= 0.0)) {
+		float pdf = ps.bsdf_pdf;
+		if (pdf == RT_BSDF_PDF_DELTA) {
+			pdf = brdf_pdf(N, next_dir, V, brdf_mat);
+			if (diffuse_transmit_p > 0.0 && diffuse_transmitted != (dot(N, next_dir) < 0.0)) {
+				pdf = 0.0;
+			}
+		}
+		ps.cone_spread = rt_cone_scatter_spread(ps.cone_spread, pdf);
 	}
 
 	// Hand the next ray back to raygen. PATH_TERMINATED_FLAG stays clear so

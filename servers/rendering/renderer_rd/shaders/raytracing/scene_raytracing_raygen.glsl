@@ -202,6 +202,7 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	h.is_front_face = transmission_flags.a > 0.5;
 	h.geometry_idx = 0u;
 	h.primitive_id = 0u;
+	h.texture_lod = RT_TEXTURE_LOD_BASE; // The raster sampled the surface's textures.
 
 	MaterialResult m;
 	m.albedo = albedo_specular.rgb;
@@ -224,7 +225,7 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 		vec3 V = -ray_dir;
 		float NdotV = max(dot(m.normal, V), 0.0001);
 		debug_visualize(vis_mode, h.geometry_normal, m.normal, vec3(0.5, 0.5, 1.0),
-				h.tangent, h.bitangent, h.uv, m.albedo, vec3(1.0, m.roughness, m.metalness), m.metalness, m.roughness, m.specular, m.emissive, V, NdotV, hit_t, h.is_front_face);
+				h.tangent, h.bitangent, h.uv, m.albedo, vec3(1.0, m.roughness, m.metalness), m.metalness, m.roughness, m.specular, m.emissive, V, NdotV, hit_t, h.is_front_face, h.texture_lod);
 		return true;
 	}
 #endif // RT_DEBUG_ENABLED
@@ -291,6 +292,8 @@ void main() {
 	vec4 target = scene_data_block.data.inv_projection_matrix * vec4(d.x, d.y, 1.0, 1.0);
 	vec4 origin = inv_view * vec4(0.0, 0.0, 0.0, 1.0);
 	vec4 direction = inv_view * vec4(normalize(target.xyz), 0);
+	// The ray cone's spread at the camera (D116), the same for every sample of the pixel.
+	const float cone_spread = rt_cone_primary_spread(scene_data_block.data.inv_projection_matrix, d, float(gl_LaunchSizeEXT.y));
 
 	// Sample count from specialization constant, frame index from uniform
 	const uint samples_per_pixel = RT_GET_SAMPLE_COUNT();
@@ -334,6 +337,8 @@ void main() {
 		ps.rng_state = init_rng(pixel, frame_index, sample_idx, samples_per_pixel);
 		ps.hit_t = 0.0;
 		ps.bsdf_pdf = 0.0;
+		ps.cone_width = 0.0;
+		ps.cone_spread = cone_spread;
 		path_clear_medium(ps);
 		if (camera_in_medium) {
 			// The camera is inside a medium (D49): the path starts in it and leaves it through the
@@ -739,7 +744,7 @@ void main() {
 			float NdotV = max(dot(m.normal, V), 0.0001);
 			vec3 orm = vec3(1.0, m.roughness, m.metalness);
 			debug_visualize(VIS_MODE, h.geometry_normal, m.normal, normal_map,
-					h.tangent, h.bitangent, h.uv, m.albedo, orm, m.metalness, m.roughness, m.specular, m.emissive + m.decal_emissive, V, NdotV, gl_HitTEXT, h.is_front_face);
+					h.tangent, h.bitangent, h.uv, m.albedo, orm, m.metalness, m.roughness, m.specular, m.emissive + m.decal_emissive, V, NdotV, gl_HitTEXT, h.is_front_face, h.texture_lod);
 			return;
 		}
 	}
@@ -812,8 +817,10 @@ void main() {
 		if (VIS_MODE != 0) {
 			vec3 V = -gl_WorldRayDirectionEXT;
 			float NdotV = max(dot(m.normal, V), 0.0001);
+			// The material's UV scale is part of the texture's density on the surface (D116).
+			float texture_lod = h.texture_lod + 0.5 * log2(max(abs(mat.uv1_scale.x * mat.uv1_scale.y), 1e-20));
 			debug_visualize(VIS_MODE, h.geometry_normal, m.normal, tangent_space_normal,
-					h.tangent, h.bitangent, uv, m.albedo, orm, m.metalness, m.roughness, mat.specular, m.emissive + m.decal_emissive, V, NdotV, gl_HitTEXT, h.is_front_face);
+					h.tangent, h.bitangent, uv, m.albedo, orm, m.metalness, m.roughness, mat.specular, m.emissive + m.decal_emissive, V, NdotV, gl_HitTEXT, h.is_front_face, h.texture_lod <= RT_TEXTURE_LOD_BASE ? RT_TEXTURE_LOD_BASE : texture_lod);
 			return;
 		}
 	}

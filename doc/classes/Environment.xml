@@ -621,6 +621,9 @@
 		<constant name="RT_DEBUG_BRDF_REJECTION" value="22" enum="PathtracingDebugMode">
 			Displays rays that were rejected by the BRDF sampling process, useful for debugging importance sampling issues.
 		</constant>
+		<constant name="RT_DEBUG_TEXTURE_LOD" value="23" enum="PathtracingDebugMode">
+			Displays the mipmap level a 1024 by 1024 texture is sampled at by the ray cone at each primary hit (see [member ProjectSettings.rendering/pathtracing/texture_lod]): blue at level 0 through cyan, green and yellow to red at level 10, darker on odd levels. Gray where the level is unknown (procedural geometry, a surface without UVs, or a G-buffer primary surface). The colors pass through the camera's exposure and the tonemapper like any debug view, so read them by order rather than by value, and surfaces with alpha blending are drawn by the rasterizer over the view with their own lit shading, since they are not part of the path-traced scene.
+		</constant>
 		<constant name="FOG_MODE_EXPONENTIAL" value="0" enum="FogMode">
 			Use a physically-based fog model defined primarily by fog density.
 		</constant>

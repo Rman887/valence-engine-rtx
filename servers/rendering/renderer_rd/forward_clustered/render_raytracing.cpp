@@ -11301,6 +11301,12 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_PRIMARY_SURFACE] = p_primary_from_gbuffer ? (float)RSE::PT_PRIMARY_SURFACE_GBUFFER : (float)RSE::PT_PRIMARY_SURFACE_TRACED;
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_HAS_PROCEDURAL_INSTANCES] = p_state->has_procedural_instances ? 1.0f : 0.0f;
 
+		// Texture LOD by ray cones (D116): the bias the raster's samplers carry for these buffers (the
+		// viewport's, the render scale's and the temporal upscaler's), and the switch. The raygen
+		// takes the camera ray's spread from the rays it traces.
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_TEXTURE_LOD_BIAS] = rb->get_computed_texture_mipmap_bias();
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_TEXTURE_LOD] = GLOBAL_GET_CACHED(bool, "rendering/pathtracing/texture_lod") ? 1.0f : 0.0f;
+
 		// The froxel volumetric fog the raygen composes over the camera segment (D37): the froxel's
 		// depth mapping as the raster's fragment reads it, and the Environment's sky affect.
 		{

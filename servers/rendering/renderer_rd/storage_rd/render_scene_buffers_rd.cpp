@@ -103,7 +103,7 @@ void RenderSceneBuffersRD::free_named_texture(NamedTexture &p_named_texture) {
 	p_named_texture.slices.clear(); // slices should be freed automatically as dependents...
 }
 
-void RenderSceneBuffersRD::update_samplers() {
+float RenderSceneBuffersRD::get_computed_texture_mipmap_bias() const {
 	float computed_mipmap_bias = texture_mipmap_bias;
 
 	if (use_taa || (RSE::scaling_3d_mode_type(scaling_3d_mode) == RSE::VIEWPORT_SCALING_3D_TYPE_TEMPORAL)) {
@@ -118,10 +118,13 @@ void RenderSceneBuffersRD::update_samplers() {
 		// If both TAA and FXAA are enabled, combine their negative LOD biases together.
 		computed_mipmap_bias -= 0.25;
 	}
+	return computed_mipmap_bias;
+}
 
+void RenderSceneBuffersRD::update_samplers() {
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	material_storage->samplers_rd_free(samplers);
-	samplers = material_storage->samplers_rd_allocate(computed_mipmap_bias, anisotropic_filtering_level);
+	samplers = material_storage->samplers_rd_allocate(get_computed_texture_mipmap_bias(), anisotropic_filtering_level);
 }
 
 void RenderSceneBuffersRD::cleanup() {

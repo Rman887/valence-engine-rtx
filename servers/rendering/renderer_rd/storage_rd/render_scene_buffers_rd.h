@@ -362,6 +362,8 @@ public:
 	_FORCE_INLINE_ RendererRD::MaterialStorage::Samplers get_samplers() const {
 		return samplers;
 	}
+	// Their mipmap bias, which the path tracer adds to its ray cones' texture levels (D116).
+	float get_computed_texture_mipmap_bias() const;
 
 	_FORCE_INLINE_ static RD::TextureSamples msaa_to_samples(RSE::ViewportMSAA p_msaa) {
 		switch (p_msaa) {

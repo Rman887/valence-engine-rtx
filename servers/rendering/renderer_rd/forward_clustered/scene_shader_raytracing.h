@@ -142,6 +142,9 @@ public:
 	static constexpr int RT_PARAM_DIRECTIONAL_COUNT = 18; // The directional lights at the head of the light buffer (D55).
 	static constexpr int RT_PARAM_MAX_DIFFUSE_BOUNCES = 19; // The diffuse bounce limit, Environment.pathtracing_max_diffuse_bounces (D74).
 	static constexpr int RT_PARAM_DECAL_COUNT = 20; // The decals the hit shaders apply (D104), 0 to skip the walk.
+	// 21 is unused.
+	static constexpr int RT_PARAM_TEXTURE_LOD_BIAS = 22; // The raster samplers' mipmap bias, added to every cone level (D116).
+	static constexpr int RT_PARAM_TEXTURE_LOD = 23; // 1 when the hit shaders sample at the cone's level, rendering/pathtracing/texture_lod (D116).
 	static constexpr int RT_PARAM_COUNT = 24;
 
 	static inline uint32_t rt_flags_pack(uint32_t p_flags, uint32_t p_sample_count, uint32_t p_max_bounces) {

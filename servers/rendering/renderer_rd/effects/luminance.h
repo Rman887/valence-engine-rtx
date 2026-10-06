@@ -31,6 +31,7 @@
 #pragma once
 
 #include "servers/rendering/renderer_rd/pipeline_cache_rd.h"
+#include "servers/rendering/renderer_rd/shaders/effects/luminance_histogram.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/luminance_reduce.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/effects/luminance_reduce_raster.glsl.gen.h"
 #include "servers/rendering/renderer_rd/storage_rd/render_scene_buffers_rd.h"
@@ -86,6 +87,33 @@ private:
 		PipelineCacheRD pipelines[LUMINANCE_REDUCE_FRAGMENT_MAX];
 	} luminance_reduce_raster;
 
+	enum LuminanceHistogramMode {
+		LUMINANCE_HISTOGRAM_BLOCK,
+		LUMINANCE_HISTOGRAM_BIN,
+		LUMINANCE_HISTOGRAM_RESOLVE,
+		LUMINANCE_HISTOGRAM_MAX
+	};
+
+	struct LuminanceHistogramPushConstant {
+		int32_t source_size[2];
+		float log_min;
+		float log_max;
+		float to_scene;
+		float clamp_log_min;
+		float clamp_log_max;
+		float adjust_up;
+		float adjust_down;
+		float low_fraction;
+		float high_fraction;
+		float pad;
+	};
+
+	struct LuminanceHistogram {
+		LuminanceHistogramShaderRD shader;
+		RID shader_version;
+		RID pipelines[LUMINANCE_HISTOGRAM_MAX];
+	} luminance_histogram;
+
 public:
 	class LuminanceBuffers : public RenderBufferCustomDataRD {
 		GDCLASS(LuminanceBuffers, RenderBufferCustomDataRD);
@@ -97,6 +125,14 @@ public:
 		Vector<RID> reduce;
 		RID current;
 
+		// Histogram metering: block means of the metered image and the bin counts.
+		RID blocks;
+		Size2i blocks_size;
+		RID histogram;
+
+		// False until a frame is metered after (re)configuration, while current holds no value.
+		bool metered = false;
+
 		virtual void configure(RenderSceneBuffersRD *p_render_buffers) override;
 		virtual void free_data() override;
 
@@ -106,6 +142,19 @@ public:
 	Ref<LuminanceBuffers> get_luminance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers);
 	RID get_current_luminance_buffer(Ref<RenderSceneBuffersRD> p_render_buffers);
 	void luminance_reduction(RID p_source_texture, const Size2i p_source_size, Ref<LuminanceBuffers> p_luminance_buffers, float p_min_luminance, float p_max_luminance, float p_adjust, bool p_set = false);
+
+	struct HistogramSettings {
+		float min_luminance = 0.0; // The camera's bounds, scene luminance.
+		float max_luminance = 0.0;
+		float to_scene = 1.0; // Image units to scene luminance.
+		float adjust_up = 1.0;
+		float adjust_down = 1.0;
+		float low_fraction = 0.5;
+		float high_fraction = 0.95;
+	};
+
+	bool can_use_histogram() const { return !prefer_raster_effects; }
+	bool luminance_histogram_metering(RID p_source_texture, const Size2i p_source_size, Ref<LuminanceBuffers> p_luminance_buffers, const HistogramSettings &p_settings);
 
 	Luminance(bool p_prefer_raster_effects);
 	~Luminance();

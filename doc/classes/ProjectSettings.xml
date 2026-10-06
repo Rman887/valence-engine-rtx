@@ -2907,6 +2907,18 @@
 		<member name="rendering/anti_aliasing/screen_space_roughness_limiter/limit" type="float" setter="" getter="" default="0.18">
 			[b]Note:[/b] This property is only read when the project starts. To control the screen-space roughness limiter at runtime, call [method RenderingServer.screen_space_roughness_limiter_set_active] instead.
 		</member>
+		<member name="rendering/camera/auto_exposure/adaptation_to_dark_scale" type="float" setter="" getter="" default="0.5">
+			Multiplies the camera's auto exposure speed when the metered luminance falls, so the camera adapts to darkness more slowly than to light, as the eye does. Only used by the [code]Histogram[/code] metering mode.
+		</member>
+		<member name="rendering/camera/auto_exposure/histogram_high_percentile" type="float" setter="" getter="" default="95.0">
+			The upper end, in percent of the image, of the luminance window the [code]Histogram[/code] metering mode averages. The brightest part of the image above it (specular highlights, the sun, isolated bright samples) does not move the exposure.
+		</member>
+		<member name="rendering/camera/auto_exposure/histogram_low_percentile" type="float" setter="" getter="" default="50.0">
+			The lower end, in percent of the image, of the luminance window the [code]Histogram[/code] metering mode averages. The darkest part of the image below it (shadow pockets, a night sky) does not move the exposure.
+		</member>
+		<member name="rendering/camera/auto_exposure/metering" type="int" setter="" getter="" default="0">
+			How auto exposure measures the scene. [code]Histogram[/code] averages the log luminance of 8×8 pixel blocks of the image the tonemapper is about to show (the temporal upscaler's output when one runs), between [member rendering/camera/auto_exposure/histogram_low_percentile] and [member rendering/camera/auto_exposure/histogram_high_percentile], in scene luminance, and clamps it to the camera's bounds. [code]Average[/code] is the arithmetic mean of the largest color channel of the internal image. [code]Histogram[/code] requires compute shaders and falls back to [code]Average[/code] in the Mobile renderer.
+		</member>
 		<member name="rendering/camera/depth_of_field/depth_of_field_bokeh_quality" type="int" setter="" getter="" default="1">
 			Sets the quality of the depth of field effect. Higher quality takes more samples, which is slower but looks smoother.
 		</member>

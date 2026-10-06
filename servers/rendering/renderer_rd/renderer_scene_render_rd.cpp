@@ -619,7 +619,31 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 		double step = RSG::camera_attributes->camera_attributes_get_auto_exposure_adjust_speed(p_render_data->camera_attributes) * time_step;
 		float auto_exposure_min_sensitivity = RSG::camera_attributes->camera_attributes_get_auto_exposure_min_sensitivity(p_render_data->camera_attributes);
 		float auto_exposure_max_sensitivity = RSG::camera_attributes->camera_attributes_get_auto_exposure_max_sensitivity(p_render_data->camera_attributes);
-		luminance->luminance_reduction(rb->get_internal_texture(), rb->get_internal_size(), luminance_buffers, auto_exposure_min_sensitivity, auto_exposure_max_sensitivity, step, set_immediate);
+
+		// A path-traced debug view (albedo, normals) replaces the traced image. Metering it would adapt
+		// the camera to a picture that is not the scene, so the last value is kept while one is on.
+		bool skip_metering = !set_immediate && luminance_buffers->metered && p_render_data->environment.is_valid() && environment_get_pathtracing_enabled(p_render_data->environment) && environment_get_pathtracing_debug_mode(p_render_data->environment) != 0;
+
+		if (!skip_metering) {
+			bool metered = false;
+			if (GLOBAL_GET_CACHED(int, "rendering/camera/auto_exposure/metering") == 0 && luminance->can_use_histogram()) {
+				// Histogram metering of the image the tonemap shows, in scene luminance (docs/r2-exposure-chain.md, E3).
+				RendererRD::Luminance::HistogramSettings settings;
+				settings.min_luminance = auto_exposure_min_sensitivity;
+				settings.max_luminance = auto_exposure_max_sensitivity;
+				float exposure_factor = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
+				settings.to_scene = rb->get_luminance_multiplier() / (exposure_factor > 0.0f ? exposure_factor : 1.0f);
+				settings.adjust_up = set_immediate ? 1.0f : float(step);
+				settings.adjust_down = set_immediate ? 1.0f : float(step) * GLOBAL_GET_CACHED(float, "rendering/camera/auto_exposure/adaptation_to_dark_scale");
+				settings.low_fraction = GLOBAL_GET_CACHED(float, "rendering/camera/auto_exposure/histogram_low_percentile") * 0.01f;
+				settings.high_fraction = GLOBAL_GET_CACHED(float, "rendering/camera/auto_exposure/histogram_high_percentile") * 0.01f;
+				metered = luminance->luminance_histogram_metering(color_texture, color_size, luminance_buffers, settings);
+			}
+			if (!metered) {
+				luminance->luminance_reduction(rb->get_internal_texture(), rb->get_internal_size(), luminance_buffers, auto_exposure_min_sensitivity, auto_exposure_max_sensitivity, step, set_immediate);
+			}
+			luminance_buffers->metered = true;
+		}
 		rb->set_auto_exposure_frame(RSG::rasterizer->get_frame_number());
 
 		// Swap final reduce with prev luminance.

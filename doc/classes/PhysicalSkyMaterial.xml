@@ -6,6 +6,7 @@
 	<description>
 		The [PhysicalSkyMaterial] uses the Preetham analytic daylight model to draw a sky based on physical properties. This results in a substantially more realistic sky than the [ProceduralSkyMaterial], but it is slightly slower and less flexible.
 		The [PhysicalSkyMaterial] only supports one sun. The color, energy, and direction of the sun are taken from the first [DirectionalLight3D] in the scene tree.
+		With [member ProjectSettings.rendering/lights_and_shadows/use_physical_light_units] enabled, the sky's shape is that of a 100,000 lux sun and its brightness scales linearly with the sun's illuminance, so a moonlit sky is as much darker than a sunlit one as the moon is. The [member night_sky] is then added after that scale.
 	</description>
 	<tutorials>
 	</tutorials>

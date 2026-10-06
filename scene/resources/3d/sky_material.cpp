@@ -302,6 +302,9 @@ void ProceduralSkyMaterial::_update_shader(bool p_use_debanding, bool p_use_sky_
 	int index = int(p_use_debanding) + int(p_use_sky_cover) * 2;
 	if (shader_cache[index].is_null()) {
 		shader_cache[index] = RS::get_singleton()->shader_create();
+		// Read when a variant is first cached. The renderer reads the setting once at startup, so a change
+		// applies after the restart the setting asks for.
+		const bool physical_light_units = GLOBAL_GET("rendering/lights_and_shadows/use_physical_light_units");
 
 		// Add a comment to describe the shader origin (useful when converting to ShaderMaterial).
 		RS::get_singleton()->shader_set_code(shader_cache[index], vformat(R"(
@@ -323,6 +326,9 @@ uniform float exposure : hint_range(0, 128) = 1.0;
 uniform sampler2D sky_cover : filter_linear, source_color, hint_default_black;
 uniform vec4 sky_cover_modulate : source_color = vec4(1.0, 1.0, 1.0, 1.0);
 
+// The lights' energy as the sky reads it: with physical light units, relative to a 100,000 lux sun.
+const float light_energy_scale = %s;
+
 void sky() {
 	float v_angle = clamp(EYEDIR.y, -1.0, 1.0);
 	vec3 sky = mix(sky_top_color.rgb, sky_horizon_color.rgb, clamp(pow(1.0 - v_angle, inv_sky_curve), 0.0, 1.0));
@@ -331,10 +337,10 @@ void sky() {
 		float sun_angle = dot(LIGHT0_DIRECTION, EYEDIR);
 		float sun_size = cos(LIGHT0_SIZE);
 		if (sun_angle > sun_size) {
-			sky = LIGHT0_COLOR * LIGHT0_ENERGY;
+			sky = LIGHT0_COLOR * LIGHT0_ENERGY * light_energy_scale;
 		} else if (sun_angle > sun_angle_max) {
 			float c2 = (sun_size - sun_angle) / (sun_size - sun_angle_max);
-			sky = mix(sky, LIGHT0_COLOR * LIGHT0_ENERGY, clamp(pow(1.0 - c2, inv_sun_curve), 0.0, 1.0));
+			sky = mix(sky, LIGHT0_COLOR * LIGHT0_ENERGY * light_energy_scale, clamp(pow(1.0 - c2, inv_sun_curve), 0.0, 1.0));
 		}
 	}
 
@@ -342,10 +348,10 @@ void sky() {
 		float sun_angle = dot(LIGHT1_DIRECTION, EYEDIR);
 		float sun_size = cos(LIGHT1_SIZE);
 		if (sun_angle > sun_size) {
-			sky = LIGHT1_COLOR * LIGHT1_ENERGY;
+			sky = LIGHT1_COLOR * LIGHT1_ENERGY * light_energy_scale;
 		} else if (sun_angle > sun_angle_max) {
 			float c2 = (sun_size - sun_angle) / (sun_size - sun_angle_max);
-			sky = mix(sky, LIGHT1_COLOR * LIGHT1_ENERGY, clamp(pow(1.0 - c2, inv_sun_curve), 0.0, 1.0));
+			sky = mix(sky, LIGHT1_COLOR * LIGHT1_ENERGY * light_energy_scale, clamp(pow(1.0 - c2, inv_sun_curve), 0.0, 1.0));
 		}
 	}
 
@@ -353,10 +359,10 @@ void sky() {
 		float sun_angle = dot(LIGHT2_DIRECTION, EYEDIR);
 		float sun_size = cos(LIGHT2_SIZE);
 		if (sun_angle > sun_size) {
-			sky = LIGHT2_COLOR * LIGHT2_ENERGY;
+			sky = LIGHT2_COLOR * LIGHT2_ENERGY * light_energy_scale;
 		} else if (sun_angle > sun_angle_max) {
 			float c2 = (sun_size - sun_angle) / (sun_size - sun_angle_max);
-			sky = mix(sky, LIGHT2_COLOR * LIGHT2_ENERGY, clamp(pow(1.0 - c2, inv_sun_curve), 0.0, 1.0));
+			sky = mix(sky, LIGHT2_COLOR * LIGHT2_ENERGY * light_energy_scale, clamp(pow(1.0 - c2, inv_sun_curve), 0.0, 1.0));
 		}
 	}
 
@@ -364,10 +370,10 @@ void sky() {
 		float sun_angle = dot(LIGHT3_DIRECTION, EYEDIR);
 		float sun_size = cos(LIGHT3_SIZE);
 		if (sun_angle > sun_size) {
-			sky = LIGHT3_COLOR * LIGHT3_ENERGY;
+			sky = LIGHT3_COLOR * LIGHT3_ENERGY * light_energy_scale;
 		} else if (sun_angle > sun_angle_max) {
 			float c2 = (sun_size - sun_angle) / (sun_size - sun_angle_max);
-			sky = mix(sky, LIGHT3_COLOR * LIGHT3_ENERGY, clamp(pow(1.0 - c2, inv_sun_curve), 0.0, 1.0));
+			sky = mix(sky, LIGHT3_COLOR * LIGHT3_ENERGY * light_energy_scale, clamp(pow(1.0 - c2, inv_sun_curve), 0.0, 1.0));
 		}
 	}
 
@@ -378,7 +384,7 @@ void sky() {
 	COLOR = mix(ground, sky, step(0.0, EYEDIR.y)) * exposure;
 }
 )",
-																		  p_use_debanding ? "render_mode use_debanding;" : "", p_use_sky_cover ? "vec4 sky_cover_texture = texture(sky_cover, SKY_COORDS);" : "", p_use_sky_cover ? "sky += (sky_cover_texture.rgb * sky_cover_modulate.rgb) * sky_cover_texture.a * sky_cover_modulate.a;" : ""));
+																		  p_use_debanding ? "render_mode use_debanding;" : "", physical_light_units ? "0.00001" : "1.0", p_use_sky_cover ? "vec4 sky_cover_texture = texture(sky_cover, SKY_COORDS);" : "", p_use_sky_cover ? "sky += (sky_cover_texture.rgb * sky_cover_modulate.rgb) * sky_cover_texture.a * sky_cover_modulate.a;" : ""));
 	}
 }
 
@@ -734,6 +740,19 @@ void PhysicalSkyMaterial::_update_shader(bool p_use_debanding, bool p_use_night_
 	int index = int(p_use_debanding) + int(p_use_night_sky) * 2;
 	if (shader_cache[index].is_null()) {
 		shader_cache[index] = RS::get_singleton()->shader_create();
+		// Read when a variant is first cached. The renderer reads the setting once at startup, so a change
+		// applies after the restart the setting asks for.
+		const bool physical_light_units = GLOBAL_GET("rendering/lights_and_shadows/use_physical_light_units");
+		// With physical light units the light is in lux: the sky's shape is that of a 100,000 lux sun and
+		// its level scales linearly with the light (single scattering is linear in the irradiance). The
+		// night sky is added after that scale, in the same units as the unlit branch.
+		String light_scale;
+		if (physical_light_units) {
+			light_scale = " * LIGHT0_ENERGY * 0.00001";
+			if (p_use_night_sky) {
+				light_scale += ";\n\t\tCOLOR += texture(night_sky, SKY_COORDS).xyz * extinction * exposure";
+			}
+		}
 
 		// Add a comment to describe the shader origin (useful when converting to ShaderMaterial).
 		RS::get_singleton()->shader_set_code(shader_cache[index], vformat(R"(
@@ -769,7 +788,7 @@ float henyey_greenstein(float cos_theta, float g) {
 void sky() {
 	if (LIGHT0_ENABLED) {
 		float zenith_angle = clamp( dot(UP, normalize(LIGHT0_DIRECTION)), -1.0, 1.0 );
-		float sun_energy = max(0.0, 0.757 * zenith_angle) * LIGHT0_ENERGY;
+		float sun_energy = max(0.0, 0.757 * zenith_angle) * %s;
 		float sun_fade = 1.0 - clamp(1.0 - exp(LIGHT0_DIRECTION.y), 0.0, 1.0);
 
 		// Rayleigh coefficients.
@@ -812,7 +831,7 @@ void sky() {
 
 		vec3 color = Lin + L0;
 		COLOR = pow(color, vec3(1.0 / (1.2 + (1.2 * sun_fade))));
-		COLOR *= exposure;
+		COLOR *= exposure%s;
 	} else {
 		// There is no sun, so display night_sky and nothing else.
 		%s
@@ -820,7 +839,7 @@ void sky() {
 	}
 }
 )",
-																		  p_use_debanding ? "render_mode use_debanding;" : "", p_use_night_sky ? "L0 += texture(night_sky, SKY_COORDS).xyz * extinction;" : "", p_use_night_sky ? "COLOR = texture(night_sky, SKY_COORDS).xyz;" : ""));
+																		  p_use_debanding ? "render_mode use_debanding;" : "", physical_light_units ? "1.0" : "LIGHT0_ENERGY", (p_use_night_sky && !physical_light_units) ? "L0 += texture(night_sky, SKY_COORDS).xyz * extinction;" : "", light_scale, p_use_night_sky ? "COLOR = texture(night_sky, SKY_COORDS).xyz;" : ""));
 	}
 }
 

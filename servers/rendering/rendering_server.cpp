@@ -4113,6 +4113,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/camera/auto_exposure/histogram_low_percentile", PROPERTY_HINT_RANGE, "0,100,0.1"), 50.0);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/camera/auto_exposure/histogram_high_percentile", PROPERTY_HINT_RANGE, "0,100,0.1"), 95.0);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/camera/auto_exposure/adaptation_to_dark_scale", PROPERTY_HINT_RANGE, "0.01,1,0.01"), 0.5);
+	GLOBAL_DEF("rendering/camera/auto_exposure/pre_exposure", true);
 
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/environment/ssao/quality", PROPERTY_HINT_ENUM, "Very Low (Fast),Low (Fast),Medium (Average),High (Slow),Ultra (Custom)"), 2);
 	GLOBAL_DEF("rendering/environment/ssao/half_size", true);

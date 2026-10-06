@@ -197,6 +197,10 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 			ubo.flags |= use_ambient_cubemap ? SCENE_DATA_FLAGS_USE_AMBIENT_CUBEMAP : 0;
 			ubo.flags |= use_ambient_light ? SCENE_DATA_FLAGS_USE_AMBIENT_LIGHT : 0;
 		}
+		// The ambient colour carries no camera exposure (upstream), but the tonemap divides the pre-exposure out of it.
+		ubo.ambient_light_color_energy[0] *= pre_exposure;
+		ubo.ambient_light_color_energy[1] *= pre_exposure;
+		ubo.ambient_light_color_energy[2] *= pre_exposure;
 
 		//specular
 		RSE::EnvironmentReflectionSource ref_src = render_scene_render->environment_get_reflection_source(p_env);
@@ -227,7 +231,7 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 		float fog_energy = render_scene_render->environment_get_fog_light_energy(p_env);
 		// The fog's light is radiance like every other source, so it carries the camera's exposure.
 		if (p_camera_attributes.is_valid()) {
-			fog_energy *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes);
+			fog_energy *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes) * pre_exposure;
 		}
 
 		ubo.fog_light_color[0] = fog_color.r * fog_energy;
@@ -249,18 +253,20 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 	}
 
 	if (p_camera_attributes.is_valid()) {
-		ubo.emissive_exposure_normalization = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes);
-		ubo.IBL_exposure_normalization = 1.0;
+		ubo.emissive_exposure_normalization = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes) * pre_exposure;
+		ubo.IBL_exposure_normalization = pre_exposure;
 		if (p_env.is_valid()) {
 			RID sky_rid = render_scene_render->environment_get_sky(p_env);
 			if (sky_rid.is_valid()) {
 				// The background energy is in the ratio for the trace, which reads no ambient_light_color_energy.a;
 				// the raster also multiplies by that, so it keeps the energy squared on its sky lighting.
-				float current_exposure = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes) * render_scene_render->environment_get_bg_intensity(p_env) * render_scene_render->environment_get_bg_energy_multiplier(p_env) / p_luminance_multiplier;
+				// The pre-exposure is not baked: it moves every frame, and the ratio carries it to every reader.
+				float current_exposure = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes) * pre_exposure * render_scene_render->environment_get_bg_intensity(p_env) * render_scene_render->environment_get_bg_energy_multiplier(p_env) / p_luminance_multiplier;
 				// The bake holds the camera's exposure, far below 1 under physical light units, so only
-				// a sky baked black (zero energy) or not baked yet is guarded: 1 is right for both.
+				// a sky baked black (zero energy) or not baked yet is guarded: the pre-exposure, which no
+				// bake holds, is right for both.
 				float baked_exposure = render_scene_render->get_sky()->sky_get_baked_exposure(sky_rid);
-				ubo.IBL_exposure_normalization = baked_exposure > 0.0 ? current_exposure / baked_exposure : 1.0;
+				ubo.IBL_exposure_normalization = baked_exposure > 0.0 ? current_exposure / baked_exposure : pre_exposure;
 			}
 		}
 	} else if (emissive_exposure_normalization > 0.0) {

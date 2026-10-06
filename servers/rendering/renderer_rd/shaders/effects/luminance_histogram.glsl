@@ -11,6 +11,8 @@
 // RESOLVE_PASS takes the mean log luminance between two percentiles, clamps it
 // to the camera's bounds, adapts toward it from the previous frame and writes
 // the metered luminance in the image's own units, the value the tonemap divides by.
+// The image's own units are those before the frame's pre-exposure, so the stored value
+// does not move when the pre-exposure does.
 
 #define BLOCK_SIZE 8
 #define HISTOGRAM_BINS 64
@@ -63,7 +65,7 @@ layout(push_constant, std430) uniform Params {
 	float adjust_down; // Same, when it falls (adapting to darkness).
 	float low_fraction; // Window as fractions of the block count.
 	float high_fraction;
-	float pad;
+	float source_scale; // 1 / the frame's pre-exposure: the metered image times this is in image units.
 }
 params;
 
@@ -117,7 +119,7 @@ void main() {
 	if (all(lessThan(pos, params.source_size))) {
 		float mean = imageLoad(source_blocks, pos).r;
 		if (mean >= 0.0) {
-			float log_lum = log2(max(mean * params.to_scene, 1e-30));
+			float log_lum = log2(max(mean * params.source_scale * params.to_scene, 1e-30));
 			float bin = (log_lum - params.log_min) / (params.log_max - params.log_min) * float(HISTOGRAM_BINS);
 			atomicAdd(local_bins[uint(clamp(bin, 0.0, float(HISTOGRAM_BINS - 1)))], 1u);
 		}

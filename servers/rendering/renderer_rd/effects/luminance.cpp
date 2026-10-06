@@ -328,6 +328,7 @@ bool Luminance::luminance_histogram_metering(RID p_source_texture, const Size2i 
 	push_constant.log_min = bins_ev100_min - 3.0;
 	push_constant.log_max = bins_ev100_max - 3.0;
 	push_constant.to_scene = p_settings.to_scene;
+	push_constant.source_scale = p_settings.source_scale;
 	push_constant.clamp_log_min = Math::log2(MAX(p_settings.min_luminance, 1e-30f));
 	push_constant.clamp_log_max = MAX(Math::log2(MAX(p_settings.max_luminance, 1e-30f)), push_constant.clamp_log_min);
 	push_constant.adjust_up = CLAMP(p_settings.adjust_up, 0.0f, 1.0f);

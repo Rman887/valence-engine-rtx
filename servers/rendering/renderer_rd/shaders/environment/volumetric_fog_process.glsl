@@ -195,7 +195,7 @@ layout(set = 0, binding = 15, std140) uniform Params {
 
 	vec2 sky_border_size;
 	float sky_exposure_normalization;
-	float pad;
+	float history_exposure_scale;
 
 	mat3x4 cam_rotation;
 	mat4 to_prev_view;
@@ -379,6 +379,7 @@ void main() {
 			//reprojectinon fits
 
 			reprojected_density = textureLod(sampler3D(prev_density_texture, linear_sampler), prev_view, 0.0);
+			reprojected_density.rgb *= params.history_exposure_scale; // Lit at the previous frame's exposure.
 			reproject_amount = params.temporal_blend;
 
 			// Since we can reproject, now we must jitter the current view pos.

@@ -79,6 +79,10 @@ public:
 	float opaque_prepass_threshold = 0.0;
 	bool material_uv2_mode = false;
 	float emissive_exposure_normalization = 0.0;
+	// The factor a path-traced frame's sources carry beyond the camera's exposure, so the trace's
+	// fp16 buffers hold the image near the display range by day and by night (docs/r2-exposure-chain.md, E4).
+	// The tonemap divides it out. 1 everywhere else.
+	float pre_exposure = 1.0;
 	bool shadow_pass = false;
 
 	Size2 shadow_atlas_pixel_size;

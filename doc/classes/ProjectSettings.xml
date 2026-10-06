@@ -2919,6 +2919,9 @@
 		<member name="rendering/camera/auto_exposure/metering" type="int" setter="" getter="" default="0">
 			How auto exposure measures the scene. [code]Histogram[/code] averages the log luminance of 8×8 pixel blocks of the image the tonemapper is about to show (the temporal upscaler's output when one runs), between [member rendering/camera/auto_exposure/histogram_low_percentile] and [member rendering/camera/auto_exposure/histogram_high_percentile], in scene luminance, and clamps it to the camera's bounds. [code]Average[/code] is the arithmetic mean of the largest color channel of the internal image. [code]Histogram[/code] requires compute shaders and falls back to [code]Average[/code] in the Mobile renderer.
 		</member>
+		<member name="rendering/camera/auto_exposure/pre_exposure" type="bool" setter="" getter="" default="true">
+			If [code]true[/code], a path-traced view whose camera auto exposes scales its light sources by a pre-exposure, so the traced image and the buffers the denoiser reads stay near the display range at any light level, and the tonemapper divides it back out. It follows the metered luminance slowly, only when that leaves a wide band, since the denoiser reads a change of it as a change of the lighting. Only used by the [code]Histogram[/code] metering mode.
+		</member>
 		<member name="rendering/camera/depth_of_field/depth_of_field_bokeh_quality" type="int" setter="" getter="" default="1">
 			Sets the quality of the depth of field effect. Higher quality takes more samples, which is slower but looks smoother.
 		</member>

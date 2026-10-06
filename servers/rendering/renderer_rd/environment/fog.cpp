@@ -1191,6 +1191,8 @@ void Fog::volumetric_fog_update(const VolumetricFogSettings &p_settings, const P
 	// small exposure factor cannot quantise it away.
 	params.exposure_normalization = p_settings.exposure_normalization;
 	params.sky_exposure_normalization = p_settings.sky_exposure_normalization;
+	params.history_exposure_scale = fog->history_exposure > 0.0f ? p_settings.exposure_normalization / fog->history_exposure : 1.0f;
+	fog->history_exposure = p_settings.exposure_normalization;
 	params.max_voxel_gi_instances = RendererSceneRenderRD::get_singleton()->environment_get_volumetric_fog_gi_inject(p_settings.env) > 0.001 ? p_voxel_gi_count : 0;
 	params.temporal_frame = RSG::rasterizer->get_frame_number() % VolumetricFog::MAX_TEMPORAL_FRAMES;
 

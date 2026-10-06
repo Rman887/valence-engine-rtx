@@ -257,6 +257,24 @@ public:
 	uint64_t get_auto_exposure_frame() const { return auto_exposure_frame; }
 	void set_auto_exposure_frame(const uint64_t p_auto_exposure_frame) { auto_exposure_frame = p_auto_exposure_frame; }
 
+	// The pre-exposure of a path-traced frame under auto exposure (docs/r2-exposure-chain.md, E4), kept
+	// by RendererSceneRenderRD: a range device, steered so the metered luminance sits near a fixed level
+	// in the trace's fp16 buffers, not the exposure itself.
+	struct PreExposure {
+		float value = 1.0; // The factor this frame's sources carry.
+		float luminance = 0.0; // The metered luminance before pre-exposure, read back frames late; 0 until one arrives.
+		bool active = false; // This frame meters with the histogram and carries the value.
+		bool settled = false; // False until a read has placed the value.
+		bool ramping = false;
+		bool read_pending = false;
+		Callable read_callback; // Bound to these buffers' ObjectID, built on the first read.
+	};
+	PreExposure &get_pre_exposure() { return pre_exposure; }
+
+private:
+	PreExposure pre_exposure;
+
+public:
 	// For our internal textures we provide some easy access methods.
 
 	_FORCE_INLINE_ bool has_internal_texture() const {

@@ -105,7 +105,7 @@ private:
 		float adjust_down;
 		float low_fraction;
 		float high_fraction;
-		float pad;
+		float source_scale; // Undoes the frame's pre-exposure on the metered image.
 	};
 
 	struct LuminanceHistogram {
@@ -147,6 +147,7 @@ public:
 		float min_luminance = 0.0; // The camera's bounds, scene luminance.
 		float max_luminance = 0.0;
 		float to_scene = 1.0; // Image units to scene luminance.
+		float source_scale = 1.0; // The metered image times this is in image units: 1 / the frame's pre-exposure.
 		float adjust_up = 1.0;
 		float adjust_down = 1.0;
 		float low_fraction = 0.5;

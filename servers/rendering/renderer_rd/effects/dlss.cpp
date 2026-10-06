@@ -345,6 +345,8 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, const DLSSContext
 		context->currentDlssDOptions.outputWidth = context->currentDlssOptions.outputWidth;
 		context->currentDlssDOptions.outputHeight = context->currentDlssOptions.outputHeight;
 		context->currentDlssDOptions.colorBuffersHDR = sl::Boolean::eTrue;
+		// NVIDIA's RR guide lists exposure as unsupported; Streamline forwards it to NGX all the same.
+		context->currentDlssDOptions.preExposure = p_params.pre_exposure;
 		context->currentDlssDOptions.alphaUpscalingEnabled = p_params.dlss_rr_alpha_upscaling ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 		context->currentDlssDOptions.normalRoughnessMode = sl::DLSSDNormalRoughnessMode::ePacked; // Normal XYZ + Roughness W
 
@@ -388,6 +390,7 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, const DLSSContext
 		}
 
 		context->currentDlssOptions.colorBuffersHDR = sl::Boolean::eTrue;
+		context->currentDlssOptions.preExposure = p_params.pre_exposure;
 		char dlssPreset = p_params.preset;
 		if (dlssPreset == '?') {
 			dlssPreset = StreamlineContext::get().dlss_default_preset;

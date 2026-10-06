@@ -36,6 +36,7 @@
 
 #include "core/config/project_settings.h"
 #include "core/io/image.h"
+#include "core/object/callable_mp.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
 #include "servers/rendering/renderer_rd/shaders/decal_data_inc.glsl.gen.h"
@@ -242,6 +243,86 @@ void RendererSceneRenderRD::_debug_sdfgi_probes(Ref<RenderSceneBuffersRD> p_rend
 }
 
 ////////////////////////////////
+// The pre-exposure of a path-traced frame (docs/r2-exposure-chain.md, E4). Every source the trace and
+// the frame's raster passes read carries it on top of the camera's exposure (the lights, emission,
+// the sky through IBL_exposure_normalization, fog, probes), so the trace's fp16 payload and output,
+// and the image RR denoises, stay near the display range at any light level; the tonemap divides it
+// out. It is a range device and not the exposure: it holds still while the metered luminance stays
+// within PRE_EXPOSURE_BAND of the target and otherwise ramps toward it at PRE_EXPOSURE_RATE a frame,
+// since RR takes no exposure input and reads a move of it as a change of the lighting. The first read
+// after it starts places it at once, a power of two, while the denoiser's history is young, and so
+// does a read beyond PRE_EXPOSURE_JUMP, where the image has changed more than a ramp should follow.
+static const float PRE_EXPOSURE_TARGET = 0.25f; // The metered luminance in the pre-exposed image: 18 EV of fp16 above, 12 below.
+static const float PRE_EXPOSURE_BAND = 3.0f; // EV either side of the target before it moves.
+static const float PRE_EXPOSURE_JUMP = 8.0f; // EV from the target beyond which it is placed at once.
+static const float PRE_EXPOSURE_SETTLE = 0.5f; // EV from the target where a ramp stops.
+static const float PRE_EXPOSURE_RATE = 1.0f / 32.0f; // EV a frame.
+
+float RendererSceneRenderRD::_update_pre_exposure(const Ref<RenderSceneBuffersRD> &p_render_buffers, RID p_environment, RID p_camera_attributes, RID p_reflection_probe) {
+	RenderSceneBuffersRD::PreExposure &pre = p_render_buffers->get_pre_exposure();
+
+	// Only where the histogram meters the image of a traced frame; the stored luminance is then in
+	// the units before pre-exposure, and the meter's input and the tonemap divide it out. The raster
+	// frame a device without ray tracing pipelines falls back to keeps 1: its drawn sky, GI and
+	// background do not carry it.
+	Size2i target_size = p_render_buffers->get_target_size();
+	pre.active = GLOBAL_GET_CACHED(bool, "rendering/camera/auto_exposure/pre_exposure") &&
+			!p_reflection_probe.is_valid() &&
+			p_environment.is_valid() && environment_get_pathtracing_enabled(p_environment) &&
+			RD::get_singleton()->has_feature(RD::SUPPORTS_RAYTRACING_PIPELINE) &&
+			RSG::camera_attributes->camera_attributes_uses_auto_exposure(p_camera_attributes) &&
+			GLOBAL_GET_CACHED(int, "rendering/camera/auto_exposure/metering") == 0 && luminance->can_use_histogram() &&
+			target_size.x >= 8 && target_size.y >= 8 && _debug_draw_can_use_effects(get_debug_draw_mode());
+	if (!pre.active) {
+		pre.value = 1.0;
+		pre.luminance = 0.0; // The next start is placed from a read taken after it.
+		pre.settled = false;
+		pre.ramping = false;
+		return 1.0;
+	}
+
+	float luminance_read = pre.luminance;
+	if (luminance_read > 0.0f && Math::is_finite(luminance_read)) {
+		float error = Math::log2(luminance_read * pre.value / PRE_EXPOSURE_TARGET);
+		if (!pre.settled || Math::abs(error) > PRE_EXPOSURE_JUMP) {
+			if (Math::abs(error) > PRE_EXPOSURE_BAND) {
+				pre.value = CLAMP(Math::pow(2.0f, Math::round(Math::log2(PRE_EXPOSURE_TARGET / luminance_read))), 1e-12f, 1e12f);
+				print_verbose(vformat("Pre-exposure placed at %s (metered luminance %s).", pre.value, luminance_read));
+			}
+			pre.settled = true;
+			pre.ramping = false;
+		} else if (pre.ramping || Math::abs(error) > PRE_EXPOSURE_BAND) {
+			if (!pre.ramping) {
+				print_verbose(vformat("Pre-exposure ramps from %s (metered luminance %s).", pre.value, luminance_read));
+			}
+			float step = CLAMP(-error, -PRE_EXPOSURE_RATE, PRE_EXPOSURE_RATE);
+			pre.value = CLAMP(pre.value * Math::pow(2.0f, step), 1e-12f, 1e12f);
+			pre.ramping = Math::abs(error + step) > PRE_EXPOSURE_SETTLE;
+			if (!pre.ramping) {
+				print_verbose(vformat("Pre-exposure settled at %s.", pre.value));
+			}
+		}
+	}
+	return pre.value;
+}
+
+// Called by RenderingDevice on the render thread as it begins a later frame.
+void RendererSceneRenderRD::_pre_exposure_read(const PackedByteArray &p_data, uint64_t p_render_buffers) {
+	if (!pre_exposure_reads_valid) {
+		return; // The renderer finished while the read was in flight.
+	}
+	RenderSceneBuffersRD *rb = Object::cast_to<RenderSceneBuffersRD>(ObjectDB::get_instance(ObjectID(p_render_buffers)));
+	if (rb == nullptr) {
+		return; // Freed while the read was in flight.
+	}
+	RenderSceneBuffersRD::PreExposure &pre = rb->get_pre_exposure();
+	pre.read_pending = false;
+	// A read issued before the pre-exposure stopped would place the next start from an old value.
+	if (pre.active && p_data.size() >= int(sizeof(float))) {
+		memcpy(&pre.luminance, p_data.ptr(), sizeof(float));
+	}
+}
+
 bool RendererSceneRenderRD::render_buffers_read_auto_exposure(const Ref<RenderSceneBuffers> &p_render_buffers, const Callable &p_callback) {
 	Ref<RenderSceneBuffersRD> rb = p_render_buffers;
 	if (rb.is_null() || rb->get_auto_exposure_frame() != RSG::rasterizer->get_frame_number()) {
@@ -624,6 +705,8 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 		// the camera to a picture that is not the scene, so the last value is kept while one is on.
 		bool skip_metering = !set_immediate && luminance_buffers->metered && p_render_data->environment.is_valid() && environment_get_pathtracing_enabled(p_render_data->environment) && environment_get_pathtracing_debug_mode(p_render_data->environment) != 0;
 
+		// The pre-exposure the stored luminance leaves out, divided out of the tonemap and glow's key below.
+		float key_pre_exposure = p_render_data->scene_data->pre_exposure;
 		if (!skip_metering) {
 			bool metered = false;
 			if (GLOBAL_GET_CACHED(int, "rendering/camera/auto_exposure/metering") == 0 && luminance->can_use_histogram()) {
@@ -633,11 +716,22 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 				settings.max_luminance = auto_exposure_max_sensitivity;
 				float exposure_factor = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
 				settings.to_scene = rb->get_luminance_multiplier() / (exposure_factor > 0.0f ? exposure_factor : 1.0f);
+				settings.source_scale = 1.0f / p_render_data->scene_data->pre_exposure;
 				settings.adjust_up = set_immediate ? 1.0f : float(step);
 				settings.adjust_down = set_immediate ? 1.0f : float(step) * GLOBAL_GET_CACHED(float, "rendering/camera/auto_exposure/adaptation_to_dark_scale");
 				settings.low_fraction = GLOBAL_GET_CACHED(float, "rendering/camera/auto_exposure/histogram_low_percentile") * 0.01f;
 				settings.high_fraction = GLOBAL_GET_CACHED(float, "rendering/camera/auto_exposure/histogram_high_percentile") * 0.01f;
 				metered = luminance->luminance_histogram_metering(color_texture, color_size, luminance_buffers, settings);
+			}
+			if (!metered && key_pre_exposure != 1.0f) {
+				// Only on the histogram's error paths: the Average meter cannot undo the pre-exposure, so
+				// its value is in the pre-exposed units this frame, and the pre-exposure restarts from 1.
+				key_pre_exposure = 1.0f;
+				RenderSceneBuffersRD::PreExposure &pre = rb->get_pre_exposure();
+				pre.value = 1.0f;
+				pre.luminance = 0.0f;
+				pre.settled = false;
+				ERR_PRINT_ONCE("Histogram metering failed under a pre-exposure; restarting it.");
 			}
 			if (!metered) {
 				luminance->luminance_reduction(rb->get_internal_texture(), rb->get_internal_size(), luminance_buffers, auto_exposure_min_sensitivity, auto_exposure_max_sensitivity, step, set_immediate);
@@ -648,7 +742,19 @@ void RendererSceneRenderRD::_render_buffers_post_process_and_tonemap(const Rende
 
 		// Swap final reduce with prev luminance.
 
-		auto_exposure_scale = RSG::camera_attributes->camera_attributes_get_auto_exposure_scale(p_render_data->camera_attributes);
+		// The stored luminance is in the units before pre-exposure, so the tonemap and glow, which divide
+		// the pre-exposed image by it, divide the pre-exposure out through the key.
+		auto_exposure_scale = RSG::camera_attributes->camera_attributes_get_auto_exposure_scale(p_render_data->camera_attributes) / key_pre_exposure;
+
+		RenderSceneBuffersRD::PreExposure &pre = rb->get_pre_exposure();
+		if (pre.active && !pre.read_pending) {
+			// One read in flight; it steers the pre-exposure frames from now.
+			if (pre.read_callback.is_null()) {
+				pre.read_callback = callable_mp_static(&RendererSceneRenderRD::_pre_exposure_read).bind(uint64_t(rb->get_instance_id()));
+			}
+			RID current = luminance->get_current_luminance_buffer(rb);
+			pre.read_pending = current.is_valid() && RD::get_singleton()->texture_get_data_async(current, 0, pre.read_callback) == OK;
+		}
 
 		RenderingServerDefault::redraw_request(); // Redraw all the time if auto exposure rendering is on.
 		RD::get_singleton()->draw_command_end_label();
@@ -1515,6 +1621,8 @@ void RendererSceneRenderRD::render_scene(const Ref<RenderSceneBuffers> &p_render
 
 		scene_data.time = time;
 		scene_data.time_step = time_step;
+
+		scene_data.pre_exposure = _update_pre_exposure(rb, p_environment, p_camera_attributes, p_reflection_probe);
 	}
 
 	//assign render data
@@ -1841,6 +1949,7 @@ void RendererSceneRenderRD::sdfgi_set_debug_probe_select(const Vector3 &p_positi
 }
 
 RendererSceneRenderRD *RendererSceneRenderRD::singleton = nullptr;
+bool RendererSceneRenderRD::pre_exposure_reads_valid = false;
 
 bool RendererSceneRenderRD::is_vrs_supported() const {
 	return RD::get_singleton()->has_feature(RD::SUPPORTS_ATTACHMENT_VRS);
@@ -1862,6 +1971,7 @@ uint32_t RendererSceneRenderRD::get_max_elements() const {
 
 RendererSceneRenderRD::RendererSceneRenderRD() {
 	singleton = this;
+	pre_exposure_reads_valid = true;
 }
 
 void RendererSceneRenderRD::init() {
@@ -2028,4 +2138,7 @@ RendererSceneRenderRD::~RendererSceneRenderRD() {
 
 	RSG::light_storage->directional_shadow_atlas_set_size(0);
 	cull_argument.reset(); //avoid exit error
+
+	// RenderingDevice::finalize runs reads still in flight after this; _pre_exposure_read checks it.
+	pre_exposure_reads_valid = false;
 }

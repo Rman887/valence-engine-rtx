@@ -185,7 +185,7 @@ private:
 
 			float sky_border_size[2];
 			float sky_exposure_normalization; // The ratio of the frame's exposure to the one the sky was baked with.
-			float pad;
+			float history_exposure_scale; // This frame's exposure over the one the reprojected history was lit with.
 
 			float cam_rotation[12];
 			float to_prev_view[16];
@@ -314,6 +314,10 @@ public:
 
 		float length;
 		float spread;
+
+		// The exposure normalization the density history was lit with, 0 before its first frame. The
+		// history carries radiance, which a move of the camera's factor or the pre-exposure rescales.
+		float history_exposure = 0.0;
 
 		RID light_density_map;
 		RID prev_light_density_map;

@@ -10220,7 +10220,7 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 			e *= Math::PI;
 		}
 		if (p_render_data->camera_attributes.is_valid()) {
-			e *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
+			e *= RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes) * p_render_data->scene_data->pre_exposure;
 		}
 		return e;
 	};
@@ -10410,7 +10410,7 @@ uint32_t RenderRaytracing::gather_emissive(const RenderDataRD *p_render_data, co
 	candidates.clear();
 	const Vector3 cam_pos = p_render_data->scene_data->cam_transform.origin - p_state->rt_origin;
 	// The shader scales emission by the exposure normalisation; the split's shares must too.
-	float exposure = p_render_data->camera_attributes.is_valid() ? RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes) : 1.0f;
+	float exposure = p_render_data->camera_attributes.is_valid() ? RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes) * p_render_data->scene_data->pre_exposure : 1.0f;
 
 	// Slot-resident instances (D94b) are read from the emissive slots the commit keeps, in slot
 	// order (the order the walk's arrays would have them in), the index a slot.
@@ -11429,7 +11429,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 				}
 				if (light_tree) {
 					const bool power_pick = (p_rt_flags & SceneShaderRaytracing::RT_FLAG_LIGHT_TREE_POWER_PICK) != 0;
-					float exposure = (p_render_data && p_render_data->camera_attributes.is_valid()) ? RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes) : 1.0f;
+					float exposure = (p_render_data && p_render_data->camera_attributes.is_valid()) ? RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes) * p_render_data->scene_data->pre_exposure : 1.0f;
 					uint32_t node_count = build_light_tree(rt_light_data, rt_light_count, rt_directional_count, emissive_scratch.ptr(), rt_emissive_count, exposure, (uint32_t)MAX(light_tree_cut_size, 1), (uint32_t)MAX(light_tree_cut_indirect_size, 1), power_pick);
 					uint32_t cut_count = node_count > 0 ? light_tree_cut.size() : 0;
 					uint32_t cut_indirect_count = node_count > 0 ? light_tree_cut_indirect.size() : 0;

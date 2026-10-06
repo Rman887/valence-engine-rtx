@@ -1295,7 +1295,7 @@ void RenderForwardClustered::_setup_lightmaps(const RenderDataRD *p_render_data,
 		scene_state.lightmaps[i].flags = light_storage->lightmap_get_shadowmask_mode(lightmap);
 		if (p_render_data->camera_attributes.is_valid()) {
 			float baked_exposure = light_storage->lightmap_get_baked_exposure_normalization(lightmap);
-			float enf = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
+			float enf = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes) * p_render_data->scene_data->pre_exposure;
 			scene_state.lightmaps[i].exposure_normalization = enf / baked_exposure;
 		}
 
@@ -1445,7 +1445,7 @@ void RenderForwardClustered::_update_volumetric_fog(Ref<RenderSceneBuffersRD> p_
 		settings.rt_tlas = p_rt_tlas;
 		settings.rt_cam_offset = p_rt_cam_offset;
 		if (p_camera_attributes.is_valid()) {
-			settings.exposure_normalization = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes);
+			settings.exposure_normalization = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes) * p_scene_data->pre_exposure;
 		}
 		// Set by this render's _setup_environment, which runs before the fog in both frames.
 		settings.sky_exposure_normalization = p_scene_data->get_ibl_exposure_normalization();
@@ -1889,6 +1889,7 @@ void RenderForwardClustered::_render_3d_upscaling(const RenderDataRD *p_render_d
 			params.velocity = rb->get_velocity_buffer(false, v);
 			params.reactive = rb->get_internal_texture_reactive(v);
 			params.exposure = exposure;
+			params.pre_exposure = p_render_data->scene_data->pre_exposure;
 			params.output = rb->get_upscaled_texture(v);
 			params.dlss_g = rb->get_frame_generation();
 			params.preset = '?'; // FIXME: Unique preset per viewport? Does anyone need this?

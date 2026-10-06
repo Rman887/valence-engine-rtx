@@ -45,6 +45,7 @@ public:
 		RID velocity;
 		RID reactive;
 		RID exposure;
+		float pre_exposure = 1.0f; // The factor the colour carries beyond the camera's exposure, divided out at the tonemap.
 		RID output;
 		float z_near = 0.0f;
 		float z_far = 0.0f;

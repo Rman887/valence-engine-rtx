@@ -128,9 +128,13 @@ protected:
 	virtual void _update_shader_quality_settings() {}
 	static bool _debug_draw_can_use_effects(RSE::ViewportDebugDraw p_debug_draw);
 
+	float _update_pre_exposure(const Ref<RenderSceneBuffersRD> &p_render_buffers, RID p_environment, RID p_camera_attributes, RID p_reflection_probe);
+	static void _pre_exposure_read(const PackedByteArray &p_data, uint64_t p_render_buffers);
+
 private:
 	RSE::ViewportDebugDraw debug_draw = RSE::VIEWPORT_DEBUG_DRAW_DISABLED;
 	static RendererSceneRenderRD *singleton;
+	static bool pre_exposure_reads_valid; // Cleared by the destructor, before RenderingDevice::finalize runs reads still in flight.
 
 	/* Shadow atlas */
 	RSE::ShadowQuality shadows_quality = RSE::SHADOW_QUALITY_MAX; //So it always updates when first set

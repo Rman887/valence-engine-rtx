@@ -260,7 +260,8 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 			if (sky_rid.is_valid()) {
 				// The background energy is in the ratio for the trace, which reads no ambient_light_color_energy.a;
 				// the raster also multiplies by that, so it keeps the energy squared on its sky lighting.
-				// The pre-exposure is not baked: it moves every frame, and the ratio carries it to every reader.
+				// The sky bakes at a held exposure (SkyRD::sky_prepare_bake_exposure), so the ratio carries
+				// every move of the factor and the pre-exposure between bakes.
 				float current_exposure = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes) * pre_exposure * render_scene_render->environment_get_bg_intensity(p_env) * render_scene_render->environment_get_bg_energy_multiplier(p_env) / p_luminance_multiplier;
 				// The bake holds the camera's exposure, far below 1 under physical light units, so only
 				// a sky baked black (zero energy) or not baked yet is guarded: the pre-exposure, which no
@@ -277,6 +278,13 @@ void RenderSceneDataRD::update_ubo(RID p_uniform_buffer, RSE::ViewportDebugDraw 
 	} else {
 		ubo.emissive_exposure_normalization = 1.0;
 		ubo.IBL_exposure_normalization = 1.0;
+		// A sky a path-traced view holds at its own exposure is read here at a factor of 1.
+		if (p_env.is_valid() && render_scene_render->environment_get_sky(p_env).is_valid()) {
+			float baked_exposure = render_scene_render->get_sky()->sky_get_baked_exposure(render_scene_render->environment_get_sky(p_env));
+			if (baked_exposure > 0.0) {
+				ubo.IBL_exposure_normalization = render_scene_render->environment_get_bg_intensity(p_env) * render_scene_render->environment_get_bg_energy_multiplier(p_env) / p_luminance_multiplier / baked_exposure;
+			}
+		}
 	}
 
 	bool roughness_limiter_enabled = p_opaque_render_buffers && render_scene_render->screen_space_roughness_limiter_is_active();

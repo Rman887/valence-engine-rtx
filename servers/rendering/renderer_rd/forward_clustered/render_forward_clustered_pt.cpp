@@ -155,6 +155,18 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 
 	p_render_data->scene_data->directional_light_count = _count_directional_lights(p_render_data);
 
+	// The sky's bake exposure follows the frame's (with its pre-exposure) before the scene UBO reads
+	// it; the same product as update_ubo's, so a sky baked at it reads a ratio of 1. Only where the sky
+	// block below is sure to bake (a subset of its condition), since that bake is what prepare promises.
+	if (p_render_data->camera_attributes.is_valid() && is_environment(p_render_data->environment) && environment_get_sky(p_render_data->environment).is_valid() && get_debug_draw_mode() != RSE::VIEWPORT_DEBUG_DRAW_OVERDRAW) {
+		RSE::EnvironmentBG bg_mode = environment_get_background(p_render_data->environment);
+		RSE::EnvironmentReflectionSource reflection_source = environment_get_reflection_source(p_render_data->environment);
+		if ((bg_mode == RSE::ENV_BG_SKY && !p_render_data->transparent_bg) || (reflection_source == RSE::ENV_REFLECTION_SOURCE_BG && bg_mode == RSE::ENV_BG_SKY) || reflection_source == RSE::ENV_REFLECTION_SOURCE_SKY || environment_get_ambient_source(p_render_data->environment) == RSE::ENV_AMBIENT_SOURCE_SKY) {
+			float bake_exposure = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes) * p_render_data->scene_data->pre_exposure * environment_get_bg_intensity(p_render_data->environment) * environment_get_bg_energy_multiplier(p_render_data->environment) / rb->get_luminance_multiplier();
+			p_render_data->scene_data->sky_rebake_scale = sky.sky_prepare_bake_exposure(environment_get_sky(p_render_data->environment), bake_exposure);
+		}
+	}
+
 	_setup_environment(p_render_data, false, screen_size, screen_size, p_default_bg_color, false);
 
 	// May have changed due to the above (light buffer enlarged, as an example).

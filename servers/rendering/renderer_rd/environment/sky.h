@@ -269,7 +269,12 @@ public:
 		bool dirty = false;
 		int processing_layer = 0;
 		Sky *dirty_list = nullptr;
-		float baked_exposure = 0.0; // 0 until the first bake, which IBL_exposure_normalization reads as 1.
+		float baked_exposure = 0.0; // 0 until the first bake, which IBL_exposure_normalization reads as the frame's pre-exposure.
+		// The exposure every bake renders at, held across routine re-bakes so the octmap's level does not
+		// follow each move of the frame's; set by sky_prepare_bake_exposure (a path-traced frame, E4), 0
+		// until then, when a bake renders at the caller's brightness.
+		float bake_exposure = 0.0;
+		bool bake_now = false; // sky_prepare_bake_exposure moved bake_exposure: re-bake whole on the next update.
 		uint64_t radiance_version = 0; // Counts the renders into the octmap's sharpest layer (D54) and its first roughness layer, the fog's level (D64).
 
 		// State to track when radiance octmap needs updating.
@@ -322,6 +327,7 @@ public:
 	RID sky_get_radiance_2d_texture_rd(RID p_sky) const;
 	uint64_t sky_get_radiance_version(RID p_sky) const;
 	float sky_get_baked_exposure(RID p_sky) const;
+	float sky_prepare_bake_exposure(RID p_sky, float p_exposure);
 
 	RID allocate_sky_rid();
 	void initialize_sky_rid(RID p_rid);

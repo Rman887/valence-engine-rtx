@@ -83,6 +83,9 @@ public:
 	// fp16 buffers hold the image near the display range by day and by night (docs/r2-exposure-chain.md, E4).
 	// The tonemap divides it out. 1 everywhere else.
 	float pre_exposure = 1.0;
+	// On a frame whose sky re-bakes at a new exposure (SkyRD::sky_prepare_bake_exposure), the factor a
+	// reader of the octmap before the bake (the froxel fog) takes on top of the frame's ratio.
+	float sky_rebake_scale = 1.0;
 	bool shadow_pass = false;
 
 	Size2 shadow_atlas_pixel_size;

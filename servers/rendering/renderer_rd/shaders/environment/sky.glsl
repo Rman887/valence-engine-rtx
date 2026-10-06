@@ -304,6 +304,11 @@ void main() {
 	// For mobile renderer we're multiplying by 0.5 as we're using a UNORM buffer.
 	// For both mobile and clustered, we also bake in the exposure value for the environment and camera.
 	frag_color.rgb = frag_color.rgb * params.luminance_multiplier;
+#ifdef USE_CUBEMAP_PASS
+	// The octmap is fp16: a sky brighter than its range (a sun disc at a held bake exposure) would
+	// store Inf, which the filtered layers and the trace's sky tables spread.
+	frag_color.rgb = min(frag_color.rgb, vec3(65504.0));
+#endif
 
 	// Blending is disabled for Sky, so alpha doesn't blend.
 	// Alpha is used for subsurface scattering so make sure it doesn't get applied to Sky.

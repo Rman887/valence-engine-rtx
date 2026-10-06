@@ -1448,7 +1448,7 @@ void RenderForwardClustered::_update_volumetric_fog(Ref<RenderSceneBuffersRD> p_
 			settings.exposure_normalization = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_camera_attributes) * p_scene_data->pre_exposure;
 		}
 		// Set by this render's _setup_environment, which runs before the fog in both frames.
-		settings.sky_exposure_normalization = p_scene_data->get_ibl_exposure_normalization();
+		settings.sky_exposure_normalization = p_scene_data->get_ibl_exposure_normalization() * p_scene_data->sky_rebake_scale;
 
 		RendererRD::Fog::get_singleton()->volumetric_fog_update(settings, p_cam_projection, p_cam_transform, p_prev_cam_inv_transform, p_shadow_atlas, p_directional_light_count, p_use_directional_shadows, p_positional_light_count, p_voxel_gi_count, p_fog_volumes);
 	}

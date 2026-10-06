@@ -1268,11 +1268,15 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 	RSE::SkyMode sky_mode = sky->internal_mode;
 	bool update_single_frame = sky_mode == RSE::SKY_MODE_REALTIME || sky_mode == RSE::SKY_MODE_QUALITY;
 
-	if (sky->processing_layer == 0 && sky_mode == RSE::SKY_MODE_INCREMENTAL) {
+	if ((sky->processing_layer == 0 || sky->bake_now) && sky_mode == RSE::SKY_MODE_INCREMENTAL) {
 		// On the first frame after creating sky, rebuild in single frame
+		// (and when its bake exposure moved: the frame already reads baked_exposure at the new value).
 		update_single_frame = true;
 		sky_mode = RSE::SKY_MODE_QUALITY;
 	}
+
+	// The bake renders at the sky's held exposure where a path-traced frame has set one.
+	float bake_brightness_multiplier = sky->bake_exposure > 0.0f ? sky->bake_exposure / p_luminance_multiplier : p_brightness_multiplier;
 
 	int max_processing_layer = sky_use_octmap_array ? sky->reflection.layers.size() : sky->reflection.layers[0].mipmaps.size();
 
@@ -1297,7 +1301,7 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 			RID texture_uniform_set = sky->get_textures(SKY_TEXTURE_SET_OCTMAP_QUARTER_RES, sky_shader.default_shader_rd, p_render_buffers);
 
 			octmap_draw_list = RD::get_singleton()->draw_list_begin(sky->reflection.layers[0].mipmaps[2].framebuffer, RD::DRAW_IGNORE_COLOR_ALL);
-			_render_sky(octmap_draw_list, p_time, sky->reflection.layers[0].mipmaps[2].framebuffer, pipeline, material->uniform_set, texture_uniform_set, cm, Basis(), p_global_pos, p_luminance_multiplier, p_brightness_multiplier, sky->uv_border_size);
+			_render_sky(octmap_draw_list, p_time, sky->reflection.layers[0].mipmaps[2].framebuffer, pipeline, material->uniform_set, texture_uniform_set, cm, Basis(), p_global_pos, p_luminance_multiplier, bake_brightness_multiplier, sky->uv_border_size);
 			RD::get_singleton()->draw_list_end();
 
 			RD::get_singleton()->draw_command_end_label();
@@ -1316,7 +1320,7 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 			RID texture_uniform_set = sky->get_textures(SKY_TEXTURE_SET_OCTMAP_HALF_RES, sky_shader.default_shader_rd, p_render_buffers);
 
 			octmap_draw_list = RD::get_singleton()->draw_list_begin(sky->reflection.layers[0].mipmaps[1].framebuffer, RD::DRAW_IGNORE_COLOR_ALL);
-			_render_sky(octmap_draw_list, p_time, sky->reflection.layers[0].mipmaps[1].framebuffer, pipeline, material->uniform_set, texture_uniform_set, cm, Basis(), p_global_pos, p_luminance_multiplier, p_brightness_multiplier, sky->uv_border_size);
+			_render_sky(octmap_draw_list, p_time, sky->reflection.layers[0].mipmaps[1].framebuffer, pipeline, material->uniform_set, texture_uniform_set, cm, Basis(), p_global_pos, p_luminance_multiplier, bake_brightness_multiplier, sky->uv_border_size);
 			RD::get_singleton()->draw_list_end();
 
 			RD::get_singleton()->draw_command_end_label();
@@ -1332,7 +1336,7 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 		RID texture_uniform_set = sky->get_textures(SKY_TEXTURE_SET_OCTMAP, sky_shader.default_shader_rd, p_render_buffers);
 
 		octmap_draw_list = RD::get_singleton()->draw_list_begin(sky->reflection.layers[0].mipmaps[0].framebuffer, RD::DRAW_IGNORE_COLOR_ALL, Vector<Color>(), 1.0f, 0, Rect2(), RDD::BreadcrumbMarker::SKY_PASS);
-		_render_sky(octmap_draw_list, p_time, sky->reflection.layers[0].mipmaps[0].framebuffer, pipeline, material->uniform_set, texture_uniform_set, cm, Basis(), p_global_pos, p_luminance_multiplier, p_brightness_multiplier, sky->uv_border_size);
+		_render_sky(octmap_draw_list, p_time, sky->reflection.layers[0].mipmaps[0].framebuffer, pipeline, material->uniform_set, texture_uniform_set, cm, Basis(), p_global_pos, p_luminance_multiplier, bake_brightness_multiplier, sky->uv_border_size);
 		RD::get_singleton()->draw_list_end();
 
 		RD::get_singleton()->draw_command_end_label();
@@ -1360,7 +1364,8 @@ void SkyRD::update_radiance_buffers(Ref<RenderSceneBuffersRD> p_render_buffers, 
 		}
 		// Everything the radiance was rendered with, the background's energy, its intensity and the
 		// camera's exposure included, so IBL_exposure_normalization is 1 at the bake.
-		sky->baked_exposure = p_luminance_multiplier * p_brightness_multiplier;
+		sky->baked_exposure = p_luminance_multiplier * bake_brightness_multiplier;
+		sky->bake_now = false;
 		sky->reflection.dirty = false;
 		sky->radiance_version++;
 
@@ -1640,6 +1645,38 @@ float SkyRD::sky_get_baked_exposure(RID p_sky) const {
 	ERR_FAIL_NULL_V(sky, 1.0);
 
 	return sky->baked_exposure;
+}
+
+// The octmap is fp16, so a bake far from the frame's exposure (a camera factor or pre-exposure that has
+// moved since, docs/r2-exposure-chain.md E4) holds the sky where it loses precision or flushes to zero,
+// while IBL_exposure_normalization scales it back. A path-traced frame calls this before its scene UBO
+// reads baked_exposure: beyond SKY_BAKE_EXPOSURE_DRIFT the sky is re-baked whole, at the frame's
+// exposure, in this frame's update, and baked_exposure takes that value now, so the ratio the frame
+// reads matches the octmap it samples. Within it every bake keeps the held exposure, so a sky that
+// re-bakes for its own reasons (the time of day, realtime mode) never moves the ratio. The caller calls
+// it only on a frame whose sky block runs, so the bake it promises happens. Returns what a reader of the
+// octmap before that bake (the froxel fog) multiplies the frame's ratio by: the new exposure over the
+// one the octmap still holds, 1 when nothing moved.
+static const float SKY_BAKE_EXPOSURE_DRIFT = 6.0f; // EV.
+
+float SkyRD::sky_prepare_bake_exposure(RID p_sky, float p_exposure) {
+	Sky *sky = get_sky(p_sky);
+	ERR_FAIL_NULL_V(sky, 1.0f);
+	if (!(p_exposure > 0.0f) || !Math::is_finite(p_exposure)) {
+		return 1.0f;
+	}
+	if (sky->bake_exposure > 0.0f && Math::abs(Math::log2(p_exposure / sky->bake_exposure)) <= SKY_BAKE_EXPOSURE_DRIFT) {
+		return 1.0f;
+	}
+	float held = sky->baked_exposure;
+	sky->bake_exposure = p_exposure;
+	sky->baked_exposure = p_exposure;
+	if (held > 0.0f) {
+		sky->reflection.dirty = true;
+		sky->bake_now = true;
+		return p_exposure / held;
+	}
+	return 1.0f;
 }
 
 RID SkyRD::allocate_sky_rid() {

@@ -4196,7 +4196,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF("rendering/pathtracing/use_shader_execution_reordering", true);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracing/shader_execution_reordering_hint", PROPERTY_HINT_ENUM, "None,Instance,Termination,Termination and Distance"), 2);
 	GLOBAL_DEF("rendering/pathtracing/async_shader_compilation", true);
-	GLOBAL_DEF("rendering/pathtracing/texture_lod", false);
+	GLOBAL_DEF("rendering/pathtracing/texture_lod", true);
 	GLOBAL_DEF_RST("rendering/pathtracing/multimesh_cache_cpu_transforms", false);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_blas_compaction", true);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_blas_deformed", true);

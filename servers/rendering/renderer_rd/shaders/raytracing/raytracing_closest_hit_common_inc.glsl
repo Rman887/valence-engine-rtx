@@ -209,6 +209,22 @@ vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags) {
 	return sample_bindless_texture(tex_idx, uv);
 }
 
+/// The texture at the ray cone's level (D116): p_lod_t, the hit's texture-independent level, plus half
+/// the log2 of this texture's texel count; its base level where p_lod_t is RT_TEXTURE_LOD_BASE.
+vec4 sample_bindless_texture(uint tex_idx, vec2 uv, float p_lod_t) {
+	if (p_lod_t <= RT_TEXTURE_LOD_BASE) {
+		return sample_bindless_texture(tex_idx, uv);
+	}
+	vec2 size = vec2(textureSize(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), 0));
+	return textureLod(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, p_lod_t + 0.5 * log2(max(size.x * size.y, 1.0)));
+}
+vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags, float p_lod_t) {
+	if ((mat_flags & 4u) != 0u) {
+		return sample_bindless_texture_point(tex_idx, uv);
+	}
+	return sample_bindless_texture(tex_idx, uv, p_lod_t);
+}
+
 /// Apply tangent-space normal map to geometry normal.
 vec3 apply_normal_map(HitData h, vec3 tangent_space_normal, float normal_map_depth) {
 	vec3 mapped = h.tangent * tangent_space_normal.x + h.bitangent * tangent_space_normal.y + h.geometry_normal * tangent_space_normal.z;

@@ -754,21 +754,29 @@ void main() {
 	// HG0: StandardMaterial3D evaluation.
 	MaterialData mat = materials[h.geometry_idx];
 	vec2 uv = h.uv * mat.uv1_scale + mat.uv1_offset;
+	// The ray cone's level for this material (D116): the material's UV scale is part of the texture's
+	// density on the surface.
+	float material_lod = RT_TEXTURE_LOD_BASE;
+	if (h.texture_lod > RT_TEXTURE_LOD_BASE) {
+		material_lod = h.texture_lod + 0.5 * log2(max(abs(mat.uv1_scale.x * mat.uv1_scale.y), 1e-20));
+	}
+	const float lod = rt_texture_lod_enabled() ? material_lod : RT_TEXTURE_LOD_BASE;
 
 	// Normal mapping.
 	vec3 tangent_space_normal = vec3(0.0, 0.0, 1.0);
 	vec3 final_normal = h.geometry_normal;
 	if ((mat.flags & 1u) != 0u) {
-		vec3 normal_sample = sample_bindless_texture(mat.normal_texture_idx, uv).rgb;
+		// A point-filtered material reads its normal map at the base level, as its other textures do.
+		vec3 normal_sample = sample_bindless_texture(mat.normal_texture_idx, uv, (mat.flags & 4u) != 0u ? RT_TEXTURE_LOD_BASE : lod).rgb;
 		tangent_space_normal.xy = normal_sample.xy * 2.0 - 1.0;
 		tangent_space_normal.z = sqrt(max(0.0, 1.0 - dot(tangent_space_normal.xy, tangent_space_normal.xy)));
 		final_normal = apply_normal_map(h, tangent_space_normal, mat.normal_map_depth);
 	}
 
 	// Texture sampling.
-	vec4 albedo_tex = sample_material_texture(mat.albedo_texture_idx, uv, mat.flags);
+	vec4 albedo_tex = sample_material_texture(mat.albedo_texture_idx, uv, mat.flags, lod);
 	vec3 albedo = albedo_tex.rgb * mat.albedo_color.rgb;
-	vec3 orm = sample_material_texture(mat.orm_texture_idx, uv, mat.flags).rgb;
+	vec3 orm = sample_material_texture(mat.orm_texture_idx, uv, mat.flags, lod).rgb;
 	float roughness = saturate(orm.g * mat.roughness);
 	float metalness = saturate(orm.b * mat.metallic);
 
@@ -776,7 +784,7 @@ void main() {
 	// or multiplied with the colour by the material's emission operator, then scaled by the energy.
 	vec3 emission_tex = vec3(0.0);
 	if ((mat.flags & 2u) != 0u) {
-		emission_tex = sample_material_texture(mat.emission_texture_idx, uv, mat.flags).rgb;
+		emission_tex = sample_material_texture(mat.emission_texture_idx, uv, mat.flags, lod).rgb;
 	}
 	vec3 emissive = ((mat.flags & 8u) != 0u) ? mat.emission_color * emission_tex : mat.emission_color + emission_tex;
 	emissive *= mat.emission_strength * scene_data_block.data.emissive_exposure_normalization;
@@ -806,7 +814,7 @@ void main() {
 		vec3 c = unpackUnorm4x8(mat.backlight_rgba8).rgb;
 		vec3 backlight = mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), greaterThan(c, vec3(0.04045)));
 		if (mat.backlight_texture_idx != 0u) {
-			backlight += sample_material_texture(mat.backlight_texture_idx, uv, mat.flags).rgb;
+			backlight += sample_material_texture(mat.backlight_texture_idx, uv, mat.flags, lod).rgb;
 		}
 		m.diffuse_transmission = clamp(backlight * m.albedo * (1.0 - m.metalness), vec3(0.0), vec3(1.0));
 	}
@@ -817,10 +825,8 @@ void main() {
 		if (VIS_MODE != 0) {
 			vec3 V = -gl_WorldRayDirectionEXT;
 			float NdotV = max(dot(m.normal, V), 0.0001);
-			// The material's UV scale is part of the texture's density on the surface (D116).
-			float texture_lod = h.texture_lod + 0.5 * log2(max(abs(mat.uv1_scale.x * mat.uv1_scale.y), 1e-20));
 			debug_visualize(VIS_MODE, h.geometry_normal, m.normal, tangent_space_normal,
-					h.tangent, h.bitangent, uv, m.albedo, orm, m.metalness, m.roughness, mat.specular, m.emissive + m.decal_emissive, V, NdotV, gl_HitTEXT, h.is_front_face, h.texture_lod <= RT_TEXTURE_LOD_BASE ? RT_TEXTURE_LOD_BASE : texture_lod);
+					h.tangent, h.bitangent, uv, m.albedo, orm, m.metalness, m.roughness, mat.specular, m.emissive + m.decal_emissive, V, NdotV, gl_HitTEXT, h.is_front_face, material_lod);
 			return;
 		}
 	}

@@ -921,6 +921,9 @@ public:
 	// leaves the trackers the main graph uses untouched. The queues order each other through semaphores.
 	void set_uses_async_twins(bool p_enable) { uses_async_twins = p_enable; }
 	bool has_commands() const { return command_count > 0; }
+	// Whether this graph recorded a write to the resource in its current frame (D98): a build for another
+	// queue that reads it would not wait on that write.
+	bool resource_written_this_frame(const ResourceTracker *p_tracker) const { return p_tracker != nullptr && p_tracker->command_frame == tracking_frame && p_tracker->write_command_or_list_index >= 0; }
 	void begin();
 	void add_blas_build(RDD::AccelerationStructureID p_blas, RDD::BufferID p_scratch_buffer, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);
 	void add_blas_update(RDD::AccelerationStructureID p_blas, RDD::BufferID p_scratch_buffer, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);

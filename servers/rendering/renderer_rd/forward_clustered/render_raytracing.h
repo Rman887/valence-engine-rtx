@@ -487,7 +487,7 @@ struct RTSurfaceData {
 	uint64_t cluster_args_implicit_offset = 0; // The addresses the implicit build wrote, the move's sources.
 	uint64_t cluster_args_compact_offset = 0; // The addresses the move writes to, the rebuild's references.
 	uint64_t cluster_args_blas_info_offset = 0; // The BLAS build info over the compact addresses.
-	uint64_t compaction_ticket = 0; // The sizes readback in flight, 0 for none.
+	uint64_t compaction_ticket = 0; // The sizes readback in flight, or the compaction on the compute queue (D98b); 0 for none.
 	int32_t arena_chunk = -1;
 	uint64_t arena_offset = 0;
 	uint64_t arena_size = 0;
@@ -534,6 +534,9 @@ struct RTSurfaceData {
 	// advances, unique over every row, whenever the walk finds `geometry` changed since.
 	RT_GeometryData row_snapshot = {};
 	uint64_t row_generation = 0;
+	// An admitted new triangle surface whose BLAS the compute queue builds (D98b): frames_drawn from
+	// which the main queue may trace it. Until then it is a waiting surface to every reader.
+	uint64_t async_ready_frame = 0;
 };
 
 // A surface's geometry metadata from its format, and the buffers a BLAS of it reads.
@@ -835,6 +838,22 @@ struct RTClusterCompactionResult {
 	PackedByteArray sizes;
 	uint64_t held_since = 0; // frames_drawn the build budget (D97) first held it back, 0 when never.
 	uint64_t held_frame = UINT64_MAX; // frames_drawn it was last held: a later viewport's step passes it on.
+};
+
+// A compaction recorded on the compute queue (D98b): the move and the BLAS over the moved CLAS run
+// beside frame `frame`, and the swap (the LOD table's compact addresses, the handle, the staging's
+// frees) waits for the next frame, the surface tracing its staging meanwhile. The surface keeps its
+// ticket in cluster_compaction_pending until then; a surface released in between leaves the region
+// and the handle to be retired.
+struct RTClusterCompactionInFlight {
+	RTSurfaceData *surf = nullptr;
+	uint64_t ticket = 0;
+	uint64_t frame = 0;
+	RID blas;
+	uint32_t chunk = 0;
+	uint64_t region_offset = 0;
+	uint64_t region_size = 0;
+	LocalVector<uint64_t> compact_addresses; // Per CLAS, then the BLAS.
 };
 
 // A region whose surface is gone but whose chunk the frames in flight may still trace: freed
@@ -1575,6 +1594,27 @@ class RenderRaytracing {
 	uint32_t materialized_deferred = 0; // Over the run.
 	HashMap<uint64_t, RTSurfaceData *> cluster_compaction_pending;
 	LocalVector<RTClusterCompactionResult> cluster_compaction_results;
+	LocalVector<RTClusterCompactionInFlight> cluster_compactions_in_flight; // D98b.
+	void _finish_cluster_compaction(const RTClusterCompactionInFlight &p_compaction);
+	void _finish_cluster_compactions_in_flight();
+
+	// The async build queue (D98b): the admitted new surfaces' triangle BLAS the walk queued for the
+	// compute queue, recorded in an async build scope after the walk, and the frame's builds recorded
+	// there (compactions included), counted as RT_ASYNC_BUILDS.
+	struct AsyncBlas {
+		RID blas;
+		uint32_t triangles = 0;
+	};
+	LocalVector<AsyncBlas> async_blas_list;
+	uint32_t frame_async_builds = 0;
+	uint64_t async_builds_total = 0;
+	uint64_t async_ready_next_frame = 0; // In-flight surfaces the walk reached in the frame after their build.
+	uint64_t async_ready_later = 0;
+	// A traced instance reaching an in-flight surface (D97's rule): its build taken back to the main
+	// queue, or, recorded on the compute queue by an earlier viewport, the instance out for a frame.
+	uint64_t async_pulled_back = 0;
+	uint64_t async_forced_drops = 0;
+	void _record_async_builds();
 
 	// D98a's concurrency probe (the debug argument --async-probe): one synthetic BLAS of about a
 	// million triangles, rebuilt in an async build scope every frame and never traced, so the compute

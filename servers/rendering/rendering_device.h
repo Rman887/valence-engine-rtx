@@ -1516,6 +1516,7 @@ public:
 	void async_build_end();
 	bool has_async_builds() const { return async_builds; }
 	uint64_t get_async_submit_count() const { return compute_submit_count; }
+	uint64_t get_async_build_fallback_count() const { return async_build_fallbacks; }
 
 	// ----- PARTITIONED TOP-LEVEL ACCELERATION STRUCTURES (D94) -----
 	//
@@ -2033,6 +2034,8 @@ private:
 	RDD::SemaphoreID compute_semaphore_to_wait_on;
 	RDD::SemaphoreID main_semaphore_to_wait_on;
 	uint64_t compute_submit_count = 0;
+	uint64_t async_build_fallbacks = 0; // Triangle builds in the scope recorded on the main queue: their inputs were written this frame.
+	RenderingDeviceGraph *_triangle_build_graph(VectorView<RDG::ResourceTracker *> p_src_trackers);
 
 	/**************************/
 	/**** FRAME MANAGEMENT ****/

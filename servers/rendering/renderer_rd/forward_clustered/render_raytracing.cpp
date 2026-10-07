@@ -281,6 +281,9 @@ RenderRaytracing::~RenderRaytracing() {
 
 	cleanup_caches();
 	_async_probe_free();
+	if (async_builds_total > 0 || async_pulled_back > 0 || async_forced_drops > 0) {
+		print_verbose(vformat("RT: async builds (D98b): %d on the compute queue over the run, %d recorded on the main queue because a source was written in their frame; new surfaces released to the walk the next frame %d, later %d; pulled back to the main queue for a traced instance %d, a traced instance dropped for a frame %d.", async_builds_total, RD::get_singleton() ? RD::get_singleton()->get_async_build_fallback_count() : 0, async_ready_next_frame, async_ready_later, async_pulled_back, async_forced_drops));
+	}
 	singleton = nullptr;
 
 	if (position_fetch_check_buffer.is_valid()) {
@@ -733,6 +736,11 @@ void RenderRaytracing::cleanup_caches() {
 	// flight has no surface to land on.
 	cluster_compaction_pending.clear();
 	cluster_compaction_results.clear();
+	for (const RTClusterCompactionInFlight &compaction : cluster_compactions_in_flight) {
+		rd->free_rid(compaction.blas); // Its region went with the arena's chunks.
+	}
+	cluster_compactions_in_flight.clear();
+	async_blas_list.clear();
 	// The gathers in flight (D93c) read only their own copies; they finish before they go.
 	for (RTLodStreamGatherJob *job : cluster_lod_stream_gathers) {
 		WorkerThreadPool::get_singleton()->wait_for_group_task_completion(job->group);
@@ -1699,6 +1707,36 @@ RTSurfaceData *RenderRaytracing::process_surface(
 	if (!needs_refresh && entry->ptr->blas.is_valid()) {
 		cache_hits++;
 		entry->last_used_frame = current_frame;
+		if (entry->ptr->async_ready_frame != 0) {
+			// Its BLAS builds beside the frame that recorded it, on the compute queue (D98b): it waits
+			// until the next one, which the main queue's submit orders after that build.
+			const uint64_t frames_drawn = RD::get_singleton()->get_frames_drawn();
+			if (entry->ptr->async_ready_frame > frames_drawn) {
+				// An instance that traced this surface index the frame before never leaves the trace
+				// (D97): a build this walk has not recorded yet goes back to the main queue, traced in
+				// this frame. One an earlier viewport recorded on the compute queue cannot (open).
+				if (!build_budget.enabled || !_build_budget_traced(surf->owner, surf->surface_index, frames_drawn)) {
+					return nullptr;
+				}
+				for (uint32_t i = 0; i < async_blas_list.size(); i++) {
+					if (async_blas_list[i].blas == entry->ptr->blas) {
+						async_blas_list.remove_at(i);
+						r_dirty_blas_list.push_back(entry->ptr->blas);
+						entry->ptr->async_ready_frame = 0;
+						async_pulled_back++;
+						return entry->ptr;
+					}
+				}
+				async_forced_drops++;
+				return nullptr;
+			}
+			if (entry->ptr->async_ready_frame == frames_drawn) {
+				async_ready_next_frame++;
+			} else {
+				async_ready_later++; // The walk did not reach it in that frame.
+			}
+			entry->ptr->async_ready_frame = 0;
+		}
 		return entry->ptr;
 	}
 
@@ -1726,9 +1764,19 @@ RTSurfaceData *RenderRaytracing::process_surface(
 
 	RTSurfaceData *surf_data = entry->ptr;
 
+	surf_data->async_ready_frame = 0;
 	_populate_surface_blas(p_mesh_surface, RID(), false, false, false, cache_key, surf_data, r_dirty_blas_list);
 	if (budgeted && surf_data->blas.is_valid()) {
 		build_budget.built++;
+		// The async build queue (D98b): an admitted new surface's triangle BLAS builds on the compute
+		// queue beside this frame, and the main queue traces it from the next. A cluster population
+		// records where it is made and stays on the main queue (D98c).
+		RD *rd = RD::get_singleton();
+		if (rd->has_async_builds() && surf_data->cluster_count == 0 && !r_dirty_blas_list.is_empty() && r_dirty_blas_list[r_dirty_blas_list.size() - 1] == surf_data->blas) {
+			r_dirty_blas_list.resize(r_dirty_blas_list.size() - 1);
+			async_blas_list.push_back({ surf_data->blas, surf_data->geometry.primitive_count });
+			surf_data->async_ready_frame = rd->get_frames_drawn() + 1;
+		}
 	}
 
 	surf->cached_final_transform_valid = false;
@@ -1741,6 +1789,9 @@ RTSurfaceData *RenderRaytracing::process_surface(
 	entry->cached_rid_version = mesh_version;
 	entry->last_used_frame = current_frame;
 
+	if (surf_data->async_ready_frame != 0) {
+		return nullptr; // In flight: the walk drops it as a waiting surface.
+	}
 	return surf_data;
 }
 
@@ -3917,6 +3968,8 @@ void RenderRaytracing::_process_cluster_compactions() {
 	// Regions retired a frame queue ago are out of every frame in flight and go back to their chunk.
 	_arena_sweep(cluster_arena, cluster_arena_retired, cluster_arena_reserved_bytes, cluster_arena_live_bytes);
 	_arena_sweep(cluster_geometry_arena, cluster_geometry_arena_retired, cluster_geometry_arena_reserved_bytes, cluster_geometry_arena_live_bytes);
+	// The compactions the compute queue ran beside an earlier frame land first (D98b).
+	_finish_cluster_compactions_in_flight();
 
 	if (cluster_compaction_results.is_empty()) {
 		return;
@@ -3999,7 +4052,15 @@ void RenderRaytracing::_process_cluster_compactions() {
 			continue;
 		}
 
-		LocalVector<uint64_t> compact_addresses;
+		RTClusterCompactionInFlight compaction;
+		compaction.surf = surf;
+		compaction.ticket = result.ticket;
+		compaction.frame = frames_drawn;
+		compaction.blas = blas;
+		compaction.chunk = chunk_index;
+		compaction.region_offset = region_offset;
+		compaction.region_size = region_size;
+		LocalVector<uint64_t> &compact_addresses = compaction.compact_addresses;
 		compact_addresses.resize(cluster_count + 1);
 		uint64_t cursor = region_address + clas_offset;
 		for (uint32_t c = 0; c < cluster_count; c++) {
@@ -4007,6 +4068,10 @@ void RenderRaytracing::_process_cluster_compactions() {
 			cursor += _align_up(sizes[c], caps.cluster_byte_alignment);
 		}
 		compact_addresses[cluster_count] = region_address;
+
+		// The async build queue (D98b): the compact addresses, the move and the BLAS run on the compute
+		// queue beside this frame, which traces the staging, and the swap waits for the next frame.
+		const bool async = rd->async_build_begin();
 		rd->buffer_update(surf->cluster_args, uint32_t(surf->cluster_args_compact_offset), uint32_t(sizeof(uint64_t) * (cluster_count + 1)), compact_addresses.ptr());
 
 		// The move: every CLAS from its implicit staging address (the address array the build
@@ -4052,6 +4117,9 @@ void RenderRaytracing::_process_cluster_compactions() {
 			build.dst_acceleration_structures.push_back(blas);
 			ok = rd->cluster_acceleration_structure_build(build) == OK;
 		}
+		if (async) {
+			rd->async_build_end();
+		}
 		if (!ok) {
 			// Nothing references the region, but a recorded move may still write it: retired, not freed.
 			rd->free_rid(blas);
@@ -4060,49 +4128,19 @@ void RenderRaytracing::_process_cluster_compactions() {
 			continue;
 		}
 		rd->set_resource_name(blas, "RT cluster BLAS" + String(surf->cluster_omm ? " OMM" : "") + " [" + itos(surf->cluster_cache_key) + "]");
-		if (surf->cluster_lod_table_offset != UINT32_MAX) {
-			// A cached level (D90) would reference the staged CLAS, which go with this frame. None is
-			// placed while the compaction is pending, so this only guards that rule.
-			_release_lod_cached_levels(surf);
-			// The selection reads the CLAS addresses from the LOD table (D86): the compact ones from
-			// this frame on, the upload ordered ahead of the frame's selection by the table's tracker
-			// and the instances' BLAS builds behind the move by the chunk's.
-			if (surf->cluster_lod_stream) {
-				// A streamed surface's persistent runs (D92), the loaded groups' addresses untouched.
-				const RTLodStream *stream = surf->cluster_lod_stream;
-				uint32_t moved = 0;
-				for (uint32_t r = 0; r < stream->persistent_runs.size(); r += 2) {
-					rd->buffer_update(cluster_lod_table, (surf->cluster_lod_table_offset + stream->persistent_runs[r] * 2) * sizeof(uint32_t), uint32_t(sizeof(uint64_t) * stream->persistent_runs[r + 1]), compact_addresses.ptr() + moved);
-					moved += stream->persistent_runs[r + 1];
-				}
-				surf->cluster_lod_stream->persistent_bytes = region_size;
-			} else {
-				rd->buffer_update(cluster_lod_table, surf->cluster_lod_table_offset * sizeof(uint32_t), uint32_t(sizeof(uint64_t) * cluster_count), compact_addresses.ptr());
-			}
-		}
 
-		// The swap: the TLAS is built from the surface's handle every frame, and the buffers the
-		// move reads are disposed of with this frame.
-		const uint64_t staged_bytes = surf->blas_size;
-		if (surf->blas.is_valid() && rd->acceleration_structure_is_valid(surf->blas)) {
-			rd->free_rid(surf->blas);
-		}
-		surf->blas = blas;
-		rd->free_rid(surf->cluster_storage);
-		surf->cluster_storage = RID();
-		rd->free_rid(surf->cluster_args);
-		surf->cluster_args = RID();
-		surf->arena_chunk = int32_t(chunk_index);
-		surf->arena_offset = region_offset;
-		surf->arena_size = region_size;
-		surf->blas_size = region_size;
-
-		cluster_compactions_total++;
 		frame_extra_builds++; // A move and a BLAS over existing CLAS: a build, no new triangles (D97).
 		build_budget.built += budgeted ? 1 : 0;
-		cluster_bytes_staged_total += staged_bytes;
-		cluster_bytes_compacted_total += region_size;
-		print_verbose(vformat("RT: cluster BLAS [%d] compacted: %d clusters, %d KB staged -> %d KB (chunk %d at %d KB; arena %d chunks, %d / %d KB live).", surf->cluster_cache_key, cluster_count, staged_bytes / 1024, region_size / 1024, chunk_index, region_offset / 1024, cluster_arena.size(), cluster_arena_live_bytes / 1024, cluster_arena_reserved_bytes / 1024));
+		if (async) {
+			// Pending again until the swap: its cached levels (D90) and its level-0 pin (D92) wait.
+			surf->compaction_ticket = result.ticket;
+			cluster_compaction_pending.insert(result.ticket, surf);
+			cluster_compactions_in_flight.push_back(std::move(compaction));
+			frame_async_builds++; // The scope routes every cluster build to the compute queue.
+			async_builds_total++;
+		} else {
+			_finish_cluster_compaction(compaction);
+		}
 	}
 	if (!held.is_empty()) {
 		build_budget.held += newly_held;
@@ -4111,6 +4149,89 @@ void RenderRaytracing::_process_cluster_compactions() {
 		}
 		cluster_compaction_results = held;
 	}
+}
+
+// A compaction lands (D81): the LOD table takes the compact addresses, the surface the compacted
+// handle, and the staging the move read goes with this frame. Recorded on the compute queue (D98b),
+// this runs at the next frame's start, ordered after the move by the queues' semaphores.
+void RenderRaytracing::_finish_cluster_compaction(const RTClusterCompactionInFlight &p_compaction) {
+	RD *rd = RD::get_singleton();
+	RTSurfaceData *surf = p_compaction.surf;
+	const uint32_t cluster_count = surf->cluster_built_count;
+	const LocalVector<uint64_t> &compact_addresses = p_compaction.compact_addresses;
+	if (surf->cluster_lod_table_offset != UINT32_MAX) {
+		// A cached level (D90) would reference the staged CLAS, which go with this frame. None is
+		// placed while the compaction is pending, so this only guards that rule.
+		_release_lod_cached_levels(surf);
+		// The selection reads the CLAS addresses from the LOD table (D86): the compact ones from
+		// this frame on, the upload ordered ahead of the frame's selection by the table's tracker
+		// and the instances' BLAS builds behind the move by the chunk's.
+		if (surf->cluster_lod_stream) {
+			// A streamed surface's persistent runs (D92), the loaded groups' addresses untouched.
+			const RTLodStream *stream = surf->cluster_lod_stream;
+			uint32_t moved = 0;
+			for (uint32_t r = 0; r < stream->persistent_runs.size(); r += 2) {
+				rd->buffer_update(cluster_lod_table, (surf->cluster_lod_table_offset + stream->persistent_runs[r] * 2) * sizeof(uint32_t), uint32_t(sizeof(uint64_t) * stream->persistent_runs[r + 1]), compact_addresses.ptr() + moved);
+				moved += stream->persistent_runs[r + 1];
+			}
+			surf->cluster_lod_stream->persistent_bytes = p_compaction.region_size;
+		} else {
+			rd->buffer_update(cluster_lod_table, surf->cluster_lod_table_offset * sizeof(uint32_t), uint32_t(sizeof(uint64_t) * cluster_count), compact_addresses.ptr());
+		}
+	}
+
+	// The swap: the TLAS is built from the surface's handle every frame, and the buffers the
+	// move reads are disposed of with this frame.
+	const uint64_t staged_bytes = surf->blas_size;
+	if (surf->blas.is_valid() && rd->acceleration_structure_is_valid(surf->blas)) {
+		rd->free_rid(surf->blas);
+	}
+	surf->blas = p_compaction.blas;
+	rd->free_rid(surf->cluster_storage);
+	surf->cluster_storage = RID();
+	rd->free_rid(surf->cluster_args);
+	surf->cluster_args = RID();
+	surf->arena_chunk = int32_t(p_compaction.chunk);
+	surf->arena_offset = p_compaction.region_offset;
+	surf->arena_size = p_compaction.region_size;
+	surf->blas_size = p_compaction.region_size;
+
+	cluster_compactions_total++;
+	cluster_bytes_staged_total += staged_bytes;
+	cluster_bytes_compacted_total += p_compaction.region_size;
+	print_verbose(vformat("RT: cluster BLAS [%d] compacted: %d clusters, %d KB staged -> %d KB (chunk %d at %d KB; arena %d chunks, %d / %d KB live).", surf->cluster_cache_key, cluster_count, staged_bytes / 1024, p_compaction.region_size / 1024, p_compaction.chunk, p_compaction.region_offset / 1024, cluster_arena.size(), cluster_arena_live_bytes / 1024, cluster_arena_reserved_bytes / 1024));
+}
+
+// The compactions recorded on the compute queue in an earlier frame (D98b). A surface released since
+// has dropped its ticket: the compacted handle goes, and its region is retired, since the move may
+// still be writing it.
+void RenderRaytracing::_finish_cluster_compactions_in_flight() {
+	if (cluster_compactions_in_flight.is_empty()) {
+		return;
+	}
+	RD *rd = RD::get_singleton();
+	const uint64_t frames_drawn = rd->get_frames_drawn();
+	uint32_t kept = 0;
+	for (uint32_t i = 0; i < cluster_compactions_in_flight.size(); i++) {
+		RTClusterCompactionInFlight &compaction = cluster_compactions_in_flight[i];
+		if (compaction.frame >= frames_drawn) {
+			if (kept != i) {
+				cluster_compactions_in_flight[kept] = std::move(compaction);
+			}
+			kept++;
+			continue;
+		}
+		RTSurfaceData **found = cluster_compaction_pending.getptr(compaction.ticket);
+		if (found == nullptr || *found != compaction.surf) {
+			rd->free_rid(compaction.blas);
+			_cluster_arena_retire(compaction.chunk, compaction.region_offset, compaction.region_size);
+			continue;
+		}
+		cluster_compaction_pending.erase(compaction.ticket);
+		compaction.surf->compaction_ticket = 0;
+		_finish_cluster_compaction(compaction);
+	}
+	cluster_compactions_in_flight.resize(kept);
 }
 
 // A cluster arena (D81): chunks sub-allocated first fit, each region size a multiple of the
@@ -8729,6 +8850,38 @@ bool RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 	return true;
 }
 
+// The admitted new surfaces' triangle BLAS the walk queued for the compute queue (D98b), recorded once
+// every population of the frame's walk is done and before its counters are published. A build counts
+// as the compute queue's only where RenderingDevice routed it there: not in a scope that failed to
+// open, and not where a source was written this frame and the build stayed on the main queue. The
+// walk counts no instance of them this frame, so the builds and their triangles count here.
+void RenderRaytracing::_record_async_builds() {
+	if (async_blas_list.is_empty()) {
+		return;
+	}
+	RD *rd = RD::get_singleton();
+	const bool async = rd->async_build_begin();
+	for (const AsyncBlas &item : async_blas_list) {
+		if (!rd->acceleration_structure_is_valid(item.blas)) {
+			continue; // Freed with its mesh's buffers since; the surface repopulates.
+		}
+		const uint64_t fallbacks = rd->get_async_build_fallback_count();
+		if (rd->blas_build(item.blas) != OK) {
+			continue;
+		}
+		frame_extra_builds++;
+		frame_extra_triangles += item.triangles;
+		if (async && rd->get_async_build_fallback_count() == fallbacks) {
+			frame_async_builds++;
+			async_builds_total++;
+		}
+	}
+	if (async) {
+		rd->async_build_end();
+	}
+	async_blas_list.clear();
+}
+
 void RenderRaytracing::finalize_buffers(RTViewportState *p_state) {
 	// Grow-only uploads. Callers must not free these in prepare_frame().
 	auto update_or_grow = [](RID &p_buffer, uint32_t &p_capacity, const void *p_data, uint32_t p_size) {
@@ -9257,6 +9410,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	}
 
 	frame_extra_builds = 0; // prepare_frame's compactions and bakes count into them (D97).
+	frame_async_builds = 0; // And the compute queue's (D98b).
+	async_blas_list.clear();
 	frame_extra_triangles = 0;
 	frame_stream_loads = 0; // And its stream loads into these (D111).
 	frame_stream_load_clusters = 0;
@@ -10247,6 +10402,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		deformed_cluster_batch.dropped_handles.clear();
 	}
 
+	_record_async_builds();
+
 	// Phase 3: BLAS / TLAS build.
 #ifdef TOOLS_ENABLED
 	if (collect_render_info) {
@@ -10267,6 +10424,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			info[RSE::VIEWPORT_RENDER_INFO_RT_BUILD_QUEUE_DEPTH] += int(build_budget.waiting + build_budget.held);
 			info[RSE::VIEWPORT_RENDER_INFO_RT_BUILD_BUDGET_TRIANGLES] += int(MIN(build_budget.spent_triangles, uint64_t(INT32_MAX)));
 		}
+		// The builds recorded for the compute queue (D98b), among the frame's builds above.
+		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_ASYNC_BUILDS] += int(frame_async_builds);
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_TRIANGLES_REFIT] += rt_triangles_refit + deformed_cluster_triangles_updated;
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_INSTANCES_COMPILING] += rt_instances_compiling;
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_INSTANCES_FAILED] += rt_instances_failed;

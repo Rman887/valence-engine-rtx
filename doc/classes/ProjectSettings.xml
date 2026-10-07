@@ -3271,7 +3271,7 @@
 			[b]Note:[/b] Due to memory constraints, occlusion culling is not supported by default in Web export templates. It can be enabled by compiling custom Web export templates with [code]module_raycast_enabled=yes[/code].
 		</member>
 		<member name="rendering/pathtracing/async_builds" type="bool" setter="" getter="" default="false">
-			If [code]true[/code] and the GPU has a compute-only queue family, acceleration-structure builds that can wait one frame run on the compute queue, overlapping the frame's rendering instead of preceding it. Every buffer is then shared between the graphics, compute and transfer queues. Experimental: no build moves to the compute queue yet.
+			If [code]true[/code] and the GPU has a compute-only queue family, acceleration-structure builds that can wait one frame run on the compute queue, overlapping the frame's rendering instead of preceding it. Every buffer is then shared between the graphics, compute and transfer queues. Experimental: cluster BLAS compactions move, and, while [member rendering/pathtracing/build_budget] is on, the triangle BLAS of new surfaces the budget admits; each is traced one frame later than on the main queue. Cluster populations, CLAS streaming loads, cached levels, merges and opacity micromaps stay on the main queue.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracing/async_shader_compilation" type="bool" setter="" getter="" default="true">

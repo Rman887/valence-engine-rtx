@@ -648,6 +648,23 @@ RID RenderingDevice::tlas_create(uint32_t p_max_instance_count, BitField<Acceler
 	return id;
 }
 
+// D98: a triangle build in an async build scope reads its geometry on the compute queue, which waits
+// only on the main queue's previous frame. A source the main graph wrote in this frame (an update of a
+// mesh's buffers recorded before the walk) would be read unordered, so that build records on the main
+// queue instead; whoever recorded it still treats it as the compute queue's, traceable a frame later.
+RenderingDeviceGraph *RenderingDevice::_triangle_build_graph(VectorView<RDG::ResourceTracker *> p_src_trackers) {
+	if (!async_build_active) {
+		return build_graph;
+	}
+	for (uint32_t i = 0; i < p_src_trackers.size(); i++) {
+		if (draw_graph.resource_written_this_frame(p_src_trackers[i])) {
+			async_build_fallbacks++;
+			return &draw_graph;
+		}
+	}
+	return build_graph;
+}
+
 Error RenderingDevice::blas_build(RID p_blas) {
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
 
@@ -661,7 +678,7 @@ Error RenderingDevice::blas_build(RID p_blas) {
 	Error err = _acceleration_structure_scratch_buffer_create(blas);
 	ERR_FAIL_COND_V(err != OK, err);
 
-	build_graph->add_blas_build(blas->driver_id, blas->scratch_buffer, blas->draw_tracker, blas->draw_trackers);
+	_triangle_build_graph(blas->draw_trackers)->add_blas_build(blas->driver_id, blas->scratch_buffer, blas->draw_tracker, blas->draw_trackers);
 
 	blas->invalidated = false;
 	_blas_remove_tlas_dependencies(blas, p_blas);
@@ -682,7 +699,7 @@ Error RenderingDevice::blas_update(RID p_blas) {
 	Error err = _acceleration_structure_scratch_buffer_create(blas);
 	ERR_FAIL_COND_V(err != OK, err);
 
-	build_graph->add_blas_update(blas->driver_id, blas->scratch_buffer, blas->draw_tracker, blas->draw_trackers);
+	_triangle_build_graph(blas->draw_trackers)->add_blas_update(blas->driver_id, blas->scratch_buffer, blas->draw_tracker, blas->draw_trackers);
 
 	blas->invalidated = false;
 	_blas_remove_tlas_dependencies(blas, p_blas);

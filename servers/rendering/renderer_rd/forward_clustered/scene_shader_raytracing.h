@@ -142,7 +142,7 @@ public:
 	static constexpr int RT_PARAM_DIRECTIONAL_COUNT = 18; // The directional lights at the head of the light buffer (D55).
 	static constexpr int RT_PARAM_MAX_DIFFUSE_BOUNCES = 19; // The diffuse bounce limit, Environment.pathtracing_max_diffuse_bounces (D74).
 	static constexpr int RT_PARAM_DECAL_COUNT = 20; // The decals the hit shaders apply (D104), 0 to skip the walk.
-	// 21 is unused.
+	static constexpr int RT_PARAM_TEXTURE_LOD_ANISOTROPIC = 21; // 1 when the hit shaders sample over the cone's elliptical footprint, rendering/pathtracing/texture_lod_anisotropic (D116).
 	static constexpr int RT_PARAM_TEXTURE_LOD_BIAS = 22; // The raster samplers' mipmap bias, added to every cone level (D116).
 	static constexpr int RT_PARAM_TEXTURE_LOD = 23; // 1 when the hit shaders sample at the cone's level, rendering/pathtracing/texture_lod (D116).
 	static constexpr int RT_PARAM_COUNT = 24;
@@ -412,6 +412,7 @@ public:
 		bool uses_transmission = false; // Writes TRANSMISSION; the instance keeps its back faces so the refracted ray finds its exit interface
 		String label; // The shader's path, or its material when it has none: what a failed compile is reported under.
 		bool uses_projected = false; // Calls texture_projected(): the hit needs the cone's footprint even on a mesh without UVs (D116)
+		bool uses_texture_grad = false; // A lookup the compiler rewrote to textureGrad: the hit computes the cone's elliptical footprint (D116)
 		bool writes_uv = false; // Writes UV or UV2, whose density the mesh's UVs no longer tell: every texture() call reads level 0 (D116)
 		bool is_procedural = false; // Uses intersection shader instead of triangle geometry
 		uint32_t alpha_texture_buffer_offset = UINT32_MAX; // Byte offset of hint_alpha texture index in CustomMaterialUniforms UBO; UINT32_MAX if absent

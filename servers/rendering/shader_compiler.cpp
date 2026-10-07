@@ -1301,6 +1301,8 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 					bool is_normal_roughness_texture = false;
 					bool texture_lod_rewrite = false;
 					String texture_lod_sampler;
+					bool texture_grad_rewrite = false;
+					String texture_grad_coordinate;
 					String texture_projected_sampler;
 
 					for (int i = 1; i < onode->arguments.size(); i++) {
@@ -1450,6 +1452,17 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 										}
 										if (reads_coordinate) {
 											texture_lod_sampler = data_type_name + "(" + node_code + ", " + sampler_name + ")";
+											// Only through a linear anisotropic sampler: the hint this call resolved to.
+											const bool anisotropic = sampler_name == _get_sampler_name(ShaderLanguage::FILTER_LINEAR_MIPMAP_ANISOTROPIC, ShaderLanguage::REPEAT_ENABLE) || sampler_name == _get_sampler_name(ShaderLanguage::FILTER_LINEAR_MIPMAP_ANISOTROPIC, ShaderLanguage::REPEAT_DISABLE);
+											if (anisotropic && !actions.texture_grad_variable.is_empty() && onode->arguments.size() == 3 && _node_reads_any(onode->arguments[2], actions.texture_grad_coordinates)) {
+												HashSet<StringName> other_coordinates;
+												for (const StringName &name : actions.texture_lod_coordinates) {
+													if (!actions.texture_grad_coordinates.has(name)) {
+														other_coordinates.insert(name);
+													}
+												}
+												texture_grad_rewrite = !_node_reads_any(onode->arguments[2], other_coordinates);
+											}
 										}
 									}
 								}
@@ -1499,6 +1512,9 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 							// The bias becomes the start of an explicit level.
 							code += "(" + node_code + ")";
 						} else {
+							if (texture_grad_rewrite && i == 2) {
+								texture_grad_coordinate = node_code;
+							}
 							code += node_code;
 						}
 					}
@@ -1506,6 +1522,16 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 						code += String(onode->arguments.size() == 4 ? " + " : ", ") + actions.texture_lod_function + "(textureSize(" + texture_lod_sampler + ", 0))";
 					}
 					code += ")";
+					if (texture_grad_rewrite) {
+						// The gradients where the hit has them, the level otherwise. The sampler and coordinate
+						// expressions are written into both branches, of which one runs.
+						const String &grad = actions.texture_grad_variable;
+						if (p_actions.usage_flag_pointers.has(grad) && !used_flag_pointers.has(grad)) {
+							*p_actions.usage_flag_pointers[grad] = true;
+							used_flag_pointers.insert(grad);
+						}
+						code = "(" + grad + ".on ? textureGrad(" + texture_lod_sampler + ", " + texture_grad_coordinate + ", " + grad + ".x, " + grad + ".y) : " + code + ")";
+					}
 					if (is_screen_texture && !texture_func_returns_data && actions.apply_luminance_multiplier) {
 						if (RS::get_singleton()->is_low_end()) {
 							code = "(" + code + " / vec4(vec3(scene_data_block.data.luminance_multiplier), 1.0))";

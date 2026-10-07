@@ -98,7 +98,8 @@ void cluster_geometry_check_hit(GeometryData p_surface, GeometryData p_blob, uin
 /// Fetch vertex attributes and transform to world space.
 /// Requires hitAttributeEXT HitAttribs and GeometryBuffer/MaterialBuffer bindings.
 /// p_footprint: the cone's footprint is wanted whether or not the mesh has UVs or the frame decals.
-HitData compute_hit_data(bool p_footprint) {
+/// p_gradients: a fetch reads the elliptical footprint's UV gradients (D116), with the anisotropic switch on.
+HitData compute_hit_data(bool p_footprint, bool p_gradients) {
 	HitData h;
 	h.geometry_idx = gl_InstanceCustomIndexEXT;
 	GeometryData geom = geometries[h.geometry_idx];
@@ -163,6 +164,7 @@ HitData compute_hit_data(bool p_footprint) {
 	// positions. A surface without UVs still has a footprint, which its decals read, when there are any.
 	h.texture_lod = RT_TEXTURE_LOD_BASE;
 	h.texture_footprint = RT_TEXTURE_LOD_BASE;
+	h.texture_grad = vec4(0.0);
 	if (rt_texture_lod_wanted() && (geom.flags & FLAG_PROCEDURAL) == 0u && (p_footprint || attrs.has_uv || get_rt_param(RT_PARAM_DECAL_COUNT) > 0.5)) {
 		vec3 p0, p1, p2;
 		bool has_positions = true;
@@ -188,6 +190,11 @@ HitData compute_hit_data(bool p_footprint) {
 			h.texture_footprint = rt_texture_footprint(n, gl_WorldRayDirectionEXT, cone.x + cone.y * gl_HitTEXT);
 			if (attrs.has_uv) {
 				h.texture_lod = rt_texture_lod_triangle(h.texture_footprint, n, attrs.uv_corners[0], attrs.uv_corners[1], attrs.uv_corners[2]);
+				// The anisotropic footprint where the level is known; a degenerate one leaves the level.
+				if (p_gradients && h.texture_lod > RT_TEXTURE_LOD_BASE && rt_texture_lod_anisotropic()) {
+					float radius = (cone.x + cone.y * gl_HitTEXT) * exp2(get_rt_param(RT_PARAM_TEXTURE_LOD_BIAS));
+					h.texture_grad = rt_texture_grad_triangle(object_to_world * (p1 - p0), object_to_world * (p2 - p0), gl_WorldRayDirectionEXT, radius, attrs.uv_corners[0], attrs.uv_corners[1], attrs.uv_corners[2]);
+				}
 			}
 		}
 	}
@@ -230,6 +237,23 @@ vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags, float p_lod_
 		return sample_bindless_texture_point(tex_idx, uv);
 	}
 	return sample_bindless_texture(tex_idx, uv, p_lod_t);
+}
+
+/// The texture over the cone's elliptical footprint (D116): textureGrad at the material's UV gradients (g1, g2)
+/// through the anisotropic sampler, where the material's filter is anisotropic. A material filtered without
+/// anisotropy, or a hit without gradients, reads at the isotropic level p_lod_t, which beats the long axis's
+/// trilinear level the raster would take.
+vec4 sample_bindless_texture(uint tex_idx, vec2 uv, float p_lod_t, vec4 p_grad, bool p_anisotropic) {
+	if (!p_anisotropic || p_grad == vec4(0.0)) {
+		return sample_bindless_texture(tex_idx, uv, p_lod_t);
+	}
+	return textureGrad(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_ANISOTROPIC_REPEAT), uv, p_grad.xy, p_grad.zw);
+}
+vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags, float p_lod_t, vec4 p_grad) {
+	if ((mat_flags & 4u) != 0u) {
+		return sample_bindless_texture_point(tex_idx, uv);
+	}
+	return sample_bindless_texture(tex_idx, uv, p_lod_t, p_grad, (mat_flags & 64u) != 0u);
 }
 
 /// Apply tangent-space normal map to geometry normal.

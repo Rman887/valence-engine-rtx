@@ -63,9 +63,10 @@ rt_frag_coord = vec4(gl_LaunchIDEXT.xy, 0.0, 1.0);
 /* RT_CUSTOM_VERTEX_CALL */
 
 #if defined(RT_STAGE_CLOSEST_HIT) && !defined(RT_CUSTOM_UV_WRITTEN)
-// The fragment's texture() calls at the mesh's UVs read at the ray cone's level (D116); the vertex
-// function's, before this, and the any-hit's alpha test read level 0.
+// The fragment's texture() calls at the mesh's UVs read at the ray cone's level, or over its elliptical
+// footprint (D116); the vertex function's, before this, and the any-hit's alpha test read level 0.
 rt_lod_t = rt_hit_texture_lod;
+rt_grad_t = RtTextureGrad(rt_hit_texture_grad != vec4(0.0), rt_hit_texture_grad.xy, rt_hit_texture_grad.zw);
 #endif
 #ifdef RT_STAGE_CLOSEST_HIT
 // And its texture_projected() calls at the cone's footprint (D116), whatever the shader does with UV.

@@ -391,6 +391,9 @@ void RenderRaytracing::_free_viewport_state_internal(RTViewportState *p_state) {
 	if (p_state->scene_uniform_set.is_valid() && RD::get_singleton()->uniform_set_is_valid(p_state->scene_uniform_set)) {
 		RD::get_singleton()->free_rid(p_state->scene_uniform_set);
 	}
+	if (!p_state->samplers.is_null()) {
+		RendererRD::MaterialStorage::get_singleton()->samplers_rd_free(p_state->samplers);
+	}
 	memdelete(p_state);
 }
 
@@ -8549,6 +8552,13 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		}
 	}
 
+	// Anisotropic filtering where the material asks for it (D116): BaseMaterial3D writes its texture_filter into
+	// every texture uniform's filter hint, so the albedo texture's stands for all five fetches.
+	const ShaderLanguage::ShaderNode::Uniform *albedo_uniform = shader_data ? shader_data->uniforms.getptr("texture_albedo") : nullptr;
+	if (albedo_uniform && albedo_uniform->filter == ShaderLanguage::FILTER_LINEAR_MIPMAP_ANISOTROPIC) {
+		mat.flags |= RT_MAT_FLAG_ANISOTROPIC;
+	}
+
 	// Update cache entry
 	entry->cached_counter = p_material_invalidation_counter;
 	entry->cached_rid_version = mat_version;
@@ -11310,10 +11320,11 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_HAS_PROCEDURAL_INSTANCES] = p_state->has_procedural_instances ? 1.0f : 0.0f;
 
 		// Texture LOD by ray cones (D116): the bias the raster's samplers carry for these buffers (the
-		// viewport's, the render scale's and the temporal upscaler's), and the switch. The raygen
-		// takes the camera ray's spread from the rays it traces.
+		// viewport's, the render scale's and the temporal upscaler's), and the switches, isotropic and
+		// anisotropic. The raygen takes the camera ray's spread from the rays it traces.
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_TEXTURE_LOD_BIAS] = rb->get_computed_texture_mipmap_bias();
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_TEXTURE_LOD] = GLOBAL_GET_CACHED(bool, "rendering/pathtracing/texture_lod") ? 1.0f : 0.0f;
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_TEXTURE_LOD_ANISOTROPIC] = GLOBAL_GET_CACHED(bool, "rendering/pathtracing/texture_lod_anisotropic") ? 1.0f : 0.0f;
 
 		// The froxel volumetric fog the raygen composes over the camera segment (D37): the froxel's
 		// depth mapping as the raster's fragment reads it, and the Environment's sky affect.
@@ -11604,8 +11615,19 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		uniforms.push_back(u);
 	}
 
-	// Bindings 16-27: Material samplers (12 filter/repeat combinations for custom shaders).
-	RendererRD::MaterialStorage::get_singleton()->samplers_rd_get_default().append_uniforms(uniforms, 16);
+	// Bindings 16-27: Material samplers (12 filter/repeat combinations for custom shaders), remade when the
+	// viewport's anisotropy changes (D116).
+	{
+		RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
+		const int anisotropy = rb->get_samplers().anisotropic_filtering_level;
+		if (p_state->samplers.is_null() || p_state->samplers.anisotropic_filtering_level != anisotropy) {
+			if (!p_state->samplers.is_null()) {
+				material_storage->samplers_rd_free(p_state->samplers);
+			}
+			p_state->samplers = material_storage->samplers_rd_allocate(0.0f, (RSE::ViewportAnisotropicFiltering)anisotropy);
+		}
+		p_state->samplers.append_uniforms(uniforms, 16);
+	}
 
 	// Binding 28: Velocity output (RG16F). Past the 16-27 sampler range.
 	{

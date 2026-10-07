@@ -16,6 +16,12 @@ bool rt_texture_lod_enabled() {
 	return get_rt_param(RT_PARAM_TEXTURE_LOD) > 0.5;
 }
 
+/// Whether the hit shaders sample over the cone's elliptical footprint with UV gradients, where they sample at
+/// its level at all.
+bool rt_texture_lod_anisotropic() {
+	return rt_texture_lod_enabled() && get_rt_param(RT_PARAM_TEXTURE_LOD_ANISOTROPIC) > 0.5;
+}
+
 /// Whether a hit computes its level: the switch, or the debug view that shows it.
 bool rt_texture_lod_wanted() {
 #ifdef RT_DEBUG_ENABLED
@@ -88,4 +94,43 @@ float rt_texture_lod_triangle(float p_footprint, vec3 p_cross, vec2 p_uv0, vec2 
 		return RT_TEXTURE_LOD_BASE;
 	}
 	return max(p_footprint + 0.5 * log2(uv_area / length(p_cross)), RT_TEXTURE_LOD_BASE);
+}
+
+/// The cone's elliptical footprint at a triangle hit as two UV gradients (JCGT 2021 section 5, Listing 1),
+/// UVs as the mesh holds them, (g1, g2) in xy and zw; zero where there are none. The cone is taken as a
+/// cylinder around the ray whose radius p_radius is the cone's full width, not the paper's half: a gradient is
+/// the UV change per pixel step, and the spread is one pixel's angle, so one step spans the width, and along
+/// the normal the ellipse reduces to the isotropic level exactly. The raster's mipmap bias comes in as a factor
+/// on the radius. The section with the face's plane is an ellipse with the axis a1 along the ray's projection
+/// onto the plane, stretched by 1 / abs(n.d) (Listing 1's similar-triangles length in closed form, the cosine
+/// clamped as the isotropic footprint's is), and a2 across it at the radius. Each axis maps to UVs through the barycentric
+/// coordinates of its end, the triangle's own UV-per-metre Jacobian. p_e1, p_e2 are the triangle's edges from
+/// its first corner in trace space.
+vec4 rt_texture_grad_triangle(vec3 p_e1, vec3 p_e2, vec3 p_ray_dir, float p_radius, vec2 p_uv0, vec2 p_uv1, vec2 p_uv2) {
+	vec3 n = cross(p_e1, p_e2);
+	float world_area = length(n);
+	if (!(world_area > 1e-20) || !(p_radius > 0.0)) {
+		return vec4(0.0);
+	}
+	vec3 f = n / world_area;
+	vec3 d = normalize(p_ray_dir);
+	float cosine = dot(f, d);
+	vec3 h1 = d - cosine * f;
+	float h1_length = length(h1);
+	// Along the normal every direction in the plane is the ray's projection; the first edge stands for it.
+	h1 = h1_length > 1e-4 ? h1 / h1_length : normalize(p_e1);
+	vec3 a1 = h1 * (p_radius / max(abs(cosine), 1e-4));
+	vec3 a2 = cross(f, h1) * p_radius;
+	// The barycentric coordinates an axis's end moves by: twice the signed areas it spans with the edges
+	// over twice the triangle's.
+	float inv_area = 1.0 / world_area;
+	vec2 b1 = vec2(dot(f, cross(a1, p_e2)), dot(f, cross(p_e1, a1))) * inv_area;
+	vec2 b2 = vec2(dot(f, cross(a2, p_e2)), dot(f, cross(p_e1, a2))) * inv_area;
+	vec2 duv1 = p_uv1 - p_uv0;
+	vec2 duv2 = p_uv2 - p_uv0;
+	vec4 grad = vec4(b1.x * duv1 + b1.y * duv2, b2.x * duv1 + b2.y * duv2);
+	if (any(isnan(grad)) || any(isinf(grad))) {
+		return vec4(0.0);
+	}
+	return grad;
 }

@@ -204,6 +204,7 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	h.primitive_id = 0u;
 	h.texture_lod = RT_TEXTURE_LOD_BASE; // The raster sampled the surface's textures.
 	h.texture_footprint = RT_TEXTURE_LOD_BASE; // And drew its decals.
+	h.texture_grad = vec4(0.0);
 
 	MaterialResult m;
 	m.albedo = albedo_specular.rgb;
@@ -695,10 +696,21 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 // ============================================================================
 void main() {
 	// A shader that calls texture_projected() needs the cone's footprint at a mesh without UVs too (D116).
-#ifdef RT_CUSTOM_PROJECTED_LOD
-	HitData h = compute_hit_data(true);
+	// And the elliptical footprint's gradients only where a fetch reads them (D116): in a custom shader with a
+	// lookup rewritten to textureGrad, in HG0 for an anisotropic-filtered material.
+#ifdef RT_CUSTOM_HIT_GROUP
+#if defined(RT_CUSTOM_TEXTURE_GRAD) && !defined(RT_CUSTOM_UV_WRITTEN)
+	const bool gradients = true;
 #else
-	HitData h = compute_hit_data(false);
+	const bool gradients = false;
+#endif
+#else
+	const bool gradients = (materials[gl_InstanceCustomIndexEXT].flags & 64u) != 0u;
+#endif
+#ifdef RT_CUSTOM_PROJECTED_LOD
+	HitData h = compute_hit_data(true, gradients);
+#else
+	HitData h = compute_hit_data(false, gradients);
 #endif
 	write_primary_hit_depth(h.hit_pos);
 	write_primary_hit_velocity(h.hit_pos);
@@ -716,6 +728,7 @@ void main() {
 	// calls read (D116), handed over after the vertex function.
 	float rt_hit_texture_lod = rt_texture_lod_enabled() ? h.texture_lod : RT_TEXTURE_LOD_BASE;
 	float rt_hit_texture_footprint = rt_texture_lod_enabled() ? h.texture_footprint : RT_TEXTURE_LOD_BASE;
+	vec4 rt_hit_texture_grad = h.texture_grad; // Zero unless the anisotropic switch is on.
 
 #include "raytracing_custom_fragment_inc.glsl"
 
@@ -771,22 +784,25 @@ void main() {
 		material_lod = h.texture_lod + 0.5 * log2(max(abs(mat.uv1_scale.x * mat.uv1_scale.y), 1e-20));
 	}
 	const float lod = rt_texture_lod_enabled() ? material_lod : RT_TEXTURE_LOD_BASE;
+	// And its elliptical footprint, the mesh's gradients through the same scale.
+	const vec4 grad = h.texture_grad * vec4(mat.uv1_scale, mat.uv1_scale);
 
 	// Normal mapping.
 	vec3 tangent_space_normal = vec3(0.0, 0.0, 1.0);
 	vec3 final_normal = h.geometry_normal;
 	if ((mat.flags & 1u) != 0u) {
 		// A point-filtered material reads its normal map at the base level, as its other textures do.
-		vec3 normal_sample = sample_bindless_texture(mat.normal_texture_idx, uv, (mat.flags & 4u) != 0u ? RT_TEXTURE_LOD_BASE : lod).rgb;
+		const bool point_filter = (mat.flags & 4u) != 0u;
+		vec3 normal_sample = sample_bindless_texture(mat.normal_texture_idx, uv, point_filter ? RT_TEXTURE_LOD_BASE : lod, point_filter ? vec4(0.0) : grad, (mat.flags & 64u) != 0u).rgb;
 		tangent_space_normal.xy = normal_sample.xy * 2.0 - 1.0;
 		tangent_space_normal.z = sqrt(max(0.0, 1.0 - dot(tangent_space_normal.xy, tangent_space_normal.xy)));
 		final_normal = apply_normal_map(h, tangent_space_normal, mat.normal_map_depth);
 	}
 
 	// Texture sampling.
-	vec4 albedo_tex = sample_material_texture(mat.albedo_texture_idx, uv, mat.flags, lod);
+	vec4 albedo_tex = sample_material_texture(mat.albedo_texture_idx, uv, mat.flags, lod, grad);
 	vec3 albedo = albedo_tex.rgb * mat.albedo_color.rgb;
-	vec3 orm = sample_material_texture(mat.orm_texture_idx, uv, mat.flags, lod).rgb;
+	vec3 orm = sample_material_texture(mat.orm_texture_idx, uv, mat.flags, lod, grad).rgb;
 	float roughness = saturate(orm.g * mat.roughness);
 	float metalness = saturate(orm.b * mat.metallic);
 
@@ -794,7 +810,7 @@ void main() {
 	// or multiplied with the colour by the material's emission operator, then scaled by the energy.
 	vec3 emission_tex = vec3(0.0);
 	if ((mat.flags & 2u) != 0u) {
-		emission_tex = sample_material_texture(mat.emission_texture_idx, uv, mat.flags, lod).rgb;
+		emission_tex = sample_material_texture(mat.emission_texture_idx, uv, mat.flags, lod, grad).rgb;
 	}
 	vec3 emissive = ((mat.flags & 8u) != 0u) ? mat.emission_color * emission_tex : mat.emission_color + emission_tex;
 	emissive *= mat.emission_strength * scene_data_block.data.emissive_exposure_normalization;
@@ -824,7 +840,7 @@ void main() {
 		vec3 c = unpackUnorm4x8(mat.backlight_rgba8).rgb;
 		vec3 backlight = mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), greaterThan(c, vec3(0.04045)));
 		if (mat.backlight_texture_idx != 0u) {
-			backlight += sample_material_texture(mat.backlight_texture_idx, uv, mat.flags, lod).rgb;
+			backlight += sample_material_texture(mat.backlight_texture_idx, uv, mat.flags, lod, grad).rgb;
 		}
 		m.diffuse_transmission = clamp(backlight * m.albedo * (1.0 - m.metalness), vec3(0.0), vec3(1.0));
 	}

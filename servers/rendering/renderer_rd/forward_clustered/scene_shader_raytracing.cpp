@@ -623,6 +623,8 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	actions.render_mode_flags["opacity_micromap"] = &detected_opacity_micromap;
 	bool detected_projected = false;
 	actions.usage_flag_pointers["texture_projected"] = &detected_projected;
+	bool detected_texture_grad = false;
+	actions.usage_flag_pointers["rt_grad_t"] = &detected_texture_grad;
 	bool detected_uv_write = false;
 	actions.write_flag_pointers["UV"] = &detected_uv_write;
 	bool detected_uv2_write = false;
@@ -646,6 +648,7 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	r_entry.label = (label_shader && !label_shader->path.is_empty()) ? label_shader->path : vformat("material %d", p_material.get_id());
 	r_entry.writes_uv = detected_uv_write || detected_uv2_write;
 	r_entry.uses_projected = detected_projected;
+	r_entry.uses_texture_grad = detected_texture_grad;
 	r_entry.vertex_code = gen_code.code.has("vertex") ? gen_code.code["vertex"] : String();
 	r_entry.fragment_code = gen_code.code.has("fragment") ? gen_code.code["fragment"] : String();
 	r_entry.fragment_globals = gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT];
@@ -1166,6 +1169,10 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 		if (entry.uses_projected) {
 			// Its texture_projected() calls read the cone's footprint, which a mesh without UVs must compute too (D116).
 			tex_defines += "#define RT_CUSTOM_PROJECTED_LOD\n";
+		}
+		if (entry.uses_texture_grad) {
+			// A lookup was rewritten to textureGrad: the hit computes the cone's elliptical footprint (D116).
+			tex_defines += "#define RT_CUSTOM_TEXTURE_GRAD\n";
 		}
 		String uniform_members = entry.uniform_members.is_empty() ? String("float _rt_pad;") : entry.uniform_members;
 
@@ -1857,10 +1864,13 @@ void SceneShaderRaytracing::init(const String p_defines) {
 
 		actions.default_filter = ShaderLanguage::FILTER_LINEAR_MIPMAP;
 		actions.default_repeat = ShaderLanguage::REPEAT_ENABLE;
-		// texture() at the mesh's UVs reads at the ray cone's level (D116, raytracing_custom_texture_inc.glsl).
+		// texture() at the mesh's UVs reads at the ray cone's level, or over its elliptical footprint at UV
+		// (D116, raytracing_custom_texture_inc.glsl).
 		actions.texture_lod_function = "rt_texture_lod";
 		actions.texture_lod_coordinates.insert("UV");
 		actions.texture_lod_coordinates.insert("UV2");
+		actions.texture_grad_variable = "rt_grad_t";
+		actions.texture_grad_coordinates.insert("UV");
 		actions.texture_projected_function = "rt_texture_projected_lod";
 		actions.global_buffer_array_variable = "global_shader_uniforms.data";
 		actions.instance_uniform_index_variable = "instances.data[instance_index_interp].instance_uniforms_ofs";

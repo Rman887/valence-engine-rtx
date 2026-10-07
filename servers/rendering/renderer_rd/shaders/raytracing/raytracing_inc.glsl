@@ -40,7 +40,7 @@
 #define RT_PARAM_MAX_DIFFUSE_BOUNCES 19 // rt_params[4].w - The diffuse bounce limit, Environment.pathtracing_max_diffuse_bounces (D74)
 #define RT_PARAM_DECAL_COUNT 20 // rt_params[5].x - The decals the hit shaders apply (D104), 0 to skip the walk
 // Texture LOD by ray cones (D116).
-// rt_params[5].y (21) is unused.
+#define RT_PARAM_TEXTURE_LOD_ANISOTROPIC 21 // rt_params[5].y - 1 when the hit shaders sample over the cone's elliptical footprint with UV gradients
 #define RT_PARAM_TEXTURE_LOD_BIAS 22 // rt_params[5].z - The raster samplers' mipmap bias, added to every cone level
 #define RT_PARAM_TEXTURE_LOD 23 // rt_params[5].w - 1 when the hit shaders sample at the cone's level, 0 for level 0 everywhere
 // A texture level that is unknown (D116): every texture reads its base level.

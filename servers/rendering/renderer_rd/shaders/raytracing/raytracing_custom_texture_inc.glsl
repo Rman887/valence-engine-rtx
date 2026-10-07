@@ -25,6 +25,19 @@ float rt_texture_lod(ivec3 p_size) {
 	return rt_texture_lod(p_size.xy);
 }
 
+// Such a lookup through a linear anisotropic sampler (the uniform's filter_linear_mipmap_anisotropic hint), without
+// a bias, whose coordinate reads UV and not UV2, becomes
+// (rt_grad_t.on ? textureGrad(s, uv, rt_grad_t.x, rt_grad_t.y) : <the level form above>): the cone's elliptical
+// footprint as the mesh's UV gradients, with rendering/pathtracing/texture_lod_anisotropic. Other hints keep the
+// isotropic level. A coordinate that scales UV gets the mesh's gradients, as it gets the mesh's level. rt_grad_t is
+// set where rt_lod_t is, and only where the hit has gradients.
+struct RtTextureGrad {
+	bool on;
+	vec2 x;
+	vec2 y;
+};
+RtTextureGrad rt_grad_t = RtTextureGrad(false, vec2(0.0), vec2(0.0));
+
 // The spatial stage function texture_projected(tex, uv, uv_per_metre) becomes
 // textureLod(tex, uv, rt_texture_projected_lod(textureSize(tex, 0), uv_per_metre)): the cone's footprint in
 // metres (rt_footprint_t, set as rt_lod_t is, but for any shader that calls the function) plus the log2 of

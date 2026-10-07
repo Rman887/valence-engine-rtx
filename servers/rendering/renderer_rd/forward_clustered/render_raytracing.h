@@ -46,6 +46,7 @@
 #include "servers/rendering/renderer_rd/shaders/raytracing/opacity_micromap.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/ptlas_rows.glsl.gen.h"
 #include "servers/rendering/renderer_rd/shaders/raytracing/sky_light_table.glsl.gen.h"
+#include "servers/rendering/renderer_rd/storage_rd/material_storage.h"
 #include "servers/rendering/rendering_device.h"
 
 #define RB_TEX_RAYTRACING SNAME("raytracing")
@@ -300,6 +301,7 @@ enum {
 	RT_MAT_FLAG_EMISSION_MULTIPLY = 8u, // BaseMaterial3D emission_operator Multiply; Add otherwise.
 	RT_MAT_FLAG_EMISSIVE_CONSTANT = 16u, // Emits a non-zero constant radiance with no texture: an emissive mesh light (D50).
 	RT_MAT_FLAG_DIFFUSE_TRANSMISSION = 32u, // BaseMaterial3D backlight: a thin diffuse-transmission lobe (D103).
+	RT_MAT_FLAG_ANISOTROPIC = 64u, // The albedo texture's filter is linear, mipmapped and anisotropic (D116).
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).
@@ -1313,6 +1315,9 @@ struct RTViewportState {
 	float sky_light_scene_exposure = 0.0f; // The exposure normalisation the kept weights were divided by.
 	float sky_light_scene[4] = {};
 	RID scene_uniform_set;
+	// The material samplers the hit shaders read through (D116): the viewport's anisotropy, as the raster's, but no
+	// mipmap bias, which the trace adds to its own levels and gradients.
+	RendererRD::MaterialStorage::Samplers samplers;
 
 	// Camera-relative tracing: the anchor every position uploaded to the trace
 	// is relative to (world minus rt_origin), and the scene UBO copy whose

@@ -203,6 +203,7 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	h.geometry_idx = 0u;
 	h.primitive_id = 0u;
 	h.texture_lod = RT_TEXTURE_LOD_BASE; // The raster sampled the surface's textures.
+	h.texture_footprint = RT_TEXTURE_LOD_BASE; // And drew its decals.
 
 	MaterialResult m;
 	m.albedo = albedo_specular.rgb;
@@ -706,6 +707,8 @@ void main() {
 	vec3 rt_tangent = h.tangent;
 	vec3 rt_bitangent = h.bitangent;
 	bool rt_front_face = h.is_front_face;
+	// The level the fragment's texture() calls at the mesh's UVs read (D116), handed over after the vertex function.
+	float rt_hit_texture_lod = rt_texture_lod_enabled() ? h.texture_lod : RT_TEXTURE_LOD_BASE;
 
 #include "raytracing_custom_fragment_inc.glsl"
 
@@ -1011,6 +1014,8 @@ layout(set = 1, binding = 0) uniform texture2D bindless_textures[];
 layout(buffer_reference, std140) readonly buffer CustomMaterialUniforms{
 	/* RT_CUSTOM_UNIFORM_MEMBERS */
 };
+
+#include "raytracing_custom_texture_inc.glsl"
 
 /* RT_CUSTOM_TEXTURE_DEFINES */
 

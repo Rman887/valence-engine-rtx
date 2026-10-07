@@ -108,6 +108,12 @@ public:
 		bool suppress_varying_io = false;
 		bool apply_luminance_multiplier = false;
 		bool check_multiview_samplers = false;
+		// When set, texture(s, uv[, bias]) on a float 2D or 2D array sampler becomes textureLod: at the level
+		// this function returns for textureSize(s, 0) when the coordinate reads one of texture_lod_coordinates
+		// directly, at level 0 otherwise, plus the bias (the path tracer's hit groups pick a level of detail
+		// there, D116).
+		String texture_lod_function;
+		HashSet<StringName> texture_lod_coordinates;
 	};
 
 private:

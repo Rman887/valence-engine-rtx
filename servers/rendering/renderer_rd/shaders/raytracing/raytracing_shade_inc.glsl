@@ -32,6 +32,7 @@ struct HitData {
 	uint geometry_idx;
 	uint primitive_id; // The triangle hit; 0 for a G-buffer surface, which never weighs its emission (D50).
 	float texture_lod; // The ray cone's texture-independent level (D116), RT_TEXTURE_LOD_BASE when unknown.
+	float texture_footprint; // The cone's footprint as a level in metres (D116): a texture of d texels per metre reads at this + log2(d).
 };
 
 // ============================================================================

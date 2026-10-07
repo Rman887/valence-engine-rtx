@@ -275,6 +275,45 @@ static String get_constant_text(SL::DataType p_type, const Vector<SL::Scalar> &p
 	}
 }
 
+// Whether an expression reads one of the named variables anywhere in it.
+static bool _node_reads_any(const SL::Node *p_node, const HashSet<StringName> &p_names) {
+	if (p_node == nullptr) {
+		return false;
+	}
+	switch (p_node->type) {
+		case SL::Node::NODE_TYPE_VARIABLE: {
+			return p_names.has(static_cast<const SL::VariableNode *>(p_node)->name);
+		}
+		case SL::Node::NODE_TYPE_OPERATOR: {
+			for (const SL::Node *argument : static_cast<const SL::OperatorNode *>(p_node)->arguments) {
+				if (_node_reads_any(argument, p_names)) {
+					return true;
+				}
+			}
+			return false;
+		}
+		case SL::Node::NODE_TYPE_MEMBER: {
+			const SL::MemberNode *member = static_cast<const SL::MemberNode *>(p_node);
+			return _node_reads_any(member->owner, p_names) || _node_reads_any(member->index_expression, p_names) || _node_reads_any(member->assign_expression, p_names) || _node_reads_any(member->call_expression, p_names);
+		}
+		case SL::Node::NODE_TYPE_ARRAY: {
+			const SL::ArrayNode *array = static_cast<const SL::ArrayNode *>(p_node);
+			return p_names.has(array->name) || _node_reads_any(array->index_expression, p_names) || _node_reads_any(array->assign_expression, p_names) || _node_reads_any(array->call_expression, p_names);
+		}
+		case SL::Node::NODE_TYPE_ARRAY_CONSTRUCT: {
+			for (const SL::Node *element : static_cast<const SL::ArrayConstructNode *>(p_node)->initializer) {
+				if (_node_reads_any(element, p_names)) {
+					return true;
+				}
+			}
+			return false;
+		}
+		default: {
+			return false;
+		}
+	}
+}
+
 String ShaderCompiler::_get_sampler_name(ShaderLanguage::TextureFilter p_filter, ShaderLanguage::TextureRepeat p_repeat) {
 	if (p_filter == ShaderLanguage::FILTER_DEFAULT) {
 		ERR_FAIL_COND_V(actions.default_filter == ShaderLanguage::FILTER_DEFAULT, String());
@@ -1253,6 +1292,8 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 					// sampler2D and sampler2D array and vec2 UV and vec3 UV.
 					bool multiview_uv_needed = false;
 					bool is_normal_roughness_texture = false;
+					bool texture_lod_rewrite = false;
+					String texture_lod_sampler;
 
 					for (int i = 1; i < onode->arguments.size(); i++) {
 						if (i > 1) {
@@ -1383,6 +1424,16 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 									data_type_name = "sampler2D";
 								} else {
 									data_type_name = ShaderLanguage::get_datatype_name(onode->arguments[i]->get_datatype());
+									if (texture_func_simple && !actions.texture_lod_function.is_empty() && (onode->arguments[i]->get_datatype() == SL::TYPE_SAMPLER2D || onode->arguments[i]->get_datatype() == SL::TYPE_SAMPLER2DARRAY) && onode->arguments.size() >= 3) {
+										bool reads_coordinate = _node_reads_any(onode->arguments[2], actions.texture_lod_coordinates);
+										texture_lod_rewrite = reads_coordinate || onode->arguments.size() == 4;
+										if (texture_lod_rewrite) {
+											code = code.replace("texture(", "textureLod(");
+										}
+										if (reads_coordinate) {
+											texture_lod_sampler = data_type_name + "(" + node_code + ", " + sampler_name + ")";
+										}
+									}
 								}
 
 								code += data_type_name + "(" + node_code + ", " + sampler_name + ")";
@@ -1423,9 +1474,15 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 							}
 
 							code += node_code;
+						} else if (texture_lod_rewrite && i == 3) {
+							// The bias becomes the start of an explicit level.
+							code += "(" + node_code + ")";
 						} else {
 							code += node_code;
 						}
+					}
+					if (!texture_lod_sampler.is_empty()) {
+						code += String(onode->arguments.size() == 4 ? " + " : ", ") + actions.texture_lod_function + "(textureSize(" + texture_lod_sampler + ", 0))";
 					}
 					code += ")";
 					if (is_screen_texture && !texture_func_returns_data && actions.apply_luminance_multiplier) {

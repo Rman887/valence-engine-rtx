@@ -5,9 +5,10 @@
 // built per frame on the CPU (RenderRaytracing::gather_decals), with the decals' transforms in trace
 // space. The math is the raster's: the box test, the upper and lower fades, the normal fade, the
 // albedo mix, the normal map into the shading normal, roughness and metallic from the ORM texture,
-// additive emission. Differences: the textures are read at LOD 0 (no ray differentials; texture LOD
-// in the trace is R2's), the ORM's occlusion has no field in MaterialResult, and the decals at a hit
-// are applied farthest rank first, which the raster does only within one 32-decal cluster word.
+// additive emission. Differences: the textures are read at the ray cone's level (D116) where the
+// raster reads at its screen derivatives, the ORM's occlusion has no field in MaterialResult, and the
+// decals at a hit are applied farthest rank first, which the raster does only within one 32-decal
+// cluster word.
 //
 // Requires: HitData and MaterialResult, geometries[] (the instance's layers in the row's first pad
 // word, RenderRaytracing::build_tlas), get_rt_param and scene_data_block.
@@ -64,6 +65,25 @@ layout(set = 0, binding = 51) uniform sampler rt_decal_sampler;
 vec3 rt_decal_uv(uint p_index, vec3 p_pos) {
 	vec4 p = vec4(p_pos, 1.0);
 	return vec3(dot(rt_decals[p_index].xform[0], p), dot(rt_decals[p_index].xform[1], p), dot(rt_decals[p_index].xform[2], p));
+}
+
+/// The level of a decal fetch from its atlas rect (D116): the hit's footprint in metres plus half the
+/// log2 of the rect's atlas texels per square metre of the receiver, 0 where the footprint is unknown.
+/// The decal's u and v gradients are projected onto the receiver's plane, so a decal falling on a
+/// slanted surface is not read as denser than it lands. Without the mipmap bias the footprint carries,
+/// as the raster's decal sampler has none. Unclamped, as the raster's textureGrad is: the atlas has
+/// five levels and pads every rect by 16 texels, one texel at the last level, so the hardware's clamp
+/// keeps a footprint off its neighbours.
+float rt_decal_lod(uint p_index, vec4 p_rect, float p_footprint, vec3 p_normal) {
+	if (p_footprint <= RT_TEXTURE_LOD_BASE) {
+		return 0.0;
+	}
+	vec2 atlas = vec2(textureSize(sampler2D(rt_decal_atlas, rt_decal_sampler), 0));
+	vec3 u = rt_decals[p_index].xform[0].xyz;
+	vec3 v = rt_decals[p_index].xform[2].xyz;
+	float texels_u = length(u - dot(u, p_normal) * p_normal) * p_rect.z * atlas.x;
+	float texels_v = length(v - dot(v, p_normal) * p_normal) * p_rect.w * atlas.y;
+	return max(p_footprint - get_rt_param(RT_PARAM_TEXTURE_LOD_BIAS) + 0.5 * log2(max(texels_u * texels_v, 1e-20)), 0.0);
 }
 
 bool rt_decal_contains(vec3 p_uv) {
@@ -128,6 +148,7 @@ void apply_decals(HitData p_h, inout MaterialResult r_m) {
 	}
 
 	// Farthest rank first, so the nearest decal is mixed in last, on top, as the raster's order within a word.
+	const float footprint = rt_texture_lod_enabled() ? p_h.texture_footprint : RT_TEXTURE_LOD_BASE;
 	for (uint k = found_count; k > 0u; k--) {
 		uint i = found[k - 1u];
 		vec3 uv_local = rt_decal_uv(i, p_h.hit_pos);
@@ -138,14 +159,14 @@ void apply_decals(HitData p_h, inout MaterialResult r_m) {
 
 		if (rt_decals[i].albedo_rect != vec4(0.0)) {
 			vec4 albedo_rect = rt_decals[i].albedo_rect;
-			vec4 decal_albedo = textureLod(sampler2D(rt_decal_atlas_srgb, rt_decal_sampler), uv_local.xz * albedo_rect.zw + albedo_rect.xy, 0.0);
+			vec4 decal_albedo = textureLod(sampler2D(rt_decal_atlas_srgb, rt_decal_sampler), uv_local.xz * albedo_rect.zw + albedo_rect.xy, rt_decal_lod(i, albedo_rect, footprint, p_h.geometry_normal));
 			decal_albedo *= rt_decals[i].modulate;
 			decal_albedo.a *= fade;
 			r_m.albedo = mix(r_m.albedo, decal_albedo.rgb, decal_albedo.a * rt_decals[i].albedo_mix);
 
 			if (rt_decals[i].normal_rect != vec4(0.0)) {
 				vec4 normal_rect = rt_decals[i].normal_rect;
-				vec3 decal_normal = textureLod(sampler2D(rt_decal_atlas, rt_decal_sampler), uv_local.xz * normal_rect.zw + normal_rect.xy, 0.0).xyz;
+				vec3 decal_normal = textureLod(sampler2D(rt_decal_atlas, rt_decal_sampler), uv_local.xz * normal_rect.zw + normal_rect.xy, rt_decal_lod(i, normal_rect, footprint, p_h.geometry_normal)).xyz;
 				decal_normal.xy = decal_normal.xy * vec2(2.0, -2.0) - vec2(1.0, -1.0); // The raster's flipped y.
 				decal_normal.z = sqrt(max(0.0, 1.0 - dot(decal_normal.xy, decal_normal.xy)));
 				// Decal space to world space, xzy because y is up.
@@ -156,7 +177,7 @@ void apply_decals(HitData p_h, inout MaterialResult r_m) {
 
 			if (rt_decals[i].orm_rect != vec4(0.0)) {
 				vec4 orm_rect = rt_decals[i].orm_rect;
-				vec3 decal_orm = textureLod(sampler2D(rt_decal_atlas, rt_decal_sampler), uv_local.xz * orm_rect.zw + orm_rect.xy, 0.0).xyz;
+				vec3 decal_orm = textureLod(sampler2D(rt_decal_atlas, rt_decal_sampler), uv_local.xz * orm_rect.zw + orm_rect.xy, rt_decal_lod(i, orm_rect, footprint, p_h.geometry_normal)).xyz;
 				r_m.roughness = mix(r_m.roughness, decal_orm.g, decal_albedo.a);
 				r_m.metalness = mix(r_m.metalness, decal_orm.b, decal_albedo.a);
 			}
@@ -166,7 +187,7 @@ void apply_decals(HitData p_h, inout MaterialResult r_m) {
 			// Additive and independent of the albedo, with the exposure normalisation MaterialResult carries,
 			// apart from the material's own: the emissive light sampling never draws it, so it takes no MIS weight.
 			vec4 emission_rect = rt_decals[i].emission_rect;
-			vec3 decal_emission = textureLod(sampler2D(rt_decal_atlas_srgb, rt_decal_sampler), uv_local.xz * emission_rect.zw + emission_rect.xy, 0.0).rgb;
+			vec3 decal_emission = textureLod(sampler2D(rt_decal_atlas_srgb, rt_decal_sampler), uv_local.xz * emission_rect.zw + emission_rect.xy, rt_decal_lod(i, emission_rect, footprint, p_h.geometry_normal)).rgb;
 			r_m.decal_emissive += decal_emission * rt_decals[i].modulate.rgb * rt_decals[i].emission_energy * fade * scene_data_block.data.emissive_exposure_normalization;
 		}
 	}

@@ -8,10 +8,6 @@
 //
 // Required includes (before this file): raytracing_inc.glsl, raytracing_common_inc.glsl.
 
-// The level of a hit whose texture density is unknown (a procedural hit, a triangle without UVs
-// or with zero area, the switch off): every texture reads its base level.
-const float RT_TEXTURE_LOD_BASE = -128.0;
-
 // The debug view of the level a 1024 x 1024 texture gets at the primary hit
 // (Environment.RT_DEBUG_TEXTURE_LOD).
 #define RT_VIS_MODE_TEXTURE_LOD 23
@@ -66,21 +62,30 @@ float rt_cone_scatter_spread(float p_spread, float p_pdf) {
 	return min(p_spread + 0.3 * lobe, 2.0 * PI);
 }
 
-/// The texture-independent level at a triangle hit: half the log2 of the triangle's UV area over
-/// its world area, plus the log2 of the cone's width over the square root of the cosine between
-/// the ray and the face normal (RTXPT's "more detail on slopes", sharper than the paper's plain
-/// cosine at grazing angles), plus the raster's mipmap bias. Edges are in trace space (the
-/// instance transform applied); UVs as the mesh holds them, before any material scale.
-float rt_texture_lod_triangle(vec3 p_e1, vec3 p_e2, vec2 p_uv0, vec2 p_uv1, vec2 p_uv2, vec3 p_ray_dir, float p_width) {
-	vec3 n = cross(p_e1, p_e2);
+/// The cone's footprint at a triangle hit as a level in metres: the log2 of the cone's width over
+/// the square root of the cosine between the ray and the face normal (RTXPT's "more detail on
+/// slopes", sharper than the paper's plain cosine at grazing angles), plus the raster's mipmap bias.
+/// A texture mapped at d texels per metre reads at this plus log2(d). p_cross is the cross product of
+/// the triangle's edges in trace space (the instance transform applied).
+float rt_texture_footprint(vec3 p_cross, vec3 p_ray_dir, float p_width) {
+	vec3 n = p_cross;
 	float world_area = length(n);
-	vec2 duv1 = p_uv1 - p_uv0;
-	vec2 duv2 = p_uv2 - p_uv0;
-	float uv_area = abs(duv1.x * duv2.y - duv1.y * duv2.x);
-	if (!(world_area > 1e-20) || !(uv_area > 1e-20) || !(p_width > 0.0)) {
+	if (!(world_area > 1e-20) || !(p_width > 0.0)) {
 		return RT_TEXTURE_LOD_BASE;
 	}
 	float cosine = max(abs(dot(n / world_area, p_ray_dir)), 1e-4);
-	float lod = 0.5 * log2(uv_area / world_area) + log2(p_width) - 0.5 * log2(cosine) + get_rt_param(RT_PARAM_TEXTURE_LOD_BIAS);
-	return max(lod, RT_TEXTURE_LOD_BASE);
+	return max(log2(p_width) - 0.5 * log2(cosine) + get_rt_param(RT_PARAM_TEXTURE_LOD_BIAS), RT_TEXTURE_LOD_BASE);
+}
+
+/// The texture-independent level at a triangle hit: the footprint plus half the log2 of the
+/// triangle's UV area over its world area, the mesh's UV density (UVs as the mesh holds them,
+/// before any material scale).
+float rt_texture_lod_triangle(float p_footprint, vec3 p_cross, vec2 p_uv0, vec2 p_uv1, vec2 p_uv2) {
+	vec2 duv1 = p_uv1 - p_uv0;
+	vec2 duv2 = p_uv2 - p_uv0;
+	float uv_area = abs(duv1.x * duv2.y - duv1.y * duv2.x);
+	if (p_footprint <= RT_TEXTURE_LOD_BASE || !(uv_area > 1e-20)) {
+		return RT_TEXTURE_LOD_BASE;
+	}
+	return max(p_footprint + 0.5 * log2(uv_area / length(p_cross)), RT_TEXTURE_LOD_BASE);
 }

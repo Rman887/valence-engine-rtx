@@ -156,11 +156,13 @@ HitData compute_hit_data() {
 
 	h.hit_pos = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
 
-	// The ray cone's level (D116), only where something reads it: the triangle's corners in object
-	// space (a compressed surface's unorm box, which the instance transform maps), from the vertex
-	// buffer, or on a cluster geometry hit from the CLAS (D93b), whose blob holds no positions.
+	// The ray cone's footprint and level (D116), only where something reads them: the triangle's
+	// corners in object space (a compressed surface's unorm box, which the instance transform maps),
+	// from the vertex buffer, or on a cluster geometry hit from the CLAS (D93b), whose blob holds no
+	// positions. A surface without UVs still has a footprint, which its decals read, when there are any.
 	h.texture_lod = RT_TEXTURE_LOD_BASE;
-	if (rt_texture_lod_wanted() && (geom.flags & FLAG_PROCEDURAL) == 0u && attrs.has_uv) {
+	h.texture_footprint = RT_TEXTURE_LOD_BASE;
+	if (rt_texture_lod_wanted() && (geom.flags & FLAG_PROCEDURAL) == 0u && (attrs.has_uv || get_rt_param(RT_PARAM_DECAL_COUNT) > 0.5)) {
 		vec3 p0, p1, p2;
 		bool has_positions = true;
 		if ((geom.flags & FLAG_CLUSTER_GEOMETRY) != 0u && rt_hit_cluster_id() != RT_CLUSTER_ID_NONE) {
@@ -180,8 +182,12 @@ HitData compute_hit_data() {
 		}
 		if (has_positions) {
 			mat3 object_to_world = mat3(gl_ObjectToWorldEXT);
+			vec3 n = cross(object_to_world * (p1 - p0), object_to_world * (p2 - p0));
 			vec2 cone = unpackHalf2x16(payload.packed_cone);
-			h.texture_lod = rt_texture_lod_triangle(object_to_world * (p1 - p0), object_to_world * (p2 - p0), attrs.uv_corners[0], attrs.uv_corners[1], attrs.uv_corners[2], gl_WorldRayDirectionEXT, cone.x + cone.y * gl_HitTEXT);
+			h.texture_footprint = rt_texture_footprint(n, gl_WorldRayDirectionEXT, cone.x + cone.y * gl_HitTEXT);
+			if (attrs.has_uv) {
+				h.texture_lod = rt_texture_lod_triangle(h.texture_footprint, n, attrs.uv_corners[0], attrs.uv_corners[1], attrs.uv_corners[2]);
+			}
 		}
 	}
 

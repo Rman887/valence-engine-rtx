@@ -37,6 +37,8 @@ vec2 alpha_texture_coordinate = vec2(0.0);
 #define color_buffer bindless_textures[0]
 #define normal_roughness_buffer bindless_textures[0]
 
+#include "raytracing_custom_texture_inc.glsl"
+
 /* RT_CUSTOM_TEXTURE_DEFINES */
 /* RT_CUSTOM_FRAGMENT_GLOBALS */
 

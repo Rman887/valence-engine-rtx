@@ -43,6 +43,8 @@
 // rt_params[5].y (21) is unused.
 #define RT_PARAM_TEXTURE_LOD_BIAS 22 // rt_params[5].z - The raster samplers' mipmap bias, added to every cone level
 #define RT_PARAM_TEXTURE_LOD 23 // rt_params[5].w - 1 when the hit shaders sample at the cone's level, 0 for level 0 everywhere
+// A texture level that is unknown (D116): every texture reads its base level.
+const float RT_TEXTURE_LOD_BASE = -128.0;
 
 // ============================================================================
 // PATHTRACING PAYLOAD (56 bytes, fp16/unorm-packed)

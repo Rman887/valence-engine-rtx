@@ -1517,6 +1517,10 @@ public:
 	bool has_async_builds() const { return async_builds; }
 	uint64_t get_async_submit_count() const { return compute_submit_count; }
 	uint64_t get_async_build_fallback_count() const { return async_build_fallbacks; }
+	// Whether the main graph wrote any of these buffers in this frame (D98c). A cluster build reads its
+	// sources by address, so RenderingDevice cannot route it as it routes a triangle build: its caller
+	// asks first and records it on the main queue if so. A true answer counts as a fallback.
+	bool async_build_sources_written(VectorView<RID> p_buffers);
 
 	// ----- PARTITIONED TOP-LEVEL ACCELERATION STRUCTURES (D94) -----
 	//
@@ -2034,7 +2038,7 @@ private:
 	RDD::SemaphoreID compute_semaphore_to_wait_on;
 	RDD::SemaphoreID main_semaphore_to_wait_on;
 	uint64_t compute_submit_count = 0;
-	uint64_t async_build_fallbacks = 0; // Triangle builds in the scope recorded on the main queue: their inputs were written this frame.
+	uint64_t async_build_fallbacks = 0; // Builds for the scope recorded on the main queue: their inputs were written this frame.
 	RenderingDeviceGraph *_triangle_build_graph(VectorView<RDG::ResourceTracker *> p_src_trackers);
 
 	/**************************/

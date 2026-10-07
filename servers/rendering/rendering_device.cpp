@@ -665,6 +665,21 @@ RenderingDeviceGraph *RenderingDevice::_triangle_build_graph(VectorView<RDG::Res
 	return build_graph;
 }
 
+bool RenderingDevice::async_build_sources_written(VectorView<RID> p_buffers) {
+	ERR_RENDER_THREAD_GUARD_V(false);
+	if (!async_builds) {
+		return false;
+	}
+	for (uint32_t i = 0; i < p_buffers.size(); i++) {
+		const Buffer *buffer = p_buffers[i].is_valid() ? _get_buffer_from_owner(p_buffers[i]) : nullptr;
+		if (buffer != nullptr && draw_graph.resource_written_this_frame(buffer->draw_tracker)) {
+			async_build_fallbacks++;
+			return true;
+		}
+	}
+	return false;
+}
+
 Error RenderingDevice::blas_build(RID p_blas) {
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
 

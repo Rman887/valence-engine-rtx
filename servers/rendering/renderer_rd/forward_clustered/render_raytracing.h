@@ -466,6 +466,8 @@ struct RTClusterArenaRegion {
 	uint64_t size = 0;
 };
 
+struct RTClusterAsyncPopulation;
+
 struct RTSurfaceData {
 	RID blas;
 	RT_GeometryData geometry = {};
@@ -534,9 +536,13 @@ struct RTSurfaceData {
 	// advances, unique over every row, whenever the walk finds `geometry` changed since.
 	RT_GeometryData row_snapshot = {};
 	uint64_t row_generation = 0;
-	// An admitted new triangle surface whose BLAS the compute queue builds (D98b): frames_drawn from
-	// which the main queue may trace it. Until then it is a waiting surface to every reader.
+	// An admitted new surface whose BLAS the compute queue builds (D98b, D98c): frames_drawn from
+	// which the main queue may trace it, stamped where its build is recorded, and UINT64_MAX from
+	// the walk that queued it until then. Until then it is a waiting surface to every reader.
 	uint64_t async_ready_frame = 0;
+	// An admitted new cluster surface (D98c): its population's commands, held from the walk for the
+	// compute queue, and its LOD table writes for the next frame. Null once those landed.
+	RTClusterAsyncPopulation *cluster_async = nullptr;
 };
 
 // A surface's geometry metadata from its format, and the buffers a BLAS of it reads.
@@ -1426,6 +1432,7 @@ struct RTViewportState {
 class RenderRaytracing {
 	friend class RenderForwardClustered;
 	friend class RenderForwardClusteredPT;
+	friend struct RTClusterAsyncPopulation; // Holds an RTClusterLayout (D98c).
 
 	RenderForwardClustered *owner = nullptr;
 	SceneShaderRaytracing *shader = nullptr;
@@ -1604,6 +1611,7 @@ class RenderRaytracing {
 	struct AsyncBlas {
 		RID blas;
 		uint32_t triangles = 0;
+		RTSurfaceData *surf = nullptr; // Stamped ready once recorded; a release takes it off the list.
 	};
 	LocalVector<AsyncBlas> async_blas_list;
 	uint32_t frame_async_builds = 0;
@@ -1615,6 +1623,30 @@ class RenderRaytracing {
 	uint64_t async_pulled_back = 0;
 	uint64_t async_forced_drops = 0;
 	void _record_async_builds();
+
+	// The cluster path on the async build queue (D98c). An admitted new surface's population runs in
+	// the walk with cluster_capture set: its CPU work and its handles are made there, and its commands
+	// are held (RTClusterAsyncPopulation) and recorded after the walk, in the scope, or on the main
+	// queue where the main graph wrote a source this frame. Its LOD table writes land on the main queue
+	// in the next frame's prepare_frame, before the walk that may trace it. A stream load's issue
+	// records in a scope of its own.
+	RTClusterAsyncPopulation *cluster_capture = nullptr;
+	LocalVector<RTClusterAsyncPopulation *> cluster_async_populations; // In the walk's order.
+	bool walk_in_compute_list = false; // Phase 2's merges: no build records here, a pull-back included.
+	uint64_t async_triangle_builds_total = 0;
+	uint64_t async_compactions_total = 0;
+	uint64_t async_cluster_populations_total = 0;
+	uint64_t async_cluster_fallbacks = 0;
+	uint64_t async_stream_issues_total = 0;
+	uint64_t async_stream_fallbacks = 0;
+	Error _cluster_buffer_update(RID p_buffer, uint32_t p_offset, uint32_t p_size, const void *p_data);
+	Error _cluster_table_update(uint32_t p_offset, uint32_t p_size, const void *p_data);
+	Error _cluster_build(const RD::ClusterAccelerationStructureBuild &p_build);
+	Error _cluster_sizes_readback(RID p_buffer, const Callable &p_callback, uint32_t p_offset, uint32_t p_size);
+	bool _record_cluster_population(RTClusterAsyncPopulation *p_population);
+	bool _finish_cluster_population(RTClusterAsyncPopulation *p_population);
+	void _finish_cluster_populations_in_flight();
+	void _drop_cluster_population(RTSurfaceData *p_surf_data);
 
 	// D98a's concurrency probe (the debug argument --async-probe): one synthetic BLAS of about a
 	// million triangles, rebuilt in an async build scope every frame and never traced, so the compute
@@ -2287,7 +2319,9 @@ class RenderRaytracing {
 	// the frame's batch, and the flush that runs the selection and builds every instance's BLAS.
 	bool _cluster_lod_table_allocate(uint32_t p_words, uint32_t &r_offset);
 	void _cluster_lod_table_free(uint32_t p_offset, uint32_t p_words);
-	void _populate_surface_cluster_lod(void *p_mesh_surface, const RTClusterLayout &p_layout, RID p_args_buffer, uint64_t p_implicit_addresses_offset, uint32_t p_cache_key, RTSurfaceData *r_surf_data);
+	void _populate_surface_cluster_lod(const Vector<uint8_t> &p_cluster_data, const RTClusterLayout &p_layout, RID p_args_buffer, uint64_t p_implicit_addresses_offset, uint32_t p_cache_key, RTSurfaceData *r_surf_data);
+	// The hierarchy with a streamed surface's residency (D92), or its coarsest cut where it cannot be placed.
+	void _attach_surface_cluster_lod(const Vector<uint8_t> &p_cluster_data, const RTClusterLayout &p_layout, RTLodStream *p_stream, RID p_args_buffer, uint64_t p_implicit_addresses_offset, uint32_t p_cache_key, RTSurfaceData *r_surf_data);
 	void _release_surface_cluster_lod(RTSurfaceData *p_surf_data);
 	RTLodInstanceEntry *_access_lod_slot(RID &r_handle);
 	void _release_lod_entry(RTLodInstanceEntry &p_entry);

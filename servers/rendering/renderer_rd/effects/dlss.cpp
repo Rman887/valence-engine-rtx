@@ -46,7 +46,9 @@ using namespace RendererRD;
 
 // Texture layout/state constants (avoid including Vulkan/D3D12 headers here).
 static constexpr uint64_t DLSS_VK_IMAGE_LAYOUT_SHADER_READ_ONLY = 5;
+static constexpr uint64_t DLSS_VK_IMAGE_LAYOUT_GENERAL = 1;
 static constexpr uint64_t DLSS_D3D12_RESOURCE_STATE_NON_PIXEL_SR = 0x40;
+static constexpr uint64_t DLSS_D3D12_RESOURCE_STATE_UNORDERED_ACCESS = 0x8;
 static constexpr float DLSS_OPTIMAL_MODE_MAX_DISTANCE = 1000000.0f;
 namespace RendererRD {
 class DLSSContextInner : public DLSSContext {
@@ -265,11 +267,12 @@ void DLSSEffect::upscale(const DLSSContext::Parameters &p_params) {
 		RD::get_singleton()->draw_command_end_label();
 	}
 
-	// Inject DLSS into the render graph
+	// Inject DLSS into the render graph. The inputs are sampled; the output is written, in the
+	// general layout its Streamline tag states, so the graph orders every later reader of it after
+	// the evaluation (the tonemap, the auto exposure meter).
 	RD::CallbackResource res[8]; // Increased for DLSS-RR buffers
 	int num_resources = 0;
 	res[num_resources++].rid = p_params.color;
-	res[num_resources++].rid = p_params.output;
 	res[num_resources++].rid = p_params.depth;
 	res[num_resources++].rid = p_params.velocity;
 
@@ -292,6 +295,8 @@ void DLSSEffect::upscale(const DLSSContext::Parameters &p_params) {
 	for (int i = 0; i < num_resources; i++) {
 		res[i].usage = RD::CALLBACK_RESOURCE_USAGE_TEXTURE_SAMPLE;
 	}
+	res[num_resources].rid = p_params.output;
+	res[num_resources++].usage = RD::CALLBACK_RESOURCE_USAGE_STORAGE_IMAGE_READ_WRITE;
 	RD::get_singleton()->driver_callback_add((RDD::DriverCallback)DLSSEffect::_upscale_internal_graph_callback, p_params.context, VectorView<RD::CallbackResource>(res, num_resources));
 }
 
@@ -301,18 +306,21 @@ void DLSSEffect::_upscale_internal(RDD::CommandBufferID cmdid, const DLSSContext
 	void *nativeCmdlist = RD::get_singleton()->get_device_driver()->command_buffer_get_native_handle(cmdid);
 
 	// Helper function for tagging resources.
-	auto assignResource = [context](sl::Resource *resources, sl::ResourceTag *resourceTags, int &numResources, RID textureRID, sl::BufferType bufferType, sl::ResourceLifecycle lifecycle) {
+	// The state a tag carries is the layout the render graph leaves the texture in for the callback:
+	// shader read-only for what DLSS samples, general for the output it writes.
+	auto assignResource = [context, &p_params](sl::Resource *resources, sl::ResourceTag *resourceTags, int &numResources, RID textureRID, sl::BufferType bufferType, sl::ResourceLifecycle lifecycle) {
 		if (!textureRID.is_valid() || textureRID.is_null()) {
 			return;
 		}
+		const bool written = textureRID == p_params.output;
 
 		RD::TextureFormat texture_format = RD::get_singleton()->texture_get_format(textureRID);
 		uint64_t texture_image = RD::get_singleton()->get_driver_resource(RD::DriverResource::DRIVER_RESOURCE_TEXTURE, textureRID);
 		uint64_t texture_view = RD::get_singleton()->get_driver_resource(RD::DriverResource::DRIVER_RESOURCE_TEXTURE_VIEW, textureRID);
 		uint64_t texture_device_memory = RD::get_singleton()->get_driver_resource(RD::DriverResource::DRIVER_RESOURCE_TEXTURE_DEVICE_MEMORY, textureRID);
-		uint64_t texture_state = DLSS_VK_IMAGE_LAYOUT_SHADER_READ_ONLY;
+		uint64_t texture_state = written ? DLSS_VK_IMAGE_LAYOUT_GENERAL : DLSS_VK_IMAGE_LAYOUT_SHADER_READ_ONLY;
 		if (context->is_d3d12) {
-			texture_state = DLSS_D3D12_RESOURCE_STATE_NON_PIXEL_SR;
+			texture_state = written ? DLSS_D3D12_RESOURCE_STATE_UNORDERED_ACCESS : DLSS_D3D12_RESOURCE_STATE_NON_PIXEL_SR;
 		}
 		uint64_t texture_vkformat = RD::get_singleton()->get_driver_resource(RD::DriverResource::DRIVER_RESOURCE_TEXTURE_DATA_FORMAT, textureRID);
 		uint64_t texture_usage_flags = RD::get_singleton()->get_driver_resource(RD::DriverResource::DRIVER_RESOURCE_TEXTURE_USAGE_FLAGS, textureRID);

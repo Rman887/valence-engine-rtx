@@ -3270,6 +3270,10 @@
 			[b]Note:[/b] Enabling occlusion culling has a cost on the CPU. Only enable occlusion culling if you actually plan to use it. Large open scenes with few or no objects blocking the view will generally not benefit much from occlusion culling. Large open scenes generally benefit more from mesh LOD and visibility ranges ([member GeometryInstance3D.visibility_range_begin] and [member GeometryInstance3D.visibility_range_end]) compared to occlusion culling.
 			[b]Note:[/b] Due to memory constraints, occlusion culling is not supported by default in Web export templates. It can be enabled by compiling custom Web export templates with [code]module_raycast_enabled=yes[/code].
 		</member>
+		<member name="rendering/pathtracing/async_builds" type="bool" setter="" getter="" default="false">
+			If [code]true[/code] and the GPU has a compute-only queue family, acceleration-structure builds that can wait one frame run on the compute queue, overlapping the frame's rendering instead of preceding it. Every buffer is then shared between the graphics, compute and transfer queues. Experimental: no build moves to the compute queue yet.
+			[b]Note:[/b] Requires a restart to take effect.
+		</member>
 		<member name="rendering/pathtracing/async_shader_compilation" type="bool" setter="" getter="" default="true">
 			If [code]true[/code], path tracing ray hit shaders are compiled asynchronously in the background. This avoids frame stalls when new shader variants are first encountered during rendering. While a shader is compiling, a fallback shader may be used, which can cause temporary visual artifacts. Disable this if you require fully deterministic rendering from the first frame at the cost of potential stalls on shader warm-up.
 		</member>

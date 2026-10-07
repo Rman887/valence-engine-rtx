@@ -162,6 +162,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	HashSet<CharString> enabled_device_extension_names;
 	TightLocalVector<TightLocalVector<Queue>> queue_families;
 	TightLocalVector<VkQueueFamilyProperties> queue_family_properties;
+	TightLocalVector<uint32_t> buffer_concurrent_queue_family_indices; // Empty: buffers are exclusive.
 	RDD::Capabilities device_capabilities;
 	SubgroupCapabilities subgroup_capabilities;
 	MultiviewCapabilities multiview_capabilities;
@@ -274,6 +275,7 @@ public:
 	};
 
 	virtual BufferID buffer_create(uint64_t p_size, BitField<BufferUsageBits> p_usage, MemoryAllocationType p_allocation_type, uint64_t p_frames_drawn) override final;
+	virtual void buffer_set_concurrent_queue_families(VectorView<CommandQueueFamilyID> p_families) override final;
 	virtual bool buffer_set_texel_format(BufferID p_buffer, DataFormat p_format) override final;
 	virtual void buffer_free(BufferID p_buffer) override final;
 	virtual uint64_t buffer_get_allocation_size(BufferID p_buffer) override final;

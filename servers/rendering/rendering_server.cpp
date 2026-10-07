@@ -4223,6 +4223,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/build_budget_triangles_per_frame", PROPERTY_HINT_RANGE, "1024,1073741824,1"), 262144);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/build_budget_builds_per_frame", PROPERTY_HINT_RANGE, "1,1048576,1"), 64);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/build_budget_max_wait_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 30);
+	GLOBAL_DEF_RST("rendering/pathtracing/async_builds", false);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/deformed_mesh_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 60);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_blas_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,18000,1"), 3600);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_merged_blas_max_triangles", PROPERTY_HINT_RANGE, "256,1048576,1"), 65536);

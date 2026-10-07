@@ -60,6 +60,9 @@
 #define ERR_RENDER_THREAD_GUARD() ERR_FAIL_COND_MSG(render_thread_id != Thread::get_caller_id(), ERR_RENDER_THREAD_MSG);
 #define ERR_RENDER_THREAD_GUARD_V(m_ret) ERR_FAIL_COND_V_MSG(render_thread_id != Thread::get_caller_id(), (m_ret), ERR_RENDER_THREAD_MSG);
 
+// What an async build scope refuses (D98): it records on the compute queue, which takes buffers and BLAS or cluster builds only.
+#define ERR_ASYNC_BUILD_GUARD_V(m_ret) ERR_FAIL_COND_V_MSG(async_build_active, (m_ret), "Only buffer transfers and BLAS or cluster builds may be recorded inside an async build scope.");
+
 /**************************/
 /**** HELPER FUNCTIONS ****/
 /**************************/
@@ -658,7 +661,7 @@ Error RenderingDevice::blas_build(RID p_blas) {
 	Error err = _acceleration_structure_scratch_buffer_create(blas);
 	ERR_FAIL_COND_V(err != OK, err);
 
-	draw_graph.add_blas_build(blas->driver_id, blas->scratch_buffer, blas->draw_tracker, blas->draw_trackers);
+	build_graph->add_blas_build(blas->driver_id, blas->scratch_buffer, blas->draw_tracker, blas->draw_trackers);
 
 	blas->invalidated = false;
 	_blas_remove_tlas_dependencies(blas, p_blas);
@@ -679,7 +682,7 @@ Error RenderingDevice::blas_update(RID p_blas) {
 	Error err = _acceleration_structure_scratch_buffer_create(blas);
 	ERR_FAIL_COND_V(err != OK, err);
 
-	draw_graph.add_blas_update(blas->driver_id, blas->scratch_buffer, blas->draw_tracker, blas->draw_trackers);
+	build_graph->add_blas_update(blas->driver_id, blas->scratch_buffer, blas->draw_tracker, blas->draw_trackers);
 
 	blas->invalidated = false;
 	_blas_remove_tlas_dependencies(blas, p_blas);
@@ -689,6 +692,7 @@ Error RenderingDevice::blas_update(RID p_blas) {
 
 Error RenderingDevice::tlas_build(RID p_tlas, Span<AccelerationStructureInstance> p_instances) {
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+	ERR_ASYNC_BUILD_GUARD_V(ERR_UNAVAILABLE);
 
 	ERR_FAIL_COND_V_MSG(draw_list.active, ERR_INVALID_PARAMETER, "Building TLAS is forbidden during creation of a draw list.");
 	ERR_FAIL_COND_V_MSG(compute_list.active, ERR_INVALID_PARAMETER, "Building TLAS is forbidden during creation of a compute list.");
@@ -879,6 +883,7 @@ RID RenderingDevice::micromap_create(Span<MicromapUsage> p_usages) {
 
 Error RenderingDevice::micromap_build(RID p_micromap, RID p_data_buffer, uint64_t p_data_offset, RID p_triangle_buffer, uint64_t p_triangle_offset) {
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+	ERR_ASYNC_BUILD_GUARD_V(ERR_UNAVAILABLE);
 	ERR_FAIL_COND_V_MSG(draw_list.active, ERR_INVALID_PARAMETER, "Building a micromap is forbidden during creation of a draw list.");
 	ERR_FAIL_COND_V_MSG(compute_list.active, ERR_INVALID_PARAMETER, "Building a micromap is forbidden during creation of a compute list.");
 	ERR_FAIL_COND_V_MSG(raytracing_list.active, ERR_INVALID_PARAMETER, "Building a micromap is forbidden during creation of a raytracing list.");
@@ -965,6 +970,7 @@ RID RenderingDevice::ptlas_create(const PartitionedAccelerationStructureLimits &
 
 Error RenderingDevice::ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p_writes, Span<PartitionTranslationWrite> p_translations, bool p_from_scratch) {
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+	ERR_ASYNC_BUILD_GUARD_V(ERR_UNAVAILABLE);
 
 	ERR_FAIL_COND_V_MSG(draw_list.active, ERR_INVALID_PARAMETER, "Building a partitioned TLAS is forbidden during creation of a draw list.");
 	ERR_FAIL_COND_V_MSG(compute_list.active, ERR_INVALID_PARAMETER, "Building a partitioned TLAS is forbidden during creation of a compute list.");
@@ -1536,7 +1542,7 @@ Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAcceler
 	frames[frame].buffers_to_dispose_of.push_back(scratch);
 	rdd_build.scratch_buffer = scratch.driver_id;
 
-	draw_graph.add_cluster_acceleration_structure_build(rdd_build, trackers, usages);
+	build_graph->add_cluster_acceleration_structure_build(rdd_build, trackers, usages);
 
 	// Usable by a TLAS now that the build that writes them is recorded, and, as blas_build and
 	// blas_update do, a TLAS that holds one is invalidated and drops the dependency, so its next
@@ -2085,10 +2091,10 @@ Error RenderingDevice::buffer_copy(RID p_src_buffer, RID p_dst_buffer, uint32_t 
 
 	if (_buffer_make_mutable(dst_buffer, p_dst_buffer)) {
 		// The destination buffer must be mutable to be used as a copy destination.
-		draw_graph.add_synchronization();
+		build_graph->add_synchronization();
 	}
 
-	draw_graph.add_buffer_copy(src_buffer->driver_id, src_buffer->draw_tracker, dst_buffer->driver_id, dst_buffer->draw_tracker, region);
+	build_graph->add_buffer_copy(src_buffer->driver_id, src_buffer->draw_tracker, dst_buffer->driver_id, dst_buffer->draw_tracker, region);
 
 	return OK;
 }
@@ -2129,10 +2135,10 @@ Error RenderingDevice::_buffer_update(Buffer *p_buffer, RID p_buffer_id, uint32_
 		if (!command_buffer_copies_vector.is_empty() && required_action == STAGING_REQUIRED_ACTION_FLUSH_AND_STALL_ALL) {
 			if (_buffer_make_mutable(p_buffer, p_buffer_id)) {
 				// The buffer must be mutable to be used as a copy destination.
-				draw_graph.add_synchronization();
+				build_graph->add_synchronization();
 			}
 
-			draw_graph.add_buffer_update(p_buffer->driver_id, p_buffer->draw_tracker, command_buffer_copies_vector);
+			build_graph->add_buffer_update(p_buffer->driver_id, p_buffer->draw_tracker, command_buffer_copies_vector);
 			command_buffer_copies_vector.clear();
 		}
 
@@ -2161,10 +2167,10 @@ Error RenderingDevice::_buffer_update(Buffer *p_buffer, RID p_buffer_id, uint32_
 	if (!command_buffer_copies_vector.is_empty()) {
 		if (_buffer_make_mutable(p_buffer, p_buffer_id)) {
 			// The buffer must be mutable to be used as a copy destination.
-			draw_graph.add_synchronization();
+			build_graph->add_synchronization();
 		}
 
-		draw_graph.add_buffer_update(p_buffer->driver_id, p_buffer->draw_tracker, command_buffer_copies_vector);
+		build_graph->add_buffer_update(p_buffer->driver_id, p_buffer->draw_tracker, command_buffer_copies_vector);
 	}
 
 	gpu_copy_count++;
@@ -2191,6 +2197,7 @@ Error RenderingDevice::buffer_update(RID p_buffer, uint32_t p_offset, uint32_t p
 
 Error RenderingDevice::driver_callback_add(RDD::DriverCallback p_callback, void *p_userdata, VectorView<CallbackResource> p_resources) {
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+	ERR_ASYNC_BUILD_GUARD_V(ERR_UNAVAILABLE);
 
 	ERR_FAIL_COND_V_MSG(draw_list.active, ERR_INVALID_PARAMETER,
 			"Driver callback is forbidden during creation of a draw list.");
@@ -2286,16 +2293,17 @@ Error RenderingDevice::buffer_clear(RID p_buffer, uint32_t p_offset, uint32_t p_
 
 	if (_buffer_make_mutable(buffer, p_buffer)) {
 		// The destination buffer must be mutable to be used as a clear destination.
-		draw_graph.add_synchronization();
+		build_graph->add_synchronization();
 	}
 
-	draw_graph.add_buffer_clear(buffer->driver_id, buffer->draw_tracker, p_offset, p_size);
+	build_graph->add_buffer_clear(buffer->driver_id, buffer->draw_tracker, p_offset, p_size);
 
 	return OK;
 }
 
 Vector<uint8_t> RenderingDevice::buffer_get_data(RID p_buffer, uint32_t p_offset, uint32_t p_size) {
 	ERR_RENDER_THREAD_GUARD_V(Vector<uint8_t>());
+	ERR_ASYNC_BUILD_GUARD_V(Vector<uint8_t>());
 
 	Buffer *buffer = _get_buffer_from_owner(p_buffer);
 	if (!buffer) {
@@ -2379,12 +2387,12 @@ Error RenderingDevice::buffer_get_data_async(RID p_buffer, const Callable &p_cal
 		if (flush_frames) {
 			if (_buffer_make_mutable(buffer, p_buffer)) {
 				// The buffer must be mutable to be used as a copy source.
-				draw_graph.add_synchronization();
+				build_graph->add_synchronization();
 			}
 
 			for (uint32_t i = 0; i < get_data_request.frame_local_count; i++) {
 				uint32_t local_index = get_data_request.frame_local_index + i;
-				draw_graph.add_buffer_get_data(buffer->driver_id, buffer->draw_tracker, frames[frame].download_buffer_staging_buffers[local_index], frames[frame].download_buffer_copy_regions[local_index]);
+				build_graph->add_buffer_get_data(buffer->driver_id, buffer->draw_tracker, frames[frame].download_buffer_staging_buffers[local_index], frames[frame].download_buffer_copy_regions[local_index]);
 			}
 		}
 
@@ -2413,12 +2421,12 @@ Error RenderingDevice::buffer_get_data_async(RID p_buffer, const Callable &p_cal
 	if (get_data_request.frame_local_count > 0) {
 		if (_buffer_make_mutable(buffer, p_buffer)) {
 			// The buffer must be mutable to be used as a copy source.
-			draw_graph.add_synchronization();
+			build_graph->add_synchronization();
 		}
 
 		for (uint32_t i = 0; i < get_data_request.frame_local_count; i++) {
 			uint32_t local_index = get_data_request.frame_local_index + i;
-			draw_graph.add_buffer_get_data(buffer->driver_id, buffer->draw_tracker, frames[frame].download_buffer_staging_buffers[local_index], frames[frame].download_buffer_copy_regions[local_index]);
+			build_graph->add_buffer_get_data(buffer->driver_id, buffer->draw_tracker, frames[frame].download_buffer_staging_buffers[local_index], frames[frame].download_buffer_copy_regions[local_index]);
 		}
 
 		frames[frame].download_buffer_get_data_requests.push_back(get_data_request);
@@ -3281,6 +3289,7 @@ Error RenderingDevice::_texture_initialize(RID p_texture, uint32_t p_layer, cons
 
 Error RenderingDevice::texture_update(RID p_texture, uint32_t p_layer, const Vector<uint8_t> &p_data) {
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+	ERR_ASYNC_BUILD_GUARD_V(ERR_UNAVAILABLE);
 
 	ERR_FAIL_COND_V_MSG(draw_list.active, ERR_INVALID_PARAMETER, "Updating textures is forbidden during creation of a draw list.");
 	ERR_FAIL_COND_V_MSG(compute_list.active, ERR_INVALID_PARAMETER, "Updating textures is forbidden during creation of a compute list.");
@@ -3699,6 +3708,7 @@ void RenderingDevice::_texture_clear_depth_stencil(RID p_texture_rid, Texture *p
 
 Vector<uint8_t> RenderingDevice::texture_get_data(RID p_texture, uint32_t p_layer) {
 	ERR_RENDER_THREAD_GUARD_V(Vector<uint8_t>());
+	ERR_ASYNC_BUILD_GUARD_V(Vector<uint8_t>());
 
 	Texture *tex = texture_owner.get_or_null(p_texture);
 	ERR_FAIL_NULL_V(tex, Vector<uint8_t>());
@@ -3818,6 +3828,7 @@ Vector<uint8_t> RenderingDevice::texture_get_data(RID p_texture, uint32_t p_laye
 
 Error RenderingDevice::texture_get_data_async(RID p_texture, uint32_t p_layer, const Callable &p_callback) {
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+	ERR_ASYNC_BUILD_GUARD_V(ERR_UNAVAILABLE);
 
 	Texture *tex = texture_owner.get_or_null(p_texture);
 	ERR_FAIL_NULL_V(tex, ERR_INVALID_PARAMETER);
@@ -3983,6 +3994,7 @@ uint64_t RenderingDevice::texture_get_native_handle(RID p_texture) {
 
 Error RenderingDevice::texture_copy(RID p_from_texture, RID p_to_texture, const Vector3 &p_from, const Vector3 &p_to, const Vector3 &p_size, uint32_t p_src_mipmap, uint32_t p_dst_mipmap, uint32_t p_src_layer, uint32_t p_dst_layer) {
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+	ERR_ASYNC_BUILD_GUARD_V(ERR_UNAVAILABLE);
 
 	Texture *src_tex = texture_owner.get_or_null(p_from_texture);
 	ERR_FAIL_NULL_V(src_tex, ERR_INVALID_PARAMETER);
@@ -4064,6 +4076,7 @@ Error RenderingDevice::texture_copy(RID p_from_texture, RID p_to_texture, const 
 
 Error RenderingDevice::texture_resolve_multisample(RID p_from_texture, RID p_to_texture) {
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+	ERR_ASYNC_BUILD_GUARD_V(ERR_UNAVAILABLE);
 
 	Texture *src_tex = texture_owner.get_or_null(p_from_texture);
 	ERR_FAIL_NULL_V(src_tex, ERR_INVALID_PARAMETER);
@@ -4143,6 +4156,7 @@ bool RenderingDevice::texture_is_discardable(RID p_texture) {
 
 Error RenderingDevice::texture_clear(RID p_texture, const Color &p_color, uint32_t p_base_mipmap, uint32_t p_mipmaps, uint32_t p_base_layer, uint32_t p_layers) {
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
+	ERR_ASYNC_BUILD_GUARD_V(ERR_UNAVAILABLE);
 
 	Texture *src_tex = texture_owner.get_or_null(p_texture);
 	ERR_FAIL_NULL_V(src_tex, ERR_INVALID_PARAMETER);
@@ -6574,6 +6588,7 @@ Error RenderingDevice::screen_free(DisplayServerEnums::WindowID p_screen) {
 
 RenderingDevice::DrawListID RenderingDevice::draw_list_begin_for_screen(DisplayServerEnums::WindowID p_screen, const Color &p_clear_color) {
 	ERR_RENDER_THREAD_GUARD_V(INVALID_ID);
+	ERR_ASYNC_BUILD_GUARD_V(INVALID_ID);
 
 	ERR_FAIL_COND_V_MSG(draw_list.active, INVALID_ID, "Only one draw list can be active at the same time.");
 	ERR_FAIL_COND_V_MSG(compute_list.active, INVALID_ID, "Only one draw/compute list can be active at the same time.");
@@ -6612,6 +6627,7 @@ RenderingDevice::DrawListID RenderingDevice::_draw_list_begin_bind(RID p_framebu
 
 RenderingDevice::DrawListID RenderingDevice::draw_list_begin(RID p_framebuffer, BitField<DrawFlags> p_draw_flags, VectorView<Color> p_clear_color_values, float p_clear_depth_value, uint32_t p_clear_stencil_value, const Rect2 &p_region, uint32_t p_breadcrumb) {
 	ERR_RENDER_THREAD_GUARD_V(INVALID_ID);
+	ERR_ASYNC_BUILD_GUARD_V(INVALID_ID);
 
 	ERR_FAIL_COND_V_MSG(draw_list.active, INVALID_ID, "Only one draw list can be active at the same time.");
 
@@ -7451,6 +7467,7 @@ void RenderingDevice::draw_list_end() {
 
 RenderingDevice::RaytracingListID RenderingDevice::raytracing_list_begin() {
 	ERR_RENDER_THREAD_GUARD_V(INVALID_ID);
+	ERR_ASYNC_BUILD_GUARD_V(INVALID_ID);
 
 	ERR_FAIL_COND_V_MSG(!has_feature(SUPPORTS_RAYTRACING_PIPELINE), INVALID_ID, "The current rendering device has no raytracing pipeline support.");
 
@@ -7760,6 +7777,7 @@ void RenderingDevice::raytracing_list_end() {
 
 RenderingDevice::ComputeListID RenderingDevice::compute_list_begin() {
 	ERR_RENDER_THREAD_GUARD_V(INVALID_ID);
+	ERR_ASYNC_BUILD_GUARD_V(INVALID_ID);
 
 	ERR_FAIL_COND_V_MSG(compute_list.active, INVALID_ID, "Only one compute list can be active at the same time.");
 	ERR_FAIL_COND_V_MSG(raytracing_list.active, INVALID_ID, "Only one raytracing list can be active at the same time.");
@@ -8394,12 +8412,26 @@ void RenderingDevice::_end_transfer_worker(TransferWorker *p_transfer_worker) {
 	p_transfer_worker->recording = false;
 }
 
-void RenderingDevice::_submit_transfer_worker(TransferWorker *p_transfer_worker, VectorView<RDD::SemaphoreID> p_signal_semaphores) {
-	driver->command_queue_execute_and_present(transfer_queue, {}, p_transfer_worker->command_buffer, p_signal_semaphores, p_transfer_worker->command_fence, {});
+void RenderingDevice::_submit_transfer_worker(TransferWorker *p_transfer_worker, VectorView<RDD::SemaphoreID> p_signal_semaphores, VectorView<RDD::SemaphoreID> p_compute_signal_semaphores) {
+	thread_local LocalVector<RDD::SemaphoreID> signal_semaphores;
+	signal_semaphores.clear();
+	for (uint32_t i = 0; i < p_signal_semaphores.size(); i++) {
+		signal_semaphores.push_back(p_signal_semaphores[i]);
+	}
+	for (uint32_t i = 0; i < p_compute_signal_semaphores.size(); i++) {
+		signal_semaphores.push_back(p_compute_signal_semaphores[i]);
+	}
+
+	driver->command_queue_execute_and_present(transfer_queue, {}, p_transfer_worker->command_buffer, signal_semaphores, p_transfer_worker->command_fence, {});
 
 	for (uint32_t i = 0; i < p_signal_semaphores.size(); i++) {
 		// Indicate the frame should wait on these semaphores before executing the main command buffer.
 		frames[frame].semaphores_to_wait_on.push_back(p_signal_semaphores[i]);
+	}
+
+	for (uint32_t i = 0; i < p_compute_signal_semaphores.size(); i++) {
+		// And these before executing the compute command buffer (D98).
+		frames[frame].compute_semaphores_to_wait_on.push_back(p_compute_signal_semaphores[i]);
 	}
 
 	p_transfer_worker->submitted = true;
@@ -8475,7 +8507,7 @@ void RenderingDevice::_check_transfer_worker_index_array(IndexArray *p_index_arr
 	}
 }
 
-void RenderingDevice::_submit_transfer_workers(RDD::CommandBufferID p_draw_command_buffer) {
+void RenderingDevice::_submit_transfer_workers(RDD::CommandBufferID p_draw_command_buffer, bool p_compute_submits) {
 	MutexLock transfer_worker_lock(transfer_worker_pool_mutex);
 	for (uint32_t i = 0; i < transfer_worker_pool_size; i++) {
 		TransferWorker *worker = transfer_worker_pool[i];
@@ -8491,8 +8523,12 @@ void RenderingDevice::_submit_transfer_workers(RDD::CommandBufferID p_draw_comma
 			MutexLock lock(worker->thread_mutex);
 			if (worker->recording) {
 				VectorView<RDD::SemaphoreID> semaphores = p_draw_command_buffer ? frames[frame].transfer_worker_semaphores[i] : VectorView<RDD::SemaphoreID>();
+				// The frame's compute submit waits on every worker the main submit waits on (D98): a check inside an
+				// async build scope counts for the main queue too, and what earlier frames uploaded the compute queue
+				// reaches through the previous main submit, which waited on it.
+				VectorView<RDD::SemaphoreID> compute_semaphores = (p_draw_command_buffer && p_compute_submits) ? frames[frame].compute_transfer_worker_semaphores[i] : VectorView<RDD::SemaphoreID>();
 				_end_transfer_worker(worker);
-				_submit_transfer_worker(worker, semaphores);
+				_submit_transfer_worker(worker, semaphores, compute_semaphores);
 			}
 
 			if (p_draw_command_buffer) {
@@ -9011,6 +9047,11 @@ RenderingDevice::DriverWorkarounds RenderingDevice::get_driver_workarounds() con
 void RenderingDevice::swap_buffers(bool p_present) {
 	ERR_RENDER_THREAD_GUARD();
 
+	if (async_build_active) {
+		ERR_PRINT("An async build scope was left open at the end of the frame; it is closed (D98).");
+		async_build_end();
+	}
+
 	GodotProfileZoneGroupedFirst(_profile_zone, "_end_frame");
 	_end_frame();
 
@@ -9221,6 +9262,14 @@ void RenderingDevice::_begin_frame(bool p_presented) {
 	GodotProfileZoneGrouped(_profile_zone, "draw_graph.begin");
 	draw_graph.begin();
 
+	if (async_builds) {
+		if (command_pool_reset_enabled) {
+			bool reset = driver->command_pool_reset(frames[frame].compute_command_pool);
+			ERR_FAIL_COND(!reset);
+		}
+		compute_graph.begin();
+	}
+
 	// Erase pending resources.
 	GodotProfileZoneGrouped(_profile_zone, "_free_pending_resources");
 	_free_pending_resources(frame);
@@ -9263,10 +9312,16 @@ void RenderingDevice::_end_frame() {
 
 	// The command buffer must be copied into a stack variable as the driver workarounds can change the command buffer in use.
 	RDD::CommandBufferID command_buffer = frames[frame].command_buffer;
+	const bool compute_submits = async_builds && compute_graph.has_commands();
 	GodotProfileZoneGroupedFirst(_profile_zone, "_submit_transfer_workers");
-	_submit_transfer_workers(command_buffer);
+	_submit_transfer_workers(command_buffer, compute_submits);
 	GodotProfileZoneGrouped(_profile_zone, "_submit_transfer_barriers");
 	_submit_transfer_barriers(command_buffer);
+
+	if (async_builds) {
+		GodotProfileZoneGrouped(_profile_zone, "_submit_compute");
+		_submit_compute(compute_submits);
+	}
 
 	GodotProfileZoneGrouped(_profile_zone, "draw_graph.end");
 	draw_graph.end(RENDER_GRAPH_REORDER == 1, RENDER_GRAPH_FULL_BARRIERS == 1, command_buffer, frames[frame].command_buffer_pool);
@@ -9274,6 +9329,145 @@ void RenderingDevice::_end_frame() {
 	driver->command_buffer_end(command_buffer);
 	GodotProfileZoneGrouped(_profile_zone, "driver->end_segment");
 	driver->end_segment();
+}
+
+void RenderingDevice::_submit_compute(bool p_has_commands) {
+	Frame &f = frames[frame];
+
+	// The builds the previous compute submit carried complete before this frame's main submit runs.
+	if (compute_semaphore_to_wait_on) {
+		f.semaphores_to_wait_on.push_back(compute_semaphore_to_wait_on);
+		compute_semaphore_to_wait_on = RDD::SemaphoreID();
+	}
+
+	// And the previous main submit completes before this compute submit runs: what the main queue
+	// wrote, read or waited on in earlier frames is ordered before every build here. A frame without
+	// builds submits an empty command buffer, which takes that wait and signals the fence.
+	if (main_semaphore_to_wait_on) {
+		f.compute_semaphores_to_wait_on.push_back(main_semaphore_to_wait_on);
+		main_semaphore_to_wait_on = RDD::SemaphoreID();
+	}
+
+	// Submitted before the main command buffer, which does not wait on it, so the two overlap.
+	RDD::CommandBufferID command_buffer = f.compute_command_buffer;
+	driver->command_buffer_begin(command_buffer);
+	if (p_has_commands) {
+		// Nothing orders this submit after the previous compute submit: the semaphores chain each queue
+		// through the other's previous frame only, and the graph's trackers start every frame afresh, so a
+		// structure or scratch rebuilt in place frame after frame (a write after a write) would get no
+		// barrier. One full memory barrier at the head of the command buffer orders it.
+		RDD::MemoryAccessBarrier memory_barrier;
+		memory_barrier.src_access = RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT;
+		memory_barrier.dst_access = RDD::BARRIER_ACCESS_MEMORY_READ_BIT | RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT;
+		driver->command_pipeline_barrier(command_buffer, RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, memory_barrier, {}, {}, {});
+		compute_graph.end(RENDER_GRAPH_REORDER == 1, RENDER_GRAPH_FULL_BARRIERS == 1, command_buffer, f.compute_command_buffer_pool);
+	}
+	driver->command_buffer_end(command_buffer);
+
+	RDD::SemaphoreID signal_semaphore;
+	if (p_has_commands) {
+		signal_semaphore = compute_done_semaphores[compute_done_index];
+		compute_done_index = (compute_done_index + 1) % compute_done_semaphores.size();
+		compute_semaphore_to_wait_on = signal_semaphore;
+		compute_submit_count++;
+	}
+	driver->command_queue_execute_and_present(compute_queue, f.compute_semaphores_to_wait_on, command_buffer, signal_semaphore ? signal_semaphore : VectorView<RDD::SemaphoreID>(), f.compute_fence, {});
+	f.compute_semaphores_to_wait_on.clear();
+	f.compute_fence_signaled = true;
+}
+
+void RenderingDevice::_free_compute_frame(Frame &p_frame) {
+	if (p_frame.compute_command_pool) {
+		driver->command_pool_free(p_frame.compute_command_pool);
+		p_frame.compute_command_pool = RDD::CommandPoolID();
+	}
+	if (p_frame.compute_fence) {
+		driver->fence_free(p_frame.compute_fence);
+		p_frame.compute_fence = RDD::FenceID();
+	}
+	for (uint32_t j = 0; j < p_frame.compute_transfer_worker_semaphores.size(); j++) {
+		if (p_frame.compute_transfer_worker_semaphores[j]) {
+			driver->semaphore_free(p_frame.compute_transfer_worker_semaphores[j]);
+		}
+	}
+	p_frame.compute_transfer_worker_semaphores.clear();
+}
+
+void RenderingDevice::_free_async_build_semaphores() {
+	for (uint32_t i = 0; i < compute_done_semaphores.size(); i++) {
+		if (compute_done_semaphores[i]) {
+			driver->semaphore_free(compute_done_semaphores[i]);
+		}
+	}
+	compute_done_semaphores.clear();
+	for (uint32_t i = 0; i < main_done_semaphores.size(); i++) {
+		if (main_done_semaphores[i]) {
+			driver->semaphore_free(main_done_semaphores[i]);
+		}
+	}
+	main_done_semaphores.clear();
+}
+
+bool RenderingDevice::_create_async_builds() {
+	// Each frame's compute command buffer, fence and transfer-worker semaphores, and the two rings of
+	// semaphores the queues wait on each other with. On a failure everything created is freed and the
+	// builds stay on the main queue.
+	bool failed = false;
+	for (uint32_t i = 0; i < frames.size() && !failed; i++) {
+		Frame &f = frames[i];
+		f.compute_command_pool = driver->command_pool_create(compute_queue_family, RDD::COMMAND_BUFFER_TYPE_PRIMARY);
+		f.compute_command_buffer = f.compute_command_pool ? driver->command_buffer_create(f.compute_command_pool) : RDD::CommandBufferID();
+		f.compute_command_buffer_pool.pool = f.compute_command_pool;
+		f.compute_fence = driver->fence_create();
+		failed = !f.compute_command_buffer || !f.compute_fence;
+		for (uint32_t j = 0; j < transfer_worker_pool_max_size && !failed; j++) {
+			f.compute_transfer_worker_semaphores.push_back(driver->semaphore_create());
+			failed = !f.compute_transfer_worker_semaphores[j];
+		}
+	}
+	for (uint32_t i = 0; i <= frames.size() && !failed; i++) {
+		compute_done_semaphores.push_back(driver->semaphore_create());
+		main_done_semaphores.push_back(driver->semaphore_create());
+		failed = !compute_done_semaphores[i] || !main_done_semaphores[i];
+	}
+
+	if (failed) {
+		for (uint32_t i = 0; i < frames.size(); i++) {
+			_free_compute_frame(frames[i]);
+		}
+		_free_async_build_semaphores();
+		driver->command_queue_free(compute_queue);
+		compute_queue = RDD::CommandQueueID();
+		async_builds = false;
+		return false;
+	}
+
+	// Every buffer is shared by the queues that touch buffers, with no ownership transfers. No buffer
+	// has been created yet.
+	RDD::CommandQueueFamilyID families[3] = { main_queue_family, compute_queue_family, transfer_queue_family };
+	driver->buffer_set_concurrent_queue_families(VectorView<RDD::CommandQueueFamilyID>(families, 3));
+	print_line(vformat("RenderingDevice: async builds on, compute queue family %d (D98).", int(compute_queue_family.id - 1)));
+	return true;
+}
+
+bool RenderingDevice::async_build_begin() {
+	ERR_RENDER_THREAD_GUARD_V(false);
+	ERR_FAIL_COND_V_MSG(async_build_active, false, "An async build scope is already open.");
+	ERR_FAIL_COND_V_MSG(draw_list.active || compute_list.active || raytracing_list.active, false, "An async build scope can't open inside a list.");
+	if (!async_builds) {
+		return false;
+	}
+
+	async_build_active = true;
+	build_graph = &compute_graph;
+	return true;
+}
+
+void RenderingDevice::async_build_end() {
+	ERR_RENDER_THREAD_GUARD();
+	ERR_FAIL_COND_MSG(!async_build_active, "No async build scope is open.");
+	async_build_active = false;
+	build_graph = &draw_graph;
 }
 
 void RenderingDevice::execute_chained_cmds(bool p_present_swap_chain, RenderingDeviceDriver::FenceID p_draw_fence,
@@ -9312,6 +9506,12 @@ void RenderingDevice::execute_chained_cmds(bool p_present_swap_chain, RenderingD
 			signal_semaphore = p_dst_draw_semaphore_to_signal;
 			signal_fence = p_draw_fence;
 
+			if (async_builds) {
+				// And the semaphore the next compute submit waits on (D98).
+				main_semaphore_to_wait_on = main_done_semaphores[main_done_index];
+				main_done_index = (main_done_index + 1) % main_done_semaphores.size();
+			}
+
 			if (p_present_swap_chain) {
 				// Just present the swap chains as part of the last command execution.
 				swap_chains = frames[frame].swap_chains_to_present;
@@ -9321,9 +9521,16 @@ void RenderingDevice::execute_chained_cmds(bool p_present_swap_chain, RenderingD
 			// Semaphores always need to be signaled if it's not the last command buffer.
 		}
 
-		driver->command_queue_execute_and_present(main_queue, wait_semaphores, command_buffer,
-				signal_semaphore ? signal_semaphore : VectorView<RDD::SemaphoreID>(), signal_fence,
-				swap_chains);
+		thread_local LocalVector<RDD::SemaphoreID> signal_semaphores;
+		signal_semaphores.clear();
+		if (signal_semaphore) {
+			signal_semaphores.push_back(signal_semaphore);
+		}
+		if (signal_fence && main_semaphore_to_wait_on) {
+			signal_semaphores.push_back(main_semaphore_to_wait_on);
+		}
+
+		driver->command_queue_execute_and_present(main_queue, wait_semaphores, command_buffer, signal_semaphores, signal_fence, swap_chains);
 
 		// Make the next command buffer wait on the semaphore signaled by this one.
 		wait_semaphores.resize(1);
@@ -9362,6 +9569,13 @@ void RenderingDevice::_execute_frame(bool p_present) {
 
 void RenderingDevice::_stall_for_frame(uint32_t p_frame) {
 	thread_local PackedByteArray packed_byte_array;
+
+	if (frames[p_frame].compute_fence_signaled) {
+		// The frame's compute submit used what the downloads and the frees below release (D98).
+		GodotProfileZoneGroupedFirst(_profile_zone, "driver->fence_wait (compute)");
+		driver->fence_wait(frames[p_frame].compute_fence);
+		frames[p_frame].compute_fence_signaled = false;
+	}
 
 	if (frames[p_frame].fence_signaled) {
 		GodotProfileZoneGroupedFirst(_profile_zone, "driver->fence_wait");
@@ -9578,6 +9792,21 @@ Error RenderingDevice::initialize(RenderingContextDriver *p_context, DisplayServ
 	transfer_queue = driver->command_queue_create(transfer_queue_family);
 	ERR_FAIL_COND_V(!transfer_queue, FAILED);
 
+	// The compute-only family's queue, for the builds recorded in an async build scope (D98). The setting
+	// is registered with the rendering server's, after the device starts, so its default is given here.
+	// Vulkan only: the other drivers keep their builds on the main queue.
+	if (is_main_instance && driver->get_api_name() == "Vulkan" && bool(ProjectSettings::get_singleton()->get_setting("rendering/pathtracing/async_builds", false))) {
+		compute_queue_family = driver->command_queue_family_get(RDD::COMMAND_QUEUE_FAMILY_COMPUTE_BIT);
+		if (compute_queue_family && compute_queue_family != main_queue_family) {
+			compute_queue = driver->command_queue_create(compute_queue_family);
+			async_builds = bool(compute_queue);
+		}
+
+		if (!async_builds) {
+			WARN_PRINT("rendering/pathtracing/async_builds is set, but the device has no separate compute queue family; builds stay on the main queue (D98).");
+		}
+	}
+
 	if (present_queue_family) {
 		// Create the present queue.
 		present_queue = driver->command_queue_create(present_queue_family);
@@ -9673,6 +9902,10 @@ Error RenderingDevice::initialize(RenderingContextDriver *p_context, DisplayServ
 		ERR_FAIL_V_MSG(FAILED, "Failed to create frame data.");
 	}
 
+	if (async_builds && !_create_async_builds()) {
+		WARN_PRINT("The compute queue's command buffers or semaphores could not be created; builds stay on the main queue (D98).");
+	}
+
 	// Start from frame count, so everything else is immediately old.
 	frames_drawn = frames.size();
 
@@ -9683,6 +9916,13 @@ Error RenderingDevice::initialize(RenderingContextDriver *p_context, DisplayServ
 	// Create draw graph and start it initialized as well.
 	draw_graph.initialize(driver, &_render_pass_create_from_graph, frames.size(), main_queue_family, SECONDARY_COMMAND_BUFFERS_PER_FRAME);
 	draw_graph.begin();
+
+	if (async_builds) {
+		// The compute queue's graph records builds and buffer transfers only, so it needs no secondary command buffers.
+		compute_graph.initialize(driver, &_render_pass_create_from_graph, frames.size(), compute_queue_family, 0);
+		compute_graph.set_uses_async_twins(true);
+		compute_graph.begin();
+	}
 
 	for (uint32_t i = 0; i < frames.size(); i++) {
 		// Reset all queries in a query pool before doing any operations with them..
@@ -10029,6 +10269,9 @@ void RenderingDevice::finalize() {
 
 	// Delete everything the graph has created.
 	draw_graph.finalize();
+	if (async_builds) {
+		compute_graph.finalize();
+	}
 
 	// Free all resources.
 	_free_rids(render_pipeline_owner, "Pipeline");
@@ -10103,7 +10346,11 @@ void RenderingDevice::finalize() {
 		for (uint32_t j = 0; j < frames[i].transfer_worker_semaphores.size(); j++) {
 			driver->semaphore_free(frames[i].transfer_worker_semaphores[j]);
 		}
+
+		_free_compute_frame(frames[i]);
 	}
+
+	_free_async_build_semaphores();
 
 	if (pipeline_cache_enabled) {
 		update_pipeline_cache(true);
@@ -10157,6 +10404,11 @@ void RenderingDevice::finalize() {
 		}
 
 		transfer_queue = RDD::CommandQueueID();
+	}
+
+	if (compute_queue) {
+		driver->command_queue_free(compute_queue);
+		compute_queue = RDD::CommandQueueID();
 	}
 
 	if (main_queue) {

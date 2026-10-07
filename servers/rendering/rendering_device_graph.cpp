@@ -383,6 +383,19 @@ RenderingDeviceGraph::RaytracingListInstruction *RenderingDeviceGraph::_allocate
 	return reinterpret_cast<RaytracingListInstruction *>(&raytracing_instruction_list.data[raytracing_list_data_offset]);
 }
 
+RenderingDeviceGraph::ResourceTracker *RenderingDeviceGraph::_get_async_twin(ResourceTracker *p_tracker) {
+	// Buffers and acceleration structures only: a second queue never touches an image (D98).
+	DEV_ASSERT(p_tracker != nullptr && p_tracker->texture_driver_id.id == 0 && p_tracker->parent == nullptr);
+	if (p_tracker->async_twin == nullptr) {
+		ResourceTracker *twin = resource_tracker_create();
+		twin->buffer_driver_id = p_tracker->buffer_driver_id;
+		twin->acceleration_structure_driver_id = p_tracker->acceleration_structure_driver_id;
+		p_tracker->async_twin = twin;
+	}
+
+	return p_tracker->async_twin;
+}
+
 void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_trackers, ResourceUsage *p_resource_usages, uint32_t p_resource_count, int32_t p_command_index, RecordedCommand *r_command) {
 	// Assign the next stages derived from the stages the command requires first.
 	r_command->next_stages = r_command->self_stages;
@@ -421,7 +434,7 @@ void RenderingDeviceGraph::_add_command_to_graph(ResourceTracker **p_resource_tr
 	}
 
 	for (uint32_t i = 0; i < p_resource_count; i++) {
-		ResourceTracker *resource_tracker = p_resource_trackers[i];
+		ResourceTracker *resource_tracker = uses_async_twins ? _get_async_twin(p_resource_trackers[i]) : p_resource_trackers[i];
 		DEV_ASSERT(resource_tracker != nullptr);
 
 		resource_tracker->reset_if_outdated(tracking_frame);
@@ -2972,6 +2985,7 @@ void RenderingDeviceGraph::resource_tracker_free(ResourceTracker *p_tracker) {
 		}
 	}
 
+	resource_tracker_free(p_tracker->async_twin);
 	memdelete(p_tracker);
 
 #if PRINT_RESOURCE_TRACKER_TOTAL

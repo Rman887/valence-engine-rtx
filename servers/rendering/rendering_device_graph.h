@@ -220,6 +220,7 @@ public:
 		bool in_parent_dirty_list = false;
 		bool write_command_list_enabled = false;
 		bool is_discardable = false;
+		ResourceTracker *async_twin = nullptr; // The state a graph that records for another queue keeps for this resource (D98).
 
 		_FORCE_INLINE_ void reset_if_outdated(int64_t new_command_frame) {
 			if (new_command_frame != command_frame) {
@@ -839,6 +840,7 @@ private:
 	RDD::DriverWorkarounds driver_workarounds;
 	RenderPassCreationFunction render_pass_creation_function = nullptr;
 	int64_t tracking_frame = 0;
+	bool uses_async_twins = false;
 	LocalVector<uint8_t> command_data;
 	LocalVector<uint32_t> command_data_offsets;
 	LocalVector<RDD::TextureBarrier> command_normalization_barriers;
@@ -873,6 +875,7 @@ private:
 #endif
 
 	static String _usage_to_string(ResourceUsage p_usage);
+	static ResourceTracker *_get_async_twin(ResourceTracker *p_tracker);
 	static bool _is_write_usage(ResourceUsage p_usage);
 	static RDD::TextureLayout _usage_to_image_layout(ResourceUsage p_usage);
 	static RDD::BarrierAccessBits _usage_to_access_bits(ResourceUsage p_usage);
@@ -914,6 +917,10 @@ public:
 	~RenderingDeviceGraph();
 	void initialize(RDD *p_driver, RenderPassCreationFunction p_render_pass_creation_function, uint32_t p_frame_count, RDD::CommandQueueFamilyID p_secondary_command_queue_family, uint32_t p_secondary_command_buffers_per_frame);
 	void finalize();
+	// The graph records for a second queue (D98): it orders its commands through each tracker's twin and
+	// leaves the trackers the main graph uses untouched. The queues order each other through semaphores.
+	void set_uses_async_twins(bool p_enable) { uses_async_twins = p_enable; }
+	bool has_commands() const { return command_count > 0; }
 	void begin();
 	void add_blas_build(RDD::AccelerationStructureID p_blas, RDD::BufferID p_scratch_buffer, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);
 	void add_blas_update(RDD::AccelerationStructureID p_blas, RDD::BufferID p_scratch_buffer, ResourceTracker *p_dst_tracker, VectorView<ResourceTracker *> p_src_trackers);

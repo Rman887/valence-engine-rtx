@@ -1503,6 +1503,20 @@ public:
 	Error blas_update(RID p_blas);
 	Error tlas_build(RID p_tlas, Span<AccelerationStructureInstance> p_instances);
 
+	// ----- ASYNC BUILDS (D98) -----
+	//
+	// With rendering/pathtracing/async_builds (restart) and a compute-only queue family, the BLAS and
+	// cluster builds and the buffer updates, copies, clears and readbacks recorded between
+	// async_build_begin() and async_build_end() run on the compute queue. They are submitted ahead of the
+	// frame's main submit and overlap it; the next frame's main submit waits on them, so what they
+	// write may be read on the main queue from the next frame on, never in the frame that records them.
+	// Images, lists and TLAS, PTLAS and micromap builds are refused inside the scope. Without the
+	// compute queue the scope records on the main queue, so callers need no second path.
+	bool async_build_begin();
+	void async_build_end();
+	bool has_async_builds() const { return async_builds; }
+	uint64_t get_async_submit_count() const { return compute_submit_count; }
+
 	// ----- PARTITIONED TOP-LEVEL ACCELERATION STRUCTURES (D94) -----
 	//
 	// Available when get_partitioned_acceleration_structure_capabilities().supported, which
@@ -1959,7 +1973,7 @@ private:
 	TransferWorker *_acquire_transfer_worker(uint32_t p_transfer_size, uint32_t p_required_align, uint32_t &r_staging_offset);
 	void _release_transfer_worker(TransferWorker *p_transfer_worker);
 	void _end_transfer_worker(TransferWorker *p_transfer_worker);
-	void _submit_transfer_worker(TransferWorker *p_transfer_worker, VectorView<RDD::SemaphoreID> p_signal_semaphores = VectorView<RDD::SemaphoreID>());
+	void _submit_transfer_worker(TransferWorker *p_transfer_worker, VectorView<RDD::SemaphoreID> p_signal_semaphores = VectorView<RDD::SemaphoreID>(), VectorView<RDD::SemaphoreID> p_compute_signal_semaphores = VectorView<RDD::SemaphoreID>());
 	void _wait_for_transfer_worker(TransferWorker *p_transfer_worker);
 	void _flush_barriers_for_transfer_worker(TransferWorker *p_transfer_worker);
 	void _check_transfer_worker_operation(uint32_t p_transfer_worker_index, uint64_t p_transfer_worker_operation);
@@ -1967,7 +1981,7 @@ private:
 	void _check_transfer_worker_texture(Texture *p_texture);
 	void _check_transfer_worker_vertex_array(VertexArray *p_vertex_array);
 	void _check_transfer_worker_index_array(IndexArray *p_index_array);
-	void _submit_transfer_workers(RDD::CommandBufferID p_draw_command_buffer = RDD::CommandBufferID());
+	void _submit_transfer_workers(RDD::CommandBufferID p_draw_command_buffer = RDD::CommandBufferID(), bool p_compute_submits = false);
 	void _submit_transfer_barriers(RDD::CommandBufferID p_draw_command_buffer);
 	void _wait_for_transfer_workers();
 	void _free_transfer_workers();
@@ -1987,6 +2001,10 @@ private:
 	bool _dependencies_make_mutable(RID p_id, RDG::ResourceTracker *p_resource_tracker);
 
 	RenderingDeviceGraph draw_graph;
+	// D98: the compute queue's graph, and the graph builds and buffer transfers record into, which is
+	// compute_graph inside an async build scope and draw_graph everywhere else.
+	RenderingDeviceGraph compute_graph;
+	RenderingDeviceGraph *build_graph = &draw_graph;
 
 	/**************************/
 	/**** QUEUE MANAGEMENT ****/
@@ -1998,6 +2016,23 @@ private:
 	RDD::CommandQueueID main_queue;
 	RDD::CommandQueueID transfer_queue;
 	RDD::CommandQueueID present_queue;
+
+	// D98: the compute-only family's queue, with rendering/pathtracing/async_builds.
+	RDD::CommandQueueFamilyID compute_queue_family;
+	RDD::CommandQueueID compute_queue;
+	bool async_builds = false;
+	bool async_build_active = false;
+	// Every frame's compute submit waits on the previous main submit, and the main submit after a
+	// compute submit that carried builds waits on it. Each semaphore is waited by the next frame's
+	// submit, so a ring of one more than the frames in flight is never signaled again before the
+	// fence of the submit that waited on it has been waited.
+	TightLocalVector<RDD::SemaphoreID> compute_done_semaphores;
+	TightLocalVector<RDD::SemaphoreID> main_done_semaphores;
+	uint32_t compute_done_index = 0;
+	uint32_t main_done_index = 0;
+	RDD::SemaphoreID compute_semaphore_to_wait_on;
+	RDD::SemaphoreID main_semaphore_to_wait_on;
+	uint64_t compute_submit_count = 0;
 
 	/**************************/
 	/**** FRAME MANAGEMENT ****/
@@ -2065,6 +2100,16 @@ private:
 		// This must have the same size of the transfer worker pool.
 		TightLocalVector<RDD::SemaphoreID> transfer_worker_semaphores;
 
+		// D98: the compute queue's command buffer, recorded from compute_graph and submitted ahead of the
+		// main one, and its fence, waited with the main fence before the frame's resources are reused.
+		RDD::CommandPoolID compute_command_pool;
+		RDD::CommandBufferID compute_command_buffer;
+		RDG::CommandBufferPool compute_command_buffer_pool;
+		RDD::FenceID compute_fence;
+		bool compute_fence_signaled = false;
+		LocalVector<RDD::SemaphoreID> compute_semaphores_to_wait_on;
+		TightLocalVector<RDD::SemaphoreID> compute_transfer_worker_semaphores;
+
 		// Extra command buffer pool used for driver workarounds or to reduce GPU bubbles by
 		// splitting the final render pass to the swapchain into its own cmd buffer.
 		RDG::CommandBufferPool command_buffer_pool;
@@ -2091,6 +2136,11 @@ private:
 	int frame = 0;
 	TightLocalVector<Frame> frames;
 	uint64_t frames_drawn = 0;
+
+	void _submit_compute(bool p_has_commands); // D98.
+	void _free_compute_frame(Frame &p_frame);
+	bool _create_async_builds();
+	void _free_async_build_semaphores();
 
 	// Whenever logic/physics request a graphics operation (not just deleting a resource) that requires
 	// us to flush all graphics commands, we must set frames_pending_resources_for_processing = frames.size().

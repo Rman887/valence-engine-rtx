@@ -2245,6 +2245,11 @@ RDD::BufferID RenderingDeviceDriverVulkan::buffer_create(uint64_t p_size, BitFie
 	create_info.size = p_size;
 	create_info.usage = p_usage & ~BUFFER_USAGE_DYNAMIC_PERSISTENT_BIT;
 	create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	if (buffer_concurrent_queue_family_indices.size() > 1) {
+		create_info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+		create_info.queueFamilyIndexCount = buffer_concurrent_queue_family_indices.size();
+		create_info.pQueueFamilyIndices = buffer_concurrent_queue_family_indices.ptr();
+	}
 
 	VmaMemoryUsage vma_usage = VMA_MEMORY_USAGE_UNKNOWN;
 	uint32_t vma_flags_to_remove = 0;
@@ -2335,6 +2340,17 @@ RDD::BufferID RenderingDeviceDriverVulkan::buffer_create(uint64_t p_size, BitFie
 	buf_info->size = original_size;
 
 	return BufferID(buf_info);
+}
+
+void RenderingDeviceDriverVulkan::buffer_set_concurrent_queue_families(VectorView<CommandQueueFamilyID> p_families) {
+	buffer_concurrent_queue_family_indices.clear();
+	for (uint32_t i = 0; i < p_families.size(); i++) {
+		ERR_CONTINUE(p_families[i].id == 0);
+		const uint32_t family_index = uint32_t(p_families[i].id - 1);
+		if (!buffer_concurrent_queue_family_indices.has(family_index)) {
+			buffer_concurrent_queue_family_indices.push_back(family_index);
+		}
+	}
 }
 
 bool RenderingDeviceDriverVulkan::buffer_set_texel_format(BufferID p_buffer, DataFormat p_format) {

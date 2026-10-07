@@ -195,6 +195,9 @@ public:
 	 * @return the buffer.
 	 */
 	virtual BufferID buffer_create(uint64_t p_size, BitField<BufferUsageBits> p_usage, MemoryAllocationType p_allocation_type, uint64_t p_frames_drawn) = 0;
+	// Buffers created from now on are shared by these queue families without ownership transfers (D98's
+	// compute queue). Called once, before any buffer that a second family uses is created.
+	virtual void buffer_set_concurrent_queue_families(VectorView<CommandQueueFamilyID> p_families) {}
 	// Only for a buffer with BUFFER_USAGE_TEXEL_BIT.
 	virtual bool buffer_set_texel_format(BufferID p_buffer, DataFormat p_format) = 0;
 	virtual void buffer_free(BufferID p_buffer) = 0;

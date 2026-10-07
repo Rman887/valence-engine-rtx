@@ -410,6 +410,7 @@ public:
 		Vector<TextureUniformInfo> texture_uniforms; // Sampler2D packed as bindless indices after UBO
 		bool uses_alpha_clip = false; // Writes ALPHA_SCISSOR_THRESHOLD; needs per-HG any-hit
 		bool uses_transmission = false; // Writes TRANSMISSION; the instance keeps its back faces so the refracted ray finds its exit interface
+		String label; // The shader's path, or its material when it has none: what a failed compile is reported under.
 		bool writes_uv = false; // Writes UV or UV2, whose density the mesh's UVs no longer tell: every texture() call reads level 0 (D116)
 		bool is_procedural = false; // Uses intersection shader instead of triangle geometry
 		uint32_t alpha_texture_buffer_offset = UINT32_MAX; // Byte offset of hint_alpha texture index in CustomMaterialUniforms UBO; UINT32_MAX if absent
@@ -466,9 +467,16 @@ public:
 
 		bool dirty = false;
 		bool initial_pipeline_built = false;
+		// The last rebuild failed to install (its pipeline or its hit SBT): the slots it would have made
+		// live stay out of the TLAS, counted as failed, until a rebuild installs.
+		bool rebuild_failed = false;
 	};
 
 	HashMap<uint32_t, PipelineBundle> pipeline_bundles;
+	// Variants whose base compile context or initial pipeline failed: reported once and not retried, so a
+	// deterministic failure does not cost every frame. A settings change keys a new variant, which gets its
+	// own attempt; invalidate_pipeline_bundles() clears the set.
+	HashSet<uint32_t> failed_variants;
 
 	// Single-lane async bundle rebuild (worker: SPIR-V + raytracing_pipeline_create; main: SBT + swap).
 	struct PipelineBuildTask;
@@ -486,6 +494,7 @@ public:
 
 	bool is_hg_ready_in_bundle(uint32_t p_slot_index, uint32_t p_rt_flags) const;
 	bool is_hg_compiling_in_bundle(uint32_t p_slot_index, uint32_t p_rt_flags) const;
+	bool is_hg_failed_in_bundle(uint32_t p_slot_index, uint32_t p_rt_flags) const;
 	void drain_completed_compiles();
 	void finalize_custom_shaders();
 

@@ -5732,7 +5732,7 @@
 			Total triangles processed by BLAS refits this frame (ray tracing only).
 		</constant>
 		<constant name="VIEWPORT_RENDER_INFO_RT_INSTANCES_COMPILING" value="8" enum="ViewportRenderInfo">
-			Instances left out of this frame's TLAS because their custom hit group is still compiling, which takes several frames under [member ProjectSettings.rendering/pathtracing/async_shader_compilation]. A hit group that failed to compile is not counted, so zero means every instance that can be traced is in the frame. A MultiMesh counts each of its instances and a procedural instance counts once, so the count is not in the unit of [constant VIEWPORT_RENDER_INFO_RT_TLAS_INSTANCES] (ray tracing only, editor builds only).
+			Instances left out of this frame's TLAS because their custom hit group is still compiling, which takes several frames under [member ProjectSettings.rendering/pathtracing/async_shader_compilation]. A hit group that failed to compile is counted in [constant VIEWPORT_RENDER_INFO_RT_INSTANCES_FAILED] instead, so zero means every instance that can be traced is in the frame. A MultiMesh counts each of its instances and a procedural instance counts once, so the count is not in the unit of [constant VIEWPORT_RENDER_INFO_RT_TLAS_INSTANCES] (ray tracing only, editor builds only).
 		</constant>
 		<constant name="VIEWPORT_RENDER_INFO_RT_SLOTS_ENABLED" value="9" enum="ViewportRenderInfo">
 			Instance slots enabled in this viewport's partitioned TLAS after this frame's commit: the instances it traces. A frame whose commit failed traces nothing and reads 0 on every partitioned TLAS counter (path tracing with [member ProjectSettings.rendering/pathtracing/partitioned_tlas] only, editor builds only).
@@ -5791,7 +5791,10 @@
 		<constant name="VIEWPORT_RENDER_INFO_RT_STREAM_LOAD_TRIANGLES" value="27" enum="ViewportRenderInfo">
 			Triangles in the groups whose loads started this frame (path tracing with [member ProjectSettings.rendering/pathtracing/cluster_lod_stream] only, editor builds only).
 		</constant>
-		<constant name="VIEWPORT_RENDER_INFO_MAX" value="28" enum="ViewportRenderInfo">
+		<constant name="VIEWPORT_RENDER_INFO_RT_INSTANCES_FAILED" value="28" enum="ViewportRenderInfo">
+			Instances left out of this frame's TLAS because their custom hit group failed to compile (path tracing only, editor builds only). The failure is reported as an engine error (in the output and the debugger) once per hit group per pipeline variant, which a debug view, the denoiser, the sampler, the bounce limits or the SER hint each key anew, naming the stage, the hit group, the shader and the first lines of the compiler's errors; a pipeline rebuild that fails to install is reported the same way and its new hit groups are counted here too. The instances stay out of the trace until the shader changes or a new custom shader rebuilds the bundle; a failed install is not retried. Zero means every custom shader in the frame compiled.
+		</constant>
+		<constant name="VIEWPORT_RENDER_INFO_MAX" value="29" enum="ViewportRenderInfo">
 			Represents the size of the [enum ViewportRenderInfo] enum.
 		</constant>
 		<constant name="VIEWPORT_RENDER_INFO_TYPE_VISIBLE" value="0" enum="ViewportRenderInfoType">

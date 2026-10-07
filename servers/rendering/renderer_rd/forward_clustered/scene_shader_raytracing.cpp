@@ -42,14 +42,32 @@
 
 using namespace RendererSceneRenderImplementation;
 
-static void _dump_failed_shader(const String &p_source, const String &p_label) {
+static String _dump_failed_shader(const String &p_source, const String &p_label) {
 	String tmp_dir = OS::get_singleton()->get_temp_path();
 	String path = tmp_dir.path_join("rt_shader_" + p_label + ".glsl");
 	Ref<FileAccess> f = FileAccess::open(path, FileAccess::WRITE);
 	if (f.is_valid()) {
 		f->store_string(p_source);
-		WARN_PRINT("Dumped failed shader to: " + path);
+		return path;
 	}
+	return String();
+}
+
+// A custom hit group that failed to build leaves its instances out of the trace for as long as the
+// shader is unchanged (RENDER_INFO_RT_INSTANCES_FAILED counts them), so the failure is an error, not a
+// warning: the stage, the slot, the shader, the first error lines and the dumped source.
+static void _report_failed_hit_group(const String &p_stage, uint32_t p_slot, uint32_t p_rt_flags, const String &p_label, const String &p_errors, const String &p_dump) {
+	String head;
+	int lines = 0;
+	for (const String &line : p_errors.split("\n", false)) {
+		if (line.contains("ERROR") || line.contains("error")) {
+			head += "\n    " + line.strip_edges();
+			if (++lines == 4) {
+				break;
+			}
+		}
+	}
+	ERR_PRINT(vformat("RT: custom hit group %d (%s) failed at %s for variant 0x%x; its instances leave the trace.%s%s", p_slot, p_label, p_stage, p_rt_flags, head, p_dump.is_empty() ? String() : "\n    Source: " + p_dump));
 }
 
 namespace {
@@ -380,6 +398,7 @@ void SceneShaderRaytracing::invalidate_pipeline_bundles() {
 	}
 	pipeline_bundles.clear();
 	variant_compile_contexts.clear();
+	failed_variants.clear();
 }
 
 // Async bundle rebuild task (worker: SPIR-V + pipeline; main thread: SBT + swap). Single-lane globally.
@@ -398,6 +417,7 @@ struct SceneShaderRaytracing::PipelineBuildTask {
 		bool needs_compile = false;
 		bool uses_alpha_clip = false;
 		bool is_procedural = false;
+		String label;
 		String ch_src;
 		String ah_src;
 		String is_src;
@@ -620,6 +640,8 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	r_entry.is_procedural = p_is_procedural;
 	r_entry.uses_alpha_clip = detected_alpha_clip || detected_alpha_hash;
 	r_entry.uses_transmission = detected_transmission;
+	const RendererRD::MaterialStorage::ShaderData *label_shader = RendererRD::MaterialStorage::get_singleton()->material_get_shader_data(p_material);
+	r_entry.label = (label_shader && !label_shader->path.is_empty()) ? label_shader->path : vformat("material %d", p_material.get_id());
 	r_entry.writes_uv = detected_uv_write || detected_uv2_write;
 	r_entry.vertex_code = gen_code.code.has("vertex") ? gen_code.code["vertex"] : String();
 	r_entry.fragment_code = gen_code.code.has("fragment") ? gen_code.code["fragment"] : String();
@@ -688,6 +710,27 @@ bool SceneShaderRaytracing::is_hg_ready_in_bundle(uint32_t p_slot_index, uint32_
 		return false;
 	}
 	return b.live_ready_mask[p_slot_index];
+}
+
+// A slot whose hit group failed to compile, for good or in this bundle: its instances stay out of
+// the TLAS until the shader changes, counted apart from the compiling ones (RT_INSTANCES_FAILED).
+bool SceneShaderRaytracing::is_hg_failed_in_bundle(uint32_t p_slot_index, uint32_t p_rt_flags) const {
+	if (p_slot_index == 0 || p_slot_index >= hit_group_slots.size()) {
+		return false;
+	}
+	if (hit_group_slots[p_slot_index].state == HGState::Failed) {
+		return true;
+	}
+	HashMap<uint32_t, PipelineBundle>::ConstIterator it = pipeline_bundles.find(p_rt_flags);
+	if (it == pipeline_bundles.end()) {
+		return false;
+	}
+	const PipelineBundle &b = it->value;
+	if (p_slot_index < b.per_hg_states.size() && b.per_hg_states[p_slot_index] == HGState::Failed) {
+		return true;
+	}
+	const bool live = p_slot_index < b.live_hg_count && p_slot_index < b.live_ready_mask.size() && b.live_ready_mask[p_slot_index];
+	return b.rebuild_failed && !live;
 }
 
 // A slot that is not live in the bundle yet but will be: it has not failed, and a rebuild of
@@ -953,9 +996,13 @@ const SceneShaderRaytracing::PipelineBundle &SceneShaderRaytracing::ensure_pipel
 	if (it != pipeline_bundles.end() && it->value.initial_pipeline_built) {
 		return it->value;
 	}
+	if (failed_variants.has(p_rt_flags)) {
+		return EMPTY_BUNDLE;
+	}
 
 	if (!_ensure_variant_compile_context(p_rt_flags)) {
-		WARN_PRINT(vformat("RT: Failed to build base compile context for variant 0x%x.", p_rt_flags));
+		ERR_PRINT(vformat("RT: Failed to build base compile context for variant 0x%x; the variant is not traced.", p_rt_flags));
+		failed_variants.insert(p_rt_flags);
 		return EMPTY_BUNDLE;
 	}
 
@@ -964,6 +1011,7 @@ const SceneShaderRaytracing::PipelineBundle &SceneShaderRaytracing::ensure_pipel
 
 	// Sync bootstrap: HG0-only pipeline + SBT on render thread; dirty if extra slots exist.
 	if (!_build_initial_bundle(p_rt_flags, bundle)) {
+		failed_variants.insert(p_rt_flags);
 		return EMPTY_BUNDLE;
 	}
 	if (hit_group_slots.size() > 1) {
@@ -1005,7 +1053,7 @@ bool SceneShaderRaytracing::_build_initial_bundle(uint32_t p_rt_flags, PipelineB
 			{ hit_groups.ptr(), (uint64_t)hit_groups.size() },
 			RT_MAX_RECURSION_DEPTH);
 	if (new_pipeline.is_null()) {
-		WARN_PRINT(vformat("RT: initial raytracing_pipeline_create failed for variant 0x%x.", p_rt_flags));
+		ERR_PRINT(vformat("RT: initial raytracing_pipeline_create failed for variant 0x%x; the variant is not traced.", p_rt_flags));
 		return false;
 	}
 	RD::get_singleton()->set_resource_name(new_pipeline, String("RT Pipeline initial [flags=") + itos(p_rt_flags) + "]");
@@ -1015,6 +1063,7 @@ bool SceneShaderRaytracing::_build_initial_bundle(uint32_t p_rt_flags, PipelineB
 
 	RID new_sbt = RD::get_singleton()->hit_sbt_create(new_pipeline, sbt_size);
 	if (new_sbt.is_null()) {
+		ERR_PRINT(vformat("RT: initial hit_sbt_create failed for variant 0x%x; the variant is not traced.", p_rt_flags));
 		RD::get_singleton()->free_rid(new_pipeline);
 		return false;
 	}
@@ -1022,6 +1071,7 @@ bool SceneShaderRaytracing::_build_initial_bundle(uint32_t p_rt_flags, PipelineB
 
 	RD::HitShaderBindingTableRange sbt_range = RD::get_singleton()->hit_sbt_range_alloc(new_sbt, sbt_size);
 	if (!sbt_range) {
+		ERR_PRINT(vformat("RT: initial hit_sbt_range_alloc failed for variant 0x%x; the variant is not traced.", p_rt_flags));
 		RD::get_singleton()->free_rid(new_sbt);
 		RD::get_singleton()->free_rid(new_pipeline);
 		return false;
@@ -1078,6 +1128,7 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 		PipelineBuildTask::SlotInput &si = task->slots[i];
 
 		si.uses_alpha_clip = slot.entry.uses_alpha_clip;
+		si.label = slot.entry.label;
 		si.is_procedural = slot.entry.is_procedural;
 
 		if (slot.state != HGState::Ready) {
@@ -1193,20 +1244,8 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 	p_task->new_per_hg_shaders.resize(n);
 	p_task->new_ready_mask.resize(n);
 
-	LocalVector<RID> created_here;
-	auto cleanup_created = [&]() {
-		for (const RID &r : created_here) {
-			if (r.is_valid()) {
-				RD::get_singleton()->free_rid(r);
-			}
-		}
-		created_here.clear();
-		for (uint32_t i = 0; i < n; i++) {
-			if (p_task->slots[i].existing_per_hg_shader.is_null()) {
-				p_task->new_per_hg_shaders[i] = RID();
-			}
-		}
-	};
+	// The hit groups made here stay in new_per_hg_shaders on every exit, failures included: RD frees on
+	// the render thread only, so _finalize_pipeline_build or _join_lane_for_shutdown frees them.
 
 	if (n > 0) {
 		p_task->new_per_hg_shaders[0] = RID();
@@ -1216,7 +1255,6 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 	String error;
 	for (uint32_t i = 1; i < n; i++) {
 		if (check_abort()) {
-			cleanup_created();
 			p_task->failed = true;
 			finish();
 			return;
@@ -1244,7 +1282,7 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 					RD::SHADER_STAGE_CLOSEST_HIT, si.ch_src, RD::SHADER_LANGUAGE_GLSL, &error);
 		}
 		if (ch_spirv.is_empty()) {
-			_dump_failed_shader(si.ch_src, vformat("hg%d_v%x_closest_hit", i, p_task->rt_flags));
+			_report_failed_hit_group("the closest hit", i, p_task->rt_flags, si.label, error, _dump_failed_shader(si.ch_src, vformat("hg%d_v%x_closest_hit", i, p_task->rt_flags)));
 			p_task->new_per_hg_shaders[i] = RID();
 			p_task->new_ready_mask[i] = false;
 			continue;
@@ -1264,7 +1302,7 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 						RD::SHADER_STAGE_ANY_HIT, si.ah_src, RD::SHADER_LANGUAGE_GLSL, &error);
 			}
 			if (ah_spirv.is_empty()) {
-				_dump_failed_shader(si.ah_src, vformat("hg%d_v%x_any_hit", i, p_task->rt_flags));
+				_report_failed_hit_group("the any hit", i, p_task->rt_flags, si.label, error, _dump_failed_shader(si.ah_src, vformat("hg%d_v%x_any_hit", i, p_task->rt_flags)));
 				p_task->new_per_hg_shaders[i] = RID();
 				p_task->new_ready_mask[i] = false;
 				continue;
@@ -1285,7 +1323,7 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 						RD::SHADER_STAGE_INTERSECTION, si.is_src, RD::SHADER_LANGUAGE_GLSL, &error);
 			}
 			if (is_spirv.is_empty()) {
-				_dump_failed_shader(si.is_src, vformat("hg%d_v%x_intersection", i, p_task->rt_flags));
+				_report_failed_hit_group("the intersection", i, p_task->rt_flags, si.label, error, _dump_failed_shader(si.is_src, vformat("hg%d_v%x_intersection", i, p_task->rt_flags)));
 				p_task->new_per_hg_shaders[i] = RID();
 				p_task->new_ready_mask[i] = false;
 				continue;
@@ -1303,6 +1341,7 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 					custom_stages, vformat("RT_hg%d_v%x", i, p_task->rt_flags));
 		}
 		if (binary.is_empty()) {
+			_report_failed_hit_group("the binary from SPIR-V", i, p_task->rt_flags, si.label, String(), String());
 			p_task->new_per_hg_shaders[i] = RID();
 			p_task->new_ready_mask[i] = false;
 			continue;
@@ -1310,17 +1349,16 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 
 		RID rid = RD::get_singleton()->shader_create_from_bytecode(binary);
 		if (!rid.is_valid()) {
+			_report_failed_hit_group("the shader from its bytecode", i, p_task->rt_flags, si.label, String(), String());
 			p_task->new_per_hg_shaders[i] = RID();
 			p_task->new_ready_mask[i] = false;
 			continue;
 		}
 		p_task->new_per_hg_shaders[i] = rid;
 		p_task->new_ready_mask[i] = true;
-		created_here.push_back(rid);
 	}
 
 	if (check_abort()) {
-		cleanup_created();
 		p_task->failed = true;
 		finish();
 		return;
@@ -1360,7 +1398,6 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 			{ hit_groups.ptr(), (uint64_t)hit_groups.size() },
 			RT_MAX_RECURSION_DEPTH);
 	if (new_pipeline.is_null()) {
-		cleanup_created();
 		p_task->failed = true;
 		p_task->error = "raytracing_pipeline_create returned null";
 		finish();
@@ -1371,8 +1408,8 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 }
 
 void SceneShaderRaytracing::_finalize_pipeline_build(PipelineBuildTask *p_task) {
-	HashMap<uint32_t, PipelineBundle>::Iterator bit = pipeline_bundles.find(p_task->rt_flags);
-	if (bit == pipeline_bundles.end()) {
+	// The hit groups the worker built for this task, freed when they are not installed.
+	auto free_new_hit_groups = [&]() {
 		for (uint32_t i = 0; i < p_task->slots.size(); i++) {
 			if (p_task->slots[i].existing_per_hg_shader.is_null() &&
 					i < p_task->new_per_hg_shaders.size() &&
@@ -1380,22 +1417,53 @@ void SceneShaderRaytracing::_finalize_pipeline_build(PipelineBuildTask *p_task) 
 				RD::get_singleton()->free_rid(p_task->new_per_hg_shaders[i]);
 			}
 		}
+	};
+	HashMap<uint32_t, PipelineBundle>::Iterator bit = pipeline_bundles.find(p_task->rt_flags);
+	if (bit == pipeline_bundles.end()) {
 		if (p_task->new_pipeline.is_valid()) {
 			RD::get_singleton()->free_rid(p_task->new_pipeline);
 		}
+		free_new_hit_groups();
 		return;
 	}
 	PipelineBundle &bundle = bit->value;
 	_bundle_resize_for_slots(bundle);
 
+	// A rebuild that fails to install leaves every slot it would have made live out of the TLAS
+	// until a later rebuild installs, so it is an error and the slots count as failed.
 	if (p_task->failed) {
-		WARN_PRINT(vformat("RT: pipeline rebuild failed for variant 0x%x: %s",
+		ERR_PRINT(vformat("RT: pipeline rebuild failed for variant 0x%x: %s; the custom hit groups it would have added stay out of the trace.",
 				p_task->rt_flags, p_task->error));
+		free_new_hit_groups();
+		bundle.rebuild_failed = true;
 		return;
 	}
 
-	// Install worker outputs into bundle arrays.
 	uint32_t n = (uint32_t)p_task->slots.size();
+	static constexpr uint32_t HIT_SBT_CAPACITY = 4096;
+	uint32_t sbt_size = MAX(n, HIT_SBT_CAPACITY);
+
+	RID new_sbt = RD::get_singleton()->hit_sbt_create(p_task->new_pipeline, sbt_size);
+	if (new_sbt.is_null()) {
+		ERR_PRINT(vformat("RT: hit_sbt_create failed for variant 0x%x; the custom hit groups the rebuild would have added stay out of the trace.", p_task->rt_flags));
+		RD::get_singleton()->free_rid(p_task->new_pipeline);
+		free_new_hit_groups();
+		bundle.rebuild_failed = true;
+		return;
+	}
+	RD::get_singleton()->set_resource_name(new_sbt, String("RT Hit SBT [flags=") + itos(p_task->rt_flags) + "]");
+
+	RD::HitShaderBindingTableRange sbt_range = RD::get_singleton()->hit_sbt_range_alloc(new_sbt, sbt_size);
+	if (!sbt_range) {
+		ERR_PRINT(vformat("RT: hit_sbt_range_alloc failed for variant 0x%x; the custom hit groups the rebuild would have added stay out of the trace.", p_task->rt_flags));
+		RD::get_singleton()->free_rid(new_sbt);
+		RD::get_singleton()->free_rid(p_task->new_pipeline);
+		free_new_hit_groups();
+		bundle.rebuild_failed = true;
+		return;
+	}
+
+	// Install the worker's outputs now that the rebuild cannot fail.
 	for (uint32_t i = 1; i < n; i++) {
 		const PipelineBuildTask::SlotInput &si = p_task->slots[i];
 		if (i >= bundle.per_hg_shaders.size()) {
@@ -1410,25 +1478,6 @@ void SceneShaderRaytracing::_finalize_pipeline_build(PipelineBuildTask *p_task) 
 		} else if (si.needs_compile) {
 			bundle.per_hg_states[i] = HGState::Failed;
 		}
-	}
-
-	static constexpr uint32_t HIT_SBT_CAPACITY = 4096;
-	uint32_t sbt_size = MAX(n, HIT_SBT_CAPACITY);
-
-	RID new_sbt = RD::get_singleton()->hit_sbt_create(p_task->new_pipeline, sbt_size);
-	if (new_sbt.is_null()) {
-		WARN_PRINT(vformat("RT: hit_sbt_create failed for variant 0x%x.", p_task->rt_flags));
-		RD::get_singleton()->free_rid(p_task->new_pipeline);
-		return;
-	}
-	RD::get_singleton()->set_resource_name(new_sbt, String("RT Hit SBT [flags=") + itos(p_task->rt_flags) + "]");
-
-	RD::HitShaderBindingTableRange sbt_range = RD::get_singleton()->hit_sbt_range_alloc(new_sbt, sbt_size);
-	if (!sbt_range) {
-		WARN_PRINT(vformat("RT: hit_sbt_range_alloc failed for variant 0x%x.", p_task->rt_flags));
-		RD::get_singleton()->free_rid(new_sbt);
-		RD::get_singleton()->free_rid(p_task->new_pipeline);
-		return;
 	}
 
 	// Slots i >= n map to sentinel HG n.
@@ -1450,6 +1499,7 @@ void SceneShaderRaytracing::_finalize_pipeline_build(PipelineBuildTask *p_task) 
 	bundle.hit_sbt = new_sbt;
 	bundle.live_hg_count = n;
 	bundle.live_ready_mask = p_task->new_ready_mask;
+	bundle.rebuild_failed = false;
 }
 
 // Single-lane rebuild dispatcher.
@@ -1562,6 +1612,11 @@ void SceneShaderRaytracing::_join_lane_for_shutdown() {
 		if (current->new_pipeline.is_valid()) {
 			RD::get_singleton()->free_rid(current->new_pipeline);
 		}
+		for (uint32_t i = 0; i < current->slots.size(); i++) {
+			if (current->slots[i].existing_per_hg_shader.is_null() && i < current->new_per_hg_shaders.size() && current->new_per_hg_shaders[i].is_valid()) {
+				RD::get_singleton()->free_rid(current->new_per_hg_shaders[i]);
+			}
+		}
 		memdelete(current);
 	}
 	for (PipelineBuildTask *t : queued) {
@@ -1594,10 +1649,10 @@ void SceneShaderRaytracing::init(const String p_defines) {
 	if (raygen_shader_version.is_valid()) {
 		const PipelineBundle &b = ensure_pipeline_bundle(RT_FLAG_NONE);
 		if (!b.pipeline.is_valid()) {
-			WARN_PRINT("Failed to create default raytracing pipeline bundle");
+			ERR_PRINT("Failed to create default raytracing pipeline bundle");
 		}
 	} else {
-		WARN_PRINT("Failed to create raytracing shader version");
+		ERR_PRINT("Failed to create raytracing shader version");
 	}
 
 	{

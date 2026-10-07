@@ -1424,8 +1424,11 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 									data_type_name = "sampler2D";
 								} else {
 									data_type_name = ShaderLanguage::get_datatype_name(onode->arguments[i]->get_datatype());
-									if (texture_func_simple && !actions.texture_lod_function.is_empty() && (onode->arguments[i]->get_datatype() == SL::TYPE_SAMPLER2D || onode->arguments[i]->get_datatype() == SL::TYPE_SAMPLER2DARRAY) && onode->arguments.size() >= 3) {
-										bool reads_coordinate = _node_reads_any(onode->arguments[2], actions.texture_lod_coordinates);
+									const SL::DataType sampler_type = onode->arguments[i]->get_datatype();
+									if (texture_func_simple && !actions.texture_lod_function.is_empty() && sampler_type != SL::TYPE_SAMPLEREXT && onode->arguments.size() >= 3) {
+										// The level of detail goes to float 2D and 2D array lookups at a coordinate read
+										// directly; the bias form becomes an explicit level on every sampler type.
+										bool reads_coordinate = (sampler_type == SL::TYPE_SAMPLER2D || sampler_type == SL::TYPE_SAMPLER2DARRAY) && _node_reads_any(onode->arguments[2], actions.texture_lod_coordinates);
 										texture_lod_rewrite = reads_coordinate || onode->arguments.size() == 4;
 										if (texture_lod_rewrite) {
 											code = code.replace("texture(", "textureLod(");

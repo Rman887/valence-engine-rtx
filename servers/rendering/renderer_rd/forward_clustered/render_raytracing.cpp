@@ -9209,8 +9209,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	lod_deformed_updates_read = 0;
 	lod_deformed_triangles_read = 0;
 	lod_static_rebuilds_read = 0;
-	// Instances left out of this TLAS because their custom hit group is still compiling.
+	// Instances left out of this TLAS because their custom hit group is still compiling, or failed to.
 	uint32_t rt_instances_compiling = 0;
+	uint32_t rt_instances_failed = 0;
 	const bool collect_render_info = (p_render_data->render_info != nullptr);
 #endif
 
@@ -9280,6 +9281,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 #ifdef TOOLS_ENABLED
 				if (collect_render_info && rt_shader->is_hg_compiling_in_bundle(hg_index, p_rt_flags)) {
 					rt_instances_compiling++;
+				} else if (collect_render_info && rt_shader->is_hg_failed_in_bundle(hg_index, p_rt_flags)) {
+					rt_instances_failed++;
 				}
 #endif
 				continue;
@@ -9404,6 +9407,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 #ifdef TOOLS_ENABLED
 					if (collect_render_info && rt_shader_singleton->is_hg_compiling_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
 						rt_instances_compiling += mm_count;
+					} else if (collect_render_info && rt_shader_singleton->is_hg_failed_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
+						rt_instances_failed += mm_count;
 					}
 #endif
 					mm_surf = mm_surf->next;
@@ -9559,6 +9564,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 #ifdef TOOLS_ENABLED
 				if (collect_render_info && rt_shader_singleton->is_hg_compiling_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
 					rt_instances_compiling++;
+				} else if (collect_render_info && rt_shader_singleton->is_hg_failed_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
+					rt_instances_failed++;
 				}
 #endif
 				surf = surf->next;
@@ -10145,6 +10152,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		}
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_TRIANGLES_REFIT] += rt_triangles_refit + deformed_cluster_triangles_updated;
 		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_INSTANCES_COMPILING] += rt_instances_compiling;
+		p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_RT_INSTANCES_FAILED] += rt_instances_failed;
 		if (cluster_lod_stream_enabled) {
 			// The stream loads (D111): their own counters, out of the builds and the triangles built.
 			int *info = p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE];

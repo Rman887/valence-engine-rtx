@@ -680,6 +680,36 @@ bool RenderingDevice::async_build_sources_written(VectorView<RID> p_buffers) {
 	return false;
 }
 
+bool RenderingDevice::async_compute_timestamps_set_enabled(bool p_enabled) {
+	ERR_RENDER_THREAD_GUARD_V(false);
+	if (!p_enabled) {
+		async_compute_timestamps = false;
+		return true;
+	}
+	if (!async_builds || driver->command_queue_family_timestamp_valid_bits(compute_queue_family) == 0) {
+		return false;
+	}
+	for (uint32_t i = 0; i < frames.size(); i++) {
+		if (!frames[i].compute_timestamp_pool) {
+			frames[i].compute_timestamp_pool = driver->timestamp_query_pool_create(2);
+			ERR_FAIL_COND_V(!frames[i].compute_timestamp_pool, false);
+		}
+	}
+	async_compute_timestamps = true;
+	return true;
+}
+
+bool RenderingDevice::get_async_compute_span(uint64_t p_frame, uint64_t &r_begin_ns, uint64_t &r_end_ns) const {
+	for (uint32_t i = 0; i < ASYNC_COMPUTE_SPANS; i++) {
+		if (async_compute_spans[i].frame == p_frame) {
+			r_begin_ns = async_compute_spans[i].begin_ns;
+			r_end_ns = async_compute_spans[i].end_ns;
+			return true;
+		}
+	}
+	return false;
+}
+
 Error RenderingDevice::blas_build(RID p_blas) {
 	ERR_RENDER_THREAD_GUARD_V(ERR_UNAVAILABLE);
 
@@ -9327,6 +9357,8 @@ void RenderingDevice::_begin_frame(bool p_presented) {
 	frames[frame].timestamp_result_count = frames[frame].timestamp_count;
 	frames[frame].timestamp_count = 0;
 	frames[frame].index = Engine::get_singleton()->get_frames_drawn();
+	frames[frame].timestamp_result_frames_drawn = frames[frame].timestamp_frames_drawn;
+	frames[frame].timestamp_frames_drawn = frames_drawn;
 }
 
 void RenderingDevice::_end_frame() {
@@ -9383,6 +9415,11 @@ void RenderingDevice::_submit_compute(bool p_has_commands) {
 	// Submitted before the main command buffer, which does not wait on it, so the two overlap.
 	RDD::CommandBufferID command_buffer = f.compute_command_buffer;
 	driver->command_buffer_begin(command_buffer);
+	const bool timed = p_has_commands && async_compute_timestamps && f.compute_timestamp_pool;
+	if (timed) {
+		driver->command_timestamp_query_pool_reset(command_buffer, f.compute_timestamp_pool, 2);
+		driver->command_timestamp_write(command_buffer, f.compute_timestamp_pool, 0);
+	}
 	if (p_has_commands) {
 		// Nothing orders this submit after the previous compute submit: the semaphores chain each queue
 		// through the other's previous frame only, and the graph's trackers start every frame afresh, so a
@@ -9393,6 +9430,11 @@ void RenderingDevice::_submit_compute(bool p_has_commands) {
 		memory_barrier.dst_access = RDD::BARRIER_ACCESS_MEMORY_READ_BIT | RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT;
 		driver->command_pipeline_barrier(command_buffer, RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, memory_barrier, {}, {}, {});
 		compute_graph.end(RENDER_GRAPH_REORDER == 1, RENDER_GRAPH_FULL_BARRIERS == 1, command_buffer, f.compute_command_buffer_pool);
+	}
+	if (timed) {
+		driver->command_timestamp_write(command_buffer, f.compute_timestamp_pool, 1);
+		f.compute_timestamps_written = true;
+		f.compute_timestamp_frame = frames_drawn;
 	}
 	driver->command_buffer_end(command_buffer);
 
@@ -9416,6 +9458,10 @@ void RenderingDevice::_free_compute_frame(Frame &p_frame) {
 	if (p_frame.compute_fence) {
 		driver->fence_free(p_frame.compute_fence);
 		p_frame.compute_fence = RDD::FenceID();
+	}
+	if (p_frame.compute_timestamp_pool) {
+		driver->timestamp_query_pool_free(p_frame.compute_timestamp_pool);
+		p_frame.compute_timestamp_pool = RDD::QueryPoolID();
 	}
 	for (uint32_t j = 0; j < p_frame.compute_transfer_worker_semaphores.size(); j++) {
 		if (p_frame.compute_transfer_worker_semaphores[j]) {
@@ -9607,6 +9653,16 @@ void RenderingDevice::_stall_for_frame(uint32_t p_frame) {
 		GodotProfileZoneGroupedFirst(_profile_zone, "driver->fence_wait (compute)");
 		driver->fence_wait(frames[p_frame].compute_fence);
 		frames[p_frame].compute_fence_signaled = false;
+		if (frames[p_frame].compute_timestamps_written) {
+			uint64_t values[2] = {};
+			driver->timestamp_query_pool_get_results(frames[p_frame].compute_timestamp_pool, 2, values);
+			AsyncComputeSpan &span = async_compute_spans[async_compute_span_next];
+			async_compute_span_next = (async_compute_span_next + 1) % ASYNC_COMPUTE_SPANS;
+			span.frame = frames[p_frame].compute_timestamp_frame;
+			span.begin_ns = driver->timestamp_query_result_to_time(values[0]);
+			span.end_ns = driver->timestamp_query_result_to_time(values[1]);
+			frames[p_frame].compute_timestamps_written = false;
+		}
 	}
 
 	if (frames[p_frame].fence_signaled) {
@@ -10264,6 +10320,11 @@ uint32_t RenderingDevice::get_captured_timestamps_count() const {
 uint64_t RenderingDevice::get_captured_timestamps_frame() const {
 	ERR_RENDER_THREAD_GUARD_V(0);
 	return frames[frame].index;
+}
+
+uint64_t RenderingDevice::get_captured_timestamps_frames_drawn() const {
+	ERR_RENDER_THREAD_GUARD_V(0);
+	return frames[frame].timestamp_result_frames_drawn;
 }
 
 uint64_t RenderingDevice::get_captured_timestamp_gpu_time(uint32_t p_index) const {

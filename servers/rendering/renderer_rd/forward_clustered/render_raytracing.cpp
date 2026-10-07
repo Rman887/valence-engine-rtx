@@ -29,6 +29,7 @@
 /**************************************************************************/
 
 #include "core/config/project_settings.h"
+#include "core/io/file_access.h"
 #include "core/math/math_funcs.h"
 #include "core/object/callable_mp.h"
 #include "core/os/os.h"
@@ -128,6 +129,32 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		print_line(vformat("RT: acceleration-structure build budget on: %d triangles and %d builds a frame, first in line after %d frames' wait (D97).", build_budget.triangles_per_frame, build_budget.builds_per_frame, build_budget.max_wait_frames));
 	}
 	async_probe.enabled = OS::get_singleton()->get_cmdline_args().find("--async-probe") != nullptr || OS::get_singleton()->get_cmdline_user_args().find("--async-probe") != nullptr;
+	// The build timer (D98d): --rt-build-timer=<path>, the CSV it writes, and --rt-build-timer-marks=off.
+	List<String> timer_args = OS::get_singleton()->get_cmdline_args();
+	for (const String &arg : OS::get_singleton()->get_cmdline_user_args()) {
+		timer_args.push_back(arg);
+	}
+	String timer_path;
+	for (const String &arg : timer_args) {
+		if (arg.begins_with("--rt-build-timer=")) {
+			timer_path = arg.trim_prefix("--rt-build-timer=");
+		} else if (arg == "--rt-build-timer-marks=off") {
+			build_timer.marks = false;
+		}
+	}
+	if (!timer_path.is_empty()) {
+		const String path = timer_path;
+		build_timer.file = FileAccess::open(path, FileAccess::WRITE);
+		if (build_timer.file.is_null()) {
+			ERR_PRINT(vformat("RT: the build timer cannot write %s (D98d).", path));
+		}
+	}
+	if (build_timer.file.is_valid()) {
+		const String path = timer_path;
+		build_timer.compute = RD::get_singleton()->async_compute_timestamps_set_enabled(true);
+		build_timer.file->store_line("frame,lag,complete,vp_us,as_us,prepare_us,walk_us,lod_us,blas_us,tlas_us,compute_us,compute_begin_us,compute_end_us,cpu_frame_us,builds,triangles,async_builds,forced,budget_triangles,refits,stream_loads,stream_load_triangles,async_populations_total,async_stream_issues_total,async_compactions_total");
+		print_line(vformat("RT: build timer on (D98d): writing %s, phase marks %s, compute submits %s.", path, build_timer.marks ? "on" : "off", build_timer.compute ? "timed" : "not timed"));
+	}
 
 	cluster_blas_enabled = RD::get_singleton()->has_feature(RD::SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE);
 	if (cluster_blas_enabled) {
@@ -324,6 +351,24 @@ RenderRaytracing::~RenderRaytracing() {
 
 	cleanup_caches();
 	_async_probe_free();
+	if (build_timer.file.is_valid()) {
+		// The rows whose timestamps never came back: their counters, no timing.
+		for (uint32_t pass = 0; pass < BUILD_TIMER_ROWS; pass++) {
+			BuildTimerRow *oldest = nullptr;
+			for (BuildTimerRow &row : build_timer.rows) {
+				if (row.frame != UINT64_MAX && !row.written && (oldest == nullptr || row.frame < oldest->frame)) {
+					oldest = &row;
+				}
+			}
+			if (oldest == nullptr) {
+				break;
+			}
+			_build_timer_write_row(*oldest, String());
+		}
+		print_line(vformat("RT: build timer (D98d) done: %d frames written, %d frames' timestamps lost to a flush before the swap read them.", build_timer.rows_written, build_timer.sets_lost));
+		build_timer.file->flush();
+		build_timer.file.unref();
+	}
 	if (async_builds_total > 0 || async_stream_issues_total > 0 || async_pulled_back > 0 || async_forced_drops > 0 || async_cluster_fallbacks > 0 || async_stream_fallbacks > 0) {
 		// RenderingDevice counts every fallback; the triangle builds' are what the RT side did not count.
 		const uint64_t fallbacks = RD::get_singleton() ? RD::get_singleton()->get_async_build_fallback_count() : 0;
@@ -1125,6 +1170,183 @@ void RenderRaytracing::_async_probe_free() {
 			rd->free_rid(*rid);
 			*rid = RID();
 		}
+	}
+}
+
+// The build timer's marks (D98d), in build_tlas's order: before prepare_frame, after it, after the walk
+// and the merges, after the selection and the deformed flush, after the BLAS builds and refits, after
+// the TLAS or the slot commit.
+static const char *BUILD_TIMER_PHASES[] = {
+	"RT build timer: begin",
+	"RT build timer: prepared",
+	"RT build timer: walked",
+	"RT build timer: selected",
+	"RT build timer: blas",
+	"RT build timer: end",
+};
+static constexpr uint32_t BUILD_TIMER_SPANS = std_size(BUILD_TIMER_PHASES) - 1;
+
+void RenderRaytracing::_build_timer_mark(uint32_t p_phase) {
+	if (build_timer.file.is_valid() && build_timer.marks) {
+		RD::get_singleton()->capture_timestamp(BUILD_TIMER_PHASES[p_phase]);
+	}
+}
+
+RenderRaytracing::BuildTimerRow &RenderRaytracing::_build_timer_row() {
+	const uint64_t frame = RD::get_singleton()->get_frames_drawn();
+	BuildTimerRow &row = build_timer.rows[frame % BUILD_TIMER_ROWS];
+	if (row.frame != frame) {
+		if (row.frame != UINT64_MAX && !row.written) {
+			_build_timer_write_row(row, String()); // Sixteen frames without a read: its counters alone.
+			build_timer.sets_lost++;
+		}
+		row = BuildTimerRow();
+		row.frame = frame;
+		row.cpu_usec = OS::get_singleton()->get_ticks_usec();
+		row.cpu_frame_usec = build_timer.last_row_cpu_usec != 0 ? int64_t(row.cpu_usec - build_timer.last_row_cpu_usec) : -1;
+		build_timer.last_row_cpu_usec = row.cpu_usec;
+	}
+	return row;
+}
+
+// One CSV line: the frame, the timing fields (p_timing, from the lag to the compute span's end, or empty
+// for a frame whose timestamps never came back), the CPU time from the row created before it, and the
+// frame's counters.
+void RenderRaytracing::_build_timer_write_row(BuildTimerRow &r_row, const String &p_timing) {
+	String line = itos(r_row.frame) + (p_timing.is_empty() ? String(",,,,,,,,,,,,") : p_timing);
+	line += "," + (r_row.cpu_frame_usec >= 0 ? itos(r_row.cpu_frame_usec) : String());
+	line += "," + itos(r_row.builds) + "," + itos(r_row.triangles) + "," + itos(r_row.async_builds) + "," + itos(r_row.forced) + "," + itos(r_row.budget_triangles);
+	line += "," + itos(r_row.refits) + "," + itos(r_row.stream_loads) + "," + itos(r_row.stream_load_triangles);
+	line += "," + itos(r_row.async_populations_total) + "," + itos(r_row.async_stream_issues_total) + "," + itos(r_row.async_compactions_total);
+	build_timer.file->store_line(line);
+	r_row.written = true;
+	build_timer.rows_written++;
+	if (build_timer.rows_written % 60 == 0) {
+		build_timer.file->flush();
+	}
+}
+
+void RenderRaytracing::frame_ended() {
+	if (singleton != nullptr && singleton->build_timer.file.is_valid()) {
+		singleton->_build_timer_read();
+	}
+}
+
+// Once per swap, right after it (RendererCompositorRD::end_frame), before anything can flush and
+// re-begin the frame, which would drop the set the swap brought back: the frame that recorded it, its
+// phases summed over the viewports whose marks all arrived in order (complete counts them), its
+// measured viewports' spans, and the compute submit's span with its ends from the first viewport's
+// start. The rows created before it and never written go out first, their counters alone, each a lost
+// set. A field with nothing to read is empty.
+void RenderRaytracing::_build_timer_read() {
+	RD *rd = RD::get_singleton();
+	const uint32_t count = rd->get_captured_timestamps_count();
+	if (count == 0) {
+		return;
+	}
+	const uint64_t measured = rd->get_captured_timestamps_frames_drawn();
+
+	uint64_t phase_ns[BUILD_TIMER_SPANS] = {};
+	uint64_t seq_ns[BUILD_TIMER_SPANS] = {};
+	int32_t last = -1;
+	uint64_t last_ns = 0;
+	uint32_t complete = 0;
+	uint64_t vp_ns = 0;
+	uint64_t vp_first_ns = 0;
+	uint64_t vp_open_ns = 0;
+	bool vp_open = false;
+	bool vp_found = false;
+	for (uint32_t i = 0; i < count; i++) {
+		const String name = rd->get_captured_timestamp_name(i);
+		const uint64_t t = rd->get_captured_timestamp_gpu_time(i);
+		if (name.begins_with("vp_begin_")) {
+			vp_open = true;
+			vp_open_ns = t;
+			if (!vp_found) {
+				vp_first_ns = t;
+				vp_found = true;
+			}
+		} else if (name.begins_with("vp_end_")) {
+			if (vp_open && t > vp_open_ns) {
+				vp_ns += t - vp_open_ns;
+			}
+			vp_open = false;
+		} else if (name.begins_with("RT build timer: ")) {
+			int32_t phase = -1;
+			for (uint32_t j = 0; j < std_size(BUILD_TIMER_PHASES); j++) {
+				if (name == BUILD_TIMER_PHASES[j]) {
+					phase = int32_t(j);
+				}
+			}
+			if (phase == 0) {
+				last = 0;
+				last_ns = t;
+			} else if (phase > 0 && last == phase - 1) {
+				seq_ns[phase - 1] = t > last_ns ? t - last_ns : 0;
+				last = phase;
+				last_ns = t;
+				if (phase == int32_t(BUILD_TIMER_SPANS)) {
+					// A viewport's sequence counts only once all its marks arrived in order.
+					for (uint32_t j = 0; j < BUILD_TIMER_SPANS; j++) {
+						phase_ns[j] += seq_ns[j];
+					}
+					complete++;
+				}
+			} else {
+				last = -1;
+			}
+		}
+	}
+
+	auto us = [](uint64_t p_ns) { return String::num(double(p_ns) / 1000.0, 1); };
+	auto signed_us = [](uint64_t p_ns, uint64_t p_from_ns) { return String::num((double(p_ns) - double(p_from_ns)) / 1000.0, 1); };
+	String timing = "," + itos(rd->get_frames_drawn() - measured) + "," + itos(complete);
+	timing += "," + (vp_found ? us(vp_ns) : String());
+	uint64_t as_ns = 0;
+	for (uint32_t i = 0; i < BUILD_TIMER_SPANS; i++) {
+		as_ns += phase_ns[i];
+	}
+	timing += "," + (complete > 0 ? us(as_ns) : String());
+	for (uint32_t i = 0; i < BUILD_TIMER_SPANS; i++) {
+		timing += "," + (complete > 0 ? us(phase_ns[i]) : String());
+	}
+	// The compute span's ends against the viewport's assume one clock across the queues: NVIDIA has one
+	// global GPU timer, and VK_KHR_calibrated_timestamps' VK_TIME_DOMAIN_DEVICE is comparable with
+	// vkCmdWriteTimestamp values; core Vulkan does not promise it.
+	uint64_t compute_begin_ns = 0;
+	uint64_t compute_end_ns = 0;
+	if (build_timer.compute && rd->get_async_compute_span(measured, compute_begin_ns, compute_end_ns)) {
+		timing += "," + us(compute_end_ns > compute_begin_ns ? compute_end_ns - compute_begin_ns : 0);
+		timing += "," + (vp_found ? signed_us(compute_begin_ns, vp_first_ns) : String());
+		timing += "," + (vp_found ? signed_us(compute_end_ns, vp_first_ns) : String());
+	} else {
+		timing += build_timer.compute ? ",0,," : ",,,";
+	}
+
+	// Older rows never written (a flush discarded their timestamps) go out first, in frame order.
+	for (uint32_t pass = 0; pass < BUILD_TIMER_ROWS; pass++) {
+		BuildTimerRow *oldest = nullptr;
+		for (BuildTimerRow &row : build_timer.rows) {
+			if (row.frame != UINT64_MAX && row.frame < measured && !row.written && (oldest == nullptr || row.frame < oldest->frame)) {
+				oldest = &row;
+			}
+		}
+		if (oldest == nullptr) {
+			break;
+		}
+		_build_timer_write_row(*oldest, String());
+		build_timer.sets_lost++;
+	}
+	BuildTimerRow &row = build_timer.rows[measured % BUILD_TIMER_ROWS];
+	if (row.frame == measured) {
+		if (!row.written) {
+			_build_timer_write_row(row, timing);
+		}
+	} else {
+		// No build_tlas recorded in that frame: its timing, no counters.
+		BuildTimerRow empty;
+		empty.frame = measured;
+		_build_timer_write_row(empty, timing);
 	}
 }
 
@@ -8980,6 +9202,7 @@ bool RenderRaytracing::build_acceleration_structures(RTViewportState *p_state, c
 			RD::get_singleton()->blas_update(blas_rid);
 		}
 	}
+	_build_timer_mark(4);
 
 	RENDER_TIMESTAMP("TLAS Build");
 
@@ -9790,6 +10013,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		return nullptr;
 	}
 
+	if (build_timer.file.is_valid()) {
+		// The build timer (D98d): this frame's row and first mark.
+		_build_timer_row();
+		_build_timer_mark(0);
+	}
+
 	frame_extra_builds = 0; // prepare_frame's compactions and bakes count into them (D97).
 	frame_async_builds = 0; // And the compute queue's (D98b).
 	frame_extra_triangles = 0;
@@ -9807,6 +10036,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	frame_stream_load_triangles = 0;
 	prepare_frame();
 	_sweep_materialized();
+	_build_timer_mark(1);
 	state->has_procedural_instances = false;
 	if (ptlas_slots_enabled) {
 		state->slot_build++; // The walk stamps the ranges it reaches with it (D94b).
@@ -10732,6 +10962,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 	RD::get_singleton()->compute_list_end();
 	walk_in_compute_list = false;
+	_build_timer_mark(2);
 
 	// The cluster LOD selection and every instance's BLAS over it (D86), the shared builds settled
 	// first (D89), recorded here so its fallback still indexes the instance arrays as they were
@@ -10744,6 +10975,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	// them; a failed flush names the handles that never got a build, and their instances leave
 	// every per-instance array here.
 	_flush_deformed_cluster_batch();
+	_build_timer_mark(3);
 	if (!deformed_cluster_batch.dropped_handles.is_empty() && ptlas_slots_enabled) {
 		// Slot-resident (D94b): the arrays stay beside their slots, and the commit disables these.
 		for (uint32_t i = 0; i < blass.size(); i++) {
@@ -10827,12 +11059,32 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			info[RSE::VIEWPORT_RENDER_INFO_RT_STREAM_LOAD_CLUSTERS] += int(frame_stream_load_clusters);
 			info[RSE::VIEWPORT_RENDER_INFO_RT_STREAM_LOAD_TRIANGLES] += int(frame_stream_load_triangles);
 		}
+		if (build_timer.file.is_valid()) {
+			// The build timer's counters (D98d): the frame's as published above. Without them (a viewport
+			// without render info, or a build without TOOLS_ENABLED) the row's counters read 0.
+			BuildTimerRow &row = _build_timer_row();
+			row.builds += frame_builds;
+			row.triangles += rt_triangles_built + cluster_triangles_built + deformed_cluster_triangles_built + frame_extra_triangles;
+			row.async_builds += frame_async_builds;
+			row.refits += rt_blas_refits + deformed_cluster_updates;
+			if (build_budget_publishes) {
+				const uint32_t budget_built = build_budget.built - MIN(build_budget.built, build_budget.enabled ? frame_stream_loads : 0u);
+				row.forced += frame_builds > budget_built ? frame_builds - budget_built : 0;
+				row.budget_triangles += uint32_t(MIN(build_budget.spent_triangles, uint64_t(UINT32_MAX)));
+			}
+			row.stream_loads += frame_stream_loads;
+			row.stream_load_triangles += frame_stream_load_triangles;
+			row.async_populations_total = async_triangle_builds_total + async_cluster_populations_total;
+			row.async_stream_issues_total = async_stream_issues_total;
+			row.async_compactions_total = async_compactions_total;
+		}
 	}
 #endif
 
 	SceneShaderRaytracing::get_singleton()->finalize_custom_shaders();
 
 	const bool built = build_acceleration_structures(state, dirty_blas_list, dirty_blas_update_list);
+	_build_timer_mark(5);
 #ifdef TOOLS_ENABLED
 	if (built && collect_render_info && ptlas_slots_enabled) {
 		// The slot commit's counters (D94b), read after it ran. A failed commit leaves them partly

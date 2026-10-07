@@ -37,6 +37,7 @@
 #include "drivers/streamline/streamline.h"
 #include "servers/display/display_server.h"
 #include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered_pt.h"
+#include "servers/rendering/renderer_rd/forward_clustered/render_raytracing.h"
 #include "servers/rendering/renderer_rd/forward_mobile/render_forward_mobile.h"
 #include "servers/rendering/rendering_server_types.h"
 
@@ -138,6 +139,8 @@ void RendererCompositorRD::begin_frame(double frame_step) {
 void RendererCompositorRD::end_frame(bool p_present) {
 	Streamline::get_singleton()->emit_marker(STREAMLINE_MARKER_END_RENDER);
 	RD::get_singleton()->swap_buffers(p_present);
+	// The path tracer's build timer reads the timestamps the swap brought back (D98d).
+	RendererSceneRenderImplementation::RenderRaytracing::frame_ended();
 }
 
 void RendererCompositorRD::initialize() {

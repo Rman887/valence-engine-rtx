@@ -439,6 +439,8 @@ public:
 	// The requested command queue family must support all specified bits or it'll fail to return a valid family otherwise. If a valid surface is specified, the queue must support presenting to it.
 	// It is valid to specify no bits and a valid surface: in this case, the dedicated presentation queue family will be the preferred option.
 	virtual CommandQueueFamilyID command_queue_family_get(BitField<CommandQueueFamilyBits> p_cmd_queue_family_bits, RenderingContextDriver::SurfaceID p_surface = 0) = 0;
+	// The bits a timestamp written on the family's queues carries, 0 if it writes none (D98d).
+	virtual uint32_t command_queue_family_timestamp_valid_bits(CommandQueueFamilyID p_cmd_queue_family) { return 0; }
 
 	// ----- QUEUE -----
 

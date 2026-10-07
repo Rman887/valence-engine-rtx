@@ -3444,6 +3444,11 @@ RDD::CommandQueueFamilyID RenderingDeviceDriverVulkan::command_queue_family_get(
 	return CommandQueueFamilyID(picked_family_index + 1);
 }
 
+uint32_t RenderingDeviceDriverVulkan::command_queue_family_timestamp_valid_bits(CommandQueueFamilyID p_cmd_queue_family) {
+	ERR_FAIL_COND_V(p_cmd_queue_family.id == 0 || p_cmd_queue_family.id > queue_family_properties.size(), 0);
+	return queue_family_properties[p_cmd_queue_family.id - 1].timestampValidBits;
+}
+
 // ----- QUEUE -----
 
 RDD::CommandQueueID RenderingDeviceDriverVulkan::command_queue_create(CommandQueueFamilyID p_cmd_queue_family, bool p_identify_as_main_queue) {

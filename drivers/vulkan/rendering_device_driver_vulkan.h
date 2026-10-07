@@ -385,6 +385,7 @@ public:
 	// ----- QUEUE FAMILY -----
 
 	virtual CommandQueueFamilyID command_queue_family_get(BitField<CommandQueueFamilyBits> p_cmd_queue_family_bits, RenderingContextDriver::SurfaceID p_surface = 0) override final;
+	virtual uint32_t command_queue_family_timestamp_valid_bits(CommandQueueFamilyID p_cmd_queue_family) override final;
 
 	// ----- QUEUE -----
 private:

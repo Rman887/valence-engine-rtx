@@ -61,6 +61,7 @@
 // The G-buffer primary surface (Environment.pathtracing_primary_surface), one scope so it frees as a unit.
 #define RB_SCOPE_RT_GBUFFER SNAME("rt_gbuffer")
 
+class FileAccess;
 class RenderDataRD;
 class RenderSceneBuffersRD;
 
@@ -1663,6 +1664,45 @@ class RenderRaytracing {
 	void _async_probe_step();
 	void _async_probe_free();
 
+	// The build timer (the debug argument --rt-build-timer=<path>, D97's budget sizing and D98d's
+	// overlap): timestamps on the main queue between the phases of build_tlas, the compute submit's span
+	// and the frame's build counters, one CSV row per frame, the timestamps read once per swap
+	// (frame_ended()). Each mark orders every command recorded before it ahead of every command after
+	// it, behind a wait for all of them, so a run with marks is compared only with another run with
+	// marks; --rt-build-timer-marks=off drops them and keeps the viewport span, the compute span and
+	// the counters, for a frame-time comparison.
+	struct BuildTimerRow {
+		uint64_t frame = UINT64_MAX;
+		uint64_t cpu_usec = 0;
+		int64_t cpu_frame_usec = -1; // From the row created before it; -1 for the first.
+		bool written = false;
+		uint32_t builds = 0;
+		uint32_t triangles = 0;
+		uint32_t async_builds = 0;
+		uint32_t forced = 0;
+		uint32_t budget_triangles = 0;
+		uint32_t refits = 0;
+		uint32_t stream_loads = 0;
+		uint32_t stream_load_triangles = 0;
+		uint64_t async_populations_total = 0;
+		uint64_t async_stream_issues_total = 0;
+		uint64_t async_compactions_total = 0;
+	};
+	static constexpr uint32_t BUILD_TIMER_ROWS = 16;
+	struct BuildTimer {
+		Ref<FileAccess> file;
+		bool marks = true;
+		bool compute = false; // The compute submits are timed too.
+		BuildTimerRow rows[BUILD_TIMER_ROWS];
+		uint64_t last_row_cpu_usec = 0;
+		uint64_t rows_written = 0;
+		uint64_t sets_lost = 0; // Frames that ran build_tlas whose timestamps a flush discarded before a swap read them.
+	} build_timer;
+	void _build_timer_mark(uint32_t p_phase);
+	void _build_timer_read();
+	void _build_timer_write_row(BuildTimerRow &r_row, const String &p_timing);
+	BuildTimerRow &_build_timer_row();
+
 	// Opacity micromaps (D96), with rendering/pathtracing/opacity_micromaps.
 	bool omm_enabled = false;
 	bool omm_indirect_2_state = false;
@@ -2448,6 +2488,8 @@ class RenderRaytracing {
 public:
 	void initialize(RenderForwardClustered *p_owner);
 	// Geometry residency (D93) is on: the hit stages compile with position fetch.
+	// The build timer reads the timestamps a swap brought back (D98d); RendererCompositorRD calls it.
+	static void frame_ended();
 	static bool is_position_fetch_enabled() { return singleton != nullptr && singleton->cluster_lod_stream_geometry_enabled; }
 	// Opacity micromaps are on and rays past the first diffuse bounce trace them in 2-state (D96 OMMe).
 	static bool is_omm_indirect_2_state_enabled() { return singleton != nullptr && singleton->omm_enabled && singleton->omm_indirect_2_state; }

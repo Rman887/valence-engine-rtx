@@ -1521,6 +1521,19 @@ public:
 	// sources by address, so RenderingDevice cannot route it as it routes a triangle build: its caller
 	// asks first and records it on the main queue if so. A true answer counts as a fallback.
 	bool async_build_sources_written(VectorView<RID> p_buffers);
+	// The compute submits' GPU spans, for a timing run (D98d): two timestamps around each compute submit
+	// that carries commands, read back with its fence. A span is found by the frame (get_frames_drawn())
+	// that recorded it, its ends in nanoseconds of the device's timestamp clock. Enabling fails without
+	// the compute queue or where its family writes no timestamps. Comparing its ends with the main queue's
+	// timestamps assumes one clock across queues: NVIDIA has one global GPU timer, and
+	// VK_KHR_calibrated_timestamps' VK_TIME_DOMAIN_DEVICE is comparable with vkCmdWriteTimestamp values;
+	// core Vulkan does not promise it.
+	bool async_compute_timestamps_set_enabled(bool p_enabled);
+	bool get_async_compute_span(uint64_t p_frame, uint64_t &r_begin_ns, uint64_t &r_end_ns) const;
+	// The frame (get_frames_drawn()) that recorded the timestamps get_captured_timestamp_*() reads (D98d):
+	// read right after swap_buffers, the frame queue's size ago (2 by default), one more for each flush
+	// in between (3 after one), since a flush begins a frame on the same slot.
+	uint64_t get_captured_timestamps_frames_drawn() const;
 
 	// ----- PARTITIONED TOP-LEVEL ACCELERATION STRUCTURES (D94) -----
 	//
@@ -2039,6 +2052,15 @@ private:
 	RDD::SemaphoreID main_semaphore_to_wait_on;
 	uint64_t compute_submit_count = 0;
 	uint64_t async_build_fallbacks = 0; // Builds for the scope recorded on the main queue: their inputs were written this frame.
+	bool async_compute_timestamps = false; // D98d.
+	struct AsyncComputeSpan {
+		uint64_t frame = UINT64_MAX;
+		uint64_t begin_ns = 0;
+		uint64_t end_ns = 0;
+	};
+	static constexpr uint32_t ASYNC_COMPUTE_SPANS = 8;
+	AsyncComputeSpan async_compute_spans[ASYNC_COMPUTE_SPANS];
+	uint32_t async_compute_span_next = 0;
 	RenderingDeviceGraph *_triangle_build_graph(VectorView<RDG::ResourceTracker *> p_src_trackers);
 
 	/**************************/
@@ -2116,6 +2138,9 @@ private:
 		bool compute_fence_signaled = false;
 		LocalVector<RDD::SemaphoreID> compute_semaphores_to_wait_on;
 		TightLocalVector<RDD::SemaphoreID> compute_transfer_worker_semaphores;
+		RDD::QueryPoolID compute_timestamp_pool; // D98d: created when the timing run asks for it.
+		bool compute_timestamps_written = false;
+		uint64_t compute_timestamp_frame = 0;
 
 		// Extra command buffer pool used for driver workarounds or to reduce GPU bubbles by
 		// splitting the final render pass to the swapchain into its own cmd buffer.
@@ -2136,6 +2161,8 @@ private:
 		TightLocalVector<uint64_t> timestamp_result_values;
 		uint32_t timestamp_result_count = 0;
 		uint64_t index = 0;
+		uint64_t timestamp_frames_drawn = 0; // D98d: the frame recording into the pool, and the results'.
+		uint64_t timestamp_result_frames_drawn = 0;
 	};
 
 	uint32_t max_timestamp_query_elements = 0;

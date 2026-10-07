@@ -1261,6 +1261,7 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 					bool texture_func_no_uv = false;
 					bool texture_func_returns_data = false;
 					bool texture_func_simple = false;
+					bool texture_func_projected = false;
 
 					if (onode->op == SL::OP_STRUCT) {
 						code += _mkid(vnode->name);
@@ -1278,6 +1279,12 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 							texture_func_no_uv = (vnode->name == "textureSize" || vnode->name == "textureQueryLevels");
 							texture_func_returns_data = texture_func_no_uv || vnode->name == "textureQueryLod";
 							texture_func_simple = vnode->name == "texture";
+						} else if (func == nullptr && vnode->name == SNAME("texture_projected")) {
+							// A lookup at a world-projected coordinate (D116): a texture function for the sampler's
+							// wrapping, emitted here rather than through a helper, which a combined sampler cannot enter.
+							is_texture_func = true;
+							texture_func_projected = true;
+							code += actions.texture_projected_function.is_empty() ? "texture" : "textureLod";
 						} else if (p_default_actions.renames.has(vnode->name)) {
 							code += p_default_actions.renames[vnode->name];
 						} else {
@@ -1294,8 +1301,16 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 					bool is_normal_roughness_texture = false;
 					bool texture_lod_rewrite = false;
 					String texture_lod_sampler;
+					String texture_projected_sampler;
 
 					for (int i = 1; i < onode->arguments.size(); i++) {
+						if (texture_func_projected && i == 3) {
+							// The coordinate's scale feeds only the trace's level of detail.
+							if (!actions.texture_projected_function.is_empty()) {
+								code += ", " + actions.texture_projected_function + "(textureSize(" + texture_projected_sampler + ", 0), " + _dump_node_code(onode->arguments[i], p_level, r_gen_code, p_actions, p_default_actions, p_assigning) + ")";
+							}
+							continue;
+						}
 						if (i > 1) {
 							code += ", ";
 						}
@@ -1439,6 +1454,9 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 									}
 								}
 
+								if (texture_func_projected) {
+									texture_projected_sampler = data_type_name + "(" + node_code + ", " + sampler_name + ")";
+								}
 								code += data_type_name + "(" + node_code + ", " + sampler_name + ")";
 							} else if (correct_texture_uniform && RS::get_singleton()->is_low_end()) {
 								// Texture function on low end hardware (i.e. OpenGL).

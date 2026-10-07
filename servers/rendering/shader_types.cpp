@@ -272,6 +272,18 @@ ShaderTypes::ShaderTypes() {
 		shader_modes[RSE::SHADER_SPATIAL].functions["intersection"].stage_functions["report_intersection"] = report_func;
 	}
 
+	{
+		// A lookup at a coordinate projected from world or object metres (a triplanar's), uv_per_metre its
+		// scale: the raster samples as texture() does, the path tracer at the level its ray cone covers (D116).
+		ShaderLanguage::StageFunctionInfo projected_func;
+		projected_func.skip_function = "vertex";
+		projected_func.arguments.push_back(ShaderLanguage::StageFunctionInfo::Argument("tex", ShaderLanguage::TYPE_SAMPLER2D));
+		projected_func.arguments.push_back(ShaderLanguage::StageFunctionInfo::Argument("uv", ShaderLanguage::TYPE_VEC2));
+		projected_func.arguments.push_back(ShaderLanguage::StageFunctionInfo::Argument("uv_per_metre", ShaderLanguage::TYPE_FLOAT));
+		projected_func.return_type = ShaderLanguage::TYPE_VEC4;
+		shader_modes[RSE::SHADER_SPATIAL].functions["fragment"].stage_functions["texture_projected"] = projected_func;
+	}
+
 	// spatial render modes
 	{
 		shader_modes[RSE::SHADER_SPATIAL].modes.push_back({ PNAME("blend"), "mix", "add", "sub", "mul", "premul_alpha" });

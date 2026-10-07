@@ -621,6 +621,8 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	actions.usage_flag_pointers["TRANSMISSION"] = &detected_transmission;
 	bool detected_opacity_micromap = false;
 	actions.render_mode_flags["opacity_micromap"] = &detected_opacity_micromap;
+	bool detected_projected = false;
+	actions.usage_flag_pointers["texture_projected"] = &detected_projected;
 	bool detected_uv_write = false;
 	actions.write_flag_pointers["UV"] = &detected_uv_write;
 	bool detected_uv2_write = false;
@@ -643,6 +645,7 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	const RendererRD::MaterialStorage::ShaderData *label_shader = RendererRD::MaterialStorage::get_singleton()->material_get_shader_data(p_material);
 	r_entry.label = (label_shader && !label_shader->path.is_empty()) ? label_shader->path : vformat("material %d", p_material.get_id());
 	r_entry.writes_uv = detected_uv_write || detected_uv2_write;
+	r_entry.uses_projected = detected_projected;
 	r_entry.vertex_code = gen_code.code.has("vertex") ? gen_code.code["vertex"] : String();
 	r_entry.fragment_code = gen_code.code.has("fragment") ? gen_code.code["fragment"] : String();
 	r_entry.fragment_globals = gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT];
@@ -1159,6 +1162,10 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 		if (entry.writes_uv) {
 			// UVs the shader rewrites have a density the mesh's do not tell, so its lookups stay at level 0 (D116).
 			tex_defines += "#define RT_CUSTOM_UV_WRITTEN\n";
+		}
+		if (entry.uses_projected) {
+			// Its texture_projected() calls read the cone's footprint, which a mesh without UVs must compute too (D116).
+			tex_defines += "#define RT_CUSTOM_PROJECTED_LOD\n";
 		}
 		String uniform_members = entry.uniform_members.is_empty() ? String("float _rt_pad;") : entry.uniform_members;
 
@@ -1854,6 +1861,7 @@ void SceneShaderRaytracing::init(const String p_defines) {
 		actions.texture_lod_function = "rt_texture_lod";
 		actions.texture_lod_coordinates.insert("UV");
 		actions.texture_lod_coordinates.insert("UV2");
+		actions.texture_projected_function = "rt_texture_projected_lod";
 		actions.global_buffer_array_variable = "global_shader_uniforms.data";
 		actions.instance_uniform_index_variable = "instances.data[instance_index_interp].instance_uniforms_ofs";
 

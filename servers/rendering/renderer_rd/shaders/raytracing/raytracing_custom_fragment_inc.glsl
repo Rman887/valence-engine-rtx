@@ -67,6 +67,10 @@ rt_frag_coord = vec4(gl_LaunchIDEXT.xy, 0.0, 1.0);
 // function's, before this, and the any-hit's alpha test read level 0.
 rt_lod_t = rt_hit_texture_lod;
 #endif
+#ifdef RT_STAGE_CLOSEST_HIT
+// And its texture_projected() calls at the cone's footprint (D116), whatever the shader does with UV.
+rt_footprint_t = rt_hit_texture_footprint;
+#endif
 
 // Post-vertex transform: object-space -> view-space (mirrors rasterizer post-vertex).
 mat4 rt_modelview = read_view_matrix * read_model_matrix;

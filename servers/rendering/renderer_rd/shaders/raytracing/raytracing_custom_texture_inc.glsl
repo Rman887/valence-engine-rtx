@@ -24,3 +24,17 @@ float rt_texture_lod(ivec2 p_size) {
 float rt_texture_lod(ivec3 p_size) {
 	return rt_texture_lod(p_size.xy);
 }
+
+// The spatial stage function texture_projected(tex, uv, uv_per_metre) becomes
+// textureLod(tex, uv, rt_texture_projected_lod(textureSize(tex, 0), uv_per_metre)): the cone's footprint in
+// metres (rt_footprint_t, set as rt_lod_t is, but for any shader that calls the function) plus the log2 of
+// the coordinate's units per metre and half the log2 of the texture's texel count; level 0 while the
+// footprint is unknown, as in the any-hit and vertex().
+float rt_footprint_t = RT_TEXTURE_LOD_BASE;
+
+float rt_texture_projected_lod(ivec2 p_size, float p_uv_per_metre) {
+	if (rt_footprint_t <= RT_TEXTURE_LOD_BASE) {
+		return 0.0;
+	}
+	return rt_footprint_t + log2(max(p_uv_per_metre, 1e-20)) + 0.5 * log2(max(float(p_size.x) * float(p_size.y), 1.0));
+}

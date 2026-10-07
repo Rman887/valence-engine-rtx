@@ -115,6 +115,10 @@ public:
 		// detail there, and their stages accept no bias form (D116).
 		String texture_lod_function;
 		HashSet<StringName> texture_lod_coordinates;
+		// The spatial stage function texture_projected(sampler2D, vec2 uv, float uv_per_metre) is texture(s, uv),
+		// or when this is set, textureLod at the level this function returns for textureSize(s, 0) and
+		// uv_per_metre (the path tracer's hit groups, D116).
+		String texture_projected_function;
 	};
 
 private:

@@ -694,7 +694,12 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 // MAIN
 // ============================================================================
 void main() {
-	HitData h = compute_hit_data();
+	// A shader that calls texture_projected() needs the cone's footprint at a mesh without UVs too (D116).
+#ifdef RT_CUSTOM_PROJECTED_LOD
+	HitData h = compute_hit_data(true);
+#else
+	HitData h = compute_hit_data(false);
+#endif
 	write_primary_hit_depth(h.hit_pos);
 	write_primary_hit_velocity(h.hit_pos);
 
@@ -707,8 +712,10 @@ void main() {
 	vec3 rt_tangent = h.tangent;
 	vec3 rt_bitangent = h.bitangent;
 	bool rt_front_face = h.is_front_face;
-	// The level the fragment's texture() calls at the mesh's UVs read (D116), handed over after the vertex function.
+	// The level the fragment's texture() calls at the mesh's UVs read and the footprint its texture_projected()
+	// calls read (D116), handed over after the vertex function.
 	float rt_hit_texture_lod = rt_texture_lod_enabled() ? h.texture_lod : RT_TEXTURE_LOD_BASE;
+	float rt_hit_texture_footprint = rt_texture_lod_enabled() ? h.texture_footprint : RT_TEXTURE_LOD_BASE;
 
 #include "raytracing_custom_fragment_inc.glsl"
 

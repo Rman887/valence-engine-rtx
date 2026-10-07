@@ -97,7 +97,8 @@ void cluster_geometry_check_hit(GeometryData p_surface, GeometryData p_blob, uin
 
 /// Fetch vertex attributes and transform to world space.
 /// Requires hitAttributeEXT HitAttribs and GeometryBuffer/MaterialBuffer bindings.
-HitData compute_hit_data() {
+/// p_footprint: the cone's footprint is wanted whether or not the mesh has UVs or the frame decals.
+HitData compute_hit_data(bool p_footprint) {
 	HitData h;
 	h.geometry_idx = gl_InstanceCustomIndexEXT;
 	GeometryData geom = geometries[h.geometry_idx];
@@ -162,7 +163,7 @@ HitData compute_hit_data() {
 	// positions. A surface without UVs still has a footprint, which its decals read, when there are any.
 	h.texture_lod = RT_TEXTURE_LOD_BASE;
 	h.texture_footprint = RT_TEXTURE_LOD_BASE;
-	if (rt_texture_lod_wanted() && (geom.flags & FLAG_PROCEDURAL) == 0u && (attrs.has_uv || get_rt_param(RT_PARAM_DECAL_COUNT) > 0.5)) {
+	if (rt_texture_lod_wanted() && (geom.flags & FLAG_PROCEDURAL) == 0u && (p_footprint || attrs.has_uv || get_rt_param(RT_PARAM_DECAL_COUNT) > 0.5)) {
 		vec3 p0, p1, p2;
 		bool has_positions = true;
 		if ((geom.flags & FLAG_CLUSTER_GEOMETRY) != 0u && rt_hit_cluster_id() != RT_CLUSTER_ID_NONE) {

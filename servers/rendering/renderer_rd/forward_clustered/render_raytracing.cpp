@@ -8540,23 +8540,29 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat_data->albedo_texture_rd = omm_custom_alpha_rd;
 	}
 
-	// Point filtering: check if material requests nearest filtering (e.g. pixel art).
-	// BaseMaterial3D exposes this as "texture_filter" int param (0=nearest, 1=linear, etc.).
-	Variant filter_var = material_storage->material_get_param(p_material_rid, "texture_filter");
-	if (filter_var.get_type() == Variant::INT) {
-		int filter_mode = filter_var;
-		// 0 = TEXTURE_FILTER_NEAREST, 2 = TEXTURE_FILTER_NEAREST_WITH_MIPMAPS,
-		// 4 = TEXTURE_FILTER_NEAREST_WITH_MIPMAPS_ANISOTROPIC
-		if (filter_mode == 0 || filter_mode == 2 || filter_mode == 4) {
-			mat.flags |= RT_MAT_FLAG_POINT_FILTER;
-		}
-	}
-
-	// Anisotropic filtering where the material asks for it (D116): BaseMaterial3D writes its texture_filter into
-	// every texture uniform's filter hint, so the albedo texture's stands for all five fetches.
+	// The texture filter the material asks for: BaseMaterial3D writes its texture_filter into every texture
+	// uniform's filter hint (it is not a material parameter), so the albedo texture's stands for all five fetches.
+	// Nearest filtering (pixel art) with or without mipmaps, linear without them, and anisotropic filtering (D116);
+	// a nearest anisotropic filter is read as nearest with mipmaps at the ray cone's level.
 	const ShaderLanguage::ShaderNode::Uniform *albedo_uniform = shader_data ? shader_data->uniforms.getptr("texture_albedo") : nullptr;
-	if (albedo_uniform && albedo_uniform->filter == ShaderLanguage::FILTER_LINEAR_MIPMAP_ANISOTROPIC) {
-		mat.flags |= RT_MAT_FLAG_ANISOTROPIC;
+	if (albedo_uniform) {
+		switch (albedo_uniform->filter) {
+			case ShaderLanguage::FILTER_NEAREST:
+				mat.flags |= RT_MAT_FLAG_POINT_FILTER | RT_MAT_FLAG_NO_MIPMAPS;
+				break;
+			case ShaderLanguage::FILTER_LINEAR:
+				mat.flags |= RT_MAT_FLAG_NO_MIPMAPS;
+				break;
+			case ShaderLanguage::FILTER_NEAREST_MIPMAP:
+			case ShaderLanguage::FILTER_NEAREST_MIPMAP_ANISOTROPIC:
+				mat.flags |= RT_MAT_FLAG_POINT_FILTER;
+				break;
+			case ShaderLanguage::FILTER_LINEAR_MIPMAP_ANISOTROPIC:
+				mat.flags |= RT_MAT_FLAG_ANISOTROPIC;
+				break;
+			default:
+				break;
+		}
 	}
 
 	// Update cache entry

@@ -232,11 +232,16 @@ vec4 sample_bindless_texture(uint tex_idx, vec2 uv, float p_lod_t) {
 	vec2 size = vec2(textureSize(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), 0));
 	return textureLod(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, p_lod_t + 0.5 * log2(max(size.x * size.y, 1.0)));
 }
-vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags, float p_lod_t) {
-	if ((mat_flags & 4u) != 0u) {
-		return sample_bindless_texture_point(tex_idx, uv);
+
+/// Nearest filtering with mipmaps at the ray cone's level, as sample_bindless_texture's linear form; level 0 where
+/// p_lod_t is RT_TEXTURE_LOD_BASE.
+vec4 sample_bindless_texture_point(uint tex_idx, vec2 uv, float p_lod_t) {
+	float level = 0.0;
+	if (p_lod_t > RT_TEXTURE_LOD_BASE) {
+		vec2 size = vec2(textureSize(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_NEAREST_WITH_MIPMAPS_REPEAT), 0));
+		level = p_lod_t + 0.5 * log2(max(size.x * size.y, 1.0));
 	}
-	return sample_bindless_texture(tex_idx, uv, p_lod_t);
+	return textureLod(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_NEAREST_WITH_MIPMAPS_REPEAT), uv, level);
 }
 
 /// The texture over the cone's elliptical footprint (D116): textureGrad at the material's UV gradients (g1, g2)
@@ -249,9 +254,20 @@ vec4 sample_bindless_texture(uint tex_idx, vec2 uv, float p_lod_t, vec4 p_grad, 
 	}
 	return textureGrad(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_ANISOTROPIC_REPEAT), uv, p_grad.xy, p_grad.zw);
 }
+
+/// A material's texture through the filter it asks for: nearest (bit 2) or linear, without mipmaps (bit 7) at the
+/// base level as the raster's mip-less samplers read, with them at the ray cone's level or over its elliptical
+/// footprint (bit 6, D116).
 vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags, float p_lod_t, vec4 p_grad) {
-	if ((mat_flags & 4u) != 0u) {
-		return sample_bindless_texture_point(tex_idx, uv);
+	const bool nearest = (mat_flags & 4u) != 0u;
+	if ((mat_flags & 128u) != 0u) {
+		if (nearest) {
+			return sample_bindless_texture_point(tex_idx, uv);
+		}
+		return textureLod(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_REPEAT), uv, 0.0);
+	}
+	if (nearest) {
+		return sample_bindless_texture_point(tex_idx, uv, p_lod_t);
 	}
 	return sample_bindless_texture(tex_idx, uv, p_lod_t, p_grad, (mat_flags & 64u) != 0u);
 }

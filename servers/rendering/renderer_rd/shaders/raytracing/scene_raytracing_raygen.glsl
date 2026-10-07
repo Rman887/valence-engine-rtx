@@ -791,9 +791,7 @@ void main() {
 	vec3 tangent_space_normal = vec3(0.0, 0.0, 1.0);
 	vec3 final_normal = h.geometry_normal;
 	if ((mat.flags & 1u) != 0u) {
-		// A point-filtered material reads its normal map at the base level, as its other textures do.
-		const bool point_filter = (mat.flags & 4u) != 0u;
-		vec3 normal_sample = sample_bindless_texture(mat.normal_texture_idx, uv, point_filter ? RT_TEXTURE_LOD_BASE : lod, point_filter ? vec4(0.0) : grad, (mat.flags & 64u) != 0u).rgb;
+		vec3 normal_sample = sample_material_texture(mat.normal_texture_idx, uv, mat.flags, lod, grad).rgb;
 		tangent_space_normal.xy = normal_sample.xy * 2.0 - 1.0;
 		tangent_space_normal.z = sqrt(max(0.0, 1.0 - dot(tangent_space_normal.xy, tangent_space_normal.xy)));
 		final_normal = apply_normal_map(h, tangent_space_normal, mat.normal_map_depth);

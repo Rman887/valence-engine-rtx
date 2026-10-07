@@ -297,11 +297,12 @@ enum {
 enum {
 	RT_MAT_FLAG_HAS_NORMAL_MAP = 1u,
 	RT_MAT_FLAG_HAS_EMISSION_TEX = 2u,
-	RT_MAT_FLAG_POINT_FILTER = 4u,
+	RT_MAT_FLAG_POINT_FILTER = 4u, // The textures' filter is nearest (pixel art), from the albedo texture's filter hint.
 	RT_MAT_FLAG_EMISSION_MULTIPLY = 8u, // BaseMaterial3D emission_operator Multiply; Add otherwise.
 	RT_MAT_FLAG_EMISSIVE_CONSTANT = 16u, // Emits a non-zero constant radiance with no texture: an emissive mesh light (D50).
 	RT_MAT_FLAG_DIFFUSE_TRANSMISSION = 32u, // BaseMaterial3D backlight: a thin diffuse-transmission lobe (D103).
 	RT_MAT_FLAG_ANISOTROPIC = 64u, // The albedo texture's filter is linear, mipmapped and anisotropic (D116).
+	RT_MAT_FLAG_NO_MIPMAPS = 128u, // The albedo texture's filter has no mipmaps: every fetch reads the base level.
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).

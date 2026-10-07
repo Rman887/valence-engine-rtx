@@ -1576,6 +1576,21 @@ class RenderRaytracing {
 	HashMap<uint64_t, RTSurfaceData *> cluster_compaction_pending;
 	LocalVector<RTClusterCompactionResult> cluster_compaction_results;
 
+	// D98a's concurrency probe (the debug argument --async-probe): one synthetic BLAS of about a
+	// million triangles, rebuilt in an async build scope every frame and never traced, so the compute
+	// queue builds beside the trace as D98's moved builds will.
+	struct AsyncProbe {
+		bool enabled = false;
+		RID vertices;
+		RID indices;
+		RID blas;
+		uint64_t frame = 0;
+		uint64_t builds = 0;
+		uint64_t async_builds = 0;
+	} async_probe;
+	void _async_probe_step();
+	void _async_probe_free();
+
 	// Opacity micromaps (D96), with rendering/pathtracing/opacity_micromaps.
 	bool omm_enabled = false;
 	bool omm_indirect_2_state = false;

@@ -84,6 +84,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		build_budget.max_wait_frames = uint32_t(MAX(1, int(GLOBAL_GET("rendering/pathtracing/build_budget_max_wait_frames"))));
 		print_line(vformat("RT: acceleration-structure build budget on: %d triangles and %d builds a frame, first in line after %d frames' wait (D97).", build_budget.triangles_per_frame, build_budget.builds_per_frame, build_budget.max_wait_frames));
 	}
+	async_probe.enabled = OS::get_singleton()->get_cmdline_args().find("--async-probe") != nullptr || OS::get_singleton()->get_cmdline_user_args().find("--async-probe") != nullptr;
 
 	cluster_blas_enabled = RD::get_singleton()->has_feature(RD::SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE);
 	if (cluster_blas_enabled) {
@@ -279,6 +280,7 @@ RenderRaytracing::~RenderRaytracing() {
 	viewport_states.clear();
 
 	cleanup_caches();
+	_async_probe_free();
 	singleton = nullptr;
 
 	if (position_fetch_check_buffer.is_valid()) {
@@ -969,6 +971,102 @@ RTMergedMMEntry *RenderRaytracing::_access_merged_mm_slot(RID &r_handle) {
 // Per-frame preparation
 // ---------------------------------------------------------------------------
 
+void RenderRaytracing::_async_probe_step() {
+	RD *rd = RD::get_singleton();
+	const uint64_t frame = rd->get_frames_drawn();
+	if (async_probe.frame == frame) {
+		return; // Once a frame, for the first viewport.
+	}
+	async_probe.frame = frame;
+
+	if (async_probe.blas.is_null()) {
+		// A flat grid of 708 x 708 quads, 1,002,528 triangles, uploaded once by a transfer worker.
+		const uint32_t side = 708;
+		const uint32_t row = side + 1;
+		Vector<uint8_t> vertices;
+		vertices.resize(row * row * 3 * sizeof(float));
+		float *v = reinterpret_cast<float *>(vertices.ptrw());
+		for (uint32_t y = 0; y < row; y++) {
+			for (uint32_t x = 0; x < row; x++) {
+				float *p = v + (y * row + x) * 3;
+				p[0] = float(x);
+				p[1] = float((x * 7 + y * 13) % 5) * 0.25f;
+				p[2] = float(y);
+			}
+		}
+		Vector<uint8_t> indices;
+		indices.resize(side * side * 6 * sizeof(uint32_t));
+		uint32_t *ix = reinterpret_cast<uint32_t *>(indices.ptrw());
+		for (uint32_t y = 0; y < side; y++) {
+			for (uint32_t x = 0; x < side; x++) {
+				const uint32_t a = y * row + x;
+				uint32_t *q = ix + (y * side + x) * 6;
+				q[0] = a;
+				q[1] = a + row;
+				q[2] = a + 1;
+				q[3] = a + 1;
+				q[4] = a + row;
+				q[5] = a + row + 1;
+			}
+		}
+		const BitField<RD::BufferCreationBits> flags = RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT | RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT;
+		async_probe.vertices = rd->vertex_buffer_create(vertices.size(), vertices, flags);
+		async_probe.indices = rd->index_buffer_create(side * side * 6, RD::INDEX_BUFFER_FORMAT_UINT32, indices, false, flags);
+		if (async_probe.vertices.is_null() || async_probe.indices.is_null()) {
+			ERR_PRINT("RT: the async probe's buffers could not be created; the probe is off (D98a).");
+			_async_probe_free();
+			async_probe.enabled = false;
+			return;
+		}
+
+		RD::AccelerationStructureGeometry geometry;
+		geometry.type = RD::AccelerationStructureGeometry::TYPE_TRIANGLES;
+		geometry.flags = RD::ACCELERATION_STRUCTURE_GEOMETRY_OPAQUE_BIT;
+		geometry.geometry.triangles.vertex_buffer = async_probe.vertices;
+		geometry.geometry.triangles.vertex_stride = 3 * sizeof(float);
+		geometry.geometry.triangles.vertex_count = row * row;
+		geometry.geometry.triangles.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
+		geometry.geometry.triangles.index_buffer = async_probe.indices;
+		geometry.geometry.triangles.index_count = side * side * 6;
+		async_probe.blas = rd->blas_create({ &geometry, 1 }, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+		if (async_probe.blas.is_null()) {
+			ERR_PRINT("RT: the async probe's BLAS could not be created; the probe is off (D98a).");
+			_async_probe_free();
+			async_probe.enabled = false;
+			return;
+		}
+		rd->set_resource_name(async_probe.blas, "RT async probe BLAS");
+		print_line(vformat("RT: async probe (D98a): a %d-triangle BLAS rebuilt every frame on the %s queue, never traced.", side * side * 2, rd->has_async_builds() ? "compute" : "main"));
+	}
+
+	const bool async = rd->async_build_begin();
+	rd->blas_build(async_probe.blas);
+	if (async) {
+		rd->async_build_end();
+	}
+	async_probe.builds++;
+	async_probe.async_builds += async ? 1 : 0;
+	if (async_probe.builds % 300 == 0) {
+		print_line(vformat("RT: async probe (D98a): %d builds, %d of them in an async scope, %d compute submits.", async_probe.builds, async_probe.async_builds, rd->get_async_submit_count()));
+	}
+}
+
+void RenderRaytracing::_async_probe_free() {
+	RD *rd = RD::get_singleton();
+	if (rd == nullptr) {
+		return;
+	}
+	if (async_probe.builds > 0) {
+		print_line(vformat("RT: async probe (D98a) done: %d builds, %d of them in an async scope, %d compute submits.", async_probe.builds, async_probe.async_builds, rd->get_async_submit_count()));
+	}
+	for (RID *rid : { &async_probe.blas, &async_probe.indices, &async_probe.vertices }) {
+		if (rid->is_valid()) {
+			rd->free_rid(*rid);
+			*rid = RID();
+		}
+	}
+}
+
 void RenderRaytracing::prepare_frame() {
 	// The build budget's frame (D97): its stand-ins below spend what the last frame left.
 	_build_budget_begin_frame();
@@ -987,6 +1085,9 @@ void RenderRaytracing::prepare_frame() {
 	if (position_fetch_check_buffer.is_valid() && RD::get_singleton()->get_frames_drawn() % 300 == 0) {
 		RD::get_singleton()->buffer_get_data_async(position_fetch_check_buffer, callable_mp_static(&RenderRaytracing::_on_position_fetch_check_read));
 		RD::get_singleton()->buffer_clear(position_fetch_check_buffer, 0, sizeof(uint32_t) * RT_POSITION_FETCH_CHECK_WORDS);
+	}
+	if (async_probe.enabled) {
+		_async_probe_step();
 	}
 
 	blass.clear();

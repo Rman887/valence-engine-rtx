@@ -96,6 +96,58 @@ void cluster_geometry_check_hit(GeometryData p_surface, GeometryData p_blob, uin
 // HIT DATA
 // ============================================================================
 
+/// The hit triangle's corners in object space (a compressed surface's unorm box, which the instance transform maps),
+/// from the vertex buffer, or on a cluster geometry hit from the CLAS (D93b), whose blob holds no positions; false
+/// where neither has them.
+bool rt_hit_triangle_positions(GeometryData geom, uint i0, uint i1, uint i2, out vec3 r_p0, out vec3 r_p1, out vec3 r_p2) {
+	r_p0 = vec3(0.0);
+	r_p1 = vec3(0.0);
+	r_p2 = vec3(0.0);
+	if ((geom.flags & FLAG_CLUSTER_GEOMETRY) != 0u && rt_hit_cluster_id() != RT_CLUSTER_ID_NONE) {
+#ifdef USE_POSITION_FETCH
+		r_p0 = gl_HitTriangleVertexPositionsEXT[0];
+		r_p1 = gl_HitTriangleVertexPositionsEXT[1];
+		r_p2 = gl_HitTriangleVertexPositionsEXT[2];
+		return true;
+#else
+		return false;
+#endif
+	}
+	if (geom.vertex_address == 0ul) {
+		return false;
+	}
+	r_p0 = emissive_fetch_position(geom, i0);
+	r_p1 = emissive_fetch_position(geom, i1);
+	r_p2 = emissive_fetch_position(geom, i2);
+	return true;
+}
+
+/// A tangent for a surface stored without one (D118): the triangle's dP/du from its corners and UVs, in the object
+/// space the vertex normal is in, its sign MikkTSpace's (the sign of the UV area); any vector perpendicular to the
+/// normal where the UVs or the positions give none. Both tests are relative, so they hold at any scale.
+vec3 rt_derived_tangent(GeometryData geom, uint i0, uint i1, uint i2, VertexAttributes p_attrs, out float r_sign) {
+	r_sign = 1.0;
+	vec3 p0, p1, p2;
+	if (p_attrs.has_uv && rt_hit_triangle_positions(geom, i0, i1, i2, p0, p1, p2)) {
+		const vec3 e1 = p1 - p0;
+		const vec3 e2 = p2 - p0;
+		const vec2 d1 = p_attrs.uv_corners[1] - p_attrs.uv_corners[0];
+		const vec2 d2 = p_attrs.uv_corners[2] - p_attrs.uv_corners[0];
+		const float det = d1.x * d2.y - d2.x * d1.y;
+		if (abs(det) > 1e-6 * length(d1) * length(d2)) {
+			// dP/du times |det|: the direction without the division.
+			const vec3 dpdu = (e1 * d2.y - e2 * d1.y) * sign(det);
+			const vec3 t = dpdu - p_attrs.normal * dot(p_attrs.normal, dpdu);
+			if (dot(t, t) > 1e-6 * dot(dpdu, dpdu)) {
+				r_sign = det < 0.0 ? -1.0 : 1.0;
+				return t;
+			}
+		}
+	}
+	const vec3 n = p_attrs.normal;
+	return abs(n.x) > abs(n.z) ? vec3(-n.y, n.x, 0.0) : vec3(0.0, -n.z, n.y);
+}
+
 /// Fetch vertex attributes and transform to world space.
 /// Requires hitAttributeEXT HitAttribs and GeometryBuffer/MaterialBuffer bindings.
 /// p_footprint: the cone's footprint is wanted whether or not the mesh has UVs or the frame decals.
@@ -147,9 +199,14 @@ HitData compute_hit_data(bool p_footprint, bool p_gradients) {
 	{
 		// Triangle hit: reuse `attrs` from the top-level fetch (already has
 		// UV / TBN from FETCH_UV | FETCH_TBN or FETCH_ALL).
+		vec3 obj_tangent = attrs.tangent;
+		float bitangent_sign = attrs.bitangent_sign;
+		if (attrs.has_normal && !attrs.has_tangent) {
+			obj_tangent = rt_derived_tangent(geom, i0, i1, i2, attrs, bitangent_sign);
+		}
 		h.geometry_normal = normalize(normal_matrix * attrs.normal);
-		h.tangent = normalize(normal_matrix * attrs.tangent);
-		h.bitangent = cross(h.geometry_normal, h.tangent) * attrs.bitangent_sign * handedness;
+		h.tangent = normalize(normal_matrix * obj_tangent);
+		h.bitangent = cross(h.geometry_normal, h.tangent) * bitangent_sign * handedness;
 
 		h.is_front_face = (gl_HitKindEXT == gl_HitKindFrontFacingTriangleEXT);
 		if (!h.is_front_face) {
@@ -159,32 +216,15 @@ HitData compute_hit_data(bool p_footprint, bool p_gradients) {
 
 	h.hit_pos = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
 
-	// The ray cone's footprint and level (D116), only where something reads them: the triangle's
-	// corners in object space (a compressed surface's unorm box, which the instance transform maps),
-	// from the vertex buffer, or on a cluster geometry hit from the CLAS (D93b), whose blob holds no
-	// positions. A surface without UVs still has a footprint, which its decals read, when there are any.
+	// The ray cone's footprint and level (D116), only where something reads them, from the triangle's
+	// corners (rt_hit_triangle_positions). A surface without UVs still has a footprint, which its decals
+	// read, when there are any.
 	h.texture_lod = RT_TEXTURE_LOD_BASE;
 	h.texture_footprint = RT_TEXTURE_LOD_BASE;
 	h.texture_grad = vec4(0.0);
 	if (rt_texture_lod_wanted() && (geom.flags & FLAG_PROCEDURAL) == 0u && (p_footprint || attrs.has_uv || get_rt_param(RT_PARAM_DECAL_COUNT) > 0.5)) {
 		vec3 p0, p1, p2;
-		bool has_positions = true;
-		if ((geom.flags & FLAG_CLUSTER_GEOMETRY) != 0u && rt_hit_cluster_id() != RT_CLUSTER_ID_NONE) {
-#ifdef USE_POSITION_FETCH
-			p0 = gl_HitTriangleVertexPositionsEXT[0];
-			p1 = gl_HitTriangleVertexPositionsEXT[1];
-			p2 = gl_HitTriangleVertexPositionsEXT[2];
-#else
-			has_positions = false;
-#endif
-		} else if (geom.vertex_address == 0ul) {
-			has_positions = false;
-		} else {
-			p0 = emissive_fetch_position(geom, i0);
-			p1 = emissive_fetch_position(geom, i1);
-			p2 = emissive_fetch_position(geom, i2);
-		}
-		if (has_positions) {
+		if (rt_hit_triangle_positions(geom, i0, i1, i2, p0, p1, p2)) {
 			mat3 object_to_world = mat3(gl_ObjectToWorldEXT);
 			vec3 n = cross(object_to_world * (p1 - p0), object_to_world * (p2 - p0));
 			vec2 cone = unpackHalf2x16(payload.packed_cone);

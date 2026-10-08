@@ -376,7 +376,9 @@ VertexAttributes fetch_vertex_attributes(in GeometryData geom, uint i0, uint i1,
 		attrs.tangent = tbn.tangent;
 		attrs.bitangent_sign = tbn.bitangent_sign;
 		attrs.has_normal = true;
-		attrs.has_tangent = true;
+		// VAL: an uncompressed surface without tangents reads the placeholder (1, 0, 0) above; a compressed one
+		// always carries its axis-angle frame (D118).
+		attrs.has_tangent = (geom.flags & FLAG_COMPRESSED) != 0u || geom.normal_stride >= 8u;
 	}
 
 	return attrs;

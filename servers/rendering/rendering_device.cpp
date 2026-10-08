@@ -9492,9 +9492,11 @@ bool RenderingDevice::_create_async_builds() {
 	// main queue.
 	main_timeline = driver->timeline_semaphore_create(0);
 	compute_timeline = driver->timeline_semaphore_create(0);
+	// A device without the feature gets no timeline and no error; a creation that failed on one with it has
+	// already printed one.
 	bool failed = !main_timeline || !compute_timeline;
 	if (failed) {
-		WARN_PRINT("rendering/pathtracing/async_builds is set, but the device has no timeline semaphores; builds stay on the main queue (D98).");
+		print_verbose("rendering/pathtracing/async_builds is set, but the device has no timeline semaphores; builds stay on the main queue (D98).");
 	}
 	for (uint32_t i = 0; i < frames.size() && !failed; i++) {
 		Frame &f = frames[i];
@@ -9884,8 +9886,9 @@ Error RenderingDevice::initialize(RenderingContextDriver *p_context, DisplayServ
 
 	// The compute-only family's queue, for the builds recorded in an async build scope (D98). The setting
 	// is registered with the rendering server's, after the device starts, so its default is given here.
-	// Vulkan only: the other drivers keep their builds on the main queue.
-	if (is_main_instance && driver->get_api_name() == "Vulkan" && bool(ProjectSettings::get_singleton()->get_setting("rendering/pathtracing/async_builds", false))) {
+	// Vulkan only: the other drivers keep their builds on the main queue. A device that cannot build
+	// acceleration structures has nothing to move.
+	if (is_main_instance && driver->get_api_name() == "Vulkan" && (has_feature(SUPPORTS_RAYTRACING_PIPELINE) || has_feature(SUPPORTS_RAY_QUERY)) && bool(ProjectSettings::get_singleton()->get_setting("rendering/pathtracing/async_builds", true))) {
 		compute_queue_family = driver->command_queue_family_get(RDD::COMMAND_QUEUE_FAMILY_COMPUTE_BIT);
 		if (compute_queue_family && compute_queue_family != main_queue_family) {
 			compute_queue = driver->command_queue_create(compute_queue_family);
@@ -9893,7 +9896,7 @@ Error RenderingDevice::initialize(RenderingContextDriver *p_context, DisplayServ
 		}
 
 		if (!async_builds) {
-			WARN_PRINT("rendering/pathtracing/async_builds is set, but the device has no separate compute queue family; builds stay on the main queue (D98).");
+			print_verbose("rendering/pathtracing/async_builds is set, but the device has no separate compute queue family; builds stay on the main queue (D98).");
 		}
 	}
 

@@ -82,7 +82,7 @@ struct InstanceMotionData {
 };
 
 // ============================================================================
-// MATERIAL DATA (matches C++ layout, 128 bytes)
+// MATERIAL DATA (matches C++ layout, 144 bytes)
 // ============================================================================
 struct MaterialData {
 	uint albedo_texture_idx;
@@ -113,4 +113,8 @@ struct MaterialData {
 	uint anisotropy_flowmap_idx; // Its flow map, read linear (0 = none: along the tangent, at full strength).
 	uint clearcoat_half2; // packHalf2x16(clearcoat, clearcoat_roughness), BaseMaterial3D's coat (D118 MM2); 0 = no coat.
 	uint clearcoat_texture_idx; // Its texture, read linear: red scales the strength, green the roughness (0 = none).
+	uint rim_half2; // packHalf2x16(rim, rim_tint), BaseMaterial3D's rim read as a sheen layer (D118 MM3); 0 = no rim.
+	uint rim_texture_idx; // Its texture, read linear: red scales the rim, green the tint (0 = none).
+	uint _reserved0;
+	uint _reserved1;
 };

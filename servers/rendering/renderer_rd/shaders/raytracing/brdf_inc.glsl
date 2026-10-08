@@ -282,6 +282,8 @@ struct MaterialProperties {
 	float clearcoat; // VAL: the coat's strength, Godot's CLEARCOAT, 0..1 (D118 MM2); 0 = no coat.
 	float clearcoatAlpha; // With a coat: its GGX alpha, mix(0.001, 0.1, CLEARCOAT_ROUGHNESS) as the raster takes it.
 	float3 clearcoatN; // With a coat: its unit normal, the vertex normal without the normal map.
+	float3 sheenColor; // VAL: the sheen layer's reflectivity, from Godot's RIM and RIM_TINT (D118 MM3); 0 = no sheen.
+	float sheenRoughness; // With a sheen: Estevez and Kulla's r, the surface's roughness clamped to 0.1..1, where the albedo fit holds.
 };
 
 // A thin surface that passes light to its other side (D103): light below N is evaluated, not rejected.
@@ -1162,16 +1164,19 @@ float clearcoatPdf(MaterialProperties material, float3 L, float3 V) {
 	return sampleGGXVNDFReflectionPdf(material.clearcoatAlpha, alphaSquared, dot(material.clearcoatN, H), min(NdotV, 1.0f), dot(L, H));
 }
 
+float sheenAlbedo(float r, float mu); // The sheen's directional albedo, in the sheen block below (D118 MM3).
+
 // The probability with which the scatter in shade_and_bounce picks the coat before the base's lobes: what the coat
-// reflects at V against the base's albedos under it (the luminances brdfSpecularProbability and the transmission
-// weigh), with specularF0 already remapped. 0 without a coat or with V below its normal (no random number drawn),
-// 1 over a black base.
-float clearcoatProbability(MaterialProperties material, float3 V, float3 specularF0, float3 diffuseReflectance) {
+// reflects at V against the albedos under it (the luminances brdfSpecularProbability and the transmission weigh,
+// and a sheen's about N, D118 MM3), with specularF0 already remapped. 0 without a coat or with V below its normal
+// (no random number drawn), 1 over a black base.
+float clearcoatProbability(MaterialProperties material, float3 N, float3 V, float3 specularF0, float3 diffuseReflectance) {
 	if (!hasClearcoat(material) || dot(material.clearcoatN, V) <= 0.0f) {
 		return 0.0f;
 	}
 	float coat = clearcoatReflectance(material, V);
-	float base = (1.0f - coat) * (luminance(specularF0) + luminance(diffuseReflectance) + luminance(material.diffuseTransmission));
+	float sheen = luminance(material.sheenColor) > 0.0f ? luminance(material.sheenColor) * sheenAlbedo(material.sheenRoughness, dot(N, V)) : 0.0f;
+	float base = (1.0f - coat) * (luminance(specularF0) + luminance(diffuseReflectance) + luminance(material.diffuseTransmission) + sheen);
 	if (base < 0.0001f) {
 		return 1.0f;
 	}
@@ -1209,6 +1214,161 @@ bool sampleClearcoat(float2 u, float3 geometryNormal, float3 V, MaterialProperti
 	}
 	sampleWeight = float3(F * G2OverG1, F * G2OverG1, F * G2OverG1);
 	rayDirection = normalize(rotatePoint(invertRotation(qRotationToZ), Llocal));
+
+	if (luminance(sampleWeight) == 0.0f) {
+		return false;
+	}
+	return dot(geometryNormal, rayDirection) > 0.0f;
+}
+
+// -------------------------------------------------------------------------
+//    VAL: sheen (D118 MM3)
+// -------------------------------------------------------------------------
+// Godot's rim read as a sheen layer: Estevez and Kulla's "Charlie" sheen ("Production Friendly Microfacet Sheen
+// BRDF", 2017) as Falcor's SheenBSDF writes it, about the shading normal, under the coat and over the base. Its
+// colour is what the raster's rim term ends up as (RIM times mix(1, albedo, RIM_TINT), then the diffuse light's
+// albedo and 1 - metallic); its r is the surface's roughness. The base under it passes what it does not reflect in
+// each direction in Kulla and Conty's normalised reciprocal form, (1 - s E(V)) (1 - s E(L)) / (1 - s E_avg), s the
+// colour's largest channel, E the lobe's directional albedo from Falcor's fit and E_avg its cosine-weighted mean:
+// over a diffuse base the pair then leaves exactly what the sheen does not reflect at V. It is sampled by the
+// cosine, as the paper recommends, and picked after the coat.
+
+bool hasSheen(MaterialProperties material) {
+	return any(greaterThan(material.sheenColor, float3(0.0f, 0.0f, 0.0f)));
+}
+
+// The microfacet distribution, its sin^2 floored as Falcor floors it.
+float sheenD(float r, float NdotH) {
+	float invR = 1.0f / r;
+	float sin2h = max(1.0f - NdotH * NdotH, 0.0078125f);
+	return (2.0f + invR) * pow(sin2h, invR * 0.5f) / TWO_PI;
+}
+
+// The fit of the shadowing's Lambda, interpolated between the paper's r = 0 and r = 1 fits by (1 - r)^2.
+float sheenL(float r, float x) {
+	float t = (1.0f - r) * (1.0f - r);
+	float a = mix(21.5473f, 25.3245f, t);
+	float b = mix(3.82987f, 3.32435f, t);
+	float c = mix(0.19823f, 0.16801f, t);
+	float d = mix(-1.97760f, -1.27393f, t);
+	float e = mix(-4.32054f, -4.85967f, t);
+	return a / (1.0f + b * pow(x, c)) + d * x + e;
+}
+
+float sheenLambda(float r, float cosTheta) {
+	return cosTheta < 0.5f ? exp(sheenL(r, cosTheta)) : exp(2.0f * sheenL(r, 0.5f) - sheenL(r, 1.0f - cosTheta));
+}
+
+// The shadowing, height-correlated and reciprocal. Unlike Falcor, without the paper's terminator softening (its
+// equation 4): the albedo fit below describes the unsoftened lobe (to 0.025), and the softened one lost up to a
+// fifth of its grazing energy that the base's attenuation still charged for.
+float sheenG(float r, float NdotL, float NdotV) {
+	return 1.0f / (1.0f + sheenLambda(r, NdotL) + sheenLambda(r, NdotV));
+}
+
+// The lobe's directional albedo for a white sheen at cosine mu: Falcor's fit, eleven rows at r = 0, 0.1 .. 1 of
+// (a, b, c, d, e) in 1 - (e + x^d + a / (1 + b x^c)), x = 20 mu + 1, interpolated linearly in r.
+const float SHEEN_ALBEDO_FIT[55] = float[](
+		1.01108f, 75.2286f, -9.4671f, 0.000973445f, -1.01325f,
+		8.44447f, 0.0135054f, 1.11637f, 0.479139f, -9.30873f,
+		5.67124f, 0.0194668f, 1.12489f, 0.453551f, -6.53104f,
+		4.50086f, 0.0237758f, 1.09376f, 0.423665f, -5.36521f,
+		3.77781f, 0.0273286f, 1.0666f, 0.400267f, -4.65601f,
+		3.35338f, 0.0307392f, 0.989189f, 0.371074f, -4.24089f,
+		3.39605f, 0.0308828f, 0.845455f, 0.333813f, -4.28662f,
+		3.62583f, 0.0303531f, 0.79754f, 0.325588f, -4.51725f,
+		4.11524f, 0.0172797f, 0.701166f, 0.275242f, -5.04394f,
+		4.4012f, 0.0159469f, 0.685892f, 0.270221f, -5.32997f,
+		5.8912f, 0.0171461f, 0.66366f, 0.288735f, -6.78867f);
+
+float sheenAlbedoFitRow(int row, float x) {
+	int i = row * 5;
+	return SHEEN_ALBEDO_FIT[i + 4] + pow(x, SHEEN_ALBEDO_FIT[i + 3]) + SHEEN_ALBEDO_FIT[i] / (1.0f + SHEEN_ALBEDO_FIT[i + 1] * pow(x, SHEEN_ALBEDO_FIT[i + 2]));
+}
+
+float sheenAlbedo(float r, float mu) {
+	float x = saturate(mu) * 20.0f + 1.0f;
+	int rowB = clamp(int(floor(r * 10.0f)), 0, 10);
+	int rowT = min(rowB + 1, 10);
+	float wB = float(rowT) - r * 10.0f;
+	return 1.0f - saturate(sheenAlbedoFitRow(rowB, x) * wB + sheenAlbedoFitRow(rowT, x) * (1.0f - wB));
+}
+
+// The fit's cosine-weighted mean, 2 * integral of E(mu) mu dmu, per row of the fit, interpolated as the rows are.
+const float SHEEN_ALBEDO_AVERAGE[11] = float[](
+		0.001252f, 0.077709f, 0.123519f, 0.162374f, 0.196127f, 0.225372f, 0.249648f, 0.266983f, 0.283394f, 0.293679f, 0.299293f);
+
+float sheenAlbedoAverage(float r) {
+	int rowB = clamp(int(floor(r * 10.0f)), 0, 10);
+	int rowT = min(rowB + 1, 10);
+	float wB = float(rowT) - r * 10.0f;
+	return SHEEN_ALBEDO_AVERAGE[rowB] * wB + SHEEN_ALBEDO_AVERAGE[rowT] * (1.0f - wB);
+}
+
+// What the sheen does not reflect along S, 1 - s E(|N.S|). The cosine is unsigned, so a thin surface's
+// transmission below N crosses it too. Over a diffuse base this one side is the base's whole share at V, which the
+// pick and the RR guides weigh.
+float sheenAttenuation(MaterialProperties material, float3 N, float3 S) {
+	float s = max(material.sheenColor.r, max(material.sheenColor.g, material.sheenColor.b));
+	return 1.0f - s * sheenAlbedo(material.sheenRoughness, abs(dot(N, S)));
+}
+
+// The base's share between V and L under the sheen: both sides over 1 - s E_avg, Kulla and Conty's normalisation.
+float sheenBaseAttenuation(MaterialProperties material, float3 N, float3 V, float3 L) {
+	float s = max(material.sheenColor.r, max(material.sheenColor.g, material.sheenColor.b));
+	return sheenAttenuation(material, N, V) * sheenAttenuation(material, N, L) / (1.0f - s * sheenAlbedoAverage(material.sheenRoughness));
+}
+
+// The sheen's reflection times its NdotL, for the light sample: colour D G / (4 NdotV). Zero for L or V below N.
+float3 evalSheen(MaterialProperties material, float3 N, float3 L, float3 V) {
+	float NdotL = dot(N, L);
+	float NdotV = dot(N, V);
+	if (NdotL <= 0.0f || NdotV <= 0.0f) {
+		return float3(0.0f, 0.0f, 0.0f);
+	}
+	NdotL = min(NdotL, 1.0f);
+	NdotV = max(0.00001f, min(NdotV, 1.0f));
+	float NdotH = saturate(dot(N, normalize(L + V)));
+	float r = material.sheenRoughness;
+	return material.sheenColor * (sheenD(r, NdotH) * sheenG(r, NdotL, NdotV) / (4.0f * NdotV));
+}
+
+// The density with which sampleSheen produces L: the cosine's; zero for L or V below N.
+float sheenPdf(float3 N, float3 L, float3 V) {
+	float NdotL = dot(N, L);
+	if (NdotL <= 0.0f || dot(N, V) <= 0.0f) {
+		return 0.0f;
+	}
+	return diffusePdf(min(NdotL, 1.0f));
+}
+
+// The probability with which the scatter in shade_and_bounce picks the sheen after the coat and before the base's
+// lobes: the sheen's albedo at V against the base's albedos under it, as clearcoatProbability weighs the coat's.
+// 0 without a sheen or with V below N (no random number drawn), 1 over a black base.
+float sheenProbability(MaterialProperties material, float3 N, float3 V, float3 specularF0, float3 diffuseReflectance) {
+	float NdotV = dot(N, V);
+	if (!hasSheen(material) || NdotV <= 0.0f) {
+		return 0.0f;
+	}
+	float sheen = luminance(material.sheenColor) * sheenAlbedo(material.sheenRoughness, NdotV);
+	float base = sheenAttenuation(material, N, V) * (luminance(specularF0) + luminance(diffuseReflectance) + luminance(material.diffuseTransmission));
+	if (base < 0.0001f) {
+		return 1.0f;
+	}
+	return clamp(sheen / (sheen + base), 0.01f, 0.99f);
+}
+
+// Samples the sheen: the cosine about N, the weight its reflection over that density, colour D G pi / (4 NdotV
+// NdotL). Returns false as evalIndirectCombinedBRDF does: on a zero weight, or a direction below the geometry
+// plane, which rayDirection still carries for the caller's recovery.
+bool sampleSheen(float2 u, float3 shadingNormal, float3 geometryNormal, float3 V, MaterialProperties material, OUT_PARAMETER(float3) rayDirection, OUT_PARAMETER(float3) sampleWeight) {
+	float3 Llocal = sampleHemisphere(u);
+	rayDirection = normalize(rotatePoint(getRotationFromZAxis(shadingNormal), Llocal));
+	float NdotL = max(0.00001f, min(1.0f, Llocal.z));
+	float NdotV = max(0.00001f, min(1.0f, dot(shadingNormal, V)));
+	float NdotH = saturate(dot(shadingNormal, normalize(rayDirection + V)));
+	float r = material.sheenRoughness;
+	sampleWeight = material.sheenColor * (sheenD(r, NdotH) * sheenG(r, NdotL, NdotV) * PI / (4.0f * NdotV * NdotL));
 
 	if (luminance(sampleWeight) == 0.0f) {
 		return false;
@@ -1315,11 +1475,15 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 	const bool coated = hasClearcoat(material);
 	const float coatSpecular = coated ? evalClearcoat(material, L, V) : 0.0f;
 	const float coatAttenuation = coated ? clearcoatAttenuation(material, V) * clearcoatAttenuation(material, L) : 1.0f;
+	// VAL: a sheen (D118 MM3), under the coat, adds its reflection to the diffuse, where the raster's rim goes, and
+	// passes the base what it does not reflect on either side.
+	const bool sheened = hasSheen(material);
+	const float sheenBase = sheened ? sheenBaseAttenuation(material, N, V, L) : 1.0f;
 	// Ignore L rays "below" the hemisphere, except through a thin surface's transmission lobe
 	// (D103): Lambertian about -N, its albedo the transmission's.
 	if (data.Lbackfacing) {
 		if (hasDiffuseTransmission(material)) {
-			outDiffuse = material.diffuseTransmission * (ONE_OVER_PI * max(-dot(N, L), 0.0f));
+			outDiffuse = material.diffuseTransmission * (ONE_OVER_PI * max(-dot(N, L), 0.0f)) * sheenBase;
 		}
 		if (coated) {
 			outDiffuse *= coatAttenuation;
@@ -1336,6 +1500,10 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 	// Specular is already multiplied by F, just attenuate diffuse
 	outDiffuse = (float3(1.0f, 1.0f, 1.0f) - data.F) * outDiffuse;
 #endif
+	if (sheened) {
+		outDiffuse = outDiffuse * sheenBase + evalSheen(material, N, L, V);
+		outSpecular *= sheenBase;
+	}
 	if (coated) {
 		outDiffuse *= coatAttenuation;
 		outSpecular = outSpecular * coatAttenuation + float3(coatSpecular, coatSpecular, coatSpecular);
@@ -1381,13 +1549,17 @@ float diffuseTransmissionProbability(float3 specularF0, float3 diffuseReflectanc
 float brdf_pdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	const BrdfData data = prepareBRDFData(N, L, V, material);
 	// VAL: a coat (D118 MM2) is picked first, the base's lobes below take the rest; a mirror coat adds no density.
-	float coatProbability = clearcoatProbability(material, V, data.specularF0, data.diffuseReflectance);
+	float coatProbability = clearcoatProbability(material, N, V, data.specularF0, data.diffuseReflectance);
 	float coatPdf = coatProbability > 0.0f ? coatProbability * clearcoatPdf(material, L, V) : 0.0f;
+	// VAL: a sheen (D118 MM3) takes its share of the rest next, the base's lobes what remains.
+	float sheenP = sheenProbability(material, N, V, data.specularF0, data.diffuseReflectance);
+	float baseProbability = (1.0f - coatProbability) * (1.0f - sheenP);
+	float sheenDensity = sheenP > 0.0f ? (1.0f - coatProbability) * sheenP * sheenPdf(N, L, V) : 0.0f;
 	// A thin surface's transmission (D103) takes its share first: cosine about -N below, the
 	// reflection lobes the rest above.
 	float transmissionProbability = diffuseTransmissionProbability(data.specularF0, data.diffuseReflectance, material.diffuseTransmission);
 	if (!data.Vbackfacing && data.Lbackfacing && transmissionProbability > 0.0f) {
-		return coatPdf + (1.0f - coatProbability) * transmissionProbability * diffusePdf(max(-dot(N, L), 0.0f));
+		return coatPdf + baseProbability * transmissionProbability * diffusePdf(max(-dot(N, L), 0.0f));
 	}
 	if (data.Vbackfacing || data.Lbackfacing) {
 		return coatPdf;
@@ -1407,7 +1579,7 @@ float brdf_pdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	if (transmissionProbability > 0.0f) {
 		pdf *= 1.0f - transmissionProbability;
 	}
-	return coatPdf + (1.0f - coatProbability) * pdf;
+	return coatPdf + sheenDensity + baseProbability * pdf;
 }
 
 // This is an entry point for evaluation of all other BRDFs based on selected configuration (for indirect light)

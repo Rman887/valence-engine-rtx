@@ -271,6 +271,8 @@ void debug_visualize(
 		dbg_mat.clearcoat = 0.0;
 		dbg_mat.clearcoatAlpha = 0.0;
 		dbg_mat.clearcoatN = vec3(0.0, 0.0, 1.0);
+		dbg_mat.sheenColor = vec3(0.0);
+		dbg_mat.sheenRoughness = 1.0;
 
 		vec3 dbg_dir;
 		vec3 dbg_weight;
@@ -465,6 +467,15 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	brdf_mat.clearcoatN = m.clearcoat > 0.0 ? normalize(m.clearcoat_normal) : N;
 	brdf_mat.clearcoat = dot(brdf_mat.clearcoatN, V) > 0.0 ? m.clearcoat : 0.0;
 	brdf_mat.clearcoatAlpha = mix(0.001, 0.1, m.clearcoat_roughness);
+	// VAL: Godot's rim as a sheen layer (D118 MM3), coloured as the raster's rim term ends up: RIM times
+	// mix(1, albedo, RIM_TINT), times the albedo and 1 - metallic its diffuse light takes; r the surface's roughness.
+	// Seen from below N (a silhouette of interpolated normals) the sheen is absent, as the coat is from below its normal,
+	// so its terms, the base's attenuation and the guides agree.
+	brdf_mat.sheenColor = vec3(0.0);
+	brdf_mat.sheenRoughness = clamp(m.roughness, 0.1, 1.0); // Below 0.1 the albedo fit leans on its r = 0 row and under-states the lobe.
+	if (m.rim > 0.0 && dot(N, V) > 0.0) {
+		brdf_mat.sheenColor = clamp(m.rim * m.albedo * mix(vec3(1.0), m.albedo, m.rim_tint) * (1.0 - m.metalness), vec3(0.0), vec3(1.0));
+	}
 
 	// Transmission: the surface is a dielectric interface. TRANSMISSION is the
 	// fraction (per channel) of the unreflected light that continues through
@@ -505,6 +516,15 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		vec3 specular_albedo = DLSSRR_computeSpecularAlbedo(m.albedo, m.metalness, brdf_mat.dielectricF0, m.roughness, NdotV);
 		vec3 guide_N = N;
 		float guide_roughness = m.roughness;
+		// VAL: under a sheen (D118 MM3) the base's albedos are what the sheen passes at V (its normalised attenuation
+		// integrated over L), and the sheen, a broad lobe where the raster's rim is diffuse light, adds its albedo to the
+		// diffuse guide; the coat below covers both.
+		float sheen_V = 1.0;
+		if (hasSheen(brdf_mat)) {
+			sheen_V = sheenAttenuation(brdf_mat, N, V);
+			specular_albedo *= sheen_V;
+			diffuse_albedo = diffuse_albedo * sheen_V + brdf_mat.sheenColor * sheenAlbedo(brdf_mat.sheenRoughness, NdotV);
+		}
 		// VAL: under a coat (D118 MM2) the specular albedo is the coat's plus the base's it passes, the diffuse what
 		// the coat passes; the normal, roughness and hit distance follow whichever specular reflects more, so a rough
 		// coat does not hide a sharp metal under it.
@@ -512,7 +532,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			float coat_V = clearcoatReflectance(brdf_mat, V);
 			float coat_roughness = sqrt(brdf_mat.clearcoatAlpha);
 			vec3 coat_albedo = brdf_mat.clearcoat * DLSSRR_envBRDFApprox(vec3(0.04), coat_roughness, max(dot(brdf_mat.clearcoatN, V), 0.0001));
-			vec3 base_albedo = (1.0 - coat_V) * DLSSRR_envBRDFApprox(clearcoatBaseF0(baseColorToSpecularF0(m.albedo, m.metalness, brdf_mat.dielectricF0), brdf_mat.clearcoat), m.roughness, NdotV);
+			vec3 base_albedo = (1.0 - coat_V) * sheen_V * DLSSRR_envBRDFApprox(clearcoatBaseF0(baseColorToSpecularF0(m.albedo, m.metalness, brdf_mat.dielectricF0), brdf_mat.clearcoat), m.roughness, NdotV);
 			specular_albedo = coat_albedo + base_albedo;
 			diffuse_albedo *= 1.0 - coat_V;
 			if (luminance(coat_albedo) > luminance(base_albedo)) {
@@ -683,6 +703,11 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			if (hasClearcoat(brdf_mat)) {
 				ps.throughput *= clearcoatAttenuation(brdf_mat, V) * clearcoatAttenuation(brdf_mat, refracted); // Through the coat (D118 MM2).
 			}
+			if (hasSheen(brdf_mat)) {
+				// And the sheen (D118 MM3), on V's side alone: what it does not reflect enters. Kulla and Conty's
+				// normalised pair holds over a diffuse base only; over this delta lobe it would add up to 18 %.
+				ps.throughput *= sheenAttenuation(brdf_mat, N, V);
+			}
 			ps.packed_bounces_flags = inc_total_bounce(ps.packed_bounces_flags);
 			// The medium behind the interface (D49): the surface's ABSORPTION and SCATTERING,
 			// which a front face sets and a back face writes as zero to clear (no nesting: the
@@ -711,7 +736,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// =================================================================
 	// VAL: a coat (D118 MM2) is chosen before the base's lobes, with the probability brdf_pdf gives it, on a
 	// dimension of its own so the base's draws keep theirs; a surface without one draws nothing here.
-	float coat_p = clearcoatProbability(brdf_mat, V, specularF0, diffuseReflectance);
+	float coat_p = clearcoatProbability(brdf_mat, N, V, specularF0, diffuseReflectance);
 	bool coat_sampled = coat_p >= 1.0;
 	if (coat_p > 0.0 && coat_p < 1.0) {
 		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_CLEARCOAT);
@@ -719,11 +744,21 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER + (transmit_p > 0.0 ? 1u : 0u));
 		ps.throughput /= coat_sampled ? coat_p : (1.0 - coat_p);
 	}
+	// VAL: a sheen (D118 MM3) is chosen next, under the coat and over the base's lobes, with the probability brdf_pdf
+	// gives it, on a dimension of its own; a surface without one draws nothing here.
+	float sheen_p = coat_sampled ? 0.0 : sheenProbability(brdf_mat, N, V, specularF0, diffuseReflectance);
+	bool sheen_sampled = sheen_p >= 1.0;
+	if (sheen_p > 0.0 && sheen_p < 1.0) {
+		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SHEEN);
+		sheen_sampled = rand(ps.rng_state) < sheen_p;
+		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER + (transmit_p > 0.0 ? 1u : 0u));
+		ps.throughput /= sheen_sampled ? sheen_p : (1.0 - sheen_p);
+	}
 
 	// A thin surface's diffuse transmission (D103) is chosen first, with the probability brdf_pdf
 	// gives it, on a dimension of its own so the lobe and direction draws keep theirs; a surface
 	// without it draws nothing here.
-	float diffuse_transmit_p = (diffuse_transmit_max > 0.0 && !coat_sampled) ? diffuseTransmissionProbability(specularF0, diffuseReflectance, m.diffuse_transmission) : 0.0;
+	float diffuse_transmit_p = (diffuse_transmit_max > 0.0 && !coat_sampled && !sheen_sampled) ? diffuseTransmissionProbability(specularF0, diffuseReflectance, m.diffuse_transmission) : 0.0;
 	bool diffuse_transmitted = false;
 	if (diffuse_transmit_p > 0.0) {
 		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_DIFFUSE_TRANSMISSION);
@@ -733,7 +768,8 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	}
 
 	int brdfType = DIFFUSE_TYPE;
-	float brdfProbability = coat_sampled ? 1.0 : (diffuse_transmitted ? 0.0 : brdfSpecularProbability(specularF0, diffuseReflectance));
+	// The sheen is a broad lobe, a diffuse bounce for the bounce budget (D74), as the raster's rim is diffuse light.
+	float brdfProbability = coat_sampled ? 1.0 : ((diffuse_transmitted || sheen_sampled) ? 0.0 : brdfSpecularProbability(specularF0, diffuseReflectance));
 	if (brdfProbability >= 1.0) {
 		brdfType = SPECULAR_TYPE;
 	} else if (brdfProbability <= 0.0) {
@@ -760,7 +796,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			next_dir = normalize(next_dir - 2.0 * above * h.geometry_normal);
 		}
 		brdf_weight = m.diffuse_transmission;
-	} else if (coat_sampled ? !sampleClearcoat(u, h.geometry_normal, V, brdf_mat, next_dir, brdf_weight) : !evalIndirectCombinedBRDF(u, N, h.geometry_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
+	} else if (coat_sampled ? !sampleClearcoat(u, h.geometry_normal, V, brdf_mat, next_dir, brdf_weight) : (sheen_sampled ? !sampleSheen(u, N, h.geometry_normal, V, brdf_mat, next_dir, brdf_weight) : !evalIndirectCombinedBRDF(u, N, h.geometry_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0)))) {
 		// Two failure modes:
 		//   1) Sample weight is zero (no contribution). Terminate.
 		//   2) Sampled direction is below the geometry plane. Recover by
@@ -776,7 +812,11 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		}
 		next_dir = recovered_dir;
 	}
-	// VAL: the base under a coat (D118 MM2) passes what the coat does not reflect, in both directions.
+	// VAL: the base under a sheen (D118 MM3) passes what the sheen does not reflect, in both directions.
+	if (!coat_sampled && !sheen_sampled && hasSheen(brdf_mat)) {
+		brdf_weight *= sheenBaseAttenuation(brdf_mat, N, V, next_dir);
+	}
+	// VAL: the sheen and the base under a coat (D118 MM2) pass what the coat does not reflect, in both directions.
 	if (!coat_sampled && hasClearcoat(brdf_mat)) {
 		brdf_weight *= clearcoatAttenuation(brdf_mat, V) * clearcoatAttenuation(brdf_mat, next_dir);
 	}
@@ -832,8 +872,9 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		// direction on the side of N the chosen lobe does not sample: a transmitted one mirrored back
 		// above N, a reflected one in the wedge between N and the geometry plane) is one light
 		// sampling does not produce this way, so the BSDF strategy keeps the whole weight. So is a base lobe's
-		// direction below N under a coat (D118 MM2): light sampling evaluates only the coat there.
-		if ((diffuse_transmit_p > 0.0 && diffuse_transmitted != (dot(N, next_dir) < 0.0)) || base_below_coat) {
+		// direction below N under a coat (D118 MM2): light sampling evaluates only the coat there. So is a sheen
+		// sample the recovery mirrored below N (D118 MM3), which the sheen's density does not cover.
+		if ((diffuse_transmit_p > 0.0 && diffuse_transmitted != (dot(N, next_dir) < 0.0)) || base_below_coat || (sheen_sampled && dot(N, next_dir) <= 0.0)) {
 			pdf = 0.0;
 		}
 		ps.bsdf_pdf = pdf > 0.0 ? pdf : RT_BSDF_PDF_DELTA;
@@ -845,7 +886,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		float pdf = ps.bsdf_pdf;
 		if (pdf == RT_BSDF_PDF_DELTA) {
 			pdf = brdf_pdf(N, next_dir, V, brdf_mat);
-			if ((diffuse_transmit_p > 0.0 && diffuse_transmitted != (dot(N, next_dir) < 0.0)) || base_below_coat) {
+			if ((diffuse_transmit_p > 0.0 && diffuse_transmitted != (dot(N, next_dir) < 0.0)) || base_below_coat || (sheen_sampled && dot(N, next_dir) <= 0.0)) {
 				pdf = 0.0;
 			}
 		}

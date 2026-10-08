@@ -225,6 +225,8 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	m.clearcoat = 0.0; // Nor a coat (D118 MM2).
 	m.clearcoat_roughness = 0.0;
 	m.clearcoat_normal = h.geometry_normal;
+	m.rim = 0.0; // Nor a rim (D118 MM3).
+	m.rim_tint = 0.0;
 
 #ifdef RT_DEBUG_ENABLED
 	int vis_mode = int(get_rt_param(RT_PARAM_VIS_MODE));
@@ -765,6 +767,10 @@ void main() {
 	m.clearcoat = clamp(clearcoat, 0.0, 1.0);
 	m.clearcoat_roughness = clamp(clearcoat_roughness, 0.0, 1.0);
 	m.clearcoat_normal = m.normal;
+	// VAL: RIM and RIM_TINT (D118 MM3), read as a sheen layer whose colour shade_and_bounce takes from the albedo
+	// after the decals; in a shader that writes no RIM it is the constant 0, on which the compiler drops the lobe.
+	m.rim = clamp(rim, 0.0, 1.0);
+	m.rim_tint = clamp(rim_tint, 0.0, 1.0);
 
 	// Apply normal map if it was written.
 	if (normal_map != vec3(0.5, 0.5, 1.0)) {
@@ -899,6 +905,19 @@ void main() {
 		}
 		m.clearcoat = clamp(clearcoat_params.x, 0.0, 1.0);
 		m.clearcoat_roughness = clamp(clearcoat_params.y, 0.0, 1.0);
+	}
+
+	// VAL: rim (D118 MM3) as BaseMaterial3D's fragment writes it: the rim times the texture's red, the tint times its
+	// green. shade_and_bounce reads the pair as a sheen layer.
+	m.rim = 0.0;
+	m.rim_tint = 0.0;
+	if (mat.rim_half2 != 0u) {
+		vec2 rim_params = unpackHalf2x16(mat.rim_half2);
+		if (mat.rim_texture_idx != 0u) {
+			rim_params *= sample_material_texture(mat.rim_texture_idx, uv, mat.flags, lod, grad, stf_u).xy;
+		}
+		m.rim = clamp(rim_params.x, 0.0, 1.0);
+		m.rim_tint = clamp(rim_params.y, 0.0, 1.0);
 	}
 
 #ifdef RT_DEBUG_ENABLED

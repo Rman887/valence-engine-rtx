@@ -285,7 +285,7 @@ const uint FLAG_CLUSTER_GEOMETRY = 8u;
 // Each bounce owns a block of dimensions (worst case 40 draws: the two strategy choices, up to 16 light
 // picks and 16 acceptances, the cone pair, the transmission and lobe choices, the direction pair, the
 // roulette, a thin surface's transmission choice, D103; then the stochastic texture filter's three, D117,
-// and the coat's choice, D118 MM2, at 45 to 48),
+// the coat's choice, D118 MM2, and the sheen's, D118 MM3, at 45 to 49),
 // so a draw keeps its dimension across frames whatever the blocks before it consumed; 8 bounces
 // use 512 of the 4096 available.
 #define RT_SOBOL_DIMS_PER_BOUNCE 64u
@@ -294,6 +294,7 @@ const uint FLAG_CLUSTER_GEOMETRY = 8u;
 #define RT_SOBOL_DIM_DIFFUSE_TRANSMISSION 44u // A thin surface's transmission choice (D103), apart so the scatter's three keep their dimensions.
 #define RT_SOBOL_DIM_TEXTURE_FILTERING 45u // The texel pair, the level and (anisotropic, past the primary hit) the major axis's position a hit's stochastic texture lookups share (D117), three dimensions.
 #define RT_SOBOL_DIM_CLEARCOAT 48u // The coat's choice before the base's lobes (D118 MM2), apart so the scatter's draws keep their dimensions.
+#define RT_SOBOL_DIM_SHEEN 49u // The sheen's choice under the coat and over the base's lobes (D118 MM3), apart as the coat's is.
 
 // Both in raytracing_common_inc.glsl, which every stage includes after this file, after its
 // ray-tracing extensions are enabled and where the specialization constant is declared.

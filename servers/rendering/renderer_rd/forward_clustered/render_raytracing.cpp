@@ -8812,6 +8812,10 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.anisotropy_flowmap_idx = 0;
 	mat.clearcoat_half2 = 0;
 	mat.clearcoat_texture_idx = 0;
+	mat.rim_half2 = 0;
+	mat.rim_texture_idx = 0;
+	mat._reserved[0] = 0;
+	mat._reserved[1] = 0;
 	bool omm_custom = false;
 	RID omm_custom_alpha_rd; // An opted-in custom shader's hint_alpha texture, with a real bindless slot.
 
@@ -9196,6 +9200,29 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 			RID clearcoat_rd = get_material_texture("texture_clearcoat");
 			if (clearcoat_rd.is_valid() && shader_declares("texture_clearcoat")) {
 				mat.clearcoat_texture_idx = bindless_block->add_texture(clearcoat_rd);
+			}
+		}
+	}
+
+	// VAL: rim as sheen (D118 MM3). BaseMaterial3D declares rim, rim_tint and texture_rim only while the feature is
+	// enabled, and its fragment writes RIM = rim * tex.r and RIM_TINT = rim_tint * tex.g. The hit shader reads them
+	// as the colour of a sheen layer. A custom shader's RIM reaches its hit group through the fragment instead.
+	if (!mat_data->is_custom_shader && shader_declares("rim")) {
+		float rim = 0.0f;
+		float rim_tint = 0.0f;
+		Variant rim_var = material_storage->material_get_param(p_material_rid, "rim");
+		if (rim_var.get_type() == Variant::FLOAT) {
+			rim = CLAMP(float(rim_var), 0.0f, 1.0f);
+		}
+		Variant tint_var = material_storage->material_get_param(p_material_rid, "rim_tint");
+		if (tint_var.get_type() == Variant::FLOAT) {
+			rim_tint = CLAMP(float(tint_var), 0.0f, 1.0f);
+		}
+		if (rim > 0.0f) {
+			mat.rim_half2 = (uint32_t(Math::make_half_float(rim_tint)) << 16) | Math::make_half_float(rim);
+			RID rim_rd = get_material_texture("texture_rim");
+			if (rim_rd.is_valid() && shader_declares("texture_rim")) {
+				mat.rim_texture_idx = bindless_block->add_texture(rim_rd);
 			}
 		}
 	}

@@ -20,6 +20,8 @@ struct MaterialResult {
 	float clearcoat; // VAL: the coat's strength as Godot's CLEARCOAT, 0..1; 0 = no coat (D118 MM2).
 	float clearcoat_roughness; // Godot's CLEARCOAT_ROUGHNESS, 0..1, mapped to the coat's alpha as the raster maps it.
 	vec3 clearcoat_normal; // World space, the coat's normal: the vertex normal (a custom shader's NORMAL) without the normal map.
+	float rim; // VAL: Godot's RIM, 0..1, read as the strength of a sheen layer; 0 = none (D118 MM3).
+	float rim_tint; // Godot's RIM_TINT, 0..1: how far the sheen's colour moves from white to the albedo.
 };
 
 /// Sensible default for a mid-grey diffuse surface.
@@ -43,5 +45,7 @@ MaterialResult default_material_result(vec3 geometry_normal) {
 	r.clearcoat = 0.0;
 	r.clearcoat_roughness = 0.0;
 	r.clearcoat_normal = geometry_normal;
+	r.rim = 0.0;
+	r.rim_tint = 0.0;
 	return r;
 }

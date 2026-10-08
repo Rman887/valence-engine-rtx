@@ -963,6 +963,25 @@ Files extracted from upstream source:
 - `LICENSE`
 
 
+## rtxtf
+
+- Upstream: https://github.com/NVIDIA-RTX/RTXTF-Library
+- Version: 1.3.0 (771b42b26a1f804212fb99521adf86cc24e04d04, 2026)
+- License: NVIDIA RTX SDKs License
+
+Files extracted from upstream source:
+
+- `LICENSE.txt`, `README.md`
+- `STFDefinitions.h`, `STFMacros.hlsli`, `STFSamplerState.hlsli`,
+  `STFSamplerStateImpl.hlsli`
+
+These files are not compiled. They are the reference for the hand-written GLSL
+port at `servers/rendering/renderer_rd/shaders/raytracing/rtxtf_stf_inc.glsl`,
+which carries the core stochastic texture filtering paths only (no wave or
+collaborative texture filtering paths). Diff a newer upstream against these
+files to update the port.
+
+
 ## rvo2
 
 For 2D in `rvo2_2d` folder

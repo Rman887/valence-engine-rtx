@@ -787,8 +787,9 @@ void main() {
 	// And its elliptical footprint, the mesh's gradients through the same scale.
 	const vec4 grad = h.texture_grad * vec4(mat.uv1_scale, mat.uv1_scale);
 	// The numbers the five lookups share under stochastic texture filtering (D117), drawn only for a material the
-	// filter applies to (not point-filtered, not anisotropic).
-	const vec4 stf_u = (rt_texture_filtering() != 0u && (mat.flags & (4u | 64u)) == 0u) ? rt_texture_filtering_random() : vec4(0.0);
+	// filter applies to (not point-filtered), with the major axis's position for an anisotropic one with the cone's
+	// elliptical footprint (F2), the same test as the lookup's.
+	const vec4 stf_u = (rt_texture_filtering() != 0u && (mat.flags & 4u) == 0u) ? rt_texture_filtering_random((mat.flags & 64u) != 0u && grad != vec4(0.0)) : vec4(0.0);
 
 	// Normal mapping.
 	vec3 tangent_space_normal = vec3(0.0, 0.0, 1.0);

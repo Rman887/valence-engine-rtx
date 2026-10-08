@@ -283,44 +283,84 @@ uint rt_texture_filtering() {
 	return uint(get_rt_param(RT_PARAM_TEXTURE_FILTERING));
 }
 
+/// Whether an anisotropic lookup takes the library's gradient path (D117 F2): at the camera ray's hit of a frame the
+/// camera jitters (a temporal upscaler or TAA; the frame's taa_jitter is the jittered projection's offset, never zero
+/// on such a frame), where the jitter across frames sweeps the footprint's major axis. Anywhere else the lookup moves
+/// along the major axis itself. The random numbers and the lookup read this one test, so u.z is drawn exactly where
+/// the lookup uses it.
+bool rt_texture_filtering_gradient_path() {
+	return get_total_bounces(payload.packed_bounces_flags) == 0u && scene_data_block.data.taa_jitter != vec2(0.0);
+}
+
 /// The uniform numbers one hit's stochastic lookups share (D117), as RTX Texture Filtering's state takes them: the
 /// texel's pair in xy and the level's in w. All of a material's textures take the same numbers (the library's
-/// reseed off, as RTXPT), so textures of one size pick the same texel and level. They come from the payload's
-/// sampler without moving it: under Sobol (D52) from this bounce's block at RT_SOBOL_DIM_TEXTURE_FILTERING on a
-/// copy of the state, and under the hash from a salted hash of the chain's current state, which the chain never
-/// advances through, so turning the filter on changes no other number in the path.
-vec4 rt_texture_filtering_random() {
+/// reseed off, as RTXPT), so textures of one size pick the same texel and level. With p_major, off the gradient
+/// path, z is the position along an anisotropic footprint's major axis (F2; the library leaves z unused in 2D).
+/// They come from the payload's sampler without moving it: under Sobol (D52) from this bounce's block at
+/// RT_SOBOL_DIM_TEXTURE_FILTERING on a copy of the state, and under the hash from a salted hash of the chain's
+/// current state, which the chain never advances through, so turning the filter on changes no other number in the
+/// path.
+vec4 rt_texture_filtering_random(bool p_major) {
 	uint state = payload.rng_state;
+	const uint bounce = get_total_bounces(payload.packed_bounces_flags);
+	const bool major = p_major && !rt_texture_filtering_gradient_path();
 	if (rng_is_sobol()) {
-		rng_set_dimension(state, get_total_bounces(payload.packed_bounces_flags) * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_TEXTURE_FILTERING);
+		rng_set_dimension(state, bounce * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_TEXTURE_FILTERING);
 		vec2 texel = rand2(state);
-		return vec4(texel, 0.0, rand(state));
+		float level = rand(state);
+		return vec4(texel, major ? rand(state) : 0.0, level);
 	}
 	state = pcg_hash(state ^ 0x5f356495u);
 	float x = float(state) / 4294967296.0;
 	state = pcg_hash(state);
 	float y = float(state) / 4294967296.0;
 	state = pcg_hash(state);
-	return vec4(x, y, 0.0, float(state) / 4294967296.0);
+	float w = float(state) / 4294967296.0;
+	float z = 0.0;
+	if (major) {
+		state = pcg_hash(state);
+		z = float(state) / 4294967296.0;
+	}
+	return vec4(x, y, z, w);
 }
 
 /// A material's texture through the filter it asks for, as sample_material_texture above, with stochastic texture
-/// filtering (D117) on a material filtered linearly (with mipmaps or without) and not anisotropically: one texel of
+/// filtering (D117) on a material filtered linearly (with mipmaps or without, anisotropically or not): one texel of
 /// the filter's footprint at one of the two levels around the cone's, picked by p_stf_u, read through the nearest
 /// sampler at its centre (the sampler wraps a texel past the edge, and decodes sRGB). A lookup the texture
-/// magnifies (its full level at most 0, or level 0 everywhere without the cone) keeps the hardware's bilinear
-/// unless rendering/pathtracing/texture_filtering_magnification asks otherwise. Under the bilinear filter both have
-/// the same expectation there; under the bicubic and Gaussian filters the hardware's bilinear is the sharper, a
-/// seam in sharpness at level 0 that D117's F4 judges. Point-filtered materials already read one texel; anisotropic
-/// ones keep the cone's footprint for now.
+/// magnifies (its full level at most 0, or level 0 everywhere without the cone) keeps the hardware's filter
+/// unless rendering/pathtracing/texture_filtering_magnification asks otherwise. For an isotropic lookup under the
+/// bilinear filter both have the same expectation there; under the bicubic and Gaussian filters the hardware's
+/// bilinear is the sharper, a seam in sharpness at level 0 that D117's F4 judges. Under every filter an anisotropic
+/// lookup on the gradient path keeps a seam along the footprint's long axis where the rule switches: T5's
+/// textureGrad under the camera's jitter filters that axis with two boxes (its probes and the jitter), the gradient
+/// path with the jitter's alone. Point-filtered materials already read one texel.
+///
+/// An anisotropic material with the cone's elliptical footprint (T5's gradients, F2) takes its level from the
+/// ellipse's minor axis, the anisotropy clamped at 16:1 as the library clamps it; the hardware's own cap is the
+/// viewport's anisotropic filtering level, so the two agree only at 16x. A gradient is the UV change across one
+/// pixel step, the footprint's full extent (rt_texture_grad_triangle's radius is the cone's width), so the
+/// footprint spans half a gradient either side of the hit. On the gradient path (the camera ray's hit under a
+/// jittered projection) the library reads that level alone and leaves the major axis to the camera's sub-pixel
+/// jitter across frames (the STF paper's section 4.2.1); elsewhere, where no jitter sweeps the footprint, the
+/// lookup moves along the major axis by (p_stf_u.z - 1/2) of its gradient, a box over the footprint's extent,
+/// before the level's pick.
 vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags, float p_lod_t, vec4 p_grad, vec4 p_stf_u) {
 	const uint stf_filter = rt_texture_filtering();
-	if (stf_filter == 0u || (mat_flags & (4u | 64u)) != 0u) {
+	if (stf_filter == 0u || (mat_flags & 4u) != 0u) {
 		return sample_material_texture(tex_idx, uv, mat_flags, p_lod_t, p_grad);
 	}
 	const bool mipmaps = (mat_flags & 128u) == 0u;
+	// The elliptical footprint where T5's path would have read it; without gradients an anisotropic material is
+	// filtered as an isotropic one, as sample_bindless_texture does.
+	const bool footprint = (mat_flags & 64u) != 0u && p_grad != vec4(0.0);
 	const uvec2 size = uvec2(textureSize(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_NEAREST_WITH_MIPMAPS_REPEAT), 0));
-	const float level = p_lod_t > RT_TEXTURE_LOD_BASE ? p_lod_t + 0.5 * log2(max(float(size.x) * float(size.y), 1.0)) : RT_TEXTURE_LOD_BASE;
+	float level;
+	if (footprint) {
+		level = STF_ComputeTextureLod_STF(size, p_grad, RT_TEXTURE_LOD_BASE, 64.0, 0.0);
+	} else {
+		level = p_lod_t > RT_TEXTURE_LOD_BASE ? p_lod_t + 0.5 * log2(max(float(size.x) * float(size.y), 1.0)) : RT_TEXTURE_LOD_BASE;
+	}
 	if (level <= 0.0 && get_rt_param(RT_PARAM_TEXTURE_FILTERING_MAGNIFICATION) < 0.5) {
 		return sample_material_texture(tex_idx, uv, mat_flags, p_lod_t, p_grad);
 	}
@@ -328,7 +368,19 @@ vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags, float p_lod_
 	STF_SamplerState stf = STF_Create(p_stf_u);
 	STF_SetFilterType(stf, stf_filter);
 	STF_SetSigma(stf, get_rt_param(RT_PARAM_TEXTURE_FILTERING_SIGMA));
-	const vec3 pos = STF_Texture2DGetSamplePosLevel(stf, size.x, size.y, levels, uv, mipmaps ? max(level, 0.0) : 0.0);
+	vec3 pos;
+	if (footprint && rt_texture_filtering_gradient_path()) {
+		pos = STF_Texture2DGetSamplePosGrad(stf, size.x, size.y, levels, uv, p_grad.xy, p_grad.zw);
+	} else {
+		vec2 at = uv;
+		if (footprint) {
+			// The major axis as the library picks it, the longer gradient in texels.
+			const vec2 g1 = p_grad.xy * vec2(size);
+			const vec2 g2 = p_grad.zw * vec2(size);
+			at += (p_stf_u.z - 0.5) * (dot(g1, g1) > dot(g2, g2) ? p_grad.xy : p_grad.zw);
+		}
+		pos = STF_Texture2DGetSamplePosLevel(stf, size.x, size.y, levels, at, mipmaps ? max(level, 0.0) : 0.0);
+	}
 	return textureLod(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_NEAREST_WITH_MIPMAPS_REPEAT), pos.xy, pos.z);
 }
 

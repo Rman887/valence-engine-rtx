@@ -291,7 +291,7 @@ const uint FLAG_CLUSTER_GEOMETRY = 8u;
 #define RT_SOBOL_DIM_SCATTER 40u // The transmission, lobe and direction draws inside a bounce's block.
 #define RT_SOBOL_DIM_ROULETTE 43u // The Russian roulette draw (D73), after the scatter's three (a fourth scatter draw must move it; the u suffix keeps it out of #if).
 #define RT_SOBOL_DIM_DIFFUSE_TRANSMISSION 44u // A thin surface's transmission choice (D103), apart so the scatter's three keep their dimensions.
-#define RT_SOBOL_DIM_TEXTURE_FILTERING 45u // The texel pair and the level a hit's stochastic texture lookups share (D117), two dimensions.
+#define RT_SOBOL_DIM_TEXTURE_FILTERING 45u // The texel pair, the level and (anisotropic, past the primary hit) the major axis's position a hit's stochastic texture lookups share (D117), three dimensions.
 
 // Both in raytracing_common_inc.glsl, which every stage includes after this file, after its
 // ray-tracing extensions are enabled and where the specialization constant is declared.

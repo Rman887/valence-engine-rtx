@@ -279,6 +279,9 @@ struct MaterialProperties {
 	float3 diffuseTransmission; // Albedo of a thin diffuse-transmission lobe on the other side of N (D103); 0 = none.
 	float anisotropy; // VAL: the specular lobe's anisotropy, Godot's ANISOTROPY, at most 1 (D118 MM1); 0 = isotropic.
 	float3 anisotropyT; // With anisotropy: the unit tangent its roughness stretches along, orthogonal to the N the BRDF is given.
+	float clearcoat; // VAL: the coat's strength, Godot's CLEARCOAT, 0..1 (D118 MM2); 0 = no coat.
+	float clearcoatAlpha; // With a coat: its GGX alpha, mix(0.001, 0.1, CLEARCOAT_ROUGHNESS) as the raster takes it.
+	float3 clearcoatN; // With a coat: its unit normal, the vertex normal without the normal map.
 };
 
 // A thin surface that passes light to its other side (D103): light below N is evaluated, not rejected.
@@ -1094,6 +1097,126 @@ bool recoverBelowHemisphereSample(
 }
 
 // -------------------------------------------------------------------------
+//    VAL: clearcoat (D118 MM2)
+// -------------------------------------------------------------------------
+// Godot's coat: a GGX layer of IOR 1.5 (F0 0.04, Schlick's Fresnel) about the vertex normal, its alpha
+// mix(0.001, 0.1, CLEARCOAT_ROUGHNESS), its strength CLEARCOAT. The base under it takes the F0 the raster remaps
+// from air to the coat, and passes what the coat does not reflect in each direction, (1 - c F_c(n_c.V)) (1 - c
+// F_c(n_c.L)): nvpro's layering, reciprocal, and on the light sample the raster's (1 - Fr) taken per direction.
+// The coat is picked before the base's lobes; brdf_pdf adds its density with that probability.
+
+// Below this alpha (CLEARCOAT_ROUGHNESS under about 0.055) the coat is a mirror: sampled as one, with no light
+// sample term, as a zero-roughness specular lobe is. GGX_D's floor (alpha 0.0032) lies under it.
+#define CLEARCOAT_DELTA_ALPHA 0.0064f
+
+bool hasClearcoat(MaterialProperties material) {
+	return material.clearcoat > 0.0f;
+}
+
+// The base's F0 under the coat: the raster's f0_Clear_Coat_To_Surface (Filament's fit of iorTof0(f0ToIor(f0), 1.5)),
+// mixed in by the coat's strength.
+float3 clearcoatBaseF0(float3 f0, float clearcoat) {
+	float3 under = saturate(f0 * (f0 * (0.941892f - 0.263008f * f0) + 0.346479f) - 0.0285998f);
+	return lerp(f0, under, clearcoat);
+}
+
+// What the coat reflects of light crossing it along S, c F_c. The cosine is unsigned, so a direction below the
+// coat's normal (a transmission, a silhouette) still crosses it.
+float clearcoatReflectance(MaterialProperties material, float3 S) {
+	float c = min(1.0f, abs(dot(material.clearcoatN, S)));
+	return material.clearcoat * (0.04f + 0.96f * pow(1.0f - c, 5.0f));
+}
+
+// The share of the base that leaves along S through the coat.
+float clearcoatAttenuation(MaterialProperties material, float3 S) {
+	return 1.0f - clearcoatReflectance(material, S);
+}
+
+// The coat's reflection times its NdotL, for the light sample: c F_c(LdotH) D G2 / (4 NdotL NdotV) NdotL. Zero for
+// a mirror coat and for L or V below its normal.
+float evalClearcoat(MaterialProperties material, float3 L, float3 V) {
+	float NdotL = dot(material.clearcoatN, L);
+	float NdotV = dot(material.clearcoatN, V);
+	if (material.clearcoatAlpha < CLEARCOAT_DELTA_ALPHA || NdotL <= 0.0f || NdotV <= 0.0f) {
+		return 0.0f;
+	}
+	NdotL = min(NdotL, 1.0f);
+	NdotV = min(NdotV, 1.0f);
+	float3 H = normalize(L + V);
+	float NdotH = saturate(dot(material.clearcoatN, H));
+	float LdotH = saturate(dot(L, H));
+	float alphaSquared = material.clearcoatAlpha * material.clearcoatAlpha;
+	float F = material.clearcoat * (0.04f + 0.96f * pow(1.0f - LdotH, 5.0f));
+	return F * GGX_D(alphaSquared, NdotH) * Smith_G2_Height_Correlated_GGX_Lagarde(alphaSquared, NdotL, NdotV) * NdotL;
+}
+
+// The density with which sampleClearcoat produces L: the coat's VNDF reflection density; zero for a mirror coat.
+float clearcoatPdf(MaterialProperties material, float3 L, float3 V) {
+	float NdotL = dot(material.clearcoatN, L);
+	float NdotV = dot(material.clearcoatN, V);
+	if (material.clearcoatAlpha < CLEARCOAT_DELTA_ALPHA || NdotL <= 0.0f || NdotV <= 0.0f) {
+		return 0.0f;
+	}
+	float3 H = normalize(L + V);
+	float alphaSquared = material.clearcoatAlpha * material.clearcoatAlpha;
+	return sampleGGXVNDFReflectionPdf(material.clearcoatAlpha, alphaSquared, dot(material.clearcoatN, H), min(NdotV, 1.0f), dot(L, H));
+}
+
+// The probability with which the scatter in shade_and_bounce picks the coat before the base's lobes: what the coat
+// reflects at V against the base's albedos under it (the luminances brdfSpecularProbability and the transmission
+// weigh), with specularF0 already remapped. 0 without a coat or with V below its normal (no random number drawn),
+// 1 over a black base.
+float clearcoatProbability(MaterialProperties material, float3 V, float3 specularF0, float3 diffuseReflectance) {
+	if (!hasClearcoat(material) || dot(material.clearcoatN, V) <= 0.0f) {
+		return 0.0f;
+	}
+	float coat = clearcoatReflectance(material, V);
+	float base = (1.0f - coat) * (luminance(specularF0) + luminance(diffuseReflectance) + luminance(material.diffuseTransmission));
+	if (base < 0.0001f) {
+		return 1.0f;
+	}
+	return clamp(coat / (coat + base), 0.01f, 0.99f);
+}
+
+// Whether light arriving from L below the shading normal reaches the BSDF: through a thin surface's
+// transmission (D103), or off a coat whose own normal L is above. The light samplers reject the rest.
+bool brdfTakesLightBelowN(MaterialProperties material, float3 L) {
+	return hasDiffuseTransmission(material) || (hasClearcoat(material) && dot(material.clearcoatN, L) > 0.0f);
+}
+
+// Samples the coat's reflection: its VNDF about the coat's normal, or the mirror direction below
+// CLEARCOAT_DELTA_ALPHA. The weight is the reflection over its density, c F_c(LdotH) G2 / G1(V) (c F_c(NdotV) for
+// the mirror). Returns false as evalIndirectCombinedBRDF does: on a zero weight, or a direction below the geometry
+// plane, which rayDirection still carries for the caller's recovery.
+bool sampleClearcoat(float2 u, float3 geometryNormal, float3 V, MaterialProperties material, OUT_PARAMETER(float3) rayDirection, OUT_PARAMETER(float3) sampleWeight) {
+	float4 qRotationToZ = getRotationToZAxis(material.clearcoatN);
+	float3 Vlocal = rotatePoint(qRotationToZ, V);
+	float alpha = material.clearcoatAlpha;
+	bool mirror = alpha < CLEARCOAT_DELTA_ALPHA;
+	float3 Hlocal = mirror ? float3(0.0f, 0.0f, 1.0f) : sampleGGXVNDF(Vlocal, float2(alpha, alpha), u);
+	float3 Llocal = reflect(-Vlocal, Hlocal);
+
+	float HdotL = max(0.00001f, min(1.0f, dot(Hlocal, Llocal)));
+	float NdotL = max(0.00001f, min(1.0f, Llocal.z));
+	float NdotV = max(0.00001f, min(1.0f, Vlocal.z));
+	float F = material.clearcoat * (0.04f + 0.96f * pow(1.0f - HdotL, 5.0f));
+	float G2OverG1 = 1.0f;
+	if (!mirror) {
+		float alphaSquared = alpha * alpha;
+		float G1V = Smith_G1_GGX(alpha, NdotV, alphaSquared, NdotV * NdotV);
+		float G1L = Smith_G1_GGX(alpha, NdotL, alphaSquared, NdotL * NdotL);
+		G2OverG1 = G1L / (G1V + G1L - G1V * G1L);
+	}
+	sampleWeight = float3(F * G2OverG1, F * G2OverG1, F * G2OverG1);
+	rayDirection = normalize(rotatePoint(invertRotation(qRotationToZ), Llocal));
+
+	if (luminance(sampleWeight) == 0.0f) {
+		return false;
+	}
+	return dot(geometryNormal, rayDirection) > 0.0f;
+}
+
+// -------------------------------------------------------------------------
 //    Combined BRDF
 // -------------------------------------------------------------------------
 
@@ -1125,6 +1248,10 @@ BrdfData prepareBRDFData(float3 N, float3 L, float3 V, MaterialProperties materi
 	// Unpack material properties
 	data.specularF0 = baseColorToSpecularF0(material.baseColor, material.metalness, material.dielectricF0);
 	data.diffuseReflectance = baseColorToDiffuseReflectance(material.baseColor, material.metalness);
+	// VAL: under a coat (D118 MM2) the base's F0 is taken from the coat's medium, as the raster remaps it.
+	if (hasClearcoat(material)) {
+		data.specularF0 = clearcoatBaseF0(data.specularF0, material.clearcoat);
+	}
 
 	// Unpack 'perceptively linear' -> 'linear' -> 'squared' roughness
 	data.roughness = material.roughness;
@@ -1183,11 +1310,20 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 	outSpecular = float3(0.0f, 0.0f, 0.0f);
 	// Prepare data needed for BRDF evaluation (uses shading normal N for all BRDF math).
 	const BrdfData data = prepareBRDFData(N, L, V, material);
+	// VAL: a coat (D118 MM2) adds its reflection to the specular and passes the base what it does not reflect on
+	// either side; its normal is not N, so it reflects light the base faces away from too.
+	const bool coated = hasClearcoat(material);
+	const float coatSpecular = coated ? evalClearcoat(material, L, V) : 0.0f;
+	const float coatAttenuation = coated ? clearcoatAttenuation(material, V) * clearcoatAttenuation(material, L) : 1.0f;
 	// Ignore L rays "below" the hemisphere, except through a thin surface's transmission lobe
 	// (D103): Lambertian about -N, its albedo the transmission's.
 	if (data.Lbackfacing) {
 		if (hasDiffuseTransmission(material)) {
 			outDiffuse = material.diffuseTransmission * (ONE_OVER_PI * max(-dot(N, L), 0.0f));
+		}
+		if (coated) {
+			outDiffuse *= coatAttenuation;
+			outSpecular = float3(coatSpecular, coatSpecular, coatSpecular);
 		}
 		return;
 	}
@@ -1200,6 +1336,10 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 	// Specular is already multiplied by F, just attenuate diffuse
 	outDiffuse = (float3(1.0f, 1.0f, 1.0f) - data.F) * outDiffuse;
 #endif
+	if (coated) {
+		outDiffuse *= coatAttenuation;
+		outSpecular = outSpecular * coatAttenuation + float3(coatSpecular, coatSpecular, coatSpecular);
+	}
 }
 
 // The probability with which the scatter in shade_and_bounce picks the specular lobe over the
@@ -1240,14 +1380,17 @@ float diffuseTransmissionProbability(float3 specularF0, float3 diffuseReflectanc
 // weighs its samples against this (D50), so it must describe the sampler exactly.
 float brdf_pdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	const BrdfData data = prepareBRDFData(N, L, V, material);
+	// VAL: a coat (D118 MM2) is picked first, the base's lobes below take the rest; a mirror coat adds no density.
+	float coatProbability = clearcoatProbability(material, V, data.specularF0, data.diffuseReflectance);
+	float coatPdf = coatProbability > 0.0f ? coatProbability * clearcoatPdf(material, L, V) : 0.0f;
 	// A thin surface's transmission (D103) takes its share first: cosine about -N below, the
 	// reflection lobes the rest above.
 	float transmissionProbability = diffuseTransmissionProbability(data.specularF0, data.diffuseReflectance, material.diffuseTransmission);
 	if (!data.Vbackfacing && data.Lbackfacing && transmissionProbability > 0.0f) {
-		return transmissionProbability * diffusePdf(max(-dot(N, L), 0.0f));
+		return coatPdf + (1.0f - coatProbability) * transmissionProbability * diffusePdf(max(-dot(N, L), 0.0f));
 	}
 	if (data.Vbackfacing || data.Lbackfacing) {
-		return 0.0f;
+		return coatPdf;
 	}
 	float specularProbability = brdfSpecularProbability(data.specularF0, data.diffuseReflectance);
 	float pdf = 0.0f;
@@ -1264,7 +1407,7 @@ float brdf_pdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	if (transmissionProbability > 0.0f) {
 		pdf *= 1.0f - transmissionProbability;
 	}
-	return pdf;
+	return coatPdf + (1.0f - coatProbability) * pdf;
 }
 
 // This is an entry point for evaluation of all other BRDFs based on selected configuration (for indirect light)

@@ -17,6 +17,9 @@ struct MaterialResult {
 	vec3 diffuse_transmission; // Albedo of a thin diffuse-transmission lobe, 0..1: what a leaf passes to its other side, BACKLIGHT times the diffuse albedo (D103).
 	float anisotropy; // VAL: the specular lobe's anisotropy as Godot's ANISOTROPY, at most 1; 0 = isotropic (D118 MM1).
 	vec3 anisotropy_tangent; // World space, the direction its roughness stretches along: the tangent turned by ANISOTROPY_FLOW, not yet orthogonal to the normal.
+	float clearcoat; // VAL: the coat's strength as Godot's CLEARCOAT, 0..1; 0 = no coat (D118 MM2).
+	float clearcoat_roughness; // Godot's CLEARCOAT_ROUGHNESS, 0..1, mapped to the coat's alpha as the raster maps it.
+	vec3 clearcoat_normal; // World space, the coat's normal: the vertex normal (a custom shader's NORMAL) without the normal map.
 };
 
 /// Sensible default for a mid-grey diffuse surface.
@@ -37,5 +40,8 @@ MaterialResult default_material_result(vec3 geometry_normal) {
 	r.diffuse_transmission = vec3(0.0);
 	r.anisotropy = 0.0;
 	r.anisotropy_tangent = vec3(0.0);
+	r.clearcoat = 0.0;
+	r.clearcoat_roughness = 0.0;
+	r.clearcoat_normal = geometry_normal;
 	return r;
 }

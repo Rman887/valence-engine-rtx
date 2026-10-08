@@ -141,7 +141,8 @@ struct alignas(16) RT_MaterialData {
 	uint32_t metallic_texture_idx; // The ORM texture again, or StandardMaterial3D's metallic texture (D118).
 	float anisotropy; // BaseMaterial3D's anisotropy_ratio (D118 MM1); 0 = an isotropic specular lobe.
 	uint32_t anisotropy_flowmap_idx; // Its flow map, read linear (0 = none: along the tangent, at full strength).
-	uint32_t _reserved[2];
+	uint32_t clearcoat_half2; // packHalf2x16(clearcoat, clearcoat_roughness), BaseMaterial3D's coat (D118 MM2); 0 = no coat.
+	uint32_t clearcoat_texture_idx; // Its texture, read linear: red scales the strength, green the roughness (0 = none).
 };
 static_assert(sizeof(RT_MaterialData) == 128, "RT_MaterialData must be 128 bytes for std430");
 

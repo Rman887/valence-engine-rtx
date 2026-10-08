@@ -222,6 +222,9 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	m.diffuse_transmission = vec3(0.0); // The G-buffer carries no backlight (D103).
 	m.anisotropy = 0.0; // Nor anisotropy (D118 MM1).
 	m.anisotropy_tangent = vec3(0.0);
+	m.clearcoat = 0.0; // Nor a coat (D118 MM2).
+	m.clearcoat_roughness = 0.0;
+	m.clearcoat_normal = h.geometry_normal;
 
 #ifdef RT_DEBUG_ENABLED
 	int vis_mode = int(get_rt_param(RT_PARAM_VIS_MODE));
@@ -757,6 +760,11 @@ void main() {
 	if (m.anisotropy != 0.0) {
 		m.anisotropy_tangent = rt_anisotropy_tangent(mat3(inv_view_matrix) * tangent, mat3(inv_view_matrix) * binormal, anisotropy_flow, m.anisotropy);
 	}
+	// VAL: CLEARCOAT and CLEARCOAT_ROUGHNESS (D118 MM2) about the fragment's NORMAL before the normal map, the raster's
+	// geo_normal; in a shader that writes no CLEARCOAT it is the constant 0, on which the compiler drops the lobe.
+	m.clearcoat = clamp(clearcoat, 0.0, 1.0);
+	m.clearcoat_roughness = clamp(clearcoat_roughness, 0.0, 1.0);
+	m.clearcoat_normal = m.normal;
 
 	// Apply normal map if it was written.
 	if (normal_map != vec3(0.5, 0.5, 1.0)) {
@@ -877,6 +885,20 @@ void main() {
 		}
 		m.anisotropy = clamp(m.anisotropy, -1.0, 1.0);
 		m.anisotropy_tangent = rt_anisotropy_tangent(h.tangent, h.bitangent, flow, m.anisotropy);
+	}
+
+	// VAL: clearcoat (D118 MM2) as BaseMaterial3D's fragment writes it: the strength times the texture's red, the
+	// roughness times its green, about the vertex normal (the raster's geo_normal ignores the normal map).
+	m.clearcoat = 0.0;
+	m.clearcoat_roughness = 0.0;
+	m.clearcoat_normal = h.geometry_normal;
+	if (mat.clearcoat_half2 != 0u) {
+		vec2 clearcoat_params = unpackHalf2x16(mat.clearcoat_half2);
+		if (mat.clearcoat_texture_idx != 0u) {
+			clearcoat_params *= sample_material_texture(mat.clearcoat_texture_idx, uv, mat.flags, lod, grad, stf_u).xy;
+		}
+		m.clearcoat = clamp(clearcoat_params.x, 0.0, 1.0);
+		m.clearcoat_roughness = clamp(clearcoat_params.y, 0.0, 1.0);
 	}
 
 #ifdef RT_DEBUG_ENABLED

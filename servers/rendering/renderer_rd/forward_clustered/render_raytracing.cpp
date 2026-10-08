@@ -8810,8 +8810,8 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.metallic_texture_idx = 0;
 	mat.anisotropy = 0.0f;
 	mat.anisotropy_flowmap_idx = 0;
-	mat._reserved[0] = 0;
-	mat._reserved[1] = 0;
+	mat.clearcoat_half2 = 0;
+	mat.clearcoat_texture_idx = 0;
 	bool omm_custom = false;
 	RID omm_custom_alpha_rd; // An opted-in custom shader's hint_alpha texture, with a real bindless slot.
 
@@ -9174,6 +9174,29 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		RID flowmap_rd = get_material_texture("texture_flowmap");
 		if (mat.anisotropy != 0.0f && flowmap_rd.is_valid() && shader_declares("texture_flowmap")) {
 			mat.anisotropy_flowmap_idx = bindless_block->add_texture(flowmap_rd);
+		}
+	}
+
+	// VAL: clearcoat (D118 MM2). BaseMaterial3D declares clearcoat, clearcoat_roughness and texture_clearcoat only
+	// while the feature is enabled, and its fragment writes CLEARCOAT = clearcoat * tex.r and CLEARCOAT_ROUGHNESS =
+	// clearcoat_roughness * tex.g. A custom shader's CLEARCOAT reaches its hit group through the fragment instead.
+	if (!mat_data->is_custom_shader && shader_declares("clearcoat")) {
+		float clearcoat = 0.0f;
+		float clearcoat_roughness = 0.0f;
+		Variant clearcoat_var = material_storage->material_get_param(p_material_rid, "clearcoat");
+		if (clearcoat_var.get_type() == Variant::FLOAT) {
+			clearcoat = CLAMP(float(clearcoat_var), 0.0f, 1.0f);
+		}
+		Variant roughness_var = material_storage->material_get_param(p_material_rid, "clearcoat_roughness");
+		if (roughness_var.get_type() == Variant::FLOAT) {
+			clearcoat_roughness = CLAMP(float(roughness_var), 0.0f, 1.0f);
+		}
+		if (clearcoat > 0.0f) {
+			mat.clearcoat_half2 = (uint32_t(Math::make_half_float(clearcoat_roughness)) << 16) | Math::make_half_float(clearcoat);
+			RID clearcoat_rd = get_material_texture("texture_clearcoat");
+			if (clearcoat_rd.is_valid() && shader_declares("texture_clearcoat")) {
+				mat.clearcoat_texture_idx = bindless_block->add_texture(clearcoat_rd);
+			}
 		}
 	}
 

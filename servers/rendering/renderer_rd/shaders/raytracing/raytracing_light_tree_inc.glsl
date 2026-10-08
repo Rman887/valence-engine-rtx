@@ -625,7 +625,8 @@ bool light_tree_sample_direct(
 		return false;
 	}
 	candidates = clamp(candidates, 1u, uint(RT_LIGHT_TREE_MAX_CANDIDATES));
-	bool two_sided = hasDiffuseTransmission(material);
+	// A coat (D118 MM2) reflects light from below the shading normal too, so its receiver is two-sided.
+	bool two_sided = hasDiffuseTransmission(material) || hasClearcoat(material);
 	float u_res = min(rand(rng_state), 0.99999994);
 	LightTreeCandidate selected;
 	selected.kind = RT_LIGHT_TREE_KIND_LEAF;

@@ -268,6 +268,9 @@ void debug_visualize(
 		dbg_mat.diffuseTransmission = vec3(0.0);
 		dbg_mat.anisotropy = 0.0;
 		dbg_mat.anisotropyT = vec3(0.0);
+		dbg_mat.clearcoat = 0.0;
+		dbg_mat.clearcoatAlpha = 0.0;
+		dbg_mat.clearcoatN = vec3(0.0, 0.0, 1.0);
 
 		vec3 dbg_dir;
 		vec3 dbg_weight;
@@ -455,6 +458,13 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		float t_len = length(t);
 		brdf_mat.anisotropyT = t_len > 1e-4 ? t / t_len : normalize(abs(N.x) > abs(N.z) ? vec3(-N.y, N.x, 0.0) : vec3(0.0, -N.z, N.y));
 	}
+	// VAL: Godot's clearcoat (D118 MM2): its strength, its alpha as the raster maps CLEARCOAT_ROUGHNESS, its normal
+	// the vertex normal, which the shading normal's clamp does not move.
+	// A coat seen from below its normal (a silhouette of interpolated normals) is absent, so its pick, its terms,
+	// the base's attenuation and the guides agree.
+	brdf_mat.clearcoatN = m.clearcoat > 0.0 ? normalize(m.clearcoat_normal) : N;
+	brdf_mat.clearcoat = dot(brdf_mat.clearcoatN, V) > 0.0 ? m.clearcoat : 0.0;
+	brdf_mat.clearcoatAlpha = mix(0.001, 0.1, m.clearcoat_roughness);
 
 	// Transmission: the surface is a dielectric interface. TRANSMISSION is the
 	// fraction (per channel) of the unreflected light that continues through
@@ -476,6 +486,9 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	}
 
 	vec3 specularF0 = baseColorToSpecularF0(brdf_mat.baseColor, brdf_mat.metalness, brdf_mat.dielectricF0);
+	if (hasClearcoat(brdf_mat)) {
+		specularF0 = clearcoatBaseF0(specularF0, brdf_mat.clearcoat); // As prepareBRDFData remaps it (D118 MM2).
+	}
 	vec3 diffuseReflectance = baseColorToDiffuseReflectance(brdf_mat.baseColor, brdf_mat.metalness);
 
 	// =================================================================
@@ -488,22 +501,39 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		// The transmitted radiance is demodulated as diffuse: the guide carries the transmitted fraction on top of the diffuse remainder.
 		// A thin surface's diffuse transmission (D103) is diffuse light too, as RTXPT's estimate adds
 		// it; T already carries (1 - metallic).
-		vec3 diffuse_albedo = DLSSRR_encodeDiffuseAlbedo(DLSSRR_computeDiffuseAlbedo(brdf_mat.baseColor + m.transmission, m.metalness) + m.diffuse_transmission);
-		imageStore(dlss_rr_diffuse_albedo, pixel, vec4(diffuse_albedo, 1.0));
-
+		vec3 diffuse_albedo = DLSSRR_computeDiffuseAlbedo(brdf_mat.baseColor + m.transmission, m.metalness) + m.diffuse_transmission;
 		vec3 specular_albedo = DLSSRR_computeSpecularAlbedo(m.albedo, m.metalness, brdf_mat.dielectricF0, m.roughness, NdotV);
+		vec3 guide_N = N;
+		float guide_roughness = m.roughness;
+		// VAL: under a coat (D118 MM2) the specular albedo is the coat's plus the base's it passes, the diffuse what
+		// the coat passes; the normal, roughness and hit distance follow whichever specular reflects more, so a rough
+		// coat does not hide a sharp metal under it.
+		if (hasClearcoat(brdf_mat)) {
+			float coat_V = clearcoatReflectance(brdf_mat, V);
+			float coat_roughness = sqrt(brdf_mat.clearcoatAlpha);
+			vec3 coat_albedo = brdf_mat.clearcoat * DLSSRR_envBRDFApprox(vec3(0.04), coat_roughness, max(dot(brdf_mat.clearcoatN, V), 0.0001));
+			vec3 base_albedo = (1.0 - coat_V) * DLSSRR_envBRDFApprox(clearcoatBaseF0(baseColorToSpecularF0(m.albedo, m.metalness, brdf_mat.dielectricF0), brdf_mat.clearcoat), m.roughness, NdotV);
+			specular_albedo = coat_albedo + base_albedo;
+			diffuse_albedo *= 1.0 - coat_V;
+			if (luminance(coat_albedo) > luminance(base_albedo)) {
+				guide_N = brdf_mat.clearcoatN;
+				guide_roughness = coat_roughness;
+			}
+		}
+		imageStore(dlss_rr_diffuse_albedo, pixel, vec4(DLSSRR_encodeDiffuseAlbedo(diffuse_albedo), 1.0));
+
 		imageStore(dlss_rr_specular_albedo, pixel, vec4(clamp(specular_albedo, vec3(0.04), vec3(1.0)), 1.0)); // match UNORM8 like before - fixes some issues with garbling..
 
-		imageStore(dlss_rr_normal_roughness, pixel, vec4(N, m.roughness));
+		imageStore(dlss_rr_normal_roughness, pixel, vec4(guide_N, guide_roughness));
 
 		// Specular hit distance via inline ray query (only for smooth surfaces).
 		float spec_hit_dist = -1.0;
-		if (m.roughness < MAX_DENOISER_SPECULAR_HIT_THRESHOLD) {
+		if (guide_roughness < MAX_DENOISER_SPECULAR_HIT_THRESHOLD) {
 			// The ray leaves the surface as the bounce ray does: a direction under the geometry plane
 			// is mirrored above it, and the origin is offset along the normal. The reflected direction
 			// has almost no normal component at grazing angles, so offsetting along it left the origin
 			// on the surface and a cull-disabled one hit itself.
-			vec3 spec_dir = mirrorDirectionAcrossPlane(reflect(-V, N), h.geometry_normal);
+			vec3 spec_dir = mirrorDirectionAcrossPlane(reflect(-V, guide_N), h.geometry_normal);
 			vec3 spec_origin = offset_ray_origin(h.hit_pos, h.geometry_normal, hit_t);
 
 			rayQueryEXT spec_rq;
@@ -606,7 +636,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		vec3 shadow_origin = hit_pos_offset;
 		vec3 shadow_dir = light_sample.direction;
 		float shadow_distance = light_sample.shadow_distance;
-		if (diffuse_transmit_max > 0.0 && dot(N, light_sample.direction) < 0.0) {
+		if (diffuse_transmit_max > 0.0 && dot(N, light_sample.direction) < 0.0 && !(hasClearcoat(brdf_mat) && dot(brdf_mat.clearcoatN, light_sample.direction) > 0.0)) {
 			shadow_origin = offset_ray_origin(h.hit_pos, -h.geometry_normal, hit_t);
 			vec3 to_light = hit_pos_offset + light_sample.direction * light_sample.shadow_distance - shadow_origin;
 			shadow_distance = length(to_light);
@@ -650,6 +680,9 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 				refracted = normalize(refracted - 2.0 * above * h.geometry_normal);
 			}
 			ps.throughput *= m.transmission / transmit_max;
+			if (hasClearcoat(brdf_mat)) {
+				ps.throughput *= clearcoatAttenuation(brdf_mat, V) * clearcoatAttenuation(brdf_mat, refracted); // Through the coat (D118 MM2).
+			}
 			ps.packed_bounces_flags = inc_total_bounce(ps.packed_bounces_flags);
 			// The medium behind the interface (D49): the surface's ABSORPTION and SCATTERING,
 			// which a front face sets and a back face writes as zero to clear (no nesting: the
@@ -676,10 +709,21 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// =================================================================
 	// BRDF importance sampling for next bounce
 	// =================================================================
+	// VAL: a coat (D118 MM2) is chosen before the base's lobes, with the probability brdf_pdf gives it, on a
+	// dimension of its own so the base's draws keep theirs; a surface without one draws nothing here.
+	float coat_p = clearcoatProbability(brdf_mat, V, specularF0, diffuseReflectance);
+	bool coat_sampled = coat_p >= 1.0;
+	if (coat_p > 0.0 && coat_p < 1.0) {
+		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_CLEARCOAT);
+		coat_sampled = rand(ps.rng_state) < coat_p;
+		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER + (transmit_p > 0.0 ? 1u : 0u));
+		ps.throughput /= coat_sampled ? coat_p : (1.0 - coat_p);
+	}
+
 	// A thin surface's diffuse transmission (D103) is chosen first, with the probability brdf_pdf
 	// gives it, on a dimension of its own so the lobe and direction draws keep theirs; a surface
 	// without it draws nothing here.
-	float diffuse_transmit_p = diffuse_transmit_max > 0.0 ? diffuseTransmissionProbability(specularF0, diffuseReflectance, m.diffuse_transmission) : 0.0;
+	float diffuse_transmit_p = (diffuse_transmit_max > 0.0 && !coat_sampled) ? diffuseTransmissionProbability(specularF0, diffuseReflectance, m.diffuse_transmission) : 0.0;
 	bool diffuse_transmitted = false;
 	if (diffuse_transmit_p > 0.0) {
 		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_DIFFUSE_TRANSMISSION);
@@ -689,7 +733,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	}
 
 	int brdfType = DIFFUSE_TYPE;
-	float brdfProbability = diffuse_transmitted ? 0.0 : brdfSpecularProbability(specularF0, diffuseReflectance);
+	float brdfProbability = coat_sampled ? 1.0 : (diffuse_transmitted ? 0.0 : brdfSpecularProbability(specularF0, diffuseReflectance));
 	if (brdfProbability >= 1.0) {
 		brdfType = SPECULAR_TYPE;
 	} else if (brdfProbability <= 0.0) {
@@ -716,7 +760,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			next_dir = normalize(next_dir - 2.0 * above * h.geometry_normal);
 		}
 		brdf_weight = m.diffuse_transmission;
-	} else if (!evalIndirectCombinedBRDF(u, N, h.geometry_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
+	} else if (coat_sampled ? !sampleClearcoat(u, h.geometry_normal, V, brdf_mat, next_dir, brdf_weight) : !evalIndirectCombinedBRDF(u, N, h.geometry_normal, V, brdf_mat, brdfType, next_dir, brdf_weight, vec4(0.0))) {
 		// Two failure modes:
 		//   1) Sample weight is zero (no contribution). Terminate.
 		//   2) Sampled direction is below the geometry plane. Recover by
@@ -732,6 +776,14 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		}
 		next_dir = recovered_dir;
 	}
+	// VAL: the base under a coat (D118 MM2) passes what the coat does not reflect, in both directions.
+	if (!coat_sampled && hasClearcoat(brdf_mat)) {
+		brdf_weight *= clearcoatAttenuation(brdf_mat, V) * clearcoatAttenuation(brdf_mat, next_dir);
+	}
+	// A base lobe's direction below N under a coat, on a surface without transmission (D118 MM2).
+	const bool base_below_coat = !coat_sampled && diffuse_transmit_max <= 0.0 && hasClearcoat(brdf_mat) && dot(N, next_dir) <= 0.0;
+	// A mirror: a zero-roughness specular lobe, or a coat below CLEARCOAT_DELTA_ALPHA (D118 MM2).
+	const bool delta_lobe = coat_sampled ? brdf_mat.clearcoatAlpha < CLEARCOAT_DELTA_ALPHA : (brdfType == SPECULAR_TYPE && brdf_mat.roughness * brdf_mat.roughness <= 0.0);
 
 	ps.throughput *= brdf_weight;
 
@@ -762,7 +814,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		ps.packed_bounces_flags = inc_total_bounce(ps.packed_bounces_flags);
 	}
 	// Past a non-delta lobe the path carries sampling variance (D53); a mirror does not.
-	if (!(brdfType == SPECULAR_TYPE && brdf_mat.roughness * brdf_mat.roughness <= 0.0)) {
+	if (!delta_lobe) {
 		ps.packed_bounces_flags = set_scattered(ps.packed_bounces_flags);
 	}
 
@@ -771,7 +823,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// weight; every other direction is weighed with the density brdf_pdf assigns it, which is
 	// the same function light sampling evaluates for its own directions. The miss weighs the sky
 	// with it too when the sky is a light (D54).
-	if ((rt_emissive_count == 0u && !sky_light_enabled()) || (brdfType == SPECULAR_TYPE && brdf_mat.roughness * brdf_mat.roughness <= 0.0)) {
+	if ((rt_emissive_count == 0u && !sky_light_enabled()) || delta_lobe) {
 		// With no emitter listed and no sky light nothing reads the density, so both off cost no ALU here.
 		ps.bsdf_pdf = RT_BSDF_PDF_DELTA;
 	} else {
@@ -779,8 +831,9 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		// A direction the density cannot own (the below-hemisphere recovery; on a thin surface, a
 		// direction on the side of N the chosen lobe does not sample: a transmitted one mirrored back
 		// above N, a reflected one in the wedge between N and the geometry plane) is one light
-		// sampling does not produce this way, so the BSDF strategy keeps the whole weight.
-		if (diffuse_transmit_p > 0.0 && diffuse_transmitted != (dot(N, next_dir) < 0.0)) {
+		// sampling does not produce this way, so the BSDF strategy keeps the whole weight. So is a base lobe's
+		// direction below N under a coat (D118 MM2): light sampling evaluates only the coat there.
+		if ((diffuse_transmit_p > 0.0 && diffuse_transmitted != (dot(N, next_dir) < 0.0)) || base_below_coat) {
 			pdf = 0.0;
 		}
 		ps.bsdf_pdf = pdf > 0.0 ? pdf : RT_BSDF_PDF_DELTA;
@@ -788,11 +841,11 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 
 	// A non-delta lobe widens the ray cone by the density of the direction it drew (D116); a mirror,
 	// like a refraction above, keeps the spread. Only a cone the hit shaders read is widened.
-	if (rt_texture_lod_enabled() && !(brdfType == SPECULAR_TYPE && brdf_mat.roughness * brdf_mat.roughness <= 0.0)) {
+	if (rt_texture_lod_enabled() && !delta_lobe) {
 		float pdf = ps.bsdf_pdf;
 		if (pdf == RT_BSDF_PDF_DELTA) {
 			pdf = brdf_pdf(N, next_dir, V, brdf_mat);
-			if (diffuse_transmit_p > 0.0 && diffuse_transmitted != (dot(N, next_dir) < 0.0)) {
+			if ((diffuse_transmit_p > 0.0 && diffuse_transmitted != (dot(N, next_dir) < 0.0)) || base_below_coat) {
 				pdf = 0.0;
 			}
 		}

@@ -111,6 +111,6 @@ struct MaterialData {
 	uint metallic_texture_idx; // The ORM texture again, or StandardMaterial3D's metallic texture (D118).
 	float anisotropy; // BaseMaterial3D's anisotropy_ratio (D118 MM1); 0 = an isotropic specular lobe.
 	uint anisotropy_flowmap_idx; // Its flow map, read linear (0 = none: along the tangent, at full strength).
-	uint _reserved0;
-	uint _reserved1;
+	uint clearcoat_half2; // packHalf2x16(clearcoat, clearcoat_roughness), BaseMaterial3D's coat (D118 MM2); 0 = no coat.
+	uint clearcoat_texture_idx; // Its texture, read linear: red scales the strength, green the roughness (0 = none).
 };

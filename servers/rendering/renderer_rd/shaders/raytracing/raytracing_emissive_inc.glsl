@@ -280,7 +280,7 @@ bool emissive_sample_instance(
 	if ((e.flags & RT_EMISSIVE_FLAG_TWO_SIDED) != 0u) {
 		cos_l = abs(cos_l);
 	}
-	if (cos_l <= 0.0 || (dot(N, L) <= 0.0 && !hasDiffuseTransmission(material))) {
+	if (cos_l <= 0.0 || (dot(N, L) <= 0.0 && !brdfTakesLightBelowN(material, L))) {
 		return false;
 	}
 

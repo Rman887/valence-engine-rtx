@@ -926,10 +926,18 @@ float3 evalMicrofacet(const BrdfData data) {
 	float G2 = Smith_G2(data.alpha, data.alphaSquared, data.NdotL, data.NdotV);
 	//float3 F = evalFresnel(data.specularF0, shadowedF90(data.specularF0), data.VdotH); //< Unused, F is precomputed already
 
-#if G2_DIVIDED_BY_DENOMINATOR
-	return data.F * (G2 * D * data.NdotL);
+	// VAL: the same multiple-scattering compensation sampleSpecularMicrofacet's weight carries (D118), so light
+	// sampling and the BSDF's own sample estimate one specular lobe under MIS.
+#if MICROFACET_DISTRIBUTION == GGX
+	float3 ms = evalMultiScatterApproximation(data.alpha, data.NdotV, data.specularF0);
 #else
-	return ((data.F * G2 * D) / (4.0f * data.NdotL * data.NdotV)) * data.NdotL;
+	float3 ms = vec3(1.0f, 1.0f, 1.0f);
+#endif
+
+#if G2_DIVIDED_BY_DENOMINATOR
+	return ms * data.F * (G2 * D * data.NdotL);
+#else
+	return ms * ((data.F * G2 * D) / (4.0f * data.NdotL * data.NdotV)) * data.NdotL;
 #endif
 }
 

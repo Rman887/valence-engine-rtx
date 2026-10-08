@@ -125,12 +125,21 @@ public:
 		// or when this is set, textureLod at the level this function returns for textureSize(s, 0) and
 		// uv_per_metre (the path tracer's hit groups, D116).
 		String texture_projected_function;
+		// When set, the level, gradient and projected forms above on a float 2D uniform of material data (source_color,
+		// hint_normal, hint_roughness_* or hint_anisotropy, through a linear filter) call these
+		// in place of textureLod and textureGrad, as f(texture, its sampler, the nearest-with-mipmaps sampler of its
+		// repeat mode, uv, then the level and whether the filter has mipmaps, or the two gradients): the path
+		// tracer's stochastic texture filtering (D117). A usage flag pointer under the level function's name is set
+		// when a call was rewritten.
+		String texture_filtering_lod_function;
+		String texture_filtering_grad_function;
 	};
 
 private:
 	ShaderLanguage parser;
 
 	String _get_sampler_name(ShaderLanguage::TextureFilter p_filter, ShaderLanguage::TextureRepeat p_repeat);
+	String _get_texture_filtering_arguments(const String &p_texture, bool p_color, ShaderLanguage::ShaderNode::Uniform::Hint p_hint, ShaderLanguage::TextureFilter p_filter, ShaderLanguage::TextureRepeat p_repeat, bool &r_mipmaps);
 
 	void _dump_function_deps(const ShaderLanguage::ShaderNode *p_node, const StringName &p_for_func, const HashMap<StringName, String> &p_func_code, String &r_to_add, HashSet<StringName> &added);
 	String _dump_node_code(const ShaderLanguage::Node *p_node, int p_level, GeneratedCode &r_gen_code, IdentifierActions &p_actions, const DefaultIdentifierActions &p_default_actions, bool p_assigning, bool p_scope = true);

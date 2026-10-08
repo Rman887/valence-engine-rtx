@@ -418,6 +418,7 @@ public:
 		String label; // The shader's path, or its material when it has none: what a failed compile is reported under.
 		bool uses_projected = false; // Calls texture_projected(): the hit needs the cone's footprint even on a mesh without UVs (D116)
 		bool uses_texture_grad = false; // A lookup the compiler rewrote to textureGrad: the hit computes the cone's elliptical footprint (D116)
+		bool uses_texture_filtering = false; // A lookup the compiler sent through the stochastic texture filter: the hit draws its random numbers (D117)
 		bool writes_uv = false; // Writes UV or UV2, whose density the mesh's UVs no longer tell: every texture() call reads level 0 (D116)
 		bool is_procedural = false; // Uses intersection shader instead of triangle geometry
 		uint32_t alpha_texture_buffer_offset = UINT32_MAX; // Byte offset of hint_alpha texture index in CustomMaterialUniforms UBO; UINT32_MAX if absent

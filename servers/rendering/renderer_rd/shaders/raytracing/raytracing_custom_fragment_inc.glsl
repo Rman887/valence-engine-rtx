@@ -72,6 +72,14 @@ rt_grad_t = RtTextureGrad(rt_hit_texture_grad != vec4(0.0), rt_hit_texture_grad.
 // And its texture_projected() calls at the cone's footprint (D116), whatever the shader does with UV.
 rt_footprint_t = rt_hit_texture_footprint;
 #endif
+#if defined(RT_STAGE_CLOSEST_HIT) && defined(RT_CUSTOM_TEXTURE_FILTERING) && defined(RT_TEXTURE_FILTERING_COMPILED)
+// The numbers its stochastic lookups share (D117 F3), drawn as HG0 draws them, the major axis's where the hit has
+// gradients.
+if (rt_texture_filtering() != 0u) {
+	rt_stf_u = rt_texture_filtering_random(rt_grad_t.on);
+	rt_stf_on = true;
+}
+#endif
 
 // Post-vertex transform: object-space -> view-space (mirrors rasterizer post-vertex).
 mat4 rt_modelview = read_view_matrix * read_model_matrix;

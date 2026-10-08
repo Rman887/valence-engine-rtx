@@ -340,6 +340,40 @@ String ShaderCompiler::_get_sampler_name(ShaderLanguage::TextureFilter p_filter,
 	return String(name_mapping[p_filter + (p_repeat == ShaderLanguage::REPEAT_ENABLE ? ShaderLanguage::FILTER_DEFAULT : 0)]);
 }
 
+// The texture, its sampler and the nearest-with-mipmaps sampler of its repeat mode, as the stochastic filter's functions
+// take them (D117), for a lookup they apply to: material data by its hints (a source_color map, or a normal, roughness
+// or anisotropy map; not a mask, a lookup table or noise, and not the screen, depth or normal-roughness buffers, whatever
+// their source_color) through a linear filter. Empty for any other. A sampler argument of a helper function carries no
+// such hint (the parser keeps only the screen, depth and normal-roughness hints there), so its lookups stay
+// deterministic.
+String ShaderCompiler::_get_texture_filtering_arguments(const String &p_texture, bool p_color, ShaderLanguage::ShaderNode::Uniform::Hint p_hint, ShaderLanguage::TextureFilter p_filter, ShaderLanguage::TextureRepeat p_repeat, bool &r_mipmaps) {
+	switch (p_hint) {
+		case ShaderLanguage::ShaderNode::Uniform::HINT_SCREEN_TEXTURE:
+		case ShaderLanguage::ShaderNode::Uniform::HINT_DEPTH_TEXTURE:
+		case ShaderLanguage::ShaderNode::Uniform::HINT_NORMAL_ROUGHNESS_TEXTURE:
+			return String();
+		case ShaderLanguage::ShaderNode::Uniform::HINT_NORMAL:
+		case ShaderLanguage::ShaderNode::Uniform::HINT_ROUGHNESS_NORMAL:
+		case ShaderLanguage::ShaderNode::Uniform::HINT_ROUGHNESS_R:
+		case ShaderLanguage::ShaderNode::Uniform::HINT_ROUGHNESS_G:
+		case ShaderLanguage::ShaderNode::Uniform::HINT_ROUGHNESS_B:
+		case ShaderLanguage::ShaderNode::Uniform::HINT_ROUGHNESS_A:
+		case ShaderLanguage::ShaderNode::Uniform::HINT_ROUGHNESS_GRAY:
+		case ShaderLanguage::ShaderNode::Uniform::HINT_ANISOTROPY:
+			break;
+		default:
+			if (!p_color) {
+				return String();
+			}
+	}
+	const ShaderLanguage::TextureFilter filter = p_filter == ShaderLanguage::FILTER_DEFAULT ? actions.default_filter : p_filter;
+	if (filter != ShaderLanguage::FILTER_LINEAR && filter != ShaderLanguage::FILTER_LINEAR_MIPMAP && filter != ShaderLanguage::FILTER_LINEAR_MIPMAP_ANISOTROPIC) {
+		return String();
+	}
+	r_mipmaps = filter != ShaderLanguage::FILTER_LINEAR;
+	return p_texture + ", " + _get_sampler_name(filter, p_repeat) + ", " + _get_sampler_name(ShaderLanguage::FILTER_NEAREST_MIPMAP, p_repeat);
+}
+
 void ShaderCompiler::_dump_function_deps(const SL::ShaderNode *p_node, const StringName &p_for_func, const HashMap<StringName, String> &p_func_code, String &r_to_add, HashSet<StringName> &added) {
 	int fidx = -1;
 
@@ -1304,12 +1338,24 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 					bool texture_grad_rewrite = false;
 					String texture_grad_coordinate;
 					String texture_projected_sampler;
+					String texture_projected_level;
+					// The stochastic filter's form of a rewritten lookup (D117): its texture and samplers, coordinate
+					// and bias.
+					bool texture_color = false;
+					ShaderLanguage::ShaderNode::Uniform::Hint texture_hint = ShaderLanguage::ShaderNode::Uniform::HINT_NONE;
+					ShaderLanguage::TextureFilter texture_filter = ShaderLanguage::FILTER_DEFAULT;
+					ShaderLanguage::TextureRepeat texture_repeat = ShaderLanguage::REPEAT_DEFAULT;
+					String texture_filtering_arguments;
+					bool texture_filtering_mipmaps = true;
+					String texture_coordinate;
+					String texture_lod_bias;
 
 					for (int i = 1; i < onode->arguments.size(); i++) {
 						if (texture_func_projected && i == 3) {
 							// The coordinate's scale feeds only the trace's level of detail.
 							if (!actions.texture_projected_function.is_empty()) {
-								code += ", " + actions.texture_projected_function + "(textureSize(" + texture_projected_sampler + ", 0), " + _dump_node_code(onode->arguments[i], p_level, r_gen_code, p_actions, p_default_actions, p_assigning) + ")";
+								texture_projected_level = actions.texture_projected_function + "(textureSize(" + texture_projected_sampler + ", 0), " + _dump_node_code(onode->arguments[i], p_level, r_gen_code, p_actions, p_default_actions, p_assigning) + ")";
+								code += ", " + texture_projected_level;
 							}
 							continue;
 						}
@@ -1393,6 +1439,10 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 											is_normal_roughness_texture = true;
 										}
 										sampler_name = _get_sampler_name(u.filter, u.repeat);
+										texture_color = u.use_color;
+										texture_hint = u.hint;
+										texture_filter = u.filter;
+										texture_repeat = u.repeat;
 									} else {
 										bool found = false;
 
@@ -1470,6 +1520,9 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 								if (texture_func_projected) {
 									texture_projected_sampler = data_type_name + "(" + node_code + ", " + sampler_name + ")";
 								}
+								if (!actions.texture_filtering_lod_function.is_empty() && onode->arguments[i]->get_datatype() == SL::TYPE_SAMPLER2D && (!texture_lod_sampler.is_empty() || (texture_func_projected && !actions.texture_projected_function.is_empty()))) {
+									texture_filtering_arguments = _get_texture_filtering_arguments(node_code, texture_color, texture_hint, texture_filter, texture_repeat, texture_filtering_mipmaps);
+								}
 								code += data_type_name + "(" + node_code + ", " + sampler_name + ")";
 							} else if (correct_texture_uniform && RS::get_singleton()->is_low_end()) {
 								// Texture function on low end hardware (i.e. OpenGL).
@@ -1511,9 +1564,13 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 						} else if (texture_lod_rewrite && i == 3) {
 							// The bias becomes the start of an explicit level.
 							code += "(" + node_code + ")";
+							texture_lod_bias = node_code;
 						} else {
 							if (texture_grad_rewrite && i == 2) {
 								texture_grad_coordinate = node_code;
+							}
+							if (i == 2) {
+								texture_coordinate = node_code;
 							}
 							code += node_code;
 						}
@@ -1522,6 +1579,22 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 						code += String(onode->arguments.size() == 4 ? " + " : ", ") + actions.texture_lod_function + "(textureSize(" + texture_lod_sampler + ", 0))";
 					}
 					code += ")";
+					if (!texture_filtering_arguments.is_empty()) {
+						// The stochastic filter's function at the same level, which falls back to this lookup.
+						String level = texture_projected_level;
+						if (!texture_lod_sampler.is_empty()) {
+							level = actions.texture_lod_function + "(textureSize(" + texture_lod_sampler + ", 0))";
+							if (onode->arguments.size() == 4) {
+								level = "(" + texture_lod_bias + ") + " + level;
+							}
+						}
+						const String &filtering = actions.texture_filtering_lod_function;
+						if (p_actions.usage_flag_pointers.has(filtering) && !used_flag_pointers.has(filtering)) {
+							*p_actions.usage_flag_pointers[filtering] = true;
+							used_flag_pointers.insert(filtering);
+						}
+						code = filtering + "(" + texture_filtering_arguments + ", " + texture_coordinate + ", " + level + ", " + (texture_filtering_mipmaps ? "true" : "false") + ")";
+					}
 					if (texture_grad_rewrite) {
 						// The gradients where the hit has them, the level otherwise. The sampler and coordinate
 						// expressions are written into both branches, of which one runs.
@@ -1530,7 +1603,11 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 							*p_actions.usage_flag_pointers[grad] = true;
 							used_flag_pointers.insert(grad);
 						}
-						code = "(" + grad + ".on ? textureGrad(" + texture_lod_sampler + ", " + texture_grad_coordinate + ", " + grad + ".x, " + grad + ".y) : " + code + ")";
+						String grad_code = "textureGrad(" + texture_lod_sampler + ", " + texture_grad_coordinate + ", " + grad + ".x, " + grad + ".y)";
+						if (!texture_filtering_arguments.is_empty()) {
+							grad_code = actions.texture_filtering_grad_function + "(" + texture_filtering_arguments + ", " + texture_grad_coordinate + ", " + grad + ".x, " + grad + ".y)";
+						}
+						code = "(" + grad + ".on ? " + grad_code + " : " + code + ")";
 					}
 					if (is_screen_texture && !texture_func_returns_data && actions.apply_luminance_multiplier) {
 						if (RS::get_singleton()->is_low_end()) {

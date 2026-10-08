@@ -51,3 +51,55 @@ float rt_texture_projected_lod(ivec2 p_size, float p_uv_per_metre) {
 	}
 	return rt_footprint_t + log2(max(p_uv_per_metre, 1e-20)) + 0.5 * log2(max(float(p_size.x) * float(p_size.y), 1.0));
 }
+
+// Stochastic texture filtering in custom hit groups (D117 F3). The level, gradient and projected forms above, on a
+// float 2D uniform of material data (a source_color, hint_normal, hint_roughness_* or hint_anisotropy hint) through a
+// linear filter, call rt_texture_filtered_lod(tex, s, nearest, uv, level, mipmaps) or
+// rt_texture_filtered_grad(tex, s, nearest, uv, dx, dy) in their place: s the uniform's sampler, nearest the
+// nearest-with-mipmaps sampler of its repeat mode, and level the expression the lookup above would read at. Any other
+// sampler (a mask, a lookup table, noise, a plain sampler2D) keeps the deterministic lookup, as does a lookup through
+// a helper function's sampler argument, which carries no hint (the parser keeps only the screen, depth and
+// normal-roughness hints on arguments). In the closest hit, with the filter on, one texel of the filter's footprint
+// is read through nearest as HG0 reads it (rt_texture_filtering_position); otherwise, in the any-hit's alpha test,
+// the intersection stage, the vertex function (before the hit draws its numbers) or with the filter off, each is
+// exactly the lookup above. The texture arrives as nonuniformEXT: a uniform here is an index into the bindless table,
+// which varies across a hit group's materials, and a texture passed through a parameter would otherwise lose the
+// qualifier its index carries.
+//
+// rt_stf_u holds the hit's four numbers, shared by its lookups as HG0's are. The closest hit draws them after the
+// vertex function, only for a shader with such a lookup (RT_CUSTOM_TEXTURE_FILTERING) and the filter on, the major
+// axis's (z) where the hit has gradients. The filter's branches compile in only for a pipeline with the filter on
+// (RT_TEXTURE_FILTERING_COMPILED, defined with RT_FLAG_TEXTURE_FILTERING): with it off, the driver compiles exactly the
+// lookups above.
+bool rt_stf_on = false;
+vec4 rt_stf_u = vec4(0.0);
+
+vec4 rt_texture_filtered_lod(nonuniformEXT texture2D p_texture, sampler p_sampler, sampler p_nearest, vec2 p_uv, float p_level, bool p_mipmaps) {
+#if defined(RT_STAGE_CLOSEST_HIT) && defined(RT_TEXTURE_FILTERING_COMPILED)
+	const uint stf_filter = rt_texture_filtering();
+	if (stf_filter != 0u && rt_stf_on && !rt_texture_filtering_magnified(p_level)) {
+		const uvec2 size = uvec2(textureSize(sampler2D(p_texture, p_nearest), 0));
+		const uint levels = p_mipmaps ? uint(textureQueryLevels(sampler2D(p_texture, p_nearest))) : 1u;
+		const vec3 pos = rt_texture_filtering_position(stf_filter, rt_stf_u, size, levels, p_mipmaps, p_uv, p_level, vec4(0.0), false);
+		return textureLod(sampler2D(p_texture, p_nearest), pos.xy, pos.z);
+	}
+#endif
+	return textureLod(sampler2D(p_texture, p_sampler), p_uv, p_level);
+}
+
+vec4 rt_texture_filtered_grad(nonuniformEXT texture2D p_texture, sampler p_sampler, sampler p_nearest, vec2 p_uv, vec2 p_dx, vec2 p_dy) {
+#if defined(RT_STAGE_CLOSEST_HIT) && defined(RT_TEXTURE_FILTERING_COMPILED)
+	const uint stf_filter = rt_texture_filtering();
+	if (stf_filter != 0u && rt_stf_on) {
+		const uvec2 size = uvec2(textureSize(sampler2D(p_texture, p_nearest), 0));
+		const vec4 grad = vec4(p_dx, p_dy);
+		const float level = rt_texture_filtering_level(size, grad);
+		if (!rt_texture_filtering_magnified(level)) {
+			const uint levels = uint(textureQueryLevels(sampler2D(p_texture, p_nearest)));
+			const vec3 pos = rt_texture_filtering_position(stf_filter, rt_stf_u, size, levels, true, p_uv, level, grad, true);
+			return textureLod(sampler2D(p_texture, p_nearest), pos.xy, pos.z);
+		}
+	}
+#endif
+	return textureGrad(sampler2D(p_texture, p_sampler), p_uv, p_dx, p_dy);
+}

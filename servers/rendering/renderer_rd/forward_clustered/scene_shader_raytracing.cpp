@@ -625,6 +625,8 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	actions.usage_flag_pointers["texture_projected"] = &detected_projected;
 	bool detected_texture_grad = false;
 	actions.usage_flag_pointers["rt_grad_t"] = &detected_texture_grad;
+	bool detected_texture_filtering = false;
+	actions.usage_flag_pointers["rt_texture_filtered_lod"] = &detected_texture_filtering;
 	bool detected_uv_write = false;
 	actions.write_flag_pointers["UV"] = &detected_uv_write;
 	bool detected_uv2_write = false;
@@ -649,6 +651,7 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	r_entry.writes_uv = detected_uv_write || detected_uv2_write;
 	r_entry.uses_projected = detected_projected;
 	r_entry.uses_texture_grad = detected_texture_grad;
+	r_entry.uses_texture_filtering = detected_texture_filtering;
 	r_entry.vertex_code = gen_code.code.has("vertex") ? gen_code.code["vertex"] : String();
 	r_entry.fragment_code = gen_code.code.has("fragment") ? gen_code.code["fragment"] : String();
 	r_entry.fragment_globals = gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT];
@@ -910,6 +913,11 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 		if (p_rt_flags & RT_FLAG_POSITION_FETCH_CHECK) {
 			inject_define(sources, "#define RT_POSITION_FETCH_CHECK\n");
 		}
+	}
+	// A define as well as the flag: custom hit groups carry their stochastic texture filtering into the driver's pipeline
+	// compile only while it is on, which costs it about 3 % on the valley's first load otherwise (D117 F3).
+	if (p_rt_flags & RT_FLAG_TEXTURE_FILTERING) {
+		inject_define(sources, "#define RT_TEXTURE_FILTERING_COMPILED\n");
 	}
 
 	// Procedural templates come from intersection stage; strip from base HG0 path.
@@ -1179,6 +1187,10 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 		if (entry.uses_texture_grad) {
 			// A lookup was rewritten to textureGrad: the hit computes the cone's elliptical footprint (D116).
 			tex_defines += "#define RT_CUSTOM_TEXTURE_GRAD\n";
+		}
+		if (entry.uses_texture_filtering) {
+			// A lookup goes through the stochastic texture filter: the hit draws its random numbers (D117).
+			tex_defines += "#define RT_CUSTOM_TEXTURE_FILTERING\n";
 		}
 		String uniform_members = entry.uniform_members.is_empty() ? String("float _rt_pad;") : entry.uniform_members;
 
@@ -1878,6 +1890,9 @@ void SceneShaderRaytracing::init(const String p_defines) {
 		actions.texture_grad_variable = "rt_grad_t";
 		actions.texture_grad_coordinates.insert("UV");
 		actions.texture_projected_function = "rt_texture_projected_lod";
+		// Those lookups on material data through a linear filter take the stochastic texture filter (D117 F3).
+		actions.texture_filtering_lod_function = "rt_texture_filtered_lod";
+		actions.texture_filtering_grad_function = "rt_texture_filtered_grad";
 		actions.global_buffer_array_variable = "global_shader_uniforms.data";
 		actions.instance_uniform_index_variable = "instances.data[instance_index_interp].instance_uniforms_ofs";
 

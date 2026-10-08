@@ -757,6 +757,7 @@ public:
 			bool tex_builtin_check;
 			StringName tex_builtin;
 			ShaderNode::Uniform::Hint tex_hint;
+			bool tex_argument_material; // Every caller passes a texture of material data (is_material_texture).
 			bool is_const;
 			int array_size;
 
@@ -859,6 +860,7 @@ public:
 	static bool is_float_type(DataType p_type);
 	static bool is_sampler_type(DataType p_type);
 	static bool is_hint_color(ShaderNode::Uniform::Hint p_hint);
+	static bool is_material_texture(bool p_use_color, ShaderNode::Uniform::Hint p_hint);
 	static Variant constant_value_to_variant(const Vector<Scalar> &p_value, DataType p_type, int p_array_size, ShaderLanguage::ShaderNode::Uniform::Hint p_hint = ShaderLanguage::ShaderNode::Uniform::HINT_NONE);
 	static Variant get_default_datatype_value(DataType p_type, int p_array_size, ShaderLanguage::ShaderNode::Uniform::Hint p_hint);
 	static PropertyInfo uniform_to_property_info(const ShaderNode::Uniform &p_uniform);
@@ -1214,7 +1216,7 @@ private:
 	bool _validate_function_call(BlockNode *p_block, const FunctionInfo &p_function_info, OperatorNode *p_func, DataType *r_ret_type, StringName *r_ret_type_str, bool *r_is_custom_function = nullptr);
 	bool _parse_function_arguments(BlockNode *p_block, const FunctionInfo &p_function_info, OperatorNode *p_func, int *r_complete_arg = nullptr);
 	ShaderNode::Uniform::Hint _sanitize_hint(ShaderNode::Uniform::Hint p_hint);
-	bool _propagate_function_call_sampler_uniform_settings(const StringName &p_name, int p_argument, TextureFilter p_filter, TextureRepeat p_repeat, ShaderNode::Uniform::Hint p_hint);
+	bool _propagate_function_call_sampler_uniform_settings(const StringName &p_name, int p_argument, TextureFilter p_filter, TextureRepeat p_repeat, ShaderNode::Uniform::Hint p_hint, bool p_material);
 	bool _propagate_function_call_sampler_builtin_reference(const StringName &p_name, int p_argument, const StringName &p_builtin);
 	bool _validate_varying_assign(ShaderNode::Varying &p_varying, String *r_message);
 	bool _check_node_constness(const Node *p_node) const;

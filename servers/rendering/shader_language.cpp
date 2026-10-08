@@ -4308,6 +4308,29 @@ bool ShaderLanguage::ShaderLanguage::is_hint_color(ShaderLanguage::ShaderNode::U
 	return p_hint == ShaderLanguage::ShaderNode::Uniform::HINT_SOURCE_COLOR || p_hint == ShaderLanguage::ShaderNode::Uniform::HINT_COLOR_CONVERSION_DISABLED;
 }
 
+// Whether a sampler holds material data, which the path tracer filters stochastically (D117): a colour map (the
+// sampler's source_color, kept as use_color), or a normal, roughness or anisotropy map. Not a mask, a lookup table or
+// noise, and not the screen, depth or normal-roughness buffers, whatever their source_color.
+bool ShaderLanguage::is_material_texture(bool p_use_color, ShaderNode::Uniform::Hint p_hint) {
+	switch (p_hint) {
+		case ShaderNode::Uniform::HINT_SCREEN_TEXTURE:
+		case ShaderNode::Uniform::HINT_DEPTH_TEXTURE:
+		case ShaderNode::Uniform::HINT_NORMAL_ROUGHNESS_TEXTURE:
+			return false;
+		case ShaderNode::Uniform::HINT_NORMAL:
+		case ShaderNode::Uniform::HINT_ROUGHNESS_NORMAL:
+		case ShaderNode::Uniform::HINT_ROUGHNESS_R:
+		case ShaderNode::Uniform::HINT_ROUGHNESS_G:
+		case ShaderNode::Uniform::HINT_ROUGHNESS_B:
+		case ShaderNode::Uniform::HINT_ROUGHNESS_A:
+		case ShaderNode::Uniform::HINT_ROUGHNESS_GRAY:
+		case ShaderNode::Uniform::HINT_ANISOTROPY:
+			return true;
+		default:
+			return p_use_color;
+	}
+}
+
 Variant ShaderLanguage::constant_value_to_variant(const Vector<Scalar> &p_value, DataType p_type, int p_array_size, ShaderLanguage::ShaderNode::Uniform::Hint p_hint) {
 	int array_size = p_array_size;
 
@@ -5666,7 +5689,7 @@ ShaderLanguage::ShaderNode::Uniform::Hint ShaderLanguage::_sanitize_hint(ShaderN
 	return ShaderNode::Uniform::HINT_NONE;
 }
 
-bool ShaderLanguage::_propagate_function_call_sampler_uniform_settings(const StringName &p_name, int p_argument, TextureFilter p_filter, TextureRepeat p_repeat, ShaderNode::Uniform::Hint p_hint) {
+bool ShaderLanguage::_propagate_function_call_sampler_uniform_settings(const StringName &p_name, int p_argument, TextureFilter p_filter, TextureRepeat p_repeat, ShaderNode::Uniform::Hint p_hint, bool p_material) {
 	for (int i = 0; i < shader->vfunctions.size(); i++) {
 		if (shader->vfunctions[i].name == p_name) {
 			ERR_FAIL_INDEX_V(p_argument, shader->vfunctions[i].function->arguments.size(), false);
@@ -5677,6 +5700,17 @@ bool ShaderLanguage::_propagate_function_call_sampler_uniform_settings(const Str
 			} else if (arg->tex_argument_check) {
 				// Was checked, verify that filter, repeat, and hint are the same.
 				if (arg->tex_argument_filter == p_filter && arg->tex_argument_repeat == p_repeat && arg->tex_hint == _sanitize_hint(p_hint)) {
+					if (arg->tex_argument_material && !p_material) {
+						// Material data only if every caller passes it, down the functions it is passed on to.
+						arg->tex_argument_material = false;
+						for (KeyValue<StringName, HashSet<int>> &E : arg->tex_argument_connect) {
+							for (const int &F : E.value) {
+								if (!_propagate_function_call_sampler_uniform_settings(E.key, F, p_filter, p_repeat, p_hint, false)) {
+									return false;
+								}
+							}
+						}
+					}
 					return true;
 				} else {
 					_set_error(vformat(RTR("Sampler argument %d of function '%s' called more than once using textures that differ in either filter, repeat, or texture hint setting."), p_argument, String(p_name)));
@@ -5687,9 +5721,10 @@ bool ShaderLanguage::_propagate_function_call_sampler_uniform_settings(const Str
 				arg->tex_argument_filter = p_filter;
 				arg->tex_argument_repeat = p_repeat;
 				arg->tex_hint = _sanitize_hint(p_hint);
+				arg->tex_argument_material = p_material;
 				for (KeyValue<StringName, HashSet<int>> &E : arg->tex_argument_connect) {
 					for (const int &F : E.value) {
-						if (!_propagate_function_call_sampler_uniform_settings(E.key, F, p_filter, p_repeat, p_hint)) {
+						if (!_propagate_function_call_sampler_uniform_settings(E.key, F, p_filter, p_repeat, p_hint, p_material)) {
 							return false;
 						}
 					}
@@ -6535,7 +6570,7 @@ ShaderLanguage::Node *ShaderLanguage::_parse_expression(BlockNode *p_block, cons
 											}
 
 											//propagate
-											if (!_propagate_function_call_sampler_uniform_settings(name, i, u->filter, u->repeat, u->hint)) {
+											if (!_propagate_function_call_sampler_uniform_settings(name, i, u->filter, u->repeat, u->hint, is_material_texture(u->use_color, u->hint))) {
 												return nullptr;
 											}
 										} else if (p_function_info.built_ins.has(varname)) {
@@ -10993,6 +11028,7 @@ Error ShaderLanguage::_parse_shader(const HashMap<StringName, FunctionInfo> &p_f
 					arg.tex_builtin_check = false;
 					arg.tex_argument_filter = FILTER_DEFAULT;
 					arg.tex_argument_repeat = REPEAT_DEFAULT;
+					arg.tex_argument_material = false;
 					arg.is_const = param_is_const;
 
 					tk = _get_token();

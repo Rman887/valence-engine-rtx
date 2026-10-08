@@ -54,17 +54,17 @@ float rt_texture_projected_lod(ivec2 p_size, float p_uv_per_metre) {
 
 // Stochastic texture filtering in custom hit groups (D117 F3). The level, gradient and projected forms above, on a
 // float 2D uniform of material data (a source_color, hint_normal, hint_roughness_* or hint_anisotropy hint) through a
-// linear filter, call rt_texture_filtered_lod(tex, s, nearest, uv, level, mipmaps) or
-// rt_texture_filtered_grad(tex, s, nearest, uv, dx, dy) in their place: s the uniform's sampler, nearest the
-// nearest-with-mipmaps sampler of its repeat mode, and level the expression the lookup above would read at. Any other
-// sampler (a mask, a lookup table, noise, a plain sampler2D) keeps the deterministic lookup, as does a lookup through
-// a helper function's sampler argument, which carries no hint (the parser keeps only the screen, depth and
-// normal-roughness hints on arguments). In the closest hit, with the filter on, one texel of the filter's footprint
-// is read through nearest as HG0 reads it (rt_texture_filtering_position); otherwise, in the any-hit's alpha test,
-// the intersection stage, the vertex function (before the hit draws its numbers) or with the filter off, each is
-// exactly the lookup above. The texture arrives as nonuniformEXT: a uniform here is an index into the bindless table,
-// which varies across a hit group's materials, and a texture passed through a parameter would otherwise lose the
-// qualifier its index carries.
+// linear filter, call rt_texture_filtered_lod(tex, s, nearest, uv, level, mipmaps) or rt_texture_filtered_grad(tex, s,
+// nearest, uv, dx, dy) in their place: s the uniform's sampler, nearest the nearest-with-mipmaps sampler of its repeat
+// mode, and level the expression the lookup above would read at. Any other sampler (a mask, a lookup table, noise, a
+// plain sampler2D) keeps the deterministic lookup. A helper function's sampler argument counts as material data when
+// every call passes it some (the parser's tex_argument_material), so a helper called with a colour map and a mask keeps
+// the deterministic lookup for both. In the closest hit, with the filter on, one texel of the filter's footprint is
+// read through nearest as HG0 reads it (rt_texture_filtering_position); otherwise, in the any-hit's alpha test, the
+// intersection stage, the vertex function (before the hit draws its numbers) or with the filter off, each is exactly
+// the lookup above. The texture arrives as nonuniformEXT: a uniform here is an index into the bindless table, which
+// varies across a hit group's materials, and a texture passed through a parameter would otherwise lose the qualifier
+// its index carries.
 //
 // rt_stf_u holds the hit's four numbers, shared by its lookups as HG0's are. The closest hit draws them after the
 // vertex function, only for a shader with such a lookup (RT_CUSTOM_TEXTURE_FILTERING) and the filter on, the major

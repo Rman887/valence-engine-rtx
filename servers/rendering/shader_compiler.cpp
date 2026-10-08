@@ -341,30 +341,12 @@ String ShaderCompiler::_get_sampler_name(ShaderLanguage::TextureFilter p_filter,
 }
 
 // The texture, its sampler and the nearest-with-mipmaps sampler of its repeat mode, as the stochastic filter's functions
-// take them (D117), for a lookup they apply to: material data by its hints (a source_color map, or a normal, roughness
-// or anisotropy map; not a mask, a lookup table or noise, and not the screen, depth or normal-roughness buffers, whatever
-// their source_color) through a linear filter. Empty for any other. A sampler argument of a helper function carries no
-// such hint (the parser keeps only the screen, depth and normal-roughness hints there), so its lookups stay
-// deterministic.
+// take them (D117), for a lookup they apply to: material data (ShaderLanguage::is_material_texture; for a helper
+// function's sampler argument, data every caller passes, p_color with no hint) through a linear filter. Empty for any
+// other.
 String ShaderCompiler::_get_texture_filtering_arguments(const String &p_texture, bool p_color, ShaderLanguage::ShaderNode::Uniform::Hint p_hint, ShaderLanguage::TextureFilter p_filter, ShaderLanguage::TextureRepeat p_repeat, bool &r_mipmaps) {
-	switch (p_hint) {
-		case ShaderLanguage::ShaderNode::Uniform::HINT_SCREEN_TEXTURE:
-		case ShaderLanguage::ShaderNode::Uniform::HINT_DEPTH_TEXTURE:
-		case ShaderLanguage::ShaderNode::Uniform::HINT_NORMAL_ROUGHNESS_TEXTURE:
-			return String();
-		case ShaderLanguage::ShaderNode::Uniform::HINT_NORMAL:
-		case ShaderLanguage::ShaderNode::Uniform::HINT_ROUGHNESS_NORMAL:
-		case ShaderLanguage::ShaderNode::Uniform::HINT_ROUGHNESS_R:
-		case ShaderLanguage::ShaderNode::Uniform::HINT_ROUGHNESS_G:
-		case ShaderLanguage::ShaderNode::Uniform::HINT_ROUGHNESS_B:
-		case ShaderLanguage::ShaderNode::Uniform::HINT_ROUGHNESS_A:
-		case ShaderLanguage::ShaderNode::Uniform::HINT_ROUGHNESS_GRAY:
-		case ShaderLanguage::ShaderNode::Uniform::HINT_ANISOTROPY:
-			break;
-		default:
-			if (!p_color) {
-				return String();
-			}
+	if (!ShaderLanguage::is_material_texture(p_color, p_hint)) {
+		return String();
 	}
 	const ShaderLanguage::TextureFilter filter = p_filter == ShaderLanguage::FILTER_DEFAULT ? actions.default_filter : p_filter;
 	if (filter != ShaderLanguage::FILTER_LINEAR && filter != ShaderLanguage::FILTER_LINEAR_MIPMAP && filter != ShaderLanguage::FILTER_LINEAR_MIPMAP_ANISOTROPIC) {
@@ -1463,6 +1445,9 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 														is_normal_roughness_texture = true;
 													}
 													sampler_name = _get_sampler_name(function->arguments[j].tex_argument_filter, function->arguments[j].tex_argument_repeat);
+													texture_color = function->arguments[j].tex_argument_material;
+													texture_filter = function->arguments[j].tex_argument_filter;
+													texture_repeat = function->arguments[j].tex_argument_repeat;
 													found = true;
 													break;
 												}

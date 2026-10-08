@@ -126,7 +126,8 @@ public:
 		// uv_per_metre (the path tracer's hit groups, D116).
 		String texture_projected_function;
 		// When set, the level, gradient and projected forms above on a float 2D uniform of material data (source_color,
-		// hint_normal, hint_roughness_* or hint_anisotropy, through a linear filter) call these
+		// hint_normal, hint_roughness_* or hint_anisotropy, through a linear filter), or on a helper function's sampler
+		// argument every call passes such a uniform, call these
 		// in place of textureLod and textureGrad, as f(texture, its sampler, the nearest-with-mipmaps sampler of its
 		// repeat mode, uv, then the level and whether the filter has mipmaps, or the two gradients): the path
 		// tracer's stochastic texture filtering (D117). A usage flag pointer under the level function's name is set

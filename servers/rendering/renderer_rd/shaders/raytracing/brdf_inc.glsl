@@ -277,6 +277,8 @@ struct MaterialProperties {
 	float transmissivness;
 	float opacity;
 	float3 diffuseTransmission; // Albedo of a thin diffuse-transmission lobe on the other side of N (D103); 0 = none.
+	float anisotropy; // VAL: the specular lobe's anisotropy, Godot's ANISOTROPY, at most 1 (D118 MM1); 0 = isotropic.
+	float3 anisotropyT; // With anisotropy: the unit tangent its roughness stretches along, orthogonal to the N the BRDF is given.
 };
 
 // A thin surface that passes light to its other side (D103): light below N is evaluated, not rejected.
@@ -294,6 +296,8 @@ struct BrdfData {
 	float roughness; //< perceptively linear roughness (artist's input)
 	float alpha; //< linear roughness - often 'alpha' in specular BRDF equations
 	float alphaSquared; //< alpha squared - pre-calculated value commonly used in BRDF equations
+	float2 alpha2D; //< VAL: alpha along T and B (D118 MM1); (alpha, alpha) for an isotropic lobe
+	bool anisotropic; //< VAL: the lobe is anisotropic; the *TB terms below are set only then
 
 	// Commonly used terms for BRDF evaluation
 	float3 F; //< Fresnel term
@@ -310,6 +314,11 @@ struct BrdfData {
 	float LdotH;
 	float NdotH;
 	float VdotH;
+
+	// VAL: H, L and V along the anisotropic lobe's tangent and bitangent (D118 MM1)
+	float2 HdotTB;
+	float2 LdotTB;
+	float2 VdotTB;
 
 	// True when V/L is backfacing wrt. shading normal N
 	bool Vbackfacing;
@@ -882,6 +891,61 @@ float3 evalMultiScatterApproximation(float alpha, float NdV, float3 F0) {
 	return 1.0 + F0 * Ems;
 }
 
+// VAL: anisotropic GGX (D118 MM1), the forms of Falcor's AnisotropicGGX.slang and Heitz's "Understanding the
+// Masking-Shadowing Function in Microfacet-Based BRDFs". Vectors are in the lobe's (T, B, N) frame, alpha2D its
+// roughness along T and B; with alpha2D = (alpha, alpha) each reduces to the isotropic function it stands beside.
+
+// The NDF, each alpha floored as GGX_D floors alpha squared.
+float GGX_D_Anisotropic(float2 alpha2D, float3 H) {
+	float2 a = max(alpha2D, float2(0.0031623f, 0.0031623f));
+	float3 h = float3(H.x / a.x, H.y / a.y, H.z);
+	float d = dot(h, h);
+	return 1.0f / (PI * a.x * a.y * d * d);
+}
+
+// sqrt(ax^2 Sx^2 + ay^2 Sy^2 + Sz^2), the length both Smith terms take: Lambda(S) = (length / Sz - 1) / 2.
+float Smith_Length_GGX_Anisotropic(float2 alpha2D, float3 S) {
+	return length(float3(alpha2D.x * S.x, alpha2D.y * S.y, S.z));
+}
+
+// Smith G1 = 1 / (1 + Lambda(S)), S.z clamped as the isotropic callers clamp NdotS.
+float Smith_G1_GGX_Anisotropic(float2 alpha2D, float3 S) {
+	float z = max(0.00001f, S.z);
+	return 2.0f * z / (z + Smith_Length_GGX_Anisotropic(alpha2D, float3(S.xy, z)));
+}
+
+// Height-correlated G2 / (4 * NdotL * NdotV), the anisotropic Smith_G2_Height_Correlated_GGX_Lagarde (Godot's
+// V_GGX_anisotropic), with L.z and V.z the clamped NdotL and NdotV.
+float Smith_G2_Height_Correlated_GGX_Anisotropic(float2 alpha2D, float3 L, float3 V) {
+	float a = V.z * Smith_Length_GGX_Anisotropic(alpha2D, L);
+	float b = L.z * Smith_Length_GGX_Anisotropic(alpha2D, V);
+	return 0.5f / (a + b);
+}
+
+// The density of a reflection sampled by sampleGGXVNDF with alpha2D: D * G1(V) / (4 * NdotV), as sampleGGXVNDFReflectionPdf.
+float sampleGGXVNDFReflectionPdfAnisotropic(float2 alpha2D, float3 H, float3 V) {
+	float NdotV = max(0.00001f, V.z);
+	return GGX_D_Anisotropic(alpha2D, float3(H.xy, max(0.00001f, H.z))) * Smith_G1_GGX_Anisotropic(alpha2D, V) / (4.0f * NdotV);
+}
+
+// sampleSpecularMicrofacet for the anisotropic lobe: the half vector from the VNDF with alpha2D and the weight
+// F * G2 / G1(V) with the multiple-scattering factor, whose roughness is sqrt(ax * ay) = alpha.
+float3 sampleSpecularMicrofacetAnisotropic(float3 Vlocal, float alpha, float2 alpha2D, float3 specularF0, float2 u, OUT_PARAMETER(float3) weight) {
+	float3 Hlocal = alpha == 0.0f ? float3(0.0f, 0.0f, 1.0f) : sampleGGXVNDF(Vlocal, alpha2D, u);
+	float3 Llocal = reflect(-Vlocal, Hlocal);
+
+	float HdotL = max(0.00001f, min(1.0f, dot(Hlocal, Llocal)));
+	float NdotV = max(0.00001f, min(1.0f, Vlocal.z));
+	float3 F = evalFresnel(specularF0, shadowedF90(specularF0), HdotL);
+	float3 ms = evalMultiScatterApproximation(alpha, NdotV, specularF0);
+
+	float G1V = Smith_G1_GGX_Anisotropic(alpha2D, Vlocal);
+	float G1L = Smith_G1_GGX_Anisotropic(alpha2D, Llocal);
+	weight = ms * F * (G1L / (G1V + G1L - G1V * G1L));
+
+	return Llocal;
+}
+
 // Samples a reflection ray from the rough surface using selected microfacet distribution and sampling method
 // Resulting weight includes multiplication by cosine (NdotL) term
 float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 specularF0, float2 u, OUT_PARAMETER(float3) weight) {
@@ -933,6 +997,13 @@ float3 evalMicrofacet(const BrdfData data) {
 #else
 	float3 ms = vec3(1.0f, 1.0f, 1.0f);
 #endif
+
+	// VAL: the anisotropic lobe (D118 MM1), its G2 already divided by the denominator.
+	if (data.anisotropic) {
+		float Da = GGX_D_Anisotropic(data.alpha2D, float3(data.HdotTB, data.NdotH));
+		float G2a = Smith_G2_Height_Correlated_GGX_Anisotropic(data.alpha2D, float3(data.LdotTB, data.NdotL), float3(data.VdotTB, data.NdotV));
+		return ms * data.F * (G2a * Da * data.NdotL);
+	}
 
 #if G2_DIVIDED_BY_DENOMINATOR
 	return ms * data.F * (G2 * D * data.NdotL);
@@ -1060,6 +1131,23 @@ BrdfData prepareBRDFData(float3 N, float3 L, float3 V, MaterialProperties materi
 	data.alpha = material.roughness * material.roughness;
 	data.alphaSquared = data.alpha * data.alpha;
 
+	// VAL: anisotropy as Godot's raster stretches the lobe (D118 MM1): alpha / aspect along T, alpha * aspect along
+	// B, aspect = sqrt(1 - 0.9 * anisotropy). The forms are GGX's.
+	data.alpha2D = float2(data.alpha, data.alpha);
+	data.anisotropic = (MICROFACET_DISTRIBUTION == GGX) && material.anisotropy != 0.0f;
+	data.HdotTB = float2(0.0f, 0.0f);
+	data.LdotTB = float2(0.0f, 0.0f);
+	data.VdotTB = float2(0.0f, 0.0f);
+	if (data.anisotropic) {
+		float aspect = sqrt(1.0f - 0.9f * material.anisotropy);
+		data.alpha2D = float2(data.alpha / aspect, data.alpha * aspect);
+		float3 T = material.anisotropyT;
+		float3 B = cross(N, T);
+		data.HdotTB = float2(dot(T, data.H), dot(B, data.H));
+		data.LdotTB = float2(dot(T, L), dot(B, L));
+		data.VdotTB = float2(dot(T, V), dot(B, V));
+	}
+
 	// Pre-calculate some more BRDF terms
 	data.F = evalFresnel(data.specularF0, shadowedF90(data.specularF0), data.LdotH);
 
@@ -1167,7 +1255,11 @@ float brdf_pdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 		pdf += (1.0f - specularProbability) * diffusePdf(data.NdotL);
 	}
 	if (specularProbability > 0.0f && data.alpha > 0.0f) {
-		pdf += specularProbability * specularPdf(data.alpha, data.alphaSquared, data.NdotH, data.NdotV, data.LdotH);
+		if (data.anisotropic) {
+			pdf += specularProbability * sampleGGXVNDFReflectionPdfAnisotropic(data.alpha2D, float3(data.HdotTB, data.NdotH), float3(data.VdotTB, data.NdotV));
+		} else {
+			pdf += specularProbability * specularPdf(data.alpha, data.alphaSquared, data.NdotH, data.NdotV, data.LdotH);
+		}
 	}
 	if (transmissionProbability > 0.0f) {
 		pdf *= 1.0f - transmissionProbability;
@@ -1182,23 +1274,29 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 
 	// Transform view direction into local space of our sampling routines
 	// (local space is oriented so that its positive Z axis points along the shading normal)
+	// VAL: an anisotropic lobe (D118 MM1) samples in its own (T, B, N) frame, where its tangent is the X axis.
+	const bool anisotropic = (MICROFACET_DISTRIBUTION == GGX) && material.anisotropy != 0.0f;
+	const float3 T = material.anisotropyT;
+	const float3 B = cross(shadingNormal, T);
 	float4 qRotationToZ = getRotationToZAxis(shadingNormal);
-	float3 Vlocal = rotatePoint(qRotationToZ, V);
+	float3 Vlocal = anisotropic ? float3(dot(V, T), dot(V, B), dot(V, shadingNormal)) : rotatePoint(qRotationToZ, V);
 	const float3 Nlocal = float3(0.0f, 0.0f, 1.0f);
+	MaterialProperties localMaterial = material;
+	localMaterial.anisotropyT = float3(1.0f, 0.0f, 0.0f);
 
 	float3 rayDirectionLocal = float3(0.0f, 0.0f, 0.0f);
 
 	if (brdfType == DIFFUSE_TYPE) {
 		// Sample diffuse ray using cosine-weighted hemisphere sampling
 		rayDirectionLocal = sampleHemisphere(u);
-		const BrdfData data = prepareBRDFData(Nlocal, rayDirectionLocal, Vlocal, material);
+		const BrdfData data = prepareBRDFData(Nlocal, rayDirectionLocal, Vlocal, localMaterial);
 
 		// Function 'diffuseTerm' is predivided by PDF of sampling the cosine weighted hemisphere
 		sampleWeight = data.diffuseReflectance * diffuseTerm(data);
 
 #if COMBINE_BRDFS_WITH_FRESNEL
 		// Sample a half-vector of specular BRDF. Note that we're reusing random variable 'u' here, but correctly it should be an new independent random number
-		float3 Hspecular = sampleSpecularHalfVector(Vlocal, float2(data.alpha, data.alpha), u);
+		float3 Hspecular = sampleSpecularHalfVector(Vlocal, data.alpha2D, u);
 
 		// Clamp HdotL to small value to prevent numerical instability. Assume that rays incident from below the hemisphere have been filtered
 		float VdotH = max(0.00001f, min(1.0f, dot(Vlocal, Hspecular)));
@@ -1206,14 +1304,18 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 #endif
 
 	} else if (brdfType == SPECULAR_TYPE) {
-		const BrdfData data = prepareBRDFData(Nlocal, float3(0.0f, 0.0f, 1.0f) /* unused L vector */, Vlocal, material);
-		rayDirectionLocal = sampleSpecular(Vlocal, data.alpha, data.alphaSquared, data.specularF0, u, sampleWeight);
+		const BrdfData data = prepareBRDFData(Nlocal, float3(0.0f, 0.0f, 1.0f) /* unused L vector */, Vlocal, localMaterial);
+		if (data.anisotropic) {
+			rayDirectionLocal = sampleSpecularMicrofacetAnisotropic(Vlocal, data.alpha, data.alpha2D, data.specularF0, u, sampleWeight);
+		} else {
+			rayDirectionLocal = sampleSpecular(Vlocal, data.alpha, data.alphaSquared, data.specularF0, u, sampleWeight);
+		}
 	}
 
 	// Transform sampled direction Llocal back to V vector space.
 	// Done before the early-out checks so the caller always receives a valid
 	// direction in 'rayDirection' (e.g. for below-hemisphere mirroring).
-	rayDirection = normalize(rotatePoint(invertRotation(qRotationToZ), rayDirectionLocal));
+	rayDirection = normalize(anisotropic ? rayDirectionLocal.x * T + rayDirectionLocal.y * B + rayDirectionLocal.z * shadingNormal : rotatePoint(invertRotation(qRotationToZ), rayDirectionLocal));
 
 	// Prevent tracing direction with no contribution
 	if (luminance(sampleWeight) == 0.0f) {

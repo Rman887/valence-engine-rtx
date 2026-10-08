@@ -117,7 +117,7 @@ enum : uint32_t {
 	RT_GEOMETRY_LAYERS_MASK = (1u << 20) - 1, // The scene's layers; the editor's (20 and up) never enter the trace.
 };
 
-// Must match GLSL MaterialData (std430, 112 bytes).
+// Must match GLSL MaterialData (std430, 128 bytes).
 struct alignas(16) RT_MaterialData {
 	uint32_t albedo_texture_idx;
 	uint32_t normal_texture_idx;
@@ -139,8 +139,11 @@ struct alignas(16) RT_MaterialData {
 	uint32_t backlight_rgba8; // With RT_MAT_FLAG_DIFFUSE_TRANSMISSION: BaseMaterial3D's backlight colour, sRGB, RGBA8.
 	uint32_t backlight_texture_idx; // Its backlight texture, read linear as the raster reads it (0 = none).
 	uint32_t metallic_texture_idx; // The ORM texture again, or StandardMaterial3D's metallic texture (D118).
+	float anisotropy; // BaseMaterial3D's anisotropy_ratio (D118 MM1); 0 = an isotropic specular lobe.
+	uint32_t anisotropy_flowmap_idx; // Its flow map, read linear (0 = none: along the tangent, at full strength).
+	uint32_t _reserved[2];
 };
-static_assert(sizeof(RT_MaterialData) == 112, "RT_MaterialData must be 112 bytes for std430");
+static_assert(sizeof(RT_MaterialData) == 128, "RT_MaterialData must be 128 bytes for std430");
 
 // Light types for raytracing (matches GLSL RT_LIGHT_TYPE_* defines).
 enum RTLightType : uint32_t {
@@ -1296,7 +1299,7 @@ struct alignas(16) RT_SlotRowWrite {
 	RT_GeometryData geometry;
 	RT_MaterialData material;
 };
-static_assert(sizeof(RT_SlotRowWrite) == 256, "RT_SlotRowWrite must match ptlas_rows.glsl");
+static_assert(sizeof(RT_SlotRowWrite) == 272, "RT_SlotRowWrite must match ptlas_rows.glsl");
 
 /// Per-viewport raytracing state.
 ///

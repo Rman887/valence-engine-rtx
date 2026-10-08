@@ -454,6 +454,19 @@ vec2 material_roughness_metallic(MaterialData p_mat, vec4 p_roughness_tex, vec4 
 			vec2(0.0), vec2(1.0));
 }
 
+/// VAL: the direction an anisotropic lobe's roughness stretches along (D118 MM1), as the raster's fragment turns its frame:
+/// above an anisotropy of 0.01 the tangent becomes the flow's direction in the tangent and binormal's plane; otherwise
+/// (a negative anisotropy among them) it stays the tangent. shade_and_bounce orthogonalises it against the normal.
+vec3 rt_anisotropy_tangent(vec3 p_tangent, vec3 p_binormal, vec2 p_flow, float p_anisotropy) {
+	vec3 t = normalize(p_tangent);
+	if (p_anisotropy > 0.01) {
+		t = p_flow.x * t + p_flow.y * normalize(p_binormal);
+		float len = length(t);
+		t = len > 1e-6 ? t / len : normalize(p_tangent);
+	}
+	return t;
+}
+
 /// Apply tangent-space normal map to geometry normal.
 vec3 apply_normal_map(HitData h, vec3 tangent_space_normal, float normal_map_depth) {
 	vec3 mapped = h.tangent * tangent_space_normal.x + h.bitangent * tangent_space_normal.y + h.geometry_normal * tangent_space_normal.z;

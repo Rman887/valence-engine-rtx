@@ -220,6 +220,8 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	m.absorption = max(absorption.rgb, vec3(0.0));
 	m.scattering = clamp(scattering.rgb, vec3(0.0), vec3(1.0));
 	m.diffuse_transmission = vec3(0.0); // The G-buffer carries no backlight (D103).
+	m.anisotropy = 0.0; // Nor anisotropy (D118 MM1).
+	m.anisotropy_tangent = vec3(0.0);
 
 #ifdef RT_DEBUG_ENABLED
 	int vis_mode = int(get_rt_param(RT_PARAM_VIS_MODE));
@@ -747,6 +749,14 @@ void main() {
 	m.absorption = max(absorption, vec3(0.0));
 	m.scattering = clamp(scattering, vec3(0.0), vec3(1.0));
 	m.diffuse_transmission = vec3(0.0);
+	// VAL: ANISOTROPY and ANISOTROPY_FLOW (D118 MM1) against the fragment's TANGENT and BINORMAL, as the raster turns
+	// them; in a shader that writes neither it is the constant 0, on which the compiler drops the lobe. Capped at 1,
+	// past which the raster's aspect soon has no root; below -1 it stretches further along B, as in the raster.
+	m.anisotropy = min(anisotropy, 1.0);
+	m.anisotropy_tangent = vec3(0.0);
+	if (m.anisotropy != 0.0) {
+		m.anisotropy_tangent = rt_anisotropy_tangent(mat3(inv_view_matrix) * tangent, mat3(inv_view_matrix) * binormal, anisotropy_flow, m.anisotropy);
+	}
 
 	// Apply normal map if it was written.
 	if (normal_map != vec3(0.5, 0.5, 1.0)) {
@@ -852,6 +862,21 @@ void main() {
 			backlight += sample_material_texture(mat.backlight_texture_idx, uv, mat.flags, lod, grad, stf_u).rgb;
 		}
 		m.diffuse_transmission = clamp(backlight * m.albedo * (1.0 - m.metalness), vec3(0.0), vec3(1.0));
+	}
+
+	// VAL: anisotropy (D118 MM1) as BaseMaterial3D's fragment writes it: the ratio times the flow map's alpha, the
+	// flow its red and green; without a flow map, along the tangent at full strength.
+	m.anisotropy = mat.anisotropy;
+	m.anisotropy_tangent = vec3(0.0);
+	if (mat.anisotropy != 0.0) {
+		vec2 flow = vec2(1.0, 0.0);
+		if (mat.anisotropy_flowmap_idx != 0u) {
+			const vec4 flowmap = sample_material_texture(mat.anisotropy_flowmap_idx, uv, mat.flags, lod, grad, stf_u);
+			flow = flowmap.rg * 2.0 - 1.0;
+			m.anisotropy *= flowmap.a;
+		}
+		m.anisotropy = clamp(m.anisotropy, -1.0, 1.0);
+		m.anisotropy_tangent = rt_anisotropy_tangent(h.tangent, h.bitangent, flow, m.anisotropy);
 	}
 
 #ifdef RT_DEBUG_ENABLED

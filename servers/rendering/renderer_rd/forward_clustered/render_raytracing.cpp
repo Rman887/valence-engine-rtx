@@ -8808,6 +8808,10 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.backlight_rgba8 = 0;
 	mat.backlight_texture_idx = 0;
 	mat.metallic_texture_idx = 0;
+	mat.anisotropy = 0.0f;
+	mat.anisotropy_flowmap_idx = 0;
+	mat._reserved[0] = 0;
+	mat._reserved[1] = 0;
 	bool omm_custom = false;
 	RID omm_custom_alpha_rd; // An opted-in custom shader's hint_alpha texture, with a real bindless slot.
 
@@ -9156,6 +9160,20 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		if (mat.backlight_texture_idx != 0 || backlight.r > 0.0f || backlight.g > 0.0f || backlight.b > 0.0f) {
 			mat.backlight_rgba8 = backlight.clamp().to_abgr32();
 			mat.flags |= RT_MAT_FLAG_DIFFUSE_TRANSMISSION;
+		}
+	}
+
+	// VAL: anisotropy (D118 MM1). BaseMaterial3D declares anisotropy_ratio and its flow map only while the feature
+	// is enabled, and its fragment writes ANISOTROPY = anisotropy_ratio * flowmap.a and ANISOTROPY_FLOW =
+	// flowmap.rg * 2 - 1. A custom shader's ANISOTROPY reaches its hit group through the fragment instead.
+	if (!mat_data->is_custom_shader && shader_declares("anisotropy_ratio")) {
+		Variant anisotropy_var = material_storage->material_get_param(p_material_rid, "anisotropy_ratio");
+		if (anisotropy_var.get_type() == Variant::FLOAT) {
+			mat.anisotropy = anisotropy_var;
+		}
+		RID flowmap_rd = get_material_texture("texture_flowmap");
+		if (mat.anisotropy != 0.0f && flowmap_rd.is_valid() && shader_declares("texture_flowmap")) {
+			mat.anisotropy_flowmap_idx = bindless_block->add_texture(flowmap_rd);
 		}
 	}
 

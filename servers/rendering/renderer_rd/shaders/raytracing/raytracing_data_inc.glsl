@@ -82,7 +82,7 @@ struct InstanceMotionData {
 };
 
 // ============================================================================
-// MATERIAL DATA (matches C++ layout, 112 bytes)
+// MATERIAL DATA (matches C++ layout, 128 bytes)
 // ============================================================================
 struct MaterialData {
 	uint albedo_texture_idx;
@@ -109,4 +109,8 @@ struct MaterialData {
 	uint backlight_rgba8; // With flag bit 5: the backlight colour, sRGB, RGBA8 (D103).
 	uint backlight_texture_idx; // Its backlight texture, sampled linear (0 = none).
 	uint metallic_texture_idx; // The ORM texture again, or StandardMaterial3D's metallic texture (D118).
+	float anisotropy; // BaseMaterial3D's anisotropy_ratio (D118 MM1); 0 = an isotropic specular lobe.
+	uint anisotropy_flowmap_idx; // Its flow map, read linear (0 = none: along the tangent, at full strength).
+	uint _reserved0;
+	uint _reserved1;
 };

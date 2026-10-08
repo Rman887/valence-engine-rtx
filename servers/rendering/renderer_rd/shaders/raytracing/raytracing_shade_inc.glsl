@@ -266,6 +266,8 @@ void debug_visualize(
 		dbg_mat.transmissivness = 0.0;
 		dbg_mat.opacity = 1.0;
 		dbg_mat.diffuseTransmission = vec3(0.0);
+		dbg_mat.anisotropy = 0.0;
+		dbg_mat.anisotropyT = vec3(0.0);
 
 		vec3 dbg_dir;
 		vec3 dbg_weight;
@@ -443,6 +445,15 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	float diffuse_transmit_max = max(m.diffuse_transmission.r, max(m.diffuse_transmission.g, m.diffuse_transmission.b));
 	if (diffuse_transmit_max > 0.0) {
 		brdf_mat.baseColor *= 1.0 - diffuse_transmit_max;
+	}
+	// VAL: an anisotropic specular lobe (D118 MM1) in an orthonormal frame about the normal every BRDF call below takes:
+	// its tangent off N by Gram-Schmidt, any vector perpendicular to N where the tangent lies along it.
+	brdf_mat.anisotropy = m.anisotropy;
+	brdf_mat.anisotropyT = vec3(0.0);
+	if (m.anisotropy != 0.0) {
+		vec3 t = m.anisotropy_tangent - N * dot(N, m.anisotropy_tangent);
+		float t_len = length(t);
+		brdf_mat.anisotropyT = t_len > 1e-4 ? t / t_len : normalize(abs(N.x) > abs(N.z) ? vec3(-N.y, N.x, 0.0) : vec3(0.0, -N.z, N.y));
 	}
 
 	// Transmission: the surface is a dielectric interface. TRANSMISSION is the

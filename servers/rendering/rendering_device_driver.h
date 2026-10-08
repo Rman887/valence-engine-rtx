@@ -423,6 +423,9 @@ public:
 
 	virtual SemaphoreID semaphore_create() = 0;
 	virtual void semaphore_free(SemaphoreID p_semaphore) = 0;
+	// A timeline semaphore (D98): a counter a submit waits on to reach a value and signals to a value,
+	// any number of times. Freed with semaphore_free(). Null where the driver or device has none.
+	virtual SemaphoreID timeline_semaphore_create(uint64_t p_initial_value) { return SemaphoreID(); }
 
 	/*************************/
 	/**** COMMAND BUFFERS ****/
@@ -446,6 +449,8 @@ public:
 
 	virtual CommandQueueID command_queue_create(CommandQueueFamilyID p_cmd_queue_family, bool p_identify_as_main_queue = false) = 0;
 	virtual Error command_queue_execute_and_present(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_semaphores, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_semaphores, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains) = 0;
+	// As above, also waiting on timeline semaphores to reach values and signaling others to values (D98).
+	virtual Error command_queue_execute_and_present_timelines(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_semaphores, VectorView<SemaphoreID> p_wait_timelines, VectorView<uint64_t> p_wait_values, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_semaphores, VectorView<SemaphoreID> p_signal_timelines, VectorView<uint64_t> p_signal_values, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains) { return ERR_UNAVAILABLE; }
 	virtual void command_queue_free(CommandQueueID p_cmd_queue) = 0;
 
 	// ----- POOL -----

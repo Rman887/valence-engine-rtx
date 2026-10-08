@@ -2040,16 +2040,17 @@ private:
 	RDD::CommandQueueID compute_queue;
 	bool async_builds = false;
 	bool async_build_active = false;
-	// Every frame's compute submit waits on the previous main submit, and the main submit after a
-	// compute submit that carried builds waits on it. Each semaphore is waited by the next frame's
-	// submit, so a ring of one more than the frames in flight is never signaled again before the
-	// fence of the submit that waited on it has been waited.
-	TightLocalVector<RDD::SemaphoreID> compute_done_semaphores;
-	TightLocalVector<RDD::SemaphoreID> main_done_semaphores;
-	uint32_t compute_done_index = 0;
-	uint32_t main_done_index = 0;
-	RDD::SemaphoreID compute_semaphore_to_wait_on;
-	RDD::SemaphoreID main_semaphore_to_wait_on;
+	// One timeline semaphore per queue. A compute submit, made only in a frame whose compute graph recorded
+	// commands, is preceded by a batch on the main queue that only signals main_timeline to the next value,
+	// covering every main submit before it; the compute submit waits on that value and signals
+	// compute_timeline to the next value. A main submit waits on the last compute value submitted in an
+	// earlier frame, once: the frame's own compute submit overlaps it. A frame without builds carries none.
+	RDD::SemaphoreID main_timeline;
+	RDD::SemaphoreID compute_timeline;
+	uint64_t main_timeline_value = 0; // The last value the main queue signaled.
+	uint64_t compute_timeline_value = 0; // The last compute submit's.
+	uint64_t compute_value_for_main = 0; // Submitted before this frame's compute submit: the next main submit waits on it.
+	uint64_t compute_value_waited = 0; // The last one a main submit waited on.
 	uint64_t compute_submit_count = 0;
 	uint64_t async_build_fallbacks = 0; // Builds for the scope recorded on the main queue: their inputs were written this frame.
 	bool async_compute_timestamps = false; // D98d.
@@ -2171,7 +2172,7 @@ private:
 	TightLocalVector<Frame> frames;
 	uint64_t frames_drawn = 0;
 
-	void _submit_compute(bool p_has_commands); // D98.
+	void _submit_compute(); // D98.
 	void _free_compute_frame(Frame &p_frame);
 	bool _create_async_builds();
 	void _free_async_build_semaphores();

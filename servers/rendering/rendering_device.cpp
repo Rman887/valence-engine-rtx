@@ -9383,8 +9383,13 @@ void RenderingDevice::_end_frame() {
 	_submit_transfer_barriers(command_buffer);
 
 	if (async_builds) {
+		// The compute submits of earlier frames, which this frame's main submit waits on; this frame's own,
+		// if any, overlaps it.
+		compute_value_for_main = compute_timeline_value;
+	}
+	if (compute_submits) {
 		GodotProfileZoneGrouped(_profile_zone, "_submit_compute");
-		_submit_compute(compute_submits);
+		_submit_compute();
 	}
 
 	GodotProfileZoneGrouped(_profile_zone, "draw_graph.end");
@@ -9395,59 +9400,60 @@ void RenderingDevice::_end_frame() {
 	driver->end_segment();
 }
 
-void RenderingDevice::_submit_compute(bool p_has_commands) {
+void RenderingDevice::_submit_compute() {
 	Frame &f = frames[frame];
-
-	// The builds the previous compute submit carried complete before this frame's main submit runs.
-	if (compute_semaphore_to_wait_on) {
-		f.semaphores_to_wait_on.push_back(compute_semaphore_to_wait_on);
-		compute_semaphore_to_wait_on = RDD::SemaphoreID();
-	}
-
-	// And the previous main submit completes before this compute submit runs: what the main queue
-	// wrote, read or waited on in earlier frames is ordered before every build here. A frame without
-	// builds submits an empty command buffer, which takes that wait and signals the fence.
-	if (main_semaphore_to_wait_on) {
-		f.compute_semaphores_to_wait_on.push_back(main_semaphore_to_wait_on);
-		main_semaphore_to_wait_on = RDD::SemaphoreID();
-	}
 
 	// Submitted before the main command buffer, which does not wait on it, so the two overlap.
 	RDD::CommandBufferID command_buffer = f.compute_command_buffer;
 	driver->command_buffer_begin(command_buffer);
-	const bool timed = p_has_commands && async_compute_timestamps && f.compute_timestamp_pool;
+	const bool timed = async_compute_timestamps && f.compute_timestamp_pool;
 	if (timed) {
 		driver->command_timestamp_query_pool_reset(command_buffer, f.compute_timestamp_pool, 2);
 		driver->command_timestamp_write(command_buffer, f.compute_timestamp_pool, 0);
 	}
-	if (p_has_commands) {
-		// Nothing orders this submit after the previous compute submit: the semaphores chain each queue
-		// through the other's previous frame only, and the graph's trackers start every frame afresh, so a
-		// structure or scratch rebuilt in place frame after frame (a write after a write) would get no
-		// barrier. One full memory barrier at the head of the command buffer orders it.
-		RDD::MemoryAccessBarrier memory_barrier;
-		memory_barrier.src_access = RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT;
-		memory_barrier.dst_access = RDD::BARRIER_ACCESS_MEMORY_READ_BIT | RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT;
-		driver->command_pipeline_barrier(command_buffer, RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, memory_barrier, {}, {}, {});
-		compute_graph.end(RENDER_GRAPH_REORDER == 1, RENDER_GRAPH_FULL_BARRIERS == 1, command_buffer, f.compute_command_buffer_pool);
-	}
+	// Nothing orders this submit after the previous compute submit: the timelines chain each queue through
+	// the other's earlier submits only, and the graph's trackers start every frame afresh, so a structure or
+	// scratch rebuilt in place frame after frame (a write after a write) would get no barrier. One full
+	// memory barrier at the head of the command buffer orders it.
+	RDD::MemoryAccessBarrier memory_barrier;
+	memory_barrier.src_access = RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT;
+	memory_barrier.dst_access = RDD::BARRIER_ACCESS_MEMORY_READ_BIT | RDD::BARRIER_ACCESS_MEMORY_WRITE_BIT;
+	driver->command_pipeline_barrier(command_buffer, RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, RDD::PIPELINE_STAGE_ALL_COMMANDS_BIT, memory_barrier, {}, {}, {});
+	compute_graph.end(RENDER_GRAPH_REORDER == 1, RENDER_GRAPH_FULL_BARRIERS == 1, command_buffer, f.compute_command_buffer_pool);
 	if (timed) {
 		driver->command_timestamp_write(command_buffer, f.compute_timestamp_pool, 1);
-		f.compute_timestamps_written = true;
-		f.compute_timestamp_frame = frames_drawn;
 	}
 	driver->command_buffer_end(command_buffer);
 
-	RDD::SemaphoreID signal_semaphore;
-	if (p_has_commands) {
-		signal_semaphore = compute_done_semaphores[compute_done_index];
-		compute_done_index = (compute_done_index + 1) % compute_done_semaphores.size();
-		compute_semaphore_to_wait_on = signal_semaphore;
-		compute_submit_count++;
+	// Every earlier main submit completes before this compute submit runs: what the main queue wrote, read
+	// or waited on in earlier frames is ordered before every build here. A batch on the main queue with no
+	// command buffers signals the main timeline now, and its signal covers every submit before it on that
+	// queue, so main submits carry no signal of their own and a frame without builds carries nothing. The
+	// transfer workers' semaphores this frame signaled for this submit are binary, waited here once.
+	const uint64_t main_value = main_timeline_value + 1;
+	if (driver->command_queue_execute_and_present_timelines(main_queue, {}, {}, {}, {}, {}, main_timeline, main_value, RDD::FenceID(), {}) == OK) {
+		main_timeline_value = main_value;
+	} else {
+		ERR_PRINT("The main queue's timeline could not be signaled; this frame's compute submit waits only on the main submits it signaled before (D98).");
 	}
-	driver->command_queue_execute_and_present(compute_queue, f.compute_semaphores_to_wait_on, command_buffer, signal_semaphore ? signal_semaphore : VectorView<RDD::SemaphoreID>(), f.compute_fence, {});
+	thread_local LocalVector<RDD::SemaphoreID> wait_timelines;
+	thread_local LocalVector<uint64_t> wait_values;
+	wait_timelines.clear();
+	wait_values.clear();
+	if (main_timeline_value > 0) {
+		wait_timelines.push_back(main_timeline);
+		wait_values.push_back(main_timeline_value);
+	}
+	// The values move only with a submit that went through: a wait on a value nothing signals never ends.
+	const uint64_t signal_value = compute_timeline_value + 1;
+	const Error err = driver->command_queue_execute_and_present_timelines(compute_queue, f.compute_semaphores_to_wait_on, wait_timelines, wait_values, command_buffer, {}, compute_timeline, signal_value, f.compute_fence, {});
 	f.compute_semaphores_to_wait_on.clear();
+	ERR_FAIL_COND_MSG(err != OK, "The compute queue's submit failed; its builds did not run (D98).");
+	compute_timeline_value = signal_value;
 	f.compute_fence_signaled = true;
+	f.compute_timestamps_written = timed;
+	f.compute_timestamp_frame = frames_drawn;
+	compute_submit_count++;
 }
 
 void RenderingDevice::_free_compute_frame(Frame &p_frame) {
@@ -9472,25 +9478,24 @@ void RenderingDevice::_free_compute_frame(Frame &p_frame) {
 }
 
 void RenderingDevice::_free_async_build_semaphores() {
-	for (uint32_t i = 0; i < compute_done_semaphores.size(); i++) {
-		if (compute_done_semaphores[i]) {
-			driver->semaphore_free(compute_done_semaphores[i]);
+	for (RDD::SemaphoreID *timeline : { &main_timeline, &compute_timeline }) {
+		if (*timeline) {
+			driver->semaphore_free(*timeline);
+			*timeline = RDD::SemaphoreID();
 		}
 	}
-	compute_done_semaphores.clear();
-	for (uint32_t i = 0; i < main_done_semaphores.size(); i++) {
-		if (main_done_semaphores[i]) {
-			driver->semaphore_free(main_done_semaphores[i]);
-		}
-	}
-	main_done_semaphores.clear();
 }
 
 bool RenderingDevice::_create_async_builds() {
-	// Each frame's compute command buffer, fence and transfer-worker semaphores, and the two rings of
-	// semaphores the queues wait on each other with. On a failure everything created is freed and the
-	// builds stay on the main queue.
-	bool failed = false;
+	// Each frame's compute command buffer, fence and transfer-worker semaphores, and the two timelines the
+	// queues wait on each other with. On a failure everything created is freed and the builds stay on the
+	// main queue.
+	main_timeline = driver->timeline_semaphore_create(0);
+	compute_timeline = driver->timeline_semaphore_create(0);
+	bool failed = !main_timeline || !compute_timeline;
+	if (failed) {
+		WARN_PRINT("rendering/pathtracing/async_builds is set, but the device has no timeline semaphores; builds stay on the main queue (D98).");
+	}
 	for (uint32_t i = 0; i < frames.size() && !failed; i++) {
 		Frame &f = frames[i];
 		f.compute_command_pool = driver->command_pool_create(compute_queue_family, RDD::COMMAND_BUFFER_TYPE_PRIMARY);
@@ -9503,13 +9508,11 @@ bool RenderingDevice::_create_async_builds() {
 			failed = !f.compute_transfer_worker_semaphores[j];
 		}
 	}
-	for (uint32_t i = 0; i <= frames.size() && !failed; i++) {
-		compute_done_semaphores.push_back(driver->semaphore_create());
-		main_done_semaphores.push_back(driver->semaphore_create());
-		failed = !compute_done_semaphores[i] || !main_done_semaphores[i];
-	}
 
 	if (failed) {
+		if (main_timeline && compute_timeline) {
+			WARN_PRINT("The compute queue's command buffers, fences or semaphores could not be created; builds stay on the main queue (D98).");
+		}
 		for (uint32_t i = 0; i < frames.size(); i++) {
 			_free_compute_frame(frames[i]);
 		}
@@ -9584,12 +9587,6 @@ void RenderingDevice::execute_chained_cmds(bool p_present_swap_chain, RenderingD
 			signal_semaphore = p_dst_draw_semaphore_to_signal;
 			signal_fence = p_draw_fence;
 
-			if (async_builds) {
-				// And the semaphore the next compute submit waits on (D98).
-				main_semaphore_to_wait_on = main_done_semaphores[main_done_index];
-				main_done_index = (main_done_index + 1) % main_done_semaphores.size();
-			}
-
 			if (p_present_swap_chain) {
 				// Just present the swap chains as part of the last command execution.
 				swap_chains = frames[frame].swap_chains_to_present;
@@ -9604,11 +9601,16 @@ void RenderingDevice::execute_chained_cmds(bool p_present_swap_chain, RenderingD
 		if (signal_semaphore) {
 			signal_semaphores.push_back(signal_semaphore);
 		}
-		if (signal_fence && main_semaphore_to_wait_on) {
-			signal_semaphores.push_back(main_semaphore_to_wait_on);
-		}
 
-		driver->command_queue_execute_and_present(main_queue, wait_semaphores, command_buffer, signal_semaphores, signal_fence, swap_chains);
+		if (async_builds && i == 0 && compute_value_for_main > compute_value_waited) {
+			// The first command buffer waits on the compute submits of earlier frames not waited on yet (D98).
+			const uint64_t wait_value = compute_value_for_main;
+			if (driver->command_queue_execute_and_present_timelines(main_queue, wait_semaphores, compute_timeline, wait_value, command_buffer, signal_semaphores, {}, {}, signal_fence, swap_chains) == OK) {
+				compute_value_waited = wait_value;
+			}
+		} else {
+			driver->command_queue_execute_and_present(main_queue, wait_semaphores, command_buffer, signal_semaphores, signal_fence, swap_chains);
+		}
 
 		// Make the next command buffer wait on the semaphore signaled by this one.
 		wait_semaphores.resize(1);
@@ -9990,8 +9992,8 @@ Error RenderingDevice::initialize(RenderingContextDriver *p_context, DisplayServ
 		ERR_FAIL_V_MSG(FAILED, "Failed to create frame data.");
 	}
 
-	if (async_builds && !_create_async_builds()) {
-		WARN_PRINT("The compute queue's command buffers or semaphores could not be created; builds stay on the main queue (D98).");
+	if (async_builds) {
+		_create_async_builds(); // On a failure it warns and turns async builds off.
 	}
 
 	// Start from frame count, so everything else is immediately old.

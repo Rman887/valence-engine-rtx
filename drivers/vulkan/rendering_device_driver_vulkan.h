@@ -172,6 +172,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	StorageBufferCapabilities storage_buffer_capabilities;
 	RenderingShaderContainerFormatVulkan shader_container_format;
 	bool buffer_device_address_support = false;
+	bool timeline_semaphore_support = false;
 	bool vulkan_memory_model_support = false;
 	bool vulkan_memory_model_device_scope_support = false;
 	AccelerationStructureCapabilities acceleration_structure_capabilities;
@@ -376,6 +377,7 @@ public:
 	/********************/
 
 	virtual SemaphoreID semaphore_create() override final;
+	virtual SemaphoreID timeline_semaphore_create(uint64_t p_initial_value) override final;
 	virtual void semaphore_free(SemaphoreID p_semaphore) override final;
 
 	/******************/
@@ -403,6 +405,7 @@ private:
 public:
 	virtual CommandQueueID command_queue_create(CommandQueueFamilyID p_cmd_queue_family, bool p_identify_as_main_queue = false) override final;
 	virtual Error command_queue_execute_and_present(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_semaphores, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_semaphores, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains) override final;
+	virtual Error command_queue_execute_and_present_timelines(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_semaphores, VectorView<SemaphoreID> p_wait_timelines, VectorView<uint64_t> p_wait_values, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_semaphores, VectorView<SemaphoreID> p_signal_timelines, VectorView<uint64_t> p_signal_values, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains) override final;
 	virtual void command_queue_free(CommandQueueID p_cmd_queue) override final;
 
 private:

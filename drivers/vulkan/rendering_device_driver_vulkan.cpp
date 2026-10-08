@@ -1102,6 +1102,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 				vulkan_memory_model_support = device_features_vk_1_2.vulkanMemoryModel;
 				vulkan_memory_model_device_scope_support = device_features_vk_1_2.vulkanMemoryModelDeviceScope;
 			}
+			timeline_semaphore_support = device_features_vk_1_2.timelineSemaphore; // Core in Vulkan 1.2 (D98).
 			// Descriptor indexing features (core in Vulkan 1.2).
 			descriptor_indexing_capabilities.shader_sampled_image_array_non_uniform_indexing = device_features_vk_1_2.shaderSampledImageArrayNonUniformIndexing;
 			descriptor_indexing_capabilities.descriptor_binding_partially_bound = device_features_vk_1_2.descriptorBindingPartiallyBound;
@@ -1680,6 +1681,7 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		vulkan_1_2_features.descriptorBindingPartiallyBound = descriptor_indexing_capabilities.descriptor_binding_partially_bound;
 		vulkan_1_2_features.descriptorBindingVariableDescriptorCount = descriptor_indexing_capabilities.descriptor_binding_variable_descriptor_count;
 		vulkan_1_2_features.runtimeDescriptorArray = descriptor_indexing_capabilities.runtime_descriptor_array;
+		vulkan_1_2_features.timelineSemaphore = timeline_semaphore_support;
 		create_info_next = &vulkan_1_2_features;
 
 		vulkan_1_1_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
@@ -3400,6 +3402,25 @@ RDD::SemaphoreID RenderingDeviceDriverVulkan::semaphore_create() {
 	return SemaphoreID(semaphore);
 }
 
+RDD::SemaphoreID RenderingDeviceDriverVulkan::timeline_semaphore_create(uint64_t p_initial_value) {
+	if (!timeline_semaphore_support) {
+		return SemaphoreID();
+	}
+	VkSemaphoreTypeCreateInfo type_info = {};
+	type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+	type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+	type_info.initialValue = p_initial_value;
+
+	VkSemaphore semaphore = VK_NULL_HANDLE;
+	VkSemaphoreCreateInfo create_info = {};
+	create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+	create_info.pNext = &type_info;
+	VkResult err = vkCreateSemaphore(vk_device, &create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SEMAPHORE), &semaphore);
+	ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, SemaphoreID(), vformat("Couldn't create Vulkan timeline semaphore (VkResult error %d).", err));
+
+	return SemaphoreID(semaphore);
+}
+
 void RenderingDeviceDriverVulkan::semaphore_free(SemaphoreID p_semaphore) {
 	vkDestroySemaphore(vk_device, VkSemaphore(p_semaphore.id), VKC::get_allocation_callbacks(VK_OBJECT_TYPE_SEMAPHORE));
 }
@@ -3491,7 +3512,17 @@ RDD::CommandQueueID RenderingDeviceDriverVulkan::command_queue_create(CommandQue
 }
 
 Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_semaphores, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_semaphores, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains) {
+	return command_queue_execute_and_present_timelines(p_cmd_queue, p_wait_semaphores, {}, {}, p_cmd_buffers, p_cmd_semaphores, {}, {}, p_cmd_fence, p_swap_chains);
+}
+
+Error RenderingDeviceDriverVulkan::command_queue_execute_and_present_timelines(CommandQueueID p_cmd_queue, VectorView<SemaphoreID> p_wait_semaphores, VectorView<SemaphoreID> p_wait_timelines, VectorView<uint64_t> p_wait_values, VectorView<CommandBufferID> p_cmd_buffers, VectorView<SemaphoreID> p_cmd_semaphores, VectorView<SemaphoreID> p_signal_timelines, VectorView<uint64_t> p_signal_values, FenceID p_cmd_fence, VectorView<SwapChainID> p_swap_chains) {
 	DEV_ASSERT(p_cmd_queue.id != 0);
+	ERR_FAIL_COND_V(p_wait_timelines.size() != p_wait_values.size() || p_signal_timelines.size() != p_signal_values.size(), ERR_INVALID_PARAMETER);
+	// A batch with timelines and no command buffers is submitted for its waits and signals alone (D98); it
+	// presents nothing, since a present would wait on what the batch waits on.
+	const bool timelines = p_wait_timelines.size() > 0 || p_signal_timelines.size() > 0;
+	const bool timelines_only = timelines && p_cmd_buffers.size() == 0;
+	ERR_FAIL_COND_V_MSG(timelines_only && p_swap_chains.size() > 0, ERR_INVALID_PARAMETER, "A timeline batch without command buffers cannot present.");
 
 	VkResult err;
 	CommandQueue *command_queue = (CommandQueue *)(p_cmd_queue.id);
@@ -3504,7 +3535,8 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
 	wait_semaphores.clear();
 	wait_semaphores_stages.clear();
 
-	if (!command_queue->pending_semaphores_for_execute.is_empty()) {
+	if (!command_queue->pending_semaphores_for_execute.is_empty() && !timelines_only) {
+		// The acquired images' semaphores stay for the frame's own submit when a batch only signals (D98).
 		for (uint32_t i = 0; i < command_queue->pending_semaphores_for_execute.size(); i++) {
 			VkSemaphore wait_semaphore = command_queue->image_semaphores[command_queue->pending_semaphores_for_execute[i]];
 			wait_semaphores.push_back(wait_semaphore);
@@ -3520,6 +3552,21 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
 		wait_semaphores_stages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
 	}
 
+	// The timelines' waits go after the binary ones, their values lined up behind a zero for each of those
+	// (D98). A submit with no timeline chains no values, as before.
+	thread_local LocalVector<uint64_t> wait_values;
+	wait_values.clear();
+	if (timelines) {
+		for (uint32_t i = 0; i < wait_semaphores.size(); i++) {
+			wait_values.push_back(0);
+		}
+		for (uint32_t i = 0; i < p_wait_timelines.size(); i++) {
+			wait_semaphores.push_back(VkSemaphore(p_wait_timelines[i].id));
+			wait_semaphores_stages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+			wait_values.push_back(p_wait_values[i]);
+		}
+	}
+
 	if (!pending_flushes.allocations.is_empty()) {
 		// We must do this now, even if p_cmd_buffers is empty; because afterwards pending_flushes.allocations
 		// could become dangling. We cannot delay this call for the next frame(s).
@@ -3532,7 +3579,7 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
 		ERR_FAIL_COND_V_MSG(err != VK_SUCCESS, FAILED, vformat("Couldn't flush Vulkan memory allocations (VkResult error %d).", err));
 	}
 
-	if (p_cmd_buffers.size() > 0) {
+	if (p_cmd_buffers.size() > 0 || timelines) {
 		thread_local LocalVector<VkCommandBuffer> command_buffers;
 		thread_local LocalVector<VkSemaphore> present_semaphores;
 		thread_local LocalVector<VkSemaphore> signal_semaphores;
@@ -3556,8 +3603,27 @@ Error RenderingDeviceDriverVulkan::command_queue_execute_and_present(CommandQueu
 			signal_semaphores.push_back(semaphore);
 		}
 
+		thread_local LocalVector<uint64_t> signal_values;
+		signal_values.clear();
+		VkTimelineSemaphoreSubmitInfo timeline_info = {};
+		if (timelines) {
+			for (uint32_t i = 0; i < signal_semaphores.size(); i++) {
+				signal_values.push_back(0);
+			}
+			for (uint32_t i = 0; i < p_signal_timelines.size(); i++) {
+				signal_semaphores.push_back(VkSemaphore(p_signal_timelines[i].id));
+				signal_values.push_back(p_signal_values[i]);
+			}
+			timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+			timeline_info.waitSemaphoreValueCount = wait_values.size();
+			timeline_info.pWaitSemaphoreValues = wait_values.ptr();
+			timeline_info.signalSemaphoreValueCount = signal_values.size();
+			timeline_info.pSignalSemaphoreValues = signal_values.ptr();
+		}
+
 		VkSubmitInfo submit_info = {};
 		submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		submit_info.pNext = timelines ? &timeline_info : nullptr;
 		submit_info.waitSemaphoreCount = wait_semaphores.size();
 		submit_info.pWaitSemaphores = wait_semaphores.ptr();
 		submit_info.pWaitDstStageMask = wait_semaphores_stages.ptr();

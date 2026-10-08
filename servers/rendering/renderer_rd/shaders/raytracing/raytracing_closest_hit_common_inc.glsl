@@ -15,6 +15,7 @@
 
 // clang-format off
 #include "raytracing_shade_inc.glsl"
+#include "rtxtf_stf_inc.glsl"
 // clang-format on
 
 // ============================================================================
@@ -270,6 +271,65 @@ vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags, float p_lod_
 		return sample_bindless_texture_point(tex_idx, uv, p_lod_t);
 	}
 	return sample_bindless_texture(tex_idx, uv, p_lod_t, p_grad, (mat_flags & 64u) != 0u);
+}
+
+/// The stochastic texture filter the hit shaders use (D117): 0 for none, else the STF_FILTER_TYPE_* of
+/// rendering/pathtracing/texture_filtering. The pipeline flag compiles the filter in only while the setting is on, so
+/// with it off every use below folds away; the filter's type is a uniform.
+uint rt_texture_filtering() {
+	if ((RT_FLAGS & RT_FLAG_TEXTURE_FILTERING) == 0u) {
+		return 0u;
+	}
+	return uint(get_rt_param(RT_PARAM_TEXTURE_FILTERING));
+}
+
+/// The uniform numbers one hit's stochastic lookups share (D117), as RTX Texture Filtering's state takes them: the
+/// texel's pair in xy and the level's in w. All of a material's textures take the same numbers (the library's
+/// reseed off, as RTXPT), so textures of one size pick the same texel and level. They come from the payload's
+/// sampler without moving it: under Sobol (D52) from this bounce's block at RT_SOBOL_DIM_TEXTURE_FILTERING on a
+/// copy of the state, and under the hash from a salted hash of the chain's current state, which the chain never
+/// advances through, so turning the filter on changes no other number in the path.
+vec4 rt_texture_filtering_random() {
+	uint state = payload.rng_state;
+	if (rng_is_sobol()) {
+		rng_set_dimension(state, get_total_bounces(payload.packed_bounces_flags) * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_TEXTURE_FILTERING);
+		vec2 texel = rand2(state);
+		return vec4(texel, 0.0, rand(state));
+	}
+	state = pcg_hash(state ^ 0x5f356495u);
+	float x = float(state) / 4294967296.0;
+	state = pcg_hash(state);
+	float y = float(state) / 4294967296.0;
+	state = pcg_hash(state);
+	return vec4(x, y, 0.0, float(state) / 4294967296.0);
+}
+
+/// A material's texture through the filter it asks for, as sample_material_texture above, with stochastic texture
+/// filtering (D117) on a material filtered linearly (with mipmaps or without) and not anisotropically: one texel of
+/// the filter's footprint at one of the two levels around the cone's, picked by p_stf_u, read through the nearest
+/// sampler at its centre (the sampler wraps a texel past the edge, and decodes sRGB). A lookup the texture
+/// magnifies (its full level at most 0, or level 0 everywhere without the cone) keeps the hardware's bilinear
+/// unless rendering/pathtracing/texture_filtering_magnification asks otherwise. Under the bilinear filter both have
+/// the same expectation there; under the bicubic and Gaussian filters the hardware's bilinear is the sharper, a
+/// seam in sharpness at level 0 that D117's F4 judges. Point-filtered materials already read one texel; anisotropic
+/// ones keep the cone's footprint for now.
+vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags, float p_lod_t, vec4 p_grad, vec4 p_stf_u) {
+	const uint stf_filter = rt_texture_filtering();
+	if (stf_filter == 0u || (mat_flags & (4u | 64u)) != 0u) {
+		return sample_material_texture(tex_idx, uv, mat_flags, p_lod_t, p_grad);
+	}
+	const bool mipmaps = (mat_flags & 128u) == 0u;
+	const uvec2 size = uvec2(textureSize(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_NEAREST_WITH_MIPMAPS_REPEAT), 0));
+	const float level = p_lod_t > RT_TEXTURE_LOD_BASE ? p_lod_t + 0.5 * log2(max(float(size.x) * float(size.y), 1.0)) : RT_TEXTURE_LOD_BASE;
+	if (level <= 0.0 && get_rt_param(RT_PARAM_TEXTURE_FILTERING_MAGNIFICATION) < 0.5) {
+		return sample_material_texture(tex_idx, uv, mat_flags, p_lod_t, p_grad);
+	}
+	const uint levels = mipmaps ? uint(textureQueryLevels(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_NEAREST_WITH_MIPMAPS_REPEAT))) : 1u;
+	STF_SamplerState stf = STF_Create(p_stf_u);
+	STF_SetFilterType(stf, stf_filter);
+	STF_SetSigma(stf, get_rt_param(RT_PARAM_TEXTURE_FILTERING_SIGMA));
+	const vec3 pos = STF_Texture2DGetSamplePosLevel(stf, size.x, size.y, levels, uv, mipmaps ? max(level, 0.0) : 0.0);
+	return textureLod(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_NEAREST_WITH_MIPMAPS_REPEAT), pos.xy, pos.z);
 }
 
 /// Apply tangent-space normal map to geometry normal.

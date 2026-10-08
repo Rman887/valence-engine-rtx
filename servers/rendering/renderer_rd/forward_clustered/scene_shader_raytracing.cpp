@@ -833,6 +833,12 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_e
 		flags |= RT_FLAG_OMM_INDIRECT_2_STATE;
 	}
 
+	// Stochastic texture filtering (D117) compiles in only while it is on, so off is the hit shaders' code
+	// without it; turning it on or off rebuilds the pipelines, a change between filters does not.
+	if (GLOBAL_GET_CACHED(int, "rendering/pathtracing/texture_filtering") != 0) {
+		flags |= RT_FLAG_TEXTURE_FILTERING;
+	}
+
 	if (GLOBAL_GET("rendering/pathtracing/use_shader_execution_reordering")) {
 		flags |= RT_FLAG_SER_ENABLED;
 		// The hint's form rides in the flags (D75), so a change rebuilds the ray-tracing pipelines

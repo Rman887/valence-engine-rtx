@@ -74,7 +74,8 @@ public:
 	// Bit 13:    Cluster BLAS (RT_FLAG_CLUSTER_AS)
 	// Bits 14-15: Position fetch and its verbose check (D93)
 	// Bit 16:    Opacity micromaps in 2-state on indirect rays (D96 OMMe)
-	// Bits 17-20: Free
+	// Bit 17:    Stochastic texture filtering (D117)
+	// Bits 18-20: Free
 	// Bits 21-28: Sample count
 	// Bits 29-31: Max bounce count (offset by 1: 0=1 bounce, 7=8 bounces)
 	enum RaytracingFlags {
@@ -94,6 +95,7 @@ public:
 		RT_FLAG_POSITION_FETCH = (1 << 14), // Cluster builds allow data access and the hit stages enable position fetch (D93). Set while geometry residency is on.
 		RT_FLAG_POSITION_FETCH_CHECK = (1 << 15), // A verbose run's closest hit compares fetched positions with the vertex buffer's (D93). Set only with RT_FLAG_POSITION_FETCH.
 		RT_FLAG_OMM_INDIRECT_2_STATE = (1 << 16), // Rays past the path's first diffuse bounce resolve unknown micro-triangles by their side (D96 OMMe). Set while micromaps are on with rendering/pathtracing/opacity_micromap_indirect_2_state.
+		RT_FLAG_TEXTURE_FILTERING = (1 << 17), // The hit shaders compile stochastic texture filtering in (D117). Set while rendering/pathtracing/texture_filtering is not off; the filter itself is RT_PARAM_TEXTURE_FILTERING.
 	};
 
 	// The coherence hint the raygen hands reorderThreadEXT beside the hit's shader (D75), the
@@ -145,7 +147,10 @@ public:
 	static constexpr int RT_PARAM_TEXTURE_LOD_ANISOTROPIC = 21; // 1 when the hit shaders sample over the cone's elliptical footprint, rendering/pathtracing/texture_lod_anisotropic (D116).
 	static constexpr int RT_PARAM_TEXTURE_LOD_BIAS = 22; // The raster samplers' mipmap bias, added to every cone level (D116).
 	static constexpr int RT_PARAM_TEXTURE_LOD = 23; // 1 when the hit shaders sample at the cone's level, rendering/pathtracing/texture_lod (D116).
-	static constexpr int RT_PARAM_COUNT = 24;
+	static constexpr int RT_PARAM_TEXTURE_FILTERING = 24; // The stochastic texture filter, 0 off, rendering/pathtracing/texture_filtering (D117).
+	static constexpr int RT_PARAM_TEXTURE_FILTERING_MAGNIFICATION = 25; // 1 when magnified lookups are filtered stochastically too (D117).
+	static constexpr int RT_PARAM_TEXTURE_FILTERING_SIGMA = 26; // The Gaussian filter's standard deviation in texels (D117).
+	static constexpr int RT_PARAM_COUNT = 28;
 
 	static inline uint32_t rt_flags_pack(uint32_t p_flags, uint32_t p_sample_count, uint32_t p_max_bounces) {
 		uint32_t result = p_flags;

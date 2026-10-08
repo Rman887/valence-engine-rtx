@@ -4200,6 +4200,9 @@ void RenderingServer::init() {
 	GLOBAL_DEF("rendering/pathtracing/async_shader_compilation", true);
 	GLOBAL_DEF("rendering/pathtracing/texture_lod", true);
 	GLOBAL_DEF("rendering/pathtracing/texture_lod_anisotropic", true);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracing/texture_filtering", PROPERTY_HINT_ENUM, "Off,Bilinear,Bicubic,Gaussian"), 0);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracing/texture_filtering_magnification", PROPERTY_HINT_ENUM, "Hardware,Stochastic"), 0);
+	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/texture_filtering_gaussian_sigma", PROPERTY_HINT_RANGE, "0.1,2.0,0.01"), 0.7);
 	GLOBAL_DEF_RST("rendering/pathtracing/multimesh_cache_cpu_transforms", false);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_blas_compaction", true);
 	GLOBAL_DEF_RST("rendering/pathtracing/cluster_blas_deformed", true);

@@ -12190,7 +12190,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			float camera_medium_absorption[4];
 			float camera_medium_scatter[4];
 		} rt_ubo = {};
-		static_assert(sizeof(rt_ubo) == 68 * sizeof(float));
+		static_assert(sizeof(rt_ubo) == 72 * sizeof(float));
 		// Without an Environment the trace keeps the diffuse bounce limit it had before it was a knob (D74); a 0 would end every path at its first hit.
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_MAX_DIFFUSE_BOUNCES] = 2.0f;
 
@@ -12234,6 +12234,11 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_TEXTURE_LOD_BIAS] = rb->get_computed_texture_mipmap_bias();
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_TEXTURE_LOD] = GLOBAL_GET_CACHED(bool, "rendering/pathtracing/texture_lod") ? 1.0f : 0.0f;
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_TEXTURE_LOD_ANISOTROPIC] = GLOBAL_GET_CACHED(bool, "rendering/pathtracing/texture_lod_anisotropic") ? 1.0f : 0.0f;
+		// Stochastic texture filtering (D117): the setting's values are the shader's filter types (0 off, then
+		// bilinear, bicubic and Gaussian, as STF_FILTER_TYPE_LINEAR to _GAUSSIAN in rtxtf_stf_inc.glsl).
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_TEXTURE_FILTERING] = (float)CLAMP(GLOBAL_GET_CACHED(int, "rendering/pathtracing/texture_filtering"), 0, 3);
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_TEXTURE_FILTERING_MAGNIFICATION] = GLOBAL_GET_CACHED(int, "rendering/pathtracing/texture_filtering_magnification") == 1 ? 1.0f : 0.0f;
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_TEXTURE_FILTERING_SIGMA] = MAX(GLOBAL_GET_CACHED(float, "rendering/pathtracing/texture_filtering_gaussian_sigma"), 0.0f);
 
 		// The froxel volumetric fog the raygen composes over the camera segment (D37): the froxel's
 		// depth mapping as the raster's fragment reads it, and the Environment's sky affect.

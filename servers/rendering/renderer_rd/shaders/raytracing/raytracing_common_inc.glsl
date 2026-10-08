@@ -2,7 +2,7 @@
 // Include AFTER raytracing_inc.glsl and scene_data_inc.glsl.
 // The includer must set exactly one of RT_STAGE_{RAYGEN,MISS,CLOSEST_HIT,ANY_HIT,INTERSECTION}.
 
-// Specialization constant (bits 0-10: flags, 11-12: the SER hint, 13: cluster BLAS, 14-15: position fetch, 16: 2-state micromaps, 17-20: free, 21-28: samples, 29-31: bounces).
+// Specialization constant (bits 0-10: flags, 11-12: the SER hint, 13: cluster BLAS, 14-15: position fetch, 16: 2-state micromaps, 17: stochastic texture filtering, 18-20: free, 21-28: samples, 29-31: bounces).
 // Bit 13 is read at compile time as USE_CLUSTER_AS (D79), bits 14-15 as USE_POSITION_FETCH and RT_POSITION_FETCH_CHECK (D93), bit 16 as USE_OMM_INDIRECT_2_STATE (D96), never from RT_FLAGS.
 layout(constant_id = 0) const uint RT_FLAGS = 0u;
 
@@ -14,6 +14,7 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 #define RT_FLAG_LIGHT_TREE_POWER_PICK (1u << 8)
 #define RT_FLAG_SKY_LIGHT_VARIANCE_SHARE (1u << 9)
 #define RT_FLAG_RUSSIAN_ROULETTE (1u << 10)
+#define RT_FLAG_TEXTURE_FILTERING (1u << 17)
 
 // The SER coherence hint's mode (D75), bits 11-12; the values of
 // rendering/pathtracing/shader_execution_reordering_hint.
@@ -67,7 +68,7 @@ layout(set = 0, binding = 14, std430) readonly buffer GlobalShaderUniformData {
 global_shader_uniforms;
 
 layout(set = 0, binding = 6, std140) uniform RaytracingParams {
-	vec4 rt_params[6];
+	vec4 rt_params[7];
 	mat4 prev_vp_unjittered;
 	mat4 curr_vp_unjittered;
 	// World-space anchor the trace is relative to (camera-relative tracing).

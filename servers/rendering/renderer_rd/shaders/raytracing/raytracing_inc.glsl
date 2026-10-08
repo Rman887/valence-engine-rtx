@@ -13,7 +13,7 @@
 // ============================================================================
 // RT_PARAMS INDICES - Must match RT_PARAM_* in scene_shader_raytracing.h
 // ============================================================================
-// rt_params is a vec4[6] uniform buffer (24 floats total)
+// rt_params is a vec4[7] uniform buffer (28 floats total)
 // Access: rt_params[idx >> 2][idx & 3] or get_rt_param(idx)
 #define RT_PARAM_VIS_MODE 0 // rt_params[0].x - Debug visualization mode (0 = disabled)
 #define RT_PARAM_SAMPLE_COUNT 1 // rt_params[0].y - Samples per pixel
@@ -43,6 +43,10 @@
 #define RT_PARAM_TEXTURE_LOD_ANISOTROPIC 21 // rt_params[5].y - 1 when the hit shaders sample over the cone's elliptical footprint with UV gradients
 #define RT_PARAM_TEXTURE_LOD_BIAS 22 // rt_params[5].z - The raster samplers' mipmap bias, added to every cone level
 #define RT_PARAM_TEXTURE_LOD 23 // rt_params[5].w - 1 when the hit shaders sample at the cone's level, 0 for level 0 everywhere
+// Stochastic texture filtering (D117).
+#define RT_PARAM_TEXTURE_FILTERING 24 // rt_params[6].x - The filter, 0 off, else STF_FILTER_TYPE_LINEAR, _CUBIC or _GAUSSIAN (rtxtf_stf_inc.glsl)
+#define RT_PARAM_TEXTURE_FILTERING_MAGNIFICATION 25 // rt_params[6].y - 1 when a magnified lookup is filtered stochastically too, 0 for the hardware's bilinear
+#define RT_PARAM_TEXTURE_FILTERING_SIGMA 26 // rt_params[6].z - The Gaussian filter's standard deviation in texels
 // A texture level that is unknown (D116): every texture reads its base level.
 const float RT_TEXTURE_LOD_BASE = -128.0;
 
@@ -287,6 +291,7 @@ const uint FLAG_CLUSTER_GEOMETRY = 8u;
 #define RT_SOBOL_DIM_SCATTER 40u // The transmission, lobe and direction draws inside a bounce's block.
 #define RT_SOBOL_DIM_ROULETTE 43u // The Russian roulette draw (D73), after the scatter's three (a fourth scatter draw must move it; the u suffix keeps it out of #if).
 #define RT_SOBOL_DIM_DIFFUSE_TRANSMISSION 44u // A thin surface's transmission choice (D103), apart so the scatter's three keep their dimensions.
+#define RT_SOBOL_DIM_TEXTURE_FILTERING 45u // The texel pair and the level a hit's stochastic texture lookups share (D117), two dimensions.
 
 // Both in raytracing_common_inc.glsl, which every stage includes after this file, after its
 // ray-tracing extensions are enabled and where the specialization constant is declared.

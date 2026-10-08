@@ -8807,6 +8807,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.alpha_threshold = 0.5f;
 	mat.backlight_rgba8 = 0;
 	mat.backlight_texture_idx = 0;
+	mat.metallic_texture_idx = 0;
 	bool omm_custom = false;
 	RID omm_custom_alpha_rd; // An opted-in custom shader's hint_alpha texture, with a real bindless slot.
 
@@ -8855,14 +8856,39 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		}
 	}
 
-	RID orm_rd = get_material_texture("texture_orm");
-	if (orm_rd.is_valid()) {
-		mat.orm_texture_idx = bindless_block->add_texture(orm_rd);
+	// VAL: roughness and metallic as the raster reads them (D118). ORMMaterial3D takes both from its ORM
+	// texture's green and blue; StandardMaterial3D from its roughness and metallic textures, each through its
+	// channel (the roughness texture's in its sampler hint, the metallic one's a mask parameter). An unassigned
+	// texture is index 0, the white default the raster's hints also give.
+	const bool orm = shader_declares("texture_orm");
+	if (orm) {
+		RID orm_rd = get_material_texture("texture_orm");
+		if (orm_rd.is_valid()) {
+			mat.orm_texture_idx = bindless_block->add_texture(orm_rd);
+		}
+		mat.metallic_texture_idx = mat.orm_texture_idx;
+		mat.flags |= (1u << RT_MAT_ROUGHNESS_CHANNEL_SHIFT) | (2u << RT_MAT_METALLIC_CHANNEL_SHIFT);
 	} else {
 		RID roughness_rd = get_material_texture("texture_roughness");
-		if (roughness_rd.is_valid()) {
+		if (roughness_rd.is_valid() && shader_declares("texture_roughness")) {
 			mat.orm_texture_idx = bindless_block->add_texture(roughness_rd);
 		}
+		RID metallic_rd = get_material_texture("texture_metallic");
+		if (metallic_rd.is_valid() && shader_declares("texture_metallic")) {
+			mat.metallic_texture_idx = bindless_block->add_texture(metallic_rd);
+		}
+		uint32_t roughness_channel = 0; // Red, BaseMaterial3D's default.
+		const ShaderLanguage::ShaderNode::Uniform *roughness_uniform = shader_data ? shader_data->uniforms.getptr("texture_roughness") : nullptr;
+		if (roughness_uniform && roughness_uniform->hint >= ShaderLanguage::ShaderNode::Uniform::HINT_ROUGHNESS_R && roughness_uniform->hint <= ShaderLanguage::ShaderNode::Uniform::HINT_ROUGHNESS_GRAY) {
+			roughness_channel = roughness_uniform->hint - ShaderLanguage::ShaderNode::Uniform::HINT_ROUGHNESS_R;
+		}
+		uint32_t metallic_channel = 0;
+		Variant metallic_channel_var = material_storage->material_get_param(p_material_rid, "metallic_texture_channel");
+		if (metallic_channel_var.get_type() == Variant::VECTOR4) {
+			const Vector4 m = metallic_channel_var;
+			metallic_channel = m.w > 0.5f ? 3 : (m.x > 0.5f ? 0 : (m.y > 0.5f ? 1 : (m.z > 0.5f ? 2 : 4)));
+		}
+		mat.flags |= (roughness_channel << RT_MAT_ROUGHNESS_CHANNEL_SHIFT) | (metallic_channel << RT_MAT_METALLIC_CHANNEL_SHIFT);
 	}
 
 	// Emission is a color texture - needs sRGB->linear conversion
@@ -9063,6 +9089,13 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	Variant specular_var = material_storage->material_get_param(p_material_rid, "specular");
 	if (specular_var.get_type() == Variant::FLOAT) {
 		mat.specular = specular_var;
+	}
+	// VAL: ORMMaterial3D's shader declares none of the three, and the raster reads its texture unscaled at the
+	// default specular (D118): the parameters BaseMaterial3D still holds are not applied.
+	if (orm) {
+		mat.metallic = 1.0f;
+		mat.roughness = 1.0f;
+		mat.specular = 0.5f;
 	}
 
 	Variant emission_var = shader_declares("emission") ? material_storage->material_get_param(p_material_rid, "emission") : Variant();

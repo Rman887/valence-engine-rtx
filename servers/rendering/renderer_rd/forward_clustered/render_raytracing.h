@@ -121,7 +121,7 @@ enum : uint32_t {
 struct alignas(16) RT_MaterialData {
 	uint32_t albedo_texture_idx;
 	uint32_t normal_texture_idx;
-	uint32_t orm_texture_idx;
+	uint32_t orm_texture_idx; // The ORM texture, or StandardMaterial3D's roughness texture (D118).
 	uint32_t emission_texture_idx;
 	float albedo_color[4];
 	float emission_color[3];
@@ -138,7 +138,7 @@ struct alignas(16) RT_MaterialData {
 	float alpha_threshold; // The alpha test's cutoff: opaque where alpha >= it (default 0.5).
 	uint32_t backlight_rgba8; // With RT_MAT_FLAG_DIFFUSE_TRANSMISSION: BaseMaterial3D's backlight colour, sRGB, RGBA8.
 	uint32_t backlight_texture_idx; // Its backlight texture, read linear as the raster reads it (0 = none).
-	uint32_t _pad;
+	uint32_t metallic_texture_idx; // The ORM texture again, or StandardMaterial3D's metallic texture (D118).
 };
 static_assert(sizeof(RT_MaterialData) == 112, "RT_MaterialData must be 112 bytes for std430");
 
@@ -304,6 +304,10 @@ enum {
 	RT_MAT_FLAG_DIFFUSE_TRANSMISSION = 32u, // BaseMaterial3D backlight: a thin diffuse-transmission lobe (D103).
 	RT_MAT_FLAG_ANISOTROPIC = 64u, // The albedo texture's filter is linear, mipmapped and anisotropic (D116).
 	RT_MAT_FLAG_NO_MIPMAPS = 128u, // The albedo texture's filter has no mipmaps: every fetch reads the base level.
+	// The channel the roughness (bits 8-10) and metallic (bits 11-13) textures are read from: BaseMaterial3D's
+	// TextureChannel, 0 red to 3 alpha, 4 the grey average (D118).
+	RT_MAT_ROUGHNESS_CHANNEL_SHIFT = 8u,
+	RT_MAT_METALLIC_CHANNEL_SHIFT = 11u,
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).

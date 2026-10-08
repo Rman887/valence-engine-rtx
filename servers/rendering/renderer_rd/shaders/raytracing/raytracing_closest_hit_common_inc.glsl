@@ -440,6 +440,20 @@ vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags, float p_lod_
 	return textureLod(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_NEAREST_WITH_MIPMAPS_REPEAT), pos.xy, pos.z);
 }
 
+/// One channel of a material texture by BaseMaterial3D's TextureChannel (D118): 0 red to 3 alpha, 4 the grey average.
+float material_texture_channel(vec4 p_texel, uint p_channel) {
+	return p_channel >= 4u ? dot(p_texel.rgb, vec3(1.0 / 3.0)) : p_texel[p_channel];
+}
+
+/// A standard material's roughness (x) and metallic (y) as the raster reads them (D118), from the lookups of its
+/// orm_texture_idx and metallic_texture_idx (vec4(1.0), the white default, for an unassigned index 0; one lookup for
+/// both when the indices are equal): each through its channel (flags bits 8-10 and 11-13), times its parameter.
+vec2 material_roughness_metallic(MaterialData p_mat, vec4 p_roughness_tex, vec4 p_metallic_tex) {
+	return clamp(vec2(material_texture_channel(p_roughness_tex, (p_mat.flags >> 8u) & 7u) * p_mat.roughness,
+						 material_texture_channel(p_metallic_tex, (p_mat.flags >> 11u) & 7u) * p_mat.metallic),
+			vec2(0.0), vec2(1.0));
+}
+
 /// Apply tangent-space normal map to geometry normal.
 vec3 apply_normal_map(HitData h, vec3 tangent_space_normal, float normal_map_depth) {
 	vec3 mapped = h.tangent * tangent_space_normal.x + h.bitangent * tangent_space_normal.y + h.geometry_normal * tangent_space_normal.z;

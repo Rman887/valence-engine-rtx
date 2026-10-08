@@ -87,7 +87,7 @@ struct InstanceMotionData {
 struct MaterialData {
 	uint albedo_texture_idx;
 	uint normal_texture_idx;
-	uint orm_texture_idx;
+	uint orm_texture_idx; // The ORM texture, or StandardMaterial3D's roughness texture (D118).
 	uint emission_texture_idx;
 
 	vec4 albedo_color;
@@ -97,7 +97,7 @@ struct MaterialData {
 	float metallic;
 	float roughness;
 	float ao_strength;
-	uint flags; // Bit 0: has_normal_map, Bit 1: has_emission_tex, Bit 2: point_filter, Bit 3: emission_multiply, Bit 4: emissive_constant (an emissive mesh light, D50), Bit 5: diffuse_transmission (backlight, D103)
+	uint flags; // Bit 0: has_normal_map, Bit 1: has_emission_tex, Bit 2: point_filter, Bit 3: emission_multiply, Bit 4: emissive_constant (an emissive mesh light, D50), Bit 5: diffuse_transmission (backlight, D103), Bits 8-10 and 11-13: the roughness and metallic textures' channels (D118)
 
 	vec2 uv1_scale; // UV1 scale (default 1,1)
 	vec2 uv1_offset; // UV1 offset (default 0,0)
@@ -108,5 +108,5 @@ struct MaterialData {
 	float alpha_threshold; // The alpha test's cutoff: opaque where alpha >= it (default 0.5).
 	uint backlight_rgba8; // With flag bit 5: the backlight colour, sRGB, RGBA8 (D103).
 	uint backlight_texture_idx; // Its backlight texture, sampled linear (0 = none).
-	uint _pad;
+	uint metallic_texture_idx; // The ORM texture again, or StandardMaterial3D's metallic texture (D118).
 };

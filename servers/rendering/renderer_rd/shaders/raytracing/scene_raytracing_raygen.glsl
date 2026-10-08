@@ -804,9 +804,16 @@ void main() {
 	// Texture sampling.
 	vec4 albedo_tex = sample_material_texture(mat.albedo_texture_idx, uv, mat.flags, lod, grad, stf_u);
 	vec3 albedo = albedo_tex.rgb * mat.albedo_color.rgb;
-	vec3 orm = sample_material_texture(mat.orm_texture_idx, uv, mat.flags, lod, grad, stf_u).rgb;
-	float roughness = saturate(orm.g * mat.roughness);
-	float metalness = saturate(orm.b * mat.metallic);
+	// VAL: roughness and metallic through their textures' channels (D118): an ORM texture's green and blue, one
+	// lookup when both are one texture; an unassigned texture (index 0) is the white default.
+	const vec4 roughness_tex = mat.orm_texture_idx != 0u ? sample_material_texture(mat.orm_texture_idx, uv, mat.flags, lod, grad, stf_u) : vec4(1.0);
+	vec4 metallic_tex = roughness_tex;
+	if (mat.metallic_texture_idx != mat.orm_texture_idx) {
+		metallic_tex = mat.metallic_texture_idx != 0u ? sample_material_texture(mat.metallic_texture_idx, uv, mat.flags, lod, grad, stf_u) : vec4(1.0);
+	}
+	const vec2 roughness_metallic = material_roughness_metallic(mat, roughness_tex, metallic_tex);
+	float roughness = roughness_metallic.x;
+	float metalness = roughness_metallic.y;
 
 	// Emission as the raster's fragment computes it: the texture (black when there is none) is added to
 	// or multiplied with the colour by the material's emission operator, then scaled by the energy.
@@ -853,6 +860,7 @@ void main() {
 		if (VIS_MODE != 0) {
 			vec3 V = -gl_WorldRayDirectionEXT;
 			float NdotV = max(dot(m.normal, V), 0.0001);
+			vec3 orm = vec3(1.0, roughness, metalness);
 			debug_visualize(VIS_MODE, h.geometry_normal, m.normal, tangent_space_normal,
 					h.tangent, h.bitangent, uv, m.albedo, orm, m.metalness, m.roughness, mat.specular, m.emissive + m.decal_emissive, V, NdotV, gl_HitTEXT, h.is_front_face, material_lod);
 			return;

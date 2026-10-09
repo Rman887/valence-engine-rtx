@@ -3432,8 +3432,8 @@
 			With [member rendering/pathtracing/partitioned_tlas], the frames an instance in the global partition goes unchanged before it returns to its world cell's partition.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
-		<member name="rendering/pathtracing/relative_origin_grid" type="float" setter="" getter="" default="1024.0">
-			Size in meters of the grid the path tracer's world-space anchor snaps to. The trace runs in world space relative to that anchor (the camera's grid cell on the X and Z axes), so 32-bit positions on the GPU stay precise kilometers from the origin; the anchor moves only when the camera leaves its cell. Set to [code]0.0[/code] to trace in absolute world space.
+		<member name="rendering/pathtracing/relative_origin_grid" type="float" setter="" getter="" default="16.0">
+			Size in meters of the grid the path tracer's world-space anchor snaps to. The trace runs in world space relative to that anchor (the camera's grid cell on the X and Z axes), so 32-bit positions on the GPU stay precise kilometers from the origin; the anchor moves when the camera is more than one grid size from it. Ray origins leave a surface by a fixed number of float steps of the hit position's coordinates, so a smaller grid keeps that offset small near the camera: within 10 meters of the camera it is about 0.5 mm at the default on the X and Z axes, and about 1.5 cm at 1024; the Y axis keeps world height, so its offset follows the altitude. Moving the anchor rebuilds nothing: what the trace reads relative to it is uploaded every frame, and a partitioned acceleration structure takes a shift as one translation per live partition plus a rewrite of its global partition's instances. Unless the grid is [code]0.0[/code], DLSS's camera constants keep a 1024 m anchor of their own, so they move only on that grid. Set to [code]0.0[/code] to trace in absolute world space.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracing/shader_execution_reordering_hint" type="int" setter="" getter="" default="2">

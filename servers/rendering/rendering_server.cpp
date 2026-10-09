@@ -4233,7 +4233,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/deformed_mesh_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,3600,1"), 60);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_blas_cache_ttl_frames", PROPERTY_HINT_RANGE, "1,18000,1"), 3600);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/multimesh_merged_blas_max_triangles", PROPERTY_HINT_RANGE, "256,1048576,1"), 65536);
-	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/relative_origin_grid", PROPERTY_HINT_RANGE, "0,65536,1"), 1024.0);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/relative_origin_grid", PROPERTY_HINT_RANGE, "0,65536,1"), 16.0);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/ptlas_cell_size", PROPERTY_HINT_RANGE, "1,65536,1"), 128.0);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/ptlas_partition_max_instances", PROPERTY_HINT_RANGE, "16,1048576,1"), 8192);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/pathtracing/ptlas_global_max_instances", PROPERTY_HINT_RANGE, "0,1048576,1"), 65536);

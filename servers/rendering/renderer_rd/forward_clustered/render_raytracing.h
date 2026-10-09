@@ -1383,6 +1383,8 @@ struct RTViewportState {
 	// is relative to (world minus rt_origin), and the scene UBO copy whose
 	// camera carries the relative origin. See `RenderRaytracing::build_tlas`.
 	Vector3 rt_origin;
+	// The coarse anchor DLSS's camera constants are relative to (1024 m grid).
+	Vector3 upscaler_origin;
 	bool rt_origin_valid = false;
 	RID scene_uniform_buffer;
 

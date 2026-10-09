@@ -255,8 +255,9 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 				_update_volumetric_fog(rb, p_render_data->environment, p_render_data->camera_attributes, p_render_data->scene_data->cam_projection, p_render_data->scene_data->cam_transform, p_render_data->scene_data->prev_cam_transform.affine_inverse(), p_render_data->shadow_atlas, pt_directional_light_count, directional_shadows, pt_positional_light_count, p_render_data->voxel_gi_count, *p_render_data->fog_volumes, p_render_data->scene_data, rt_state->tlas, p_render_data->scene_data->cam_transform.origin - rt_state->rt_origin);
 			}
 			rt_uniform_set = raytracing->update_uniform_set(rt_state, p_render_data, rt_flags, use_gbuffer);
-			// DLSS gets the same camera-relative frame the trace rendered.
-			upscaler_world_offset = rt_state->rt_origin;
+			// DLSS gets a coarse camera-relative frame of its own: its reprojection
+			// is anchor-independent, and its camera constants move only on a 1024 m grid.
+			upscaler_world_offset = rt_state->upscaler_origin;
 		}
 	} else if (rb_data.is_valid() && raytracing && raytracing->dlss_rr_has_buffers(rb.ptr())) {
 		// No RT shader available: free DLSS RR buffers so DLSS falls back to SR.

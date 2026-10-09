@@ -439,8 +439,9 @@ float _offset_component(float p, float n_comp, int of_comp) {
 // that went into it, not with each component's own: a component near zero (a water plane at
 // trace-space y = 0) took 256 ULP of itself, or a fixed 1/65536 below 1/32, less than the error
 // of a position rebuilt along a long ray or from raster depth (the G-buffer primary). Each
-// component therefore moves at least a few ULP of the largest coordinate (the anchor-relative
-// grid, up to 1024 m from the camera under D20) and 1/65536 of the ray's length along n.
+// component therefore moves at least a few ULP of the largest coordinate (on x and z, the anchor
+// is within one grid size of the camera, rendering/pathtracing/relative_origin_grid; y is world
+// height) and 1/65536 of the ray's length along n.
 vec3 offset_ray_origin(vec3 p, vec3 n, float t) {
 	const float int_scale = 256.0;
 	const float floor_scale = 1.0 / 65536.0;

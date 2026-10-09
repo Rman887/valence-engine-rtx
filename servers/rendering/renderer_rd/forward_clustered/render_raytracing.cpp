@@ -10280,18 +10280,28 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 	// Camera-relative tracing: the trace runs in world space minus an anchor
 	// snapped to a grid on x and z, so float32 stays precise kilometers from
-	// the origin. The anchor moves only when the camera leaves its cell, and
-	// every instance, light and camera upload below subtracts it in double
-	// before narrowing to float. Its y stays 0 so world height (fog height,
-	// user shaders) is exact. A grid of 0 disables it (absolute world).
+	// the origin. The anchor moves when the camera is more than one grid size
+	// from it on x or z, and every instance, light and camera upload below
+	// subtracts it in double before narrowing to float. Its y stays 0 so world
+	// height (fog height, user shaders) is exact. A grid of 0 disables it
+	// (absolute world). DLSS gets a coarse anchor of its own on the same rule:
+	// its reprojection does not depend on the anchor, but its camera constants
+	// jump with it, and frame generation reads them.
 	{
 		static const double RT_ORIGIN_GRID = (double)GLOBAL_GET("rendering/pathtracing/relative_origin_grid");
+		const double UPSCALER_ORIGIN_GRID = 1024.0;
 		const Vector3 cam_pos = p_render_data->scene_data->cam_transform.origin;
 		if (RT_ORIGIN_GRID <= 0.0) {
 			state->rt_origin = Vector3();
+			state->upscaler_origin = Vector3();
 			state->rt_origin_valid = true;
-		} else if (!state->rt_origin_valid || Math::abs(cam_pos.x - state->rt_origin.x) > RT_ORIGIN_GRID || Math::abs(cam_pos.z - state->rt_origin.z) > RT_ORIGIN_GRID) {
-			state->rt_origin = Vector3(Math::floor(cam_pos.x / RT_ORIGIN_GRID) * RT_ORIGIN_GRID, 0.0, Math::floor(cam_pos.z / RT_ORIGIN_GRID) * RT_ORIGIN_GRID);
+		} else {
+			if (!state->rt_origin_valid || Math::abs(cam_pos.x - state->rt_origin.x) > RT_ORIGIN_GRID || Math::abs(cam_pos.z - state->rt_origin.z) > RT_ORIGIN_GRID) {
+				state->rt_origin = Vector3(Math::floor(cam_pos.x / RT_ORIGIN_GRID) * RT_ORIGIN_GRID, 0.0, Math::floor(cam_pos.z / RT_ORIGIN_GRID) * RT_ORIGIN_GRID);
+			}
+			if (!state->rt_origin_valid || Math::abs(cam_pos.x - state->upscaler_origin.x) > UPSCALER_ORIGIN_GRID || Math::abs(cam_pos.z - state->upscaler_origin.z) > UPSCALER_ORIGIN_GRID) {
+				state->upscaler_origin = Vector3(Math::floor(cam_pos.x / UPSCALER_ORIGIN_GRID) * UPSCALER_ORIGIN_GRID, 0.0, Math::floor(cam_pos.z / UPSCALER_ORIGIN_GRID) * UPSCALER_ORIGIN_GRID);
+			}
 			state->rt_origin_valid = true;
 		}
 	}

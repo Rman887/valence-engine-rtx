@@ -33,6 +33,7 @@
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/forward_clustered/scene_shader_raytracing.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
+#include "servers/rendering/renderer_rd/storage_rd/mesh_storage.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 #include "servers/rendering/rendering_device.h"
 #include "servers/rendering/rendering_server_default.h" // IWYU pragma: keep. RENDER_TIMESTAMP macro uses RSG.
@@ -131,6 +132,20 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		// precompiled per surface like every other pass's.
 		scene_shader.enable_advanced_shader_group();
 		global_pipeline_data_required.use_gbuffer = true;
+		// Its rays leave from the raster's surface, so the raster draws no fallback level (D93d): what
+		// this frame draws gets its whole buffers back before the render lists are filled. Particles
+		// are outside the trace, so their draw passes shadow nothing and keep theirs.
+		if (p_render_data->instances && RendererRD::MeshStorage::is_cluster_geometry_streaming_wanted()) {
+			RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+			for (uint32_t i = 0; i < (uint32_t)p_render_data->instances->size(); i++) {
+				const GeometryInstanceForwardClustered *inst = static_cast<GeometryInstanceForwardClustered *>((*p_render_data->instances)[i]);
+				if (inst->data->base_type == RSE::INSTANCE_MESH) {
+					mesh_storage->mesh_restore_raster_geometry(inst->data->base);
+				} else if (inst->data->base_type == RSE::INSTANCE_MULTIMESH) {
+					mesh_storage->mesh_restore_raster_geometry(mesh_storage->multimesh_get_mesh(inst->data->base));
+				}
+			}
+		}
 	}
 
 	// Free GPU resources for the screen-space effects the path tracer replaces.

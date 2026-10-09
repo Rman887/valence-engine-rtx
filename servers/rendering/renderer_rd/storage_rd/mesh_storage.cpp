@@ -664,7 +664,8 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	// Geometry residency (D93): a surface that streams its geometry keeps in RAM the arrays it was
 	// added with (the index data with its coarse tail), for the trace's blobs and for
 	// mesh_get_surface(); the vectors share the caller's data. Its buffers hold its fallback level
-	// (D93d), which every raster consumer draws, and the trace reads the whole surface through
+	// (D93d), which every raster consumer draws until a region write or the G-buffer primary surface
+	// gives them back the whole surface (mesh_restore_raster_geometry()), and the trace reads it through
 	// blobs or an upload of its own. A skinned or blend-shaped surface is deformed, and deformed
 	// surfaces do not stream; skin data marks one even without the bones flag, as for
 	// use_as_storage above. The mesh storage decides, and is the authority: the tables' tests are
@@ -916,9 +917,9 @@ void MeshStorage::mesh_surface_update_vertex_region(RID p_mesh, int p_surface, i
 	uint64_t data_size = p_data.size();
 	const uint8_t *r = p_data.ptr();
 
-	// A surface that streams its geometry (D93d) gets its own arrays back in its buffers first, so the
-	// region lands at the offsets it names; its RAM copy goes below.
-	if (mesh_surface_is_geometry_streamed(mesh->surfaces[p_surface])) {
+	// A surface whose buffers hold its fallback level (D93d) gets its own arrays back in them first, so
+	// the region lands at the offsets it names; its RAM copy goes below.
+	if (mesh->surfaces[p_surface]->fallback_in_buffers) {
 		_mesh_surface_restore_buffers(p_mesh, mesh, p_surface);
 	}
 
@@ -953,21 +954,27 @@ void MeshStorage::mesh_surface_update_attribute_region(RID p_mesh, int p_surface
 	const uint8_t *r = p_data.ptr();
 
 	// A surface that streams its geometry (D93d): the region goes into the RAM copy, which the blobs
-	// gathered at the repopulation below read, and the fallback level's attributes are made again
-	// from it. A region past the copy gets the surface's own arrays back in its buffers first, and
-	// the copy goes below.
+	// gathered at the repopulation below read, and the buffer gets the region too, or the fallback
+	// level's attributes made again from the copy. A region past the copy gets the surface's own
+	// arrays back in its buffers first, and the copy goes below.
 	Mesh::Surface *surface = mesh->surfaces[p_surface];
 	if (mesh_surface_is_geometry_streamed(surface)) {
 		Vector<uint8_t> &attributes = surface->ram_attribute_data;
 		if (p_offset >= 0 && uint64_t(p_offset) + data_size <= uint64_t(attributes.size())) {
 			memcpy(attributes.ptrw() + p_offset, r, data_size);
-			Vector<uint8_t> fallback;
-			_cluster_fallback_attributes(attributes, surface->rt_vertex_count, surface->ram_fallback_vertices, fallback);
-			RD::get_singleton()->buffer_update(surface->attribute_buffer, 0, fallback.size(), fallback.ptr());
+			if (surface->fallback_in_buffers) {
+				Vector<uint8_t> fallback;
+				_cluster_fallback_attributes(attributes, surface->rt_vertex_count, surface->ram_fallback_vertices, fallback);
+				RD::get_singleton()->buffer_update(surface->attribute_buffer, 0, fallback.size(), fallback.ptr());
+			} else {
+				RD::get_singleton()->buffer_update(surface->attribute_buffer, p_offset, data_size, r);
+			}
 			surface->rt_invalidation_counter++;
 			return;
 		}
-		_mesh_surface_restore_buffers(p_mesh, mesh, p_surface);
+		if (surface->fallback_in_buffers) {
+			_mesh_surface_restore_buffers(p_mesh, mesh, p_surface);
+		}
 	}
 
 	RD::get_singleton()->buffer_update(mesh->surfaces[p_surface]->attribute_buffer, p_offset, data_size, r);
@@ -1007,9 +1014,9 @@ void RendererRD::MeshStorage::mesh_surface_update_index_region(RID p_mesh, int p
 	uint64_t data_size = p_data.size();
 	const uint8_t *r = p_data.ptr();
 
-	// A surface that streams its geometry (D93d) gets its own arrays back in its buffers first, so the
-	// region lands at the offsets it names; its RAM copy goes below.
-	if (mesh_surface_is_geometry_streamed(mesh->surfaces[p_surface])) {
+	// A surface whose buffers hold its fallback level (D93d) gets its own arrays back in them first, so
+	// the region lands at the offsets it names; its RAM copy goes below.
+	if (mesh->surfaces[p_surface]->fallback_in_buffers) {
 		_mesh_surface_restore_buffers(p_mesh, mesh, p_surface);
 	}
 
@@ -1070,11 +1077,12 @@ RID MeshStorage::mesh_surface_get_material(RID p_mesh, int p_surface) const {
 }
 
 // A surface that streams its geometry gets its own arrays back in its buffers (D93d), from its RAM
-// copy, before a region write lands at the offsets the arrays have: the fallback level's buffers go,
+// copy, before a region write lands at the offsets the arrays have, or for the G-buffer primary
+// surface (mesh_restore_raster_geometry(), which keeps the RAM copy): the fallback level's buffers go,
 // with the vertex arrays cached over them here and in the mesh's instances, and the whole vertex,
 // attribute and index buffers (the coarse tail included) and Godot's LODs are made as
 // mesh_add_surface() makes them, and an indirect MultiMesh of the mesh draws the surface's count
-// again. The caller writes the region, then drops the RAM copy.
+// again. A region write's caller writes the region, then drops the RAM copy.
 void MeshStorage::_mesh_surface_restore_buffers(RID p_mesh_rid, Mesh *p_mesh, int p_surface) {
 	Mesh::Surface &s = *p_mesh->surfaces[p_surface];
 	RD *rd = RD::get_singleton();
@@ -1153,12 +1161,31 @@ void MeshStorage::_mesh_surface_restore_buffers(RID p_mesh_rid, Mesh *p_mesh, in
 	// was set (_multimesh_set_mesh); the instance count beside it stays. Rare enough to walk them all.
 	const uint32_t count = mesh_surface_get_vertices_drawn_count(&s);
 	for (const RID &multimesh_rid : multimesh_owner.get_owned_list()) {
-		MultiMesh *multimesh = multimesh_owner.get_or_null(multimesh_rid);
+		// The list holds allocated slots not yet initialized too, which owns() refuses.
+		MultiMesh *multimesh = multimesh_owner.owns(multimesh_rid) ? multimesh_owner.get_or_null(multimesh_rid) : nullptr;
 		if (multimesh && multimesh->indirect && multimesh->mesh == p_mesh_rid && multimesh->command_buffer.is_valid() && uint32_t(p_surface) < multimesh->command_buffer_surfaces) {
 			rd->buffer_update(multimesh->command_buffer, p_surface * sizeof(uint32_t) * INDIRECT_MULTIMESH_COMMAND_STRIDE, sizeof(uint32_t), &count);
 		}
 	}
 	p_mesh->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_MESH);
+}
+
+// The G-buffer primary surface (D35) casts its shadow and bounce rays from the surface the raster
+// drew, so the raster must draw what the trace intersects: a fallback level (D93d) lies inside the
+// whole surface and shadows itself. Each of its frames hands the mesh of every instance it draws
+// here before its render lists are filled, on the render thread, so a surface whose buffers hold a
+// fallback level gets its whole buffers back. The RAM copy stays, so the trace still streams the
+// surface, and the buffers stay whole: the fallback level only saves memory.
+void MeshStorage::mesh_restore_raster_geometry(RID p_mesh) {
+	Mesh *mesh = mesh_owner.get_or_null(p_mesh);
+	if (mesh == nullptr) {
+		return;
+	}
+	for (uint32_t i = 0; i < mesh->surface_count; i++) {
+		if (mesh->surfaces[i]->fallback_in_buffers) {
+			_mesh_surface_restore_buffers(p_mesh, mesh, i);
+		}
+	}
 }
 
 RenderingServerTypes::SurfaceData MeshStorage::mesh_get_surface(RID p_mesh, int p_surface) const {

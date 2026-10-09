@@ -598,6 +598,9 @@ public:
 	// Geometry residency's host memory (D93d): the RAM copies held, and the fallback levels' buffers.
 	uint64_t get_cluster_geometry_ram_bytes() const { return cluster_geometry_ram_bytes; }
 	uint64_t get_cluster_geometry_fallback_bytes() const { return cluster_geometry_fallback_bytes; }
+	// A mesh's surfaces whose buffers hold a fallback level (D93d) get their whole buffers back: the
+	// G-buffer primary surface (D35) rasterizes what the trace intersects.
+	void mesh_restore_raster_geometry(RID p_mesh);
 
 	// The surface's arrays in RAM (D93), empty unless it keeps them.
 	_FORCE_INLINE_ const Vector<uint8_t> &mesh_surface_get_ram_vertex_data(void *p_surface) {

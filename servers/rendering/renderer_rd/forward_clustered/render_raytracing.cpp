@@ -2524,7 +2524,8 @@ void RenderRaytracing::_populate_surface_blas(
 	RT_GeometryData &geom = r_surf_data->geometry;
 
 	// Geometry residency (D93d): a surface whose geometry the mesh storage streams has its fallback
-	// level in its buffers, which the trace never reads. Its blobs carry its hits, with no buffer
+	// level in its buffers (or, once the G-buffer primary drew it, the whole surface), which the trace
+	// never reads. Its blobs carry its hits, with no buffer
 	// addressed; where they cannot (no stream, a failed population, an allocation), the surface's
 	// arrays are uploaded from the RAM copy for the population's life and it builds from those.
 	r_surf_data->geometry_streamed = p_vertex_buffer_override.is_null() && RendererRD::MeshStorage::get_singleton()->mesh_surface_is_geometry_streamed(p_mesh_surface);
@@ -10536,9 +10537,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				// the expanded path traces anyway. A merge that does not bake this frame reads nothing
 				// of the surface, so its upload goes past the minimum age.
 				if (mesh_storage->mesh_surface_is_geometry_streamed(mesh_surface)) {
-					if (p_primary_from_gbuffer) {
-						WARN_PRINT_ONCE("RT: the G-buffer primary rasterizes a MultiMesh of a surface whose geometry streams at its fallback level (D93d), coarser than the traced surface; the traced primary is the look.");
-					}
 					bool bakes = false;
 					const bool merges = !_build_budget_merge_waits(mm_rid, mm_surf->surface_index) && _plan_merged_mm(mm_rid, mm_gpu_buffer, mesh_surface, mm_count, mm_surf->surface_index, surface_counter, bakes);
 					pending.source = process_surface(mm_surf, mesh_surface, surface_counter, instance_transform, dirty_blas_list);
@@ -10788,9 +10786,6 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			// A slot-resident instance (D94b) whose BLAS this frame builds or may build after the walk
 			// is never proven unchanged here: the commit sees the BLAS it ends on.
 			bool slot_rebuilt = dirty_blas_list.size() != pre_slot_build_size || dirty_blas_update_list.size() != pre_slot_refit_size;
-			if (p_primary_from_gbuffer && surf_data->geometry_streamed) {
-				WARN_PRINT_ONCE("RT: the G-buffer primary rasterizes a surface whose geometry streams at its fallback level (D93d), coarser than the traced surface; the traced primary is the look.");
-			}
 			// An emissive material samples the surface's own triangles (D50), which a surface whose
 			// buffers hold its fallback level has only as an upload (D93d).
 			if (surf_data->geometry_streamed && (mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT)) {
@@ -10871,7 +10866,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			if (collect_render_info) {
 				tlas_instance_count++;
 				uint32_t vertices = mesh_storage->mesh_surface_get_vertices_drawn_count(mesh_surface);
-				// A surface whose geometry streams draws its fallback level; the trace holds the surface (D93d).
+				// A surface whose geometry streams may draw its fallback level; the trace holds the surface (D93d).
 				uint32_t prim_count = surf_data->geometry_streamed ? surf_data->geometry.primitive_count : _rt_indices_to_primitives(surf->primitive, vertices);
 				tlas_primitive_count += prim_count;
 				uint32_t build_delta = dirty_blas_list.size() - pre_build_size;

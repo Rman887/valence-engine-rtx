@@ -353,6 +353,9 @@ void main() {
 		ps.bsdf_pdf = 0.0;
 		ps.cone_width = 0.0;
 		ps.cone_spread = cone_spread;
+#ifdef RT_SUBSURFACE_COMPILED
+		ps.exit_position = vec3(0.0);
+#endif
 		path_clear_medium(ps);
 		if (camera_in_medium) {
 			// The camera is inside a medium (D49): the path starts in it and leaves it through the
@@ -376,6 +379,11 @@ void main() {
 					break;
 				}
 				vec3 hit_pos = ray_origin + ray_dir * ps.hit_t;
+#ifdef RT_SUBSURFACE_COMPILED
+				if ((ps.packed_bounces_flags & SUBSURFACE_EXIT_FLAG) != 0u) {
+					hit_pos = ps.exit_position; // Where the subsurface walk left the surface (D120).
+				}
+#endif
 				ray_origin = offset_ray_origin(hit_pos, is_back_offset(ps.packed_bounces_flags) ? -ps.offset_normal : ps.offset_normal, ps.hit_t);
 				ray_dir = ps.next_ray_dir;
 				continue;
@@ -393,6 +401,11 @@ void main() {
 			}
 			// Reconstruct the next ray origin from the current ray + hit distance, apply bias
 			vec3 hit_pos = ray_origin + ray_dir * ps.hit_t;
+#ifdef RT_SUBSURFACE_COMPILED
+			if ((ps.packed_bounces_flags & SUBSURFACE_EXIT_FLAG) != 0u) {
+				hit_pos = ps.exit_position; // Where the subsurface walk left the surface (D120).
+			}
+#endif
 			ray_origin = offset_ray_origin(hit_pos, is_back_offset(ps.packed_bounces_flags) ? -ps.offset_normal : ps.offset_normal, ps.hit_t);
 			ray_dir = ps.next_ray_dir;
 		}

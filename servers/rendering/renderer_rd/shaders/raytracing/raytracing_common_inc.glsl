@@ -2,7 +2,7 @@
 // Include AFTER raytracing_inc.glsl and scene_data_inc.glsl.
 // The includer must set exactly one of RT_STAGE_{RAYGEN,MISS,CLOSEST_HIT,ANY_HIT,INTERSECTION}.
 
-// Specialization constant (bits 0-10: flags, 11-12: the SER hint, 13: cluster BLAS, 14-15: position fetch, 16: 2-state micromaps, 17: stochastic texture filtering, 18: the subsurface walk, 19-20: free, 21-28: samples, 29-31: bounces).
+// Specialization constant (bits 0-10: flags, 11-12: the SER hint, 13: cluster BLAS, 14-15: position fetch, 16: 2-state micromaps, 17: stochastic texture filtering, 18: the subsurface walk, 19: its counters, 20: free, 21-28: samples, 29-31: bounces).
 // Bit 13 is read at compile time as USE_CLUSTER_AS (D79), bits 14-15 as USE_POSITION_FETCH and RT_POSITION_FETCH_CHECK (D93), bit 16 as USE_OMM_INDIRECT_2_STATE (D96), never from RT_FLAGS.
 layout(constant_id = 0) const uint RT_FLAGS = 0u;
 
@@ -56,6 +56,7 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 // Camera and bounce rays select all bits; the G-buffer probe selects only bit 2.
 #define RT_MASK_SHADOW 0x02u
 #define RT_MASK_PROCEDURAL 0x04u
+#define RT_MASK_SUBSURFACE 0x08u // Instances whose material walks under its surface (D120), the walk's own rays select them alone.
 
 layout(set = 0, binding = 2, std140) uniform SceneDataBlock {
 	SceneData data;

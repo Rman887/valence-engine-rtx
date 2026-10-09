@@ -249,6 +249,9 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, uint o
 	shadow_ps.bsdf_pdf = 0.0;
 	shadow_ps.cone_width = 0.0;
 	shadow_ps.cone_spread = 0.0;
+#ifdef RT_SUBSURFACE_COMPILED
+	shadow_ps.exit_position = vec3(0.0);
+#endif
 	shadow_ps.offset_normal = vec3(0.0, 0.0, 1.0);
 	shadow_ps.next_ray_dir = vec3(0.0, 0.0, 1.0);
 	path_clear_medium(shadow_ps);

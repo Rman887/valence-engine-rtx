@@ -284,6 +284,7 @@ struct MaterialProperties {
 	float3 clearcoatN; // With a coat: its unit normal, the vertex normal without the normal map.
 	float3 sheenColor; // VAL: the sheen layer's reflectivity, from Godot's RIM and RIM_TINT (D118 MM3); 0 = no sheen.
 	float sheenRoughness; // With a sheen: Estevez and Kulla's r, the surface's roughness clamped to 0.1..1, where the albedo fit holds.
+	float subsurface; // VAL: the diffuse lobe's share that walks under the surface, Godot's SSS_STRENGTH (D120); the direct lobe keeps 1 - it.
 };
 
 // A thin surface that passes light to its other side (D103): light below N is evaluated, not rejected.
@@ -1549,6 +1550,8 @@ void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties m
 	// Specular is already multiplied by F, just attenuate diffuse
 	outDiffuse = (float3(1.0f, 1.0f, 1.0f) - data.F) * outDiffuse;
 #endif
+	// VAL: the subsurface walk's share of the diffuse lobe (D120) arrives at the walk's exit, not here.
+	outDiffuse *= 1.0f - material.subsurface;
 	if (sheened) {
 		outDiffuse = outDiffuse * sheenBase + evalSheen(material, N, L, V);
 		outSpecular *= sheenBase;
@@ -1616,7 +1619,8 @@ float brdf_pdf(float3 N, float3 L, float3 V, MaterialProperties material) {
 	float specularProbability = brdfSpecularProbability(data.specularF0, data.diffuseReflectance);
 	float pdf = 0.0f;
 	if (specularProbability < 1.0f) {
-		pdf += (1.0f - specularProbability) * diffusePdf(data.NdotL);
+		// VAL: a diffuse pick walks under the surface with the subsurface share (D120), so the direct lobe's density keeps the rest.
+		pdf += (1.0f - specularProbability) * (1.0f - material.subsurface) * diffusePdf(data.NdotL);
 	}
 	if (specularProbability > 0.0f && data.alpha > 0.0f) {
 		if (data.anisotropic) {

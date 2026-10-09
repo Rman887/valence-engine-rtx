@@ -381,6 +381,10 @@ RenderRaytracing::~RenderRaytracing() {
 		RD::get_singleton()->free_rid(position_fetch_check_buffer);
 		position_fetch_check_buffer = RID();
 	}
+	if (subsurface_stats_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(subsurface_stats_buffer);
+		subsurface_stats_buffer = RID();
+	}
 
 	if (mat_ubo_pool_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(mat_ubo_pool_buffer);
@@ -1368,6 +1372,11 @@ void RenderRaytracing::prepare_frame() {
 	if (position_fetch_check_buffer.is_valid() && RD::get_singleton()->get_frames_drawn() % 300 == 0) {
 		RD::get_singleton()->buffer_get_data_async(position_fetch_check_buffer, callable_mp_static(&RenderRaytracing::_on_position_fetch_check_read));
 		RD::get_singleton()->buffer_clear(position_fetch_check_buffer, 0, sizeof(uint32_t) * RT_POSITION_FETCH_CHECK_WORDS);
+	}
+	// The subsurface walk's counts (D120), on the same cadence.
+	if (subsurface_stats_buffer.is_valid() && RD::get_singleton()->get_frames_drawn() % 300 == 0) {
+		RD::get_singleton()->buffer_get_data_async(subsurface_stats_buffer, callable_mp_static(&RenderRaytracing::_on_subsurface_stats_read));
+		RD::get_singleton()->buffer_clear(subsurface_stats_buffer, 0, sizeof(uint32_t) * RT_SUBSURFACE_STATS_WORDS);
 	}
 	if (async_probe.enabled) {
 		_async_probe_step();
@@ -8572,6 +8581,19 @@ void RenderRaytracing::_flush_lod_batch(const RenderDataRD *p_render_data, const
 	batch.static_persistent = false;
 }
 
+void RenderRaytracing::_on_subsurface_stats_read(const PackedByteArray &p_bytes) {
+	if (p_bytes.size() < int64_t(sizeof(uint32_t) * RT_SUBSURFACE_STATS_WORDS)) {
+		return;
+	}
+	uint32_t words[RT_SUBSURFACE_STATS_WORDS];
+	memcpy(words, p_bytes.ptr(), sizeof(words));
+	if (words[0] == 0) {
+		return; // No walk in the sampled pixels.
+	}
+	const double walks = words[0];
+	print_line(vformat("RT: subsurface walk (D120), the last 300 frames, one pixel in 64: %d walks, %.1f steps a walk, %d at most; %.2f %% left the surface, %.2f %% ended by roulette or a zero throughput, %.2f %% by the cap of 256; %d front faces stepped past.", words[0], double(words[1]) / walks, words[2], 100.0 * words[3] / walks, 100.0 * words[4] / walks, 100.0 * words[5] / walks, words[6]));
+}
+
 void RenderRaytracing::_on_position_fetch_check_read(const PackedByteArray &p_bytes) {
 	if (p_bytes.size() < int64_t(sizeof(uint32_t) * RT_POSITION_FETCH_CHECK_WORDS)) {
 		return;
@@ -10278,6 +10300,20 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	SceneShaderRaytracing *rt_shader_singleton = SceneShaderRaytracing::get_singleton();
 	rt_shader_singleton->ensure_pipeline_bundle(p_rt_flags);
 
+	// The subsurface walk (D120): while it is compiled in, an instance whose material can walk takes the walk's mask
+	// bit (a BaseMaterial3D with a strength, a custom shader using SSS_STRENGTH), which the walk's rays select alone.
+	const bool subsurface_on = (p_rt_flags & SceneShaderRaytracing::RT_FLAG_SUBSURFACE) != 0;
+	auto subsurface_mask = [&](const RTMaterialData *p_mat) -> uint8_t {
+		if (!subsurface_on || p_mat == nullptr) {
+			return 0;
+		}
+		if (p_mat->rt_sbt_offset > 0) {
+			const SceneShaderRaytracing::CustomShaderEntry *cse = rt_shader_singleton->get_custom_shader_entry(p_mat->rt_sbt_offset);
+			return (cse && cse->uses_sss_strength) ? RT_INSTANCE_MASK_SUBSURFACE : 0;
+		}
+		return p_mat->data.subsurface_strength > 0.0f ? RT_INSTANCE_MASK_SUBSURFACE : 0;
+	};
+
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
 	LocalVector<RID> dirty_blas_list;
@@ -10578,7 +10614,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				pending.transform_moved = transform_moved;
 				pending.mat_data = mat_data;
 				pending.inst_flags = inst_flags;
-				pending.inst_mask = RT_INSTANCE_MASK_GEOMETRY | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0);
+				pending.inst_mask = RT_INSTANCE_MASK_GEOMETRY | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0) | subsurface_mask(mat_data);
 				pending.mm_aabb = mesh_storage->_multimesh_get_aabb(mm_rid);
 				pending.omm_eligible = omm_enabled && !(inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) && (mat_data->rt_sbt_offset == 0 || mat_data->omm_custom) && !mesh_storage->mesh_surface_is_geometry_streamed(mesh_surface);
 				pending_mm_surfaces.push_back(pending);
@@ -10721,7 +10757,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT;
 				}
 			}
-			const uint8_t inst_mask = RT_INSTANCE_MASK_GEOMETRY | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0);
+			const uint8_t inst_mask = RT_INSTANCE_MASK_GEOMETRY | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0) | subsurface_mask(mat_data);
 
 			// The cluster LOD selection (D86): an instance of a surface whose hierarchy is on the GPU
 			// traces its own BLAS over the clusters this frame's selection picks for it, built at
@@ -12904,6 +12940,21 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		sampler.uniform_type = RD::UNIFORM_TYPE_SAMPLER;
 		sampler.append_id(RendererRD::MaterialStorage::get_singleton()->sampler_rd_get_default(filter, RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED));
 		uniforms.push_back(sampler);
+	}
+
+	// Binding 52: the subsurface walk's counters (D120), declared only by a verbose run's shaders with the walk compiled in.
+	if (p_rt_flags & SceneShaderRaytracing::RT_FLAG_SUBSURFACE_STATS) {
+		if (!subsurface_stats_buffer.is_valid()) {
+			Vector<uint8_t> zeros;
+			zeros.resize_initialized(sizeof(uint32_t) * RT_SUBSURFACE_STATS_WORDS);
+			subsurface_stats_buffer = RD::get_singleton()->storage_buffer_create(zeros.size(), zeros);
+			RD::get_singleton()->set_resource_name(subsurface_stats_buffer, "RT subsurface stats");
+		}
+		RD::Uniform u;
+		u.binding = 52;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.append_id(subsurface_stats_buffer);
+		uniforms.push_back(u);
 	}
 
 	// Binding 46: the position-fetch check (D93a), declared only by a verbose run's shaders.

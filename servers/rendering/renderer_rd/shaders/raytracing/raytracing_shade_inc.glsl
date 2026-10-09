@@ -276,6 +276,7 @@ void debug_visualize(
 		dbg_mat.clearcoatN = vec3(0.0, 0.0, 1.0);
 		dbg_mat.sheenColor = vec3(0.0);
 		dbg_mat.sheenRoughness = 1.0;
+		dbg_mat.subsurface = 0.0;
 
 		vec3 dbg_dir;
 		vec3 dbg_weight;
@@ -459,6 +460,159 @@ void shade_direct_light(vec3 p_hit_pos, vec3 p_geometry_normal, float p_hit_t, v
 	}
 }
 
+#ifdef RT_SUBSURFACE_COMPILED
+// ============================================================================
+// SUBSURFACE WALK (D120, docs/r2-subsurface.md)
+// ============================================================================
+
+#define RT_SUBSURFACE_FREE_EVENTS 64u // Scatter events before Russian roulette (nvpro's free budget).
+#define RT_SUBSURFACE_MAX_EVENTS 256u // A walk this long ends its path (Cycles' cap).
+#define RT_SUBSURFACE_MAX_SKIPS 4u // Front faces stepped past in one step; past them the step scatters at its distance.
+#define RT_SUBSURFACE_EXITED 0u
+#define RT_SUBSURFACE_DIED 1u
+#define RT_SUBSURFACE_CAPPED 2u
+
+#ifdef RT_SUBSURFACE_STATS
+// The walk's counters (D120), one pixel in 64: walks, steps (queries), the most steps of one walk, walks that left the
+// surface, walks Russian roulette or a zero throughput ended, walks the cap ended, front faces stepped past. The host
+// reads and clears them on the verbose report's cadence.
+layout(set = 0, binding = 52, std430) buffer SubsurfaceStats {
+	uint words[];
+}
+subsurface_stats;
+#endif
+
+float subsurface_rand(inout uint state) {
+	state = pcg_hash(state);
+	return float(state) * (1.0 / 4294967296.0);
+}
+
+/// The single-scattering albedo of a medium whose semi-infinite slab reflects A in all (Chiang et al. 2016, the form
+/// Cycles' volume_subsurface_albedo_to_single_scattering takes at g = 0).
+vec3 subsurface_single_scattering_albedo(vec3 A) {
+	vec3 s = vec3(4.09712) + 4.20863 * A - sqrt(vec3(9.59217) + 41.6808 * A + 17.7126 * A * A);
+	return vec3(1.0) - s * s;
+}
+
+/// A random walk under the surface h (Cycles' shape): in by a cosine direction about -N from the hit, through a
+/// homogeneous medium whose coefficients come from the albedo and the mean free path (the setting times skin's channel
+/// ratios or equal ones), a channel drawn per step by the throughput it carries times its albedo and the step weighed
+/// by the balance heuristic over the three, isotropic scattering, Russian roulette past the free events and a hard cap.
+/// The walk's rays see only subsurface instances. The first back face of any of them ends the walk: a head and a body
+/// joined at an open seam pass walks across it, and two touching subsurface objects exchange them. A front face is
+/// another walking surface met from outside inside this body (the head's neck shell from the body, teeth in the gums):
+/// the step goes on past it, at most RT_SUBSURFACE_MAX_SKIPS times, then scatters at its distance. On RT_SUBSURFACE_EXITED the
+/// throughput has carried the walk and r_exit_* name where it left: the point, the interpolated vertex normal facing
+/// out, the step's length. The walk draws from a hash of its own, seeded per vertex.
+uint subsurface_walk(HitData h, vec3 p_albedo, bool p_skin, vec3 N, float hit_t, uint p_seed, inout vec3 throughput, out vec3 r_exit_position, out vec3 r_exit_normal, out float r_exit_t, out uint r_events, out uint r_skips) {
+	r_exit_position = h.hit_pos;
+	r_exit_normal = h.geometry_normal;
+	r_exit_t = hit_t;
+	r_events = 0u;
+	r_skips = 0u;
+	const vec3 A = clamp(p_albedo, vec3(0.0), vec3(1.0));
+	// The diffuse lobe's weight carries the albedo, which the walk adds back by scattering: a slab of this medium reflects
+	// A (Cycles divides it out the same way).
+	throughput = vec3(A.r > 0.0 ? throughput.r / A.r : 0.0, A.g > 0.0 ? throughput.g / A.g : 0.0, A.b > 0.0 ? throughput.b / A.b : 0.0);
+	const vec3 ratio = p_skin ? vec3(1.0, 0.373, 0.185) : vec3(1.0);
+	const vec3 sigma_t = 1.0 / max(get_rt_param(RT_PARAM_SUBSURFACE_SCALE) * ratio, vec3(1e-7));
+	const vec3 alpha = subsurface_single_scattering_albedo(A);
+	const vec3 sigma_s = alpha * sigma_t;
+
+	uint rng = p_seed;
+	// The walk's position is kept as an offset from the hit, so trace space rounds each query's origin once and the steps
+	// do not accumulate its error: up to 1024 m from the relative origin (rendering/pathtracing/relative_origin_grid) a
+	// float's step is about 0.1 mm, a fair share of a mean free path. The walk starts on the hit itself, its first query
+	// stepping over the entered triangle by a few of those steps (offset_ray_origin moves a point 256 of them, about
+	// 1.5 cm there, which started walks centimetres deep); a step past a front face starts again as far beyond it.
+	vec3 local = vec3(0.0);
+	const float entry_tmin = max(max(abs(h.hit_pos.x), max(abs(h.hit_pos.y), abs(h.hit_pos.z))) * (4.0 / 8388608.0), 1e-6);
+	vec3 direction = rotatePoint(getRotationFromZAxis(-N), sampleHemisphere(vec2(subsurface_rand(rng), subsurface_rand(rng))));
+	// A shading normal tilted far from the geometry can aim the entry back out; mirror it under the plane.
+	float above = dot(direction, h.geometry_normal);
+	if (above > 0.0) {
+		direction = normalize(direction - 2.0 * above * h.geometry_normal);
+	}
+
+	for (uint event = 0u; event < RT_SUBSURFACE_MAX_EVENTS; event++) {
+		r_events = event;
+		vec3 channel_weight = abs(throughput * alpha);
+		float weight_sum = channel_weight.r + channel_weight.g + channel_weight.b;
+		if (!(weight_sum > 0.0)) {
+			return RT_SUBSURFACE_DIED; // Nothing left to carry (or not a number).
+		}
+		vec3 channel_pdf = channel_weight / weight_sum;
+		float u_channel = subsurface_rand(rng);
+		float sigma = u_channel < channel_pdf.r ? sigma_t.r : (u_channel < channel_pdf.r + channel_pdf.g ? sigma_t.g : sigma_t.b);
+		float t = -log(max(1.0 - subsurface_rand(rng), 1e-10)) / sigma;
+
+		// The step: the first back face along it is the exit; front faces are stepped past.
+		bool exited = false;
+		float t_exit = t;
+		float travelled = 0.0;
+		float step_tmin = event == 0u ? min(entry_tmin, t) : 0.0;
+		for (uint skip = 0u; skip <= RT_SUBSURFACE_MAX_SKIPS && travelled < t; skip++) {
+			rayQueryEXT q;
+			rayQueryInitializeEXT(q, tlas, gl_RayFlagsOpaqueEXT, RT_MASK_SUBSURFACE, h.hit_pos + (local + direction * travelled), step_tmin, direction, t - travelled);
+			while (rayQueryProceedEXT(q)) {
+			}
+			if (rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+				break;
+			}
+			float t_hit = travelled + rayQueryGetIntersectionTEXT(q, true);
+			if (rayQueryGetIntersectionFrontFaceEXT(q, true)) {
+				r_skips++;
+				travelled = t_hit;
+				step_tmin = entry_tmin; // Over the face just met.
+				continue;
+			}
+			exited = true;
+			t_exit = t_hit;
+			// The exit's interpolated vertex normal, which faces out of the body it leaves, as compute_hit_data builds the hit's.
+			int cluster_id = RT_CLUSTER_ID_NONE;
+#ifdef USE_CLUSTER_AS
+			cluster_id = rayQueryGetIntersectionClusterIdNV(q, true);
+#endif
+			GeometryData geom = geometries[rayQueryGetIntersectionInstanceCustomIndexEXT(q, true)];
+			uint i0, i1, i2;
+			rt_resolve_triangle(geom, cluster_id, uint(rayQueryGetIntersectionPrimitiveIndexEXT(q, true)), i0, i1, i2);
+			vec2 b = rayQueryGetIntersectionBarycentricsEXT(q, true);
+			TBNResult tbn = fetch_tbn(geom, i0, i1, i2, vec3(1.0 - b.x - b.y, b.x, b.y));
+			mat3 basis = rt_instance_basis(geom, mat3(rayQueryGetIntersectionObjectToWorldEXT(q, true)));
+			r_exit_normal = normalize(rt_normal_basis(basis) * tbn.normal);
+			break;
+		}
+
+		if (exited) {
+			vec3 transmittance = exp(-sigma_t * t_exit);
+			throughput *= transmittance / dot(channel_pdf, transmittance);
+			r_exit_position = h.hit_pos + (local + direction * t_exit);
+			r_exit_t = t_exit;
+			r_events = event + 1u;
+			return RT_SUBSURFACE_EXITED;
+		}
+		vec3 transmittance = exp(-sigma_t * t);
+		throughput *= sigma_s * transmittance / dot(channel_pdf, sigma_t * transmittance);
+		local += direction * t;
+		float z = 1.0 - 2.0 * subsurface_rand(rng);
+		float r = sqrt(max(0.0, 1.0 - z * z));
+		float phi = TWO_PI * subsurface_rand(rng);
+		direction = vec3(r * cos(phi), r * sin(phi), z);
+
+		if (event + 1u >= RT_SUBSURFACE_FREE_EVENTS) {
+			float survive = min(max(throughput.r, max(throughput.g, throughput.b)), 0.999);
+			if (!(subsurface_rand(rng) < survive)) {
+				r_events = event + 1u;
+				return RT_SUBSURFACE_DIED;
+			}
+			throughput /= survive;
+		}
+	}
+	r_events = RT_SUBSURFACE_MAX_EVENTS;
+	return RT_SUBSURFACE_CAPPED;
+}
+#endif
+
 /// ray_dir and hit_t describe the ray that reached h.hit_pos: the hit stage's
 /// built-ins, or the raygen's own primary ray for a G-buffer surface.
 void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
@@ -468,6 +622,9 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// previous vertex's back offset (D103) is spent: only a transmission below sets it again.
 	ps.hit_t = hit_t;
 	ps.packed_bounces_flags = set_back_offset(ps.packed_bounces_flags, false);
+#ifdef RT_SUBSURFACE_COMPILED
+	ps.packed_bounces_flags &= ~SUBSURFACE_EXIT_FLAG; // And so is the previous vertex's walk exit (D120).
+#endif
 	// The ray cone moves to the hit (D116), which is the next ray's origin on every exit.
 	ps.cone_width += ps.cone_spread * hit_t;
 
@@ -568,6 +725,11 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// so its terms, the base's attenuation and the guides agree.
 	brdf_mat.sheenColor = vec3(0.0);
 	brdf_mat.sheenRoughness = clamp(m.roughness, 0.1, 1.0); // Below 0.1 the albedo fit leans on its r = 0 row and under-states the lobe.
+	// VAL: the diffuse lobe's share that walks under the surface (D120); constant 0 while the walk is not compiled in.
+	brdf_mat.subsurface = 0.0;
+#ifdef RT_SUBSURFACE_COMPILED
+	brdf_mat.subsurface = m.subsurface;
+#endif
 	if (m.rim > 0.0 && dot(N, V) > 0.0) {
 		brdf_mat.sheenColor = clamp(m.rim * m.albedo * mix(vec3(1.0), m.albedo, m.rim_tint) * (1.0 - m.metalness), vec3(0.0), vec3(1.0));
 	}
@@ -839,6 +1001,67 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 
 	ps.throughput *= brdf_weight;
 
+#ifdef RT_SUBSURFACE_COMPILED
+	// VAL: subsurface scattering (D120). A diffuse pick walks under the surface with the subsurface share s. The direct
+	// lobe's NEE and density carry 1 - s and the walk s, so the choice divides neither weight. The walk replaces the
+	// diffuse bounce: its exit samples a light with a white Lambert and the path leaves by a cosine direction about the
+	// exit's normal, counted as the diffuse bounce.
+	bool walked = false;
+	vec3 exit_position = h.hit_pos;
+	vec3 exit_normal = h.geometry_normal;
+	MaterialProperties exit_mat = brdf_mat;
+	// Only from outside: a back face (seen from inside an open mesh) keeps the plain diffuse bounce.
+	if (brdfType == DIFFUSE_TYPE && !coat_sampled && !sheen_sampled && !diffuse_transmitted && brdf_mat.subsurface > 0.0 && h.is_front_face) {
+		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SUBSURFACE);
+		if (rand(ps.rng_state) < brdf_mat.subsurface) {
+			float exit_t;
+			uint events, skips;
+			uint seed = pcg_hash(ps.rng_state ^ pcg_hash(rt_pixel_seed() + total_bounces * 0x9e3779b9u));
+			uint status = subsurface_walk(h, m.albedo, m.subsurface_skin, N, hit_t, seed, ps.throughput, exit_position, exit_normal, exit_t, events, skips);
+#ifdef RT_SUBSURFACE_STATS
+			if (((gl_LaunchIDEXT.x | gl_LaunchIDEXT.y) & 7u) == 0u) {
+				atomicAdd(subsurface_stats.words[0], 1u);
+				atomicAdd(subsurface_stats.words[1], events);
+				atomicMax(subsurface_stats.words[2], events);
+				atomicAdd(subsurface_stats.words[3u + status], 1u);
+				atomicAdd(subsurface_stats.words[6], skips);
+			}
+#endif
+			if (status != RT_SUBSURFACE_EXITED) {
+				ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+				path_pack(payload, ps);
+				return;
+			}
+			walked = true;
+			exit_mat.baseColor = vec3(1.0);
+			exit_mat.metalness = 0.0;
+			exit_mat.roughness = 1.0;
+			exit_mat.dielectricF0 = 0.0;
+			exit_mat.emissive = vec3(0.0);
+			exit_mat.transmissivness = 0.0;
+			exit_mat.opacity = 1.0;
+			exit_mat.diffuseTransmission = vec3(0.0);
+			exit_mat.anisotropy = 0.0;
+			exit_mat.anisotropyT = vec3(0.0);
+			exit_mat.clearcoat = 0.0;
+			exit_mat.clearcoatAlpha = 0.001;
+			exit_mat.clearcoatN = exit_normal;
+			exit_mat.sheenColor = vec3(0.0);
+			exit_mat.sheenRoughness = 1.0;
+			exit_mat.subsurface = 0.0;
+			// The exit's light sample, viewed along its normal (a Lambert is the same from every side), on its own block. Past
+			// the walk the path has scattered, so its light is indirect for the clamp (D53).
+			ps.packed_bounces_flags = set_scattered(ps.packed_bounces_flags);
+			path_pack(payload, ps);
+			rng_set_dimension(ps.rng_state, RT_SOBOL_DIM_SUBSURFACE_EXIT_BASE + total_bounces * RT_SOBOL_DIMS_PER_BOUNCE);
+			shade_direct_light(exit_position, exit_normal, exit_t, exit_normal, exit_normal, exit_mat, 0.0, diffuse_bounces, rt_emissive_count, in_medium, ps);
+			// And its direction: the cosine cancels its density, leaving a weight of 1.
+			rng_set_dimension(ps.rng_state, RT_SOBOL_DIM_SUBSURFACE_EXIT_BASE + total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER);
+			next_dir = rotatePoint(getRotationFromZAxis(exit_normal), sampleHemisphere(rand2(ps.rng_state)));
+		}
+	}
+#endif
+
 	// Russian roulette (D73): once an earlier vertex has scattered (D53's flag: a non-delta lobe,
 	// so a surface seen through glass, water or a mirror is exempt as a directly seen one is), the
 	// path continues with the probability of its throughput's brightest channel and, when it does,
@@ -875,18 +1098,31 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// weight; every other direction is weighed with the density brdf_pdf assigns it, which is
 	// the same function light sampling evaluates for its own directions. The miss weighs the sky
 	// with it too when the sky is a light (D54).
+	vec3 pdf_N = N;
+	vec3 pdf_V = V;
+	MaterialProperties pdf_mat = brdf_mat;
+	bool pdf_unowned = (diffuse_transmit_p > 0.0 && diffuse_transmitted != (dot(N, next_dir) < 0.0)) || base_below_coat || (sheen_sampled && dot(N, next_dir) <= 0.0);
+#ifdef RT_SUBSURFACE_COMPILED
+	if (walked) {
+		// After a walk the direction left the exit by its Lambert (D120).
+		pdf_N = exit_normal;
+		pdf_V = exit_normal;
+		pdf_mat = exit_mat;
+		pdf_unowned = false;
+	}
+#endif
 	if ((rt_emissive_count == 0u && !sky_light_enabled()) || delta_lobe) {
 		// With no emitter listed and no sky light nothing reads the density, so both off cost no ALU here.
 		ps.bsdf_pdf = RT_BSDF_PDF_DELTA;
 	} else {
-		float pdf = brdf_pdf(N, next_dir, V, brdf_mat);
+		float pdf = brdf_pdf(pdf_N, next_dir, pdf_V, pdf_mat);
 		// A direction the density cannot own (the below-hemisphere recovery; on a thin surface, a
 		// direction on the side of N the chosen lobe does not sample: a transmitted one mirrored back
 		// above N, a reflected one in the wedge between N and the geometry plane) is one light
 		// sampling does not produce this way, so the BSDF strategy keeps the whole weight. So is a base lobe's
 		// direction below N under a coat (D118 MM2): light sampling evaluates only the coat there. So is a sheen
 		// sample the recovery mirrored below N (D118 MM3), which the sheen's density does not cover.
-		if ((diffuse_transmit_p > 0.0 && diffuse_transmitted != (dot(N, next_dir) < 0.0)) || base_below_coat || (sheen_sampled && dot(N, next_dir) <= 0.0)) {
+		if (pdf_unowned) {
 			pdf = 0.0;
 		}
 		ps.bsdf_pdf = pdf > 0.0 ? pdf : RT_BSDF_PDF_DELTA;
@@ -897,8 +1133,8 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	if (rt_texture_lod_enabled() && !delta_lobe) {
 		float pdf = ps.bsdf_pdf;
 		if (pdf == RT_BSDF_PDF_DELTA) {
-			pdf = brdf_pdf(N, next_dir, V, brdf_mat);
-			if ((diffuse_transmit_p > 0.0 && diffuse_transmitted != (dot(N, next_dir) < 0.0)) || base_below_coat || (sheen_sampled && dot(N, next_dir) <= 0.0)) {
+			pdf = brdf_pdf(pdf_N, next_dir, pdf_V, pdf_mat);
+			if (pdf_unowned) {
 				pdf = 0.0;
 			}
 		}
@@ -910,6 +1146,14 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	ps.hit_t = hit_t;
 	ps.offset_normal = h.geometry_normal;
 	ps.packed_bounces_flags = set_back_offset(ps.packed_bounces_flags, diffuse_transmitted);
+#ifdef RT_SUBSURFACE_COMPILED
+	if (walked) {
+		// The next ray leaves from where the walk left the surface (D120), offset along its exit normal.
+		ps.offset_normal = exit_normal;
+		ps.exit_position = exit_position;
+		ps.packed_bounces_flags |= SUBSURFACE_EXIT_FLAG;
+	}
+#endif
 	ps.next_ray_dir = next_dir;
 	path_pack(payload, ps);
 }

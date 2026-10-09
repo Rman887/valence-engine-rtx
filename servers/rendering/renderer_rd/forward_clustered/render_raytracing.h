@@ -631,6 +631,7 @@ static constexpr uint32_t RT_LOD_STREAM_STATE_FLAG_ROOT = 1;
 // (D93b) cluster geometry hits whose blob was compared with the surface's buffers and those with a
 // word that differs.
 static constexpr uint32_t RT_POSITION_FETCH_CHECK_WORDS = 11;
+static constexpr uint32_t RT_SUBSURFACE_STATS_WORDS = 7; // The walk's counters (D120), binding 52.
 // A cluster geometry record (D93b): the cluster's blob address (two words), its vertex count |
 // triangle count << 16, its first triangle in [LOD 0 | coarse tail]. Must match the GLSL.
 static constexpr uint32_t RT_CLUSTER_GEOMETRY_RECORD_WORDS = 4;
@@ -1899,6 +1900,9 @@ class RenderRaytracing {
 	// fetched positions it compared with the vertex buffer's, of those that differ and the largest
 	// difference, by kind (RT_POSITION_FETCH_CHECK_WORDS words, binding 46), cleared after each read.
 	RID position_fetch_check_buffer;
+	// The subsurface walk's counters (D120, RT_SUBSURFACE_STATS_WORDS words, binding 52), made by the first verbose
+	// frame that compiles the walk in, read and cleared on the verbose report's cadence.
+	RID subsurface_stats_buffer;
 	HashMap<uint32_t, RTSurfaceData *> cluster_lod_stream_surfaces;
 	LocalVector<RTLodStreamRead> cluster_lod_stream_reads;
 	LocalVector<RTLodStreamLoad> cluster_lod_stream_loads;
@@ -2119,6 +2123,7 @@ class RenderRaytracing {
 	static constexpr uint8_t RT_INSTANCE_MASK_GEOMETRY = 0x01;
 	static constexpr uint8_t RT_INSTANCE_MASK_SHADOW = 0x02;
 	static constexpr uint8_t RT_INSTANCE_MASK_PROCEDURAL = 0x04;
+	static constexpr uint8_t RT_INSTANCE_MASK_SUBSURFACE = 0x08; // A material whose diffuse lobe walks (D120); the walk's rays select it alone.
 	LocalVector<uint32_t> sbt_offsets; // 0 = default material hit group
 
 	// Slot-resident instances (D94b): on with every TLAS a PTLAS (D94a). The arrays above then hold
@@ -2494,6 +2499,7 @@ class RenderRaytracing {
 		return flags;
 	}
 	static void _on_position_fetch_check_read(const PackedByteArray &p_bytes);
+	static void _on_subsurface_stats_read(const PackedByteArray &p_bytes);
 	static void _mesh_surface_freed(RID p_mesh, uint32_t p_surface);
 	// Frees the surface's BLAS and, on the cluster path, the staging buffers or the arena region it lives in.
 	void _release_surface_data(RTSurfaceData *p_surf_data);

@@ -66,7 +66,7 @@ const float RT_TEXTURE_LOD_BASE = -128.0;
 
 struct PathPayload {
 	uint packed_rt[3]; // 12 bytes - radiance+throughput interleaved as fp16
-	uint packed_bounces_flags; //  4 bytes - [flags:8][unused:7][back offset:1, D103][diffuse:8][total:8]
+	uint packed_bounces_flags; //  4 bytes - [flags:8][unused:6][subsurface exit:1, D120][back offset:1, D103][diffuse:8][total:8]
 	uint rng_state; //  4 bytes - the sampler's state (D52): the PCG chain, or the Sobol index and dimension
 	float hit_t; //  4 bytes - ray distance, used by raygen to rebuild origin
 	uint oct_offset_nrm; //  4 bytes - packUnorm2x16(vec3_to_oct(offset normal))
@@ -83,6 +83,11 @@ struct PathPayload {
 	// The ray cone at the ray's origin (D116): its width in metres and its full spread angle in
 	// radians, as an fp16 pair. The width at a hit is width + spread * t.
 	uint packed_cone; //  4 bytes
+#ifdef RT_SUBSURFACE_COMPILED
+	// Where a subsurface walk (D120) left the surface, in trace space: under SUBSURFACE_EXIT_FLAG the raygen starts
+	// the next ray there in place of the point it reconstructs from hit_t. 68 bytes in all while the walk is compiled in.
+	vec3 exit_position; // 12 bytes
+#endif
 };
 
 const float RT_BSDF_PDF_DELTA = -1.0;
@@ -102,6 +107,9 @@ struct PathState {
 	float bsdf_pdf;
 	float cone_width;
 	float cone_spread;
+#ifdef RT_SUBSURFACE_COMPILED
+	vec3 exit_position;
+#endif
 };
 
 PathState path_unpack(PathPayload p) {
@@ -126,6 +134,9 @@ PathState path_unpack(PathPayload p) {
 	vec2 cone = unpackHalf2x16(p.packed_cone);
 	s.cone_width = cone.x;
 	s.cone_spread = cone.y;
+#ifdef RT_SUBSURFACE_COMPILED
+	s.exit_position = p.exit_position;
+#endif
 	return s;
 }
 
@@ -149,6 +160,9 @@ void path_pack(inout PathPayload p, PathState s) {
 	p.medium_entry_height = s.medium_entry_height;
 	p.bsdf_pdf = s.bsdf_pdf;
 	p.packed_cone = packHalf2x16(clamp(vec2(s.cone_width, s.cone_spread), vec2(0.0), vec2(FP16_MAX)));
+#ifdef RT_SUBSURFACE_COMPILED
+	p.exit_position = s.exit_position;
+#endif
 }
 
 /// A path state with no medium: the fields every fresh path (a sample's start, a shadow ray)
@@ -180,6 +194,8 @@ uint inc_diffuse_bounce(uint packed) {
 // transmission. The origin is offset along -offset_normal, while offset_normal stays the receiver
 // the light selection judged, so the next vertex's chance-hit and miss densities read it unchanged.
 const uint BACK_OFFSET_FLAG = (1u << 16);
+// The next ray starts at PathState.exit_position, where a subsurface walk left the surface (D120).
+const uint SUBSURFACE_EXIT_FLAG = (1u << 17);
 uint set_back_offset(uint packed, bool back) {
 	return back ? (packed | BACK_OFFSET_FLAG) : (packed & ~BACK_OFFSET_FLAG);
 }
@@ -300,6 +316,10 @@ const uint FLAG_ATTRIBUTES_COMPRESSED = 16u;
 #define RT_SOBOL_DIM_TEXTURE_FILTERING 45u // The texel pair, the level and (anisotropic, past the primary hit) the major axis's position a hit's stochastic texture lookups share (D117), three dimensions.
 #define RT_SOBOL_DIM_CLEARCOAT 48u // The coat's choice before the base's lobes (D118 MM2), apart so the scatter's draws keep their dimensions.
 #define RT_SOBOL_DIM_SHEEN 49u // The sheen's choice under the coat and over the base's lobes (D118 MM3), apart as the coat's is.
+#define RT_SOBOL_DIM_SUBSURFACE 50u // The diffuse lobe's choice between its direct share and the subsurface walk (D120).
+// The walk's exit vertex (D120) takes a block past the eight bounces' (512 + 64 x bounce), so its light sample and
+// direction never share dimensions with the next vertex's; the walk itself draws from a hash of its own.
+#define RT_SOBOL_DIM_SUBSURFACE_EXIT_BASE 512u
 
 // Both in raytracing_common_inc.glsl, which every stage includes after this file, after its
 // ray-tracing extensions are enabled and where the specialization constant is declared.

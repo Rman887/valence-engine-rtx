@@ -76,7 +76,8 @@ public:
 	// Bit 16:    Opacity micromaps in 2-state on indirect rays (D96 OMMe)
 	// Bit 17:    Stochastic texture filtering (D117)
 	// Bit 18:    Subsurface walk (D120)
-	// Bits 19-20: Free
+	// Bit 19:    Its counters (D120)
+	// Bit 20:    Free
 	// Bits 21-28: Sample count
 	// Bits 29-31: Max bounce count (offset by 1: 0=1 bounce, 7=8 bounces)
 	enum RaytracingFlags {
@@ -98,6 +99,7 @@ public:
 		RT_FLAG_OMM_INDIRECT_2_STATE = (1 << 16), // Rays past the path's first diffuse bounce resolve unknown micro-triangles by their side (D96 OMMe). Set while micromaps are on with rendering/pathtracing/opacity_micromap_indirect_2_state.
 		RT_FLAG_TEXTURE_FILTERING = (1 << 17), // The hit shaders compile stochastic texture filtering in (D117). Set while rendering/pathtracing/texture_filtering is not off; the filter itself is RT_PARAM_TEXTURE_FILTERING.
 		RT_FLAG_SUBSURFACE = (1 << 18), // The hit shaders compile the subsurface walk in (D120). Set while rendering/pathtracing/subsurface is on.
+		RT_FLAG_SUBSURFACE_STATS = (1 << 19), // A verbose run's walks count themselves (D120, binding 52). Set only with RT_FLAG_SUBSURFACE.
 	};
 
 	// The coherence hint the raygen hands reorderThreadEXT beside the hit's shader (D75), the
@@ -425,6 +427,7 @@ public:
 		bool writes_uv = false; // Writes UV or UV2, whose density the mesh's UVs no longer tell: every texture() call reads level 0 (D116)
 		bool uses_uv2 = false; // Reads or writes UV2: the hits fetch the mesh's second UV set (D118)
 		bool sss_mode_skin = false; // render_mode sss_mode_skin: the subsurface walk takes skin's channel ratios (D120)
+		bool uses_sss_strength = false; // Uses SSS_STRENGTH: its instances take the walk's mask bit while the walk is on (D120)
 		bool is_procedural = false; // Uses intersection shader instead of triangle geometry
 		uint32_t alpha_texture_buffer_offset = UINT32_MAX; // Byte offset of hint_alpha texture index in CustomMaterialUniforms UBO; UINT32_MAX if absent
 		// render_mode opacity_micromap with a hint_alpha texture (D96): the trace's alpha test is the standard

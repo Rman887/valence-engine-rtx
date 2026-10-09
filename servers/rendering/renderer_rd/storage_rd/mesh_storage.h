@@ -32,6 +32,7 @@
 
 #include "core/templates/local_vector.h"
 #include "core/templates/rid_owner.h"
+#include "core/templates/safe_refcount.h"
 #include "core/templates/self_list.h"
 #include "servers/rendering/renderer_compositor.h"
 #include "servers/rendering/renderer_rd/shaders/skeleton.glsl.gen.h"
@@ -254,9 +255,9 @@ private:
 	// Drops a surface's RAM copy (D93): its hierarchy is gone or no longer describes it, or the
 	// surface is going. A surface whose buffers still hold its fallback level is being freed.
 	void _mesh_surface_clear_ram(Mesh::Surface &r_surface) {
-		cluster_geometry_ram_bytes -= _mesh_surface_ram_bytes(r_surface);
+		cluster_geometry_ram_bytes.sub(_mesh_surface_ram_bytes(r_surface));
 		if (r_surface.fallback_in_buffers) {
-			cluster_geometry_fallback_bytes -= uint64_t(r_surface.vertex_buffer_size) + r_surface.attribute_buffer_size + r_surface.index_buffer_size;
+			cluster_geometry_fallback_bytes.sub(uint64_t(r_surface.vertex_buffer_size) + r_surface.attribute_buffer_size + r_surface.index_buffer_size);
 			r_surface.fallback_in_buffers = false;
 		}
 		r_surface.ram_vertex_data.clear();
@@ -273,8 +274,9 @@ private:
 		return bytes;
 	}
 	void _mesh_surface_restore_buffers(RID p_mesh_rid, Mesh *p_mesh, int p_surface);
-	uint64_t cluster_geometry_ram_bytes = 0;
-	uint64_t cluster_geometry_fallback_bytes = 0;
+	// Written from loader threads (mesh_create_from_surfaces) and the render thread (restores, region writes, frees).
+	SafeNumeric<uint64_t> cluster_geometry_ram_bytes;
+	SafeNumeric<uint64_t> cluster_geometry_fallback_bytes;
 	static float _cluster_geometry_fallback_ratio();
 	// mesh_get_surface() from the GPU buffers, and for a surface that streams its geometry from its
 	// RAM copy (D93d).
@@ -596,8 +598,8 @@ public:
 	}
 
 	// Geometry residency's host memory (D93d): the RAM copies held, and the fallback levels' buffers.
-	uint64_t get_cluster_geometry_ram_bytes() const { return cluster_geometry_ram_bytes; }
-	uint64_t get_cluster_geometry_fallback_bytes() const { return cluster_geometry_fallback_bytes; }
+	uint64_t get_cluster_geometry_ram_bytes() const { return cluster_geometry_ram_bytes.get(); }
+	uint64_t get_cluster_geometry_fallback_bytes() const { return cluster_geometry_fallback_bytes.get(); }
 	// A mesh's surfaces whose buffers hold a fallback level (D93d) get their whole buffers back: the
 	// G-buffer primary surface (D35) rasterizes what the trace intersects.
 	void mesh_restore_raster_geometry(RID p_mesh);

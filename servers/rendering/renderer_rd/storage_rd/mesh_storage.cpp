@@ -773,8 +773,8 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	s->uv_scale = new_surface.uv_scale;
 	s->cluster_data = new_surface.cluster_data;
 	if (mesh_surface_is_geometry_streamed(s)) {
-		cluster_geometry_ram_bytes += _mesh_surface_ram_bytes(*s);
-		cluster_geometry_fallback_bytes += uint64_t(s->vertex_buffer_size) + s->attribute_buffer_size + s->index_buffer_size;
+		cluster_geometry_ram_bytes.add(_mesh_surface_ram_bytes(*s));
+		cluster_geometry_fallback_bytes.add(uint64_t(s->vertex_buffer_size) + s->attribute_buffer_size + s->index_buffer_size);
 		if (_is_cluster_geometry_ram_check_wanted()) {
 			_mesh_surface_check_ram(*s, new_surface, buffer_vertex_data, buffer_attribute_data, buffer_index_data);
 		}
@@ -1087,7 +1087,7 @@ void MeshStorage::_mesh_surface_restore_buffers(RID p_mesh_rid, Mesh *p_mesh, in
 	Mesh::Surface &s = *p_mesh->surfaces[p_surface];
 	RD *rd = RD::get_singleton();
 	if (s.fallback_in_buffers) {
-		cluster_geometry_fallback_bytes -= uint64_t(s.vertex_buffer_size) + s.attribute_buffer_size + s.index_buffer_size;
+		cluster_geometry_fallback_bytes.sub(uint64_t(s.vertex_buffer_size) + s.attribute_buffer_size + s.index_buffer_size);
 		s.fallback_in_buffers = false;
 	}
 	// The buffers' dependents (vertex and index arrays) go with them.

@@ -725,10 +725,11 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// so its terms, the base's attenuation and the guides agree.
 	brdf_mat.sheenColor = vec3(0.0);
 	brdf_mat.sheenRoughness = clamp(m.roughness, 0.1, 1.0); // Below 0.1 the albedo fit leans on its r = 0 row and under-states the lobe.
-	// VAL: the diffuse lobe's share that walks under the surface (D120); constant 0 while the walk is not compiled in.
+	// VAL: the diffuse lobe's share that walks under the surface (D120); constant 0 while the walk is not compiled in. A
+	// back face (an open mesh seen from inside) never walks, so it keeps the whole diffuse lobe.
 	brdf_mat.subsurface = 0.0;
 #ifdef RT_SUBSURFACE_COMPILED
-	brdf_mat.subsurface = m.subsurface;
+	brdf_mat.subsurface = h.is_front_face ? m.subsurface : 0.0;
 #endif
 	if (m.rim > 0.0 && dot(N, V) > 0.0) {
 		brdf_mat.sheenColor = clamp(m.rim * m.albedo * mix(vec3(1.0), m.albedo, m.rim_tint) * (1.0 - m.metalness), vec3(0.0), vec3(1.0));

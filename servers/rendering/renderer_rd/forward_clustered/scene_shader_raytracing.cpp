@@ -1764,6 +1764,10 @@ void SceneShaderRaytracing::init(const String p_defines) {
 		actions.renames["SSS_TRANSMITTANCE_DEPTH"] = "transmittance_depth";
 		actions.renames["SSS_TRANSMITTANCE_BOOST"] = "transmittance_boost";
 		actions.renames["BACKLIGHT"] = "backlight";
+		actions.renames["BENT_NORMAL_MAP"] = "bent_normal_map";
+		// The trace has no shadow pass and draws one view.
+		actions.renames["IN_SHADOW_PASS"] = "false";
+		actions.renames["IS_MULTIVIEW"] = "false";
 		actions.renames["TRANSMISSION"] = "transmission";
 		actions.renames["IOR"] = "ior";
 		actions.renames["ABSORPTION"] = "absorption";

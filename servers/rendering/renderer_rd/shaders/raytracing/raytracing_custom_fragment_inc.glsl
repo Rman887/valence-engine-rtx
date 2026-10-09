@@ -37,6 +37,11 @@ inv_view_matrix = transpose(mat4(scene_data_block.data.inv_view_matrix[0],
 // The trace runs in world space minus rt_origin; user shader code gets the
 // absolute matrices it expects (view_abs = view_rel * translate(-rt_origin)).
 read_model_matrix[3].xyz += rt_origin.xyz;
+// As the raster builds it: the basis itself under uniform scale, its inverse transpose otherwise.
+model_normal_matrix = mat3(read_model_matrix);
+if (!rt_basis_has_uniform_scale(model_normal_matrix)) {
+	model_normal_matrix = transpose(inverse(model_normal_matrix));
+}
 inv_view_matrix[3].xyz += rt_origin.xyz;
 read_view_matrix[3].xyz -= mat3(read_view_matrix) * rt_origin.xyz;
 projection_matrix = scene_data_block.data.projection_matrix;
@@ -108,6 +113,19 @@ float ior = 1.5;
 vec3 absorption = vec3(0.0);
 vec3 scattering = vec3(0.0);
 float sss_strength = 0.0;
+// Built-ins the trace has no use for, at the raster's defaults: declared so a shader the raster runs
+// still compiles its hit group (an undeclared built-in fails it, and the instance leaves the TLAS).
+vec4 transmittance_color = vec4(0.0, 0.0, 0.0, 1.0);
+float transmittance_depth = 0.0;
+float transmittance_boost = 0.0;
+float rt_depth = 0.0;
+float premul_alpha = 1.0;
+vec4 custom_radiance = vec4(0.0);
+vec4 custom_irradiance = vec4(0.0);
+vec3 light_vertex = vertex;
+vec3 bent_normal_map = vec3(0.5);
+vec2 rt_point_coord = vec2(0.5);
+vec4 fog = vec4(0.0, 0.0, 0.0, 1.0);
 float rim = 0.0;
 float rim_tint = 0.0;
 float clearcoat = 0.0;

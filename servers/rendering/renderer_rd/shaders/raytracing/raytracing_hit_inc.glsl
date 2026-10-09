@@ -355,6 +355,13 @@ mat3 rt_normal_basis(mat3 basis) {
 	return dot(basis[0], cofactor[0]) < 0.0 ? -cofactor : cofactor;
 }
 
+/// Whether a basis scales its axes alike, the raster's test for drawing an instance's normals with
+/// the basis itself rather than its inverse transpose (RenderGeometryInstanceBase::set_transform).
+bool rt_basis_has_uniform_scale(mat3 basis) {
+	vec3 scale = vec3(length(basis[0]), length(basis[1]), length(basis[2]));
+	return min(scale.x, min(scale.y, scale.z)) >= 0.999 * max(scale.x, max(scale.y, scale.z));
+}
+
 // ============================================================================
 // VERTEX ATTRIBUTE FETCHING (requires hitAttributeEXT vec2 attribs to be declared)
 // ============================================================================

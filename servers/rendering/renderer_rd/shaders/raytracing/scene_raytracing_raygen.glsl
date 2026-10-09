@@ -1191,6 +1191,9 @@ layout(buffer_reference, std140) readonly buffer CustomMaterialUniforms{
 /* RT_CUSTOM_TEXTURE_DEFINES */
 
 // File-scope built-ins accessible from user helper functions in globals.
+#define ViewIndex 0
+#define SHADER_IS_SRGB false
+#define SHADER_SPACE_FAR 0.0
 float global_time = scene_data_block.data.time;
 float global_prev_time = 0.0;
 mat4 read_model_matrix = mat4(0.0);

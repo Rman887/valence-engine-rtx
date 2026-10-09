@@ -367,6 +367,98 @@ vec3 shade_previous_origin(HitData h, vec3 ray_dir, float hit_t) {
 #endif
 }
 
+/// One light sample at a surface for its next-event estimate (D50 to D72): the strategy split, the sample,
+/// the shadow ray and the BSDF, added to ps.radiance at the path's throughput. The caller pins the
+/// sampler's dimension first. p_hit_pos and p_geometry_normal are the vertex and its normal facing the side
+/// the path arrived from, p_hit_t the length of the segment that reached it (for the origin's offset);
+/// diffuse_transmit_max a thin surface's transmission (D103), whose samples below N leave from the back.
+void shade_direct_light(vec3 p_hit_pos, vec3 p_geometry_normal, float p_hit_t, vec3 N, vec3 V, MaterialProperties brdf_mat, float diffuse_transmit_max, uint diffuse_bounces, uint rt_emissive_count, bool in_medium, inout PathState ps) {
+	uint rt_light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
+	// The selection's receiver: the geometry normal as the payload carries it to the next vertex,
+	// so the chance-hit and miss densities there read the same function of the same normal (the
+	// light tree's since D55, the sky's share by variance since D65).
+	vec3 N_select = oct_to_vec3(unpackUnorm2x16(packUnorm2x16(vec3_to_oct(p_geometry_normal))) * 2.0 - 1.0);
+	// The sky's share of the light samples (D54), 0 without a sky light; the surface lights
+	// split the rest, so their densities carry the remainder on both sides of the weight.
+	float p_sky = light_tree_enabled() ? 0.0 : sky_light_probability(N_select);
+	// Under the tree (D55) the sky's share is per hit, so a frame whose only light is the sky still
+	// takes its sample here (the miss weighs against it either way).
+	bool tree_sky = light_tree_enabled() && sky_light_enabled() && sky_total > 0.0;
+	if (rt_light_count > 0u || rt_emissive_count > 0u || p_sky > 0.0 || tree_sky) {
+		vec3 hit_pos_offset = offset_ray_origin(p_hit_pos, p_geometry_normal, p_hit_t);
+		bool is_indirect = (diffuse_bounces > 0u);
+		// One light sample per hit (D50): the analytic lights or the emissive list, chosen by the
+		// per-frame share, the contribution divided by its share. Nothing is drawn for the choice
+		// when the emissive list is empty, so such a frame keeps its random sequence. Only the
+		// sample's generation diverges; the shadow ray and the BRDF below are shared, so a warp
+		// whose threads chose differently traces once. The sky is the third strategy (D54), drawn
+		// first by its share; the surface lights split the rest as before, so a frame without a
+		// sky light keeps its random sequence.
+		bool sample_sky = p_sky > 0.0;
+		float strategy_probability = 1.0;
+		if (sample_sky && (rt_light_count > 0u || rt_emissive_count > 0u)) {
+			sample_sky = rand(ps.rng_state) < p_sky;
+			strategy_probability = sample_sky ? p_sky : (1.0 - p_sky);
+		}
+		bool sample_emissive = !sample_sky && rt_emissive_count > 0u;
+		if (!light_tree_enabled() && !sample_sky && rt_light_count > 0u && rt_emissive_count > 0u) {
+			float p_emissive = get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY);
+			sample_emissive = rand(ps.rng_state) < p_emissive;
+			strategy_probability *= sample_emissive ? p_emissive : (1.0 - p_emissive);
+		}
+		LightSampleNEE light_sample;
+		bool have_sample;
+		if (light_tree_enabled()) {
+			// The light tree (D55) chooses among every strategy by its importance here, judged on
+			// N_select, so the next vertex recovers the same probability; the shading normal still
+			// decides what the sample delivers.
+			uint tree_candidates = uint(get_rt_param(RT_PARAM_EMISSIVE_CANDIDATES));
+			// Past the first diffuse bounce the sample is drawn over the coarser indirect cut (D59);
+			// the payload tells the next vertex, whose chance-hit and miss densities read the same cut.
+			if (is_indirect) {
+				ps.packed_bounces_flags = set_light_tree_indirect(ps.packed_bounces_flags);
+			}
+			have_sample = light_tree_sample_direct(hit_pos_offset, N_select, N, V, brdf_mat, ps.rng_state, is_indirect, tree_candidates, light_sample, strategy_probability);
+		} else if (sample_sky) {
+			have_sample = sky_sample_direct(N, V, brdf_mat, ps.rng_state, strategy_probability, light_sample);
+		} else if (sample_emissive) {
+			uint candidates = uint(get_rt_param(RT_PARAM_EMISSIVE_CANDIDATES));
+			have_sample = emissive_sample_direct(hit_pos_offset, N, V, brdf_mat, ps.rng_state, strategy_probability, rt_emissive_count, candidates, light_sample);
+		} else {
+			have_sample = lights_sample_direct(hit_pos_offset, N, brdf_mat, ps.rng_state, is_indirect, rt_light_count, light_sample);
+		}
+		// A sample a thin surface takes through its transmission (D103) leaves from the other side,
+		// aimed at the point the light was sampled at from the front origin, so it ends where the
+		// front ray would; the BRDF keeps the sample's own direction.
+		vec3 shadow_origin = hit_pos_offset;
+		vec3 shadow_dir = light_sample.direction;
+		float shadow_distance = light_sample.shadow_distance;
+		if (diffuse_transmit_max > 0.0 && dot(N, light_sample.direction) < 0.0 && !(hasClearcoat(brdf_mat) && dot(brdf_mat.clearcoatN, light_sample.direction) > 0.0)) {
+			shadow_origin = offset_ray_origin(p_hit_pos, -p_geometry_normal, p_hit_t);
+			vec3 to_light = hit_pos_offset + light_sample.direction * light_sample.shadow_distance - shadow_origin;
+			shadow_distance = length(to_light);
+			shadow_dir = to_light / max(shadow_distance, 1e-6);
+		}
+		if (have_sample && lights_trace_shadow_ray(shadow_origin, shadow_dir, shadow_distance, RT_OMM_RAY_FLAGS(diffuse_bounces), ps.rng_state)) {
+			// Evaluate BRDF (diffuse + specular separately for specular_amount control).
+			vec3 brdf_diffuse, brdf_specular;
+			evalCombinedBRDFSeparate(N, light_sample.direction, V, brdf_mat, brdf_diffuse, brdf_specular);
+			// NdotL is already included in the BRDF value (evalLambertian/evalMicrofacet bake it in).
+			vec3 direct_light = (brdf_diffuse + brdf_specular * light_sample.specular_multiplier) * light_sample.radiance * (light_sample.weight / strategy_probability);
+			if (in_medium) {
+				// The light's own leg through the medium (D49): to the light, or up to the medium's
+				// top, the horizontal plane through the point the path entered at, whichever is
+				// nearer. The shadow ray is a visibility test that does not resolve the interface, so
+				// the leg is this estimate (a named limit); a light under the plane takes its distance.
+				float leg = min(light_sample.leg_distance, max(ps.medium_entry_height - p_hit_pos.y, 0.0) / max(light_sample.direction.y, 0.1));
+				direct_light *= exp(-ps.medium_absorption * leg);
+			}
+			// The clamp (D53): direct at the surface the camera sees, indirect after a scatter.
+			ps.radiance += rt_clamp_contribution(ps.throughput * direct_light, get_rt_param(is_scattered(ps.packed_bounces_flags) ? RT_PARAM_CLAMP_INDIRECT : RT_PARAM_CLAMP_DIRECT));
+		}
+	}
+}
+
 /// ray_dir and hit_t describe the ray that reached h.hit_pos: the hit stage's
 /// built-ins, or the raygen's own primary ray for a G-buffer surface.
 void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
@@ -599,90 +691,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 #error RT_SOBOL_DIM_SCATTER must exceed the light sampling paths' draw counts
 #endif
 	rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE);
-	uint rt_light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
-	// The selection's receiver: the geometry normal as the payload carries it to the next vertex,
-	// so the chance-hit and miss densities there read the same function of the same normal (the
-	// light tree's since D55, the sky's share by variance since D65).
-	vec3 N_select = oct_to_vec3(unpackUnorm2x16(packUnorm2x16(vec3_to_oct(h.geometry_normal))) * 2.0 - 1.0);
-	// The sky's share of the light samples (D54), 0 without a sky light; the surface lights
-	// split the rest, so their densities carry the remainder on both sides of the weight.
-	float p_sky = light_tree_enabled() ? 0.0 : sky_light_probability(N_select);
-	// Under the tree (D55) the sky's share is per hit, so a frame whose only light is the sky still
-	// takes its sample here (the miss weighs against it either way).
-	bool tree_sky = light_tree_enabled() && sky_light_enabled() && sky_total > 0.0;
-	if (rt_light_count > 0u || rt_emissive_count > 0u || p_sky > 0.0 || tree_sky) {
-		vec3 hit_pos_offset = offset_ray_origin(h.hit_pos, h.geometry_normal, hit_t);
-		bool is_indirect = (diffuse_bounces > 0u);
-		// One light sample per hit (D50): the analytic lights or the emissive list, chosen by the
-		// per-frame share, the contribution divided by its share. Nothing is drawn for the choice
-		// when the emissive list is empty, so such a frame keeps its random sequence. Only the
-		// sample's generation diverges; the shadow ray and the BRDF below are shared, so a warp
-		// whose threads chose differently traces once. The sky is the third strategy (D54), drawn
-		// first by its share; the surface lights split the rest as before, so a frame without a
-		// sky light keeps its random sequence.
-		bool sample_sky = p_sky > 0.0;
-		float strategy_probability = 1.0;
-		if (sample_sky && (rt_light_count > 0u || rt_emissive_count > 0u)) {
-			sample_sky = rand(ps.rng_state) < p_sky;
-			strategy_probability = sample_sky ? p_sky : (1.0 - p_sky);
-		}
-		bool sample_emissive = !sample_sky && rt_emissive_count > 0u;
-		if (!light_tree_enabled() && !sample_sky && rt_light_count > 0u && rt_emissive_count > 0u) {
-			float p_emissive = get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY);
-			sample_emissive = rand(ps.rng_state) < p_emissive;
-			strategy_probability *= sample_emissive ? p_emissive : (1.0 - p_emissive);
-		}
-		LightSampleNEE light_sample;
-		bool have_sample;
-		if (light_tree_enabled()) {
-			// The light tree (D55) chooses among every strategy by its importance here, judged on
-			// N_select, so the next vertex recovers the same probability; the shading normal still
-			// decides what the sample delivers.
-			uint tree_candidates = uint(get_rt_param(RT_PARAM_EMISSIVE_CANDIDATES));
-			// Past the first diffuse bounce the sample is drawn over the coarser indirect cut (D59);
-			// the payload tells the next vertex, whose chance-hit and miss densities read the same cut.
-			if (is_indirect) {
-				ps.packed_bounces_flags = set_light_tree_indirect(ps.packed_bounces_flags);
-			}
-			have_sample = light_tree_sample_direct(hit_pos_offset, N_select, N, V, brdf_mat, ps.rng_state, is_indirect, tree_candidates, light_sample, strategy_probability);
-		} else if (sample_sky) {
-			have_sample = sky_sample_direct(N, V, brdf_mat, ps.rng_state, strategy_probability, light_sample);
-		} else if (sample_emissive) {
-			uint candidates = uint(get_rt_param(RT_PARAM_EMISSIVE_CANDIDATES));
-			have_sample = emissive_sample_direct(hit_pos_offset, N, V, brdf_mat, ps.rng_state, strategy_probability, rt_emissive_count, candidates, light_sample);
-		} else {
-			have_sample = lights_sample_direct(hit_pos_offset, N, brdf_mat, ps.rng_state, is_indirect, rt_light_count, light_sample);
-		}
-		// A sample a thin surface takes through its transmission (D103) leaves from the other side,
-		// aimed at the point the light was sampled at from the front origin, so it ends where the
-		// front ray would; the BRDF keeps the sample's own direction.
-		vec3 shadow_origin = hit_pos_offset;
-		vec3 shadow_dir = light_sample.direction;
-		float shadow_distance = light_sample.shadow_distance;
-		if (diffuse_transmit_max > 0.0 && dot(N, light_sample.direction) < 0.0 && !(hasClearcoat(brdf_mat) && dot(brdf_mat.clearcoatN, light_sample.direction) > 0.0)) {
-			shadow_origin = offset_ray_origin(h.hit_pos, -h.geometry_normal, hit_t);
-			vec3 to_light = hit_pos_offset + light_sample.direction * light_sample.shadow_distance - shadow_origin;
-			shadow_distance = length(to_light);
-			shadow_dir = to_light / max(shadow_distance, 1e-6);
-		}
-		if (have_sample && lights_trace_shadow_ray(shadow_origin, shadow_dir, shadow_distance, RT_OMM_RAY_FLAGS(diffuse_bounces), ps.rng_state)) {
-			// Evaluate BRDF (diffuse + specular separately for specular_amount control).
-			vec3 brdf_diffuse, brdf_specular;
-			evalCombinedBRDFSeparate(N, light_sample.direction, V, brdf_mat, brdf_diffuse, brdf_specular);
-			// NdotL is already included in the BRDF value (evalLambertian/evalMicrofacet bake it in).
-			vec3 direct_light = (brdf_diffuse + brdf_specular * light_sample.specular_multiplier) * light_sample.radiance * (light_sample.weight / strategy_probability);
-			if (in_medium) {
-				// The light's own leg through the medium (D49): to the light, or up to the medium's
-				// top, the horizontal plane through the point the path entered at, whichever is
-				// nearer. The shadow ray is a visibility test that does not resolve the interface, so
-				// the leg is this estimate (a named limit); a light under the plane takes its distance.
-				float leg = min(light_sample.leg_distance, max(ps.medium_entry_height - h.hit_pos.y, 0.0) / max(light_sample.direction.y, 0.1));
-				direct_light *= exp(-ps.medium_absorption * leg);
-			}
-			// The clamp (D53): direct at the surface the camera sees, indirect after a scatter.
-			ps.radiance += rt_clamp_contribution(ps.throughput * direct_light, get_rt_param(is_scattered(ps.packed_bounces_flags) ? RT_PARAM_CLAMP_INDIRECT : RT_PARAM_CLAMP_DIRECT));
-		}
-	}
+	shade_direct_light(h.hit_pos, h.geometry_normal, hit_t, N, V, brdf_mat, diffuse_transmit_max, diffuse_bounces, rt_emissive_count, in_medium, ps);
 
 	// =================================================================
 	// Transmission: refract through the surface with probability transmit_p

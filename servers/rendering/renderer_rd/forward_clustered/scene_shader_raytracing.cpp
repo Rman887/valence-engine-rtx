@@ -633,6 +633,8 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	actions.write_flag_pointers["UV2"] = &detected_uv2_write;
 	bool detected_uv2 = false;
 	actions.usage_flag_pointers["UV2"] = &detected_uv2;
+	bool detected_sss_skin = false;
+	actions.render_mode_flags["sss_mode_skin"] = &detected_sss_skin;
 
 	HashMap<StringName, ShaderLanguage::ShaderNode::Uniform> uniform_sink;
 	actions.uniforms = &uniform_sink;
@@ -655,6 +657,7 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	r_entry.uses_projected = detected_projected;
 	r_entry.uses_texture_grad = detected_texture_grad;
 	r_entry.uses_texture_filtering = detected_texture_filtering;
+	r_entry.sss_mode_skin = detected_sss_skin;
 	r_entry.vertex_code = gen_code.code.has("vertex") ? gen_code.code["vertex"] : String();
 	r_entry.fragment_code = gen_code.code.has("fragment") ? gen_code.code["fragment"] : String();
 	r_entry.fragment_globals = gen_code.stage_globals[ShaderCompiler::STAGE_FRAGMENT];
@@ -844,6 +847,10 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_e
 	if (GLOBAL_GET_CACHED(int, "rendering/pathtracing/texture_filtering") != 0) {
 		flags |= RT_FLAG_TEXTURE_FILTERING;
 	}
+	// The subsurface walk (D120) likewise compiles in only while it is on.
+	if (GLOBAL_GET_CACHED(bool, "rendering/pathtracing/subsurface")) {
+		flags |= RT_FLAG_SUBSURFACE;
+	}
 
 	if (GLOBAL_GET("rendering/pathtracing/use_shader_execution_reordering")) {
 		flags |= RT_FLAG_SER_ENABLED;
@@ -921,6 +928,10 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 	// compile only while it is on, which costs it about 3 % on the valley's first load otherwise (D117 F3).
 	if (p_rt_flags & RT_FLAG_TEXTURE_FILTERING) {
 		inject_define(sources, "#define RT_TEXTURE_FILTERING_COMPILED\n");
+	}
+	// A define as well as the flag, for the same reason: the walk stays out of every hit group's compile while off (D120).
+	if (p_rt_flags & RT_FLAG_SUBSURFACE) {
+		inject_define(sources, "#define RT_SUBSURFACE_COMPILED\n");
 	}
 
 	// Procedural templates come from intersection stage; strip from base HG0 path.
@@ -1198,6 +1209,11 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 		if (entry.uses_uv2) {
 			// UV2 reads the mesh's second set, which the hits fetch only for a shader that reads it (D118).
 			tex_defines += "#define RT_CUSTOM_UV2_USED\n";
+		}
+		if (entry.sss_mode_skin) {
+			// render_mode sss_mode_skin: the subsurface walk scatters over skin's channel ratios (D120). The compiler's
+			// render-mode defines never reach a hit group, so the mode is carried here.
+			tex_defines += "#define RT_CUSTOM_SSS_SKIN\n";
 		}
 		String uniform_members = entry.uniform_members.is_empty() ? String("float _rt_pad;") : entry.uniform_members;
 

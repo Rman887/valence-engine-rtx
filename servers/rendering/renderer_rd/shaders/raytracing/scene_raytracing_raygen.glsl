@@ -230,6 +230,8 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	m.clearcoat_normal = h.geometry_normal;
 	m.rim = 0.0; // Nor a rim (D118 MM3).
 	m.rim_tint = 0.0;
+	m.subsurface = 0.0; // Nor subsurface scattering (D120).
+	m.subsurface_skin = false;
 
 #ifdef RT_DEBUG_ENABLED
 	int vis_mode = int(get_rt_param(RT_PARAM_VIS_MODE));
@@ -787,6 +789,16 @@ void main() {
 	// after the decals; in a shader that writes no RIM it is the constant 0, on which the compiler drops the lobe.
 	m.rim = clamp(rim, 0.0, 1.0);
 	m.rim_tint = clamp(rim_tint, 0.0, 1.0);
+	// VAL: SSS_STRENGTH (D120), the diffuse share that walks under the surface, over skin's channel ratios under
+	// render_mode sss_mode_skin.
+	m.subsurface = 0.0;
+	m.subsurface_skin = false;
+#ifdef RT_SUBSURFACE_COMPILED
+	m.subsurface = clamp(sss_strength, 0.0, 1.0);
+#ifdef RT_CUSTOM_SSS_SKIN
+	m.subsurface_skin = true;
+#endif
+#endif
 
 	// Apply normal map if it was written.
 	if (normal_map != vec3(0.5, 0.5, 1.0)) {
@@ -986,6 +998,22 @@ void main() {
 		m.rim = clamp(rim_params.x, 0.0, 1.0);
 		m.rim_tint = clamp(rim_params.y, 0.0, 1.0);
 	}
+
+	// VAL: subsurface scattering (D120) as BaseMaterial3D's fragment writes it: the strength times the texture's red on
+	// UV1, the diffuse share that walks under the surface; the skin mode from its flag. Constant 0 while the walk is not
+	// compiled in.
+	m.subsurface = 0.0;
+	m.subsurface_skin = false;
+#ifdef RT_SUBSURFACE_COMPILED
+	m.subsurface_skin = (mat.flags & (1u << 19)) != 0u;
+	if (mat.subsurface_strength > 0.0) {
+		m.subsurface = mat.subsurface_strength;
+		if (mat.subsurface_texture_idx != 0u) {
+			m.subsurface *= sample_material_texture(mat.subsurface_texture_idx, uv, mat.flags, lod, grad, stf_u).r;
+		}
+		m.subsurface = clamp(m.subsurface, 0.0, 1.0);
+	}
+#endif
 
 #ifdef RT_DEBUG_ENABLED
 	{

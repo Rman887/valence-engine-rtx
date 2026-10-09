@@ -47,6 +47,8 @@
 #define RT_PARAM_TEXTURE_FILTERING 24 // rt_params[6].x - The filter, 0 off, else STF_FILTER_TYPE_LINEAR, _CUBIC or _GAUSSIAN (rtxtf_stf_inc.glsl)
 #define RT_PARAM_TEXTURE_FILTERING_MAGNIFICATION 25 // rt_params[6].y - 1 when a magnified lookup is filtered stochastically too, 0 for the hardware's bilinear
 #define RT_PARAM_TEXTURE_FILTERING_SIGMA 26 // rt_params[6].z - The Gaussian filter's standard deviation in texels
+// Subsurface scattering as a random walk (D120).
+#define RT_PARAM_SUBSURFACE_SCALE 27 // rt_params[6].w - The walk's red mean free path in metres
 // A texture level that is unknown (D116): every texture reads its base level.
 const float RT_TEXTURE_LOD_BASE = -128.0;
 

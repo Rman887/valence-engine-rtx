@@ -154,7 +154,9 @@ struct alignas(16) RT_MaterialData {
 	uint32_t detail_albedo_texture_idx; // With RT_MAT_FLAG_DETAIL: the detail albedo, sRGB (0 = none: the white default).
 	uint32_t detail_normal_texture_idx; // Its normal map, read linear (0 = none: flat).
 	uint32_t detail_mask_texture_idx; // Its mask, red read linear on UV1 (0 = none: the white default, everywhere).
-	uint32_t _reserved[3];
+	float subsurface_strength; // BaseMaterial3D's subsurf_scatter_strength, the diffuse share that walks under the surface (D120); 0 = none.
+	uint32_t subsurface_texture_idx; // Its texture, red read linear on UV1, scaling the strength (0 = none).
+	uint32_t _reserved;
 };
 static_assert(sizeof(RT_MaterialData) == 176, "RT_MaterialData must be 176 bytes for std430");
 
@@ -330,6 +332,7 @@ enum {
 	RT_MAT_DETAIL_BLEND_SHIFT = 15u,
 	RT_MAT_FLAG_DETAIL_UV2 = 1u << 17,
 	RT_MAT_FLAG_EMISSION_UV2 = 1u << 18, // BaseMaterial3D's emission_on_uv2: the emission texture read on UV2 (D118 MM4).
+	RT_MAT_FLAG_SUBSURFACE_SKIN = 1u << 19, // BaseMaterial3D's subsurf_scatter_skin_mode: the walk takes skin's channel ratios (D120).
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).

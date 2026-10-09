@@ -8830,9 +8830,9 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.detail_albedo_texture_idx = 0;
 	mat.detail_normal_texture_idx = 0;
 	mat.detail_mask_texture_idx = 0;
-	mat._reserved[0] = 0;
-	mat._reserved[1] = 0;
-	mat._reserved[2] = 0;
+	mat.subsurface_strength = 0.0f;
+	mat.subsurface_texture_idx = 0;
+	mat._reserved = 0;
 	bool omm_custom = false;
 	RID omm_custom_alpha_rd; // An opted-in custom shader's hint_alpha texture, with a real bindless slot.
 
@@ -9305,6 +9305,28 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 			}
 			if (uv2_layer) {
 				mat.flags |= RT_MAT_FLAG_DETAIL_UV2;
+			}
+		}
+	}
+
+	// VAL: subsurface scattering (D120). BaseMaterial3D declares subsurface_scattering_strength and its texture only
+	// while the feature is enabled, and its fragment writes SSS_STRENGTH = strength * tex.r; the skin mode is baked
+	// into the raster's shader and published as the parameter subsurface_scattering_skin_mode. The hit shader reads
+	// the strength as the diffuse share that walks under the surface. A custom shader's SSS_STRENGTH reaches its hit
+	// group through the fragment instead.
+	if (!mat_data->is_custom_shader && shader_declares("subsurface_scattering_strength")) {
+		Variant strength_var = material_storage->material_get_param(p_material_rid, "subsurface_scattering_strength");
+		if (strength_var.get_type() == Variant::FLOAT) {
+			mat.subsurface_strength = CLAMP(float(strength_var), 0.0f, 1.0f);
+		}
+		if (mat.subsurface_strength > 0.0f) {
+			RID sss_rd = get_material_texture("texture_subsurface_scattering");
+			if (sss_rd.is_valid() && shader_declares("texture_subsurface_scattering")) {
+				mat.subsurface_texture_idx = bindless_block->add_texture(sss_rd);
+			}
+			Variant skin_var = material_storage->material_get_param(p_material_rid, "subsurface_scattering_skin_mode");
+			if (skin_var.get_type() == Variant::BOOL && bool(skin_var)) {
+				mat.flags |= RT_MAT_FLAG_SUBSURFACE_SKIN;
 			}
 		}
 	}
@@ -12416,6 +12438,8 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_TEXTURE_FILTERING] = (float)CLAMP(GLOBAL_GET_CACHED(int, "rendering/pathtracing/texture_filtering"), 0, 3);
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_TEXTURE_FILTERING_MAGNIFICATION] = GLOBAL_GET_CACHED(int, "rendering/pathtracing/texture_filtering_magnification") == 1 ? 1.0f : 0.0f;
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_TEXTURE_FILTERING_SIGMA] = MAX(GLOBAL_GET_CACHED(float, "rendering/pathtracing/texture_filtering_gaussian_sigma"), 0.0f);
+		// The subsurface walk's red mean free path (D120); the walk itself is compiled in by RT_FLAG_SUBSURFACE.
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_SUBSURFACE_SCALE] = MAX(GLOBAL_GET_CACHED(float, "rendering/pathtracing/subsurface_scale"), 1e-6f);
 
 		// The froxel volumetric fog the raygen composes over the camera segment (D37): the froxel's
 		// depth mapping as the raster's fragment reads it, and the Environment's sky affect.

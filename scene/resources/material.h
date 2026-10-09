@@ -472,6 +472,7 @@ private:
 		StringName detail_blend_mode;
 		StringName detail_uv_layer;
 		StringName emission_on_uv2;
+		StringName subsurface_scattering_skin_mode;
 		StringName normal_scale;
 		StringName rim;
 		StringName rim_tint;

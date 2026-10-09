@@ -570,6 +570,7 @@ void BaseMaterial3D::init_shaders() {
 	shader_names->detail_blend_mode = "detail_blend_mode";
 	shader_names->detail_uv_layer = "detail_uv_layer";
 	shader_names->emission_on_uv2 = "emission_on_uv2";
+	shader_names->subsurface_scattering_skin_mode = "subsurface_scattering_skin_mode";
 	shader_names->normal_scale = "normal_scale";
 	shader_names->rim = "rim";
 	shader_names->rim_tint = "rim_tint";
@@ -2476,6 +2477,10 @@ void BaseMaterial3D::set_flag(Flags p_flag, bool p_enabled) {
 	if (p_flag == FLAG_EMISSION_ON_UV2) {
 		// Baked into the shader for the raster; published as a parameter for a renderer that evaluates the material itself.
 		_material_set_param(shader_names->emission_on_uv2, p_enabled);
+	}
+	if (p_flag == FLAG_SUBSURFACE_MODE_SKIN) {
+		// As above: the raster bakes it as render_mode sss_mode_skin.
+		_material_set_param(shader_names->subsurface_scattering_skin_mode, p_enabled);
 	}
 
 	if (

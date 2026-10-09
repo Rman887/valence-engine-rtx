@@ -22,6 +22,8 @@ struct MaterialResult {
 	vec3 clearcoat_normal; // World space, the coat's normal: the vertex normal (a custom shader's NORMAL) without the normal map.
 	float rim; // VAL: Godot's RIM, 0..1, read as the strength of a sheen layer; 0 = none (D118 MM3).
 	float rim_tint; // Godot's RIM_TINT, 0..1: how far the sheen's colour moves from white to the albedo.
+	float subsurface; // VAL: Godot's SSS_STRENGTH, 0..1: the share of the diffuse lobe that walks under the surface (D120); 0 = none.
+	bool subsurface_skin; // The walk scatters over skin's channel ratios (sss_mode_skin), else over equal distances.
 };
 
 /// Sensible default for a mid-grey diffuse surface.
@@ -47,5 +49,7 @@ MaterialResult default_material_result(vec3 geometry_normal) {
 	r.clearcoat_normal = geometry_normal;
 	r.rim = 0.0;
 	r.rim_tint = 0.0;
+	r.subsurface = 0.0;
+	r.subsurface_skin = false;
 	return r;
 }

@@ -225,6 +225,7 @@ HitData compute_hit_data(bool p_footprint, bool p_gradients, bool p_uv2) {
 	h.texture_footprint = RT_TEXTURE_LOD_BASE;
 	h.texture_grad = vec4(0.0);
 	h.texture_lod2 = RT_TEXTURE_LOD_BASE;
+	h.texture_grad2 = vec4(0.0);
 	if (rt_texture_lod_wanted() && (geom.flags & FLAG_PROCEDURAL) == 0u && (p_footprint || attrs.has_uv || attrs.has_uv2 || get_rt_param(RT_PARAM_DECAL_COUNT) > 0.5)) {
 		vec3 p0, p1, p2;
 		if (rt_hit_triangle_positions(geom, i0, i1, i2, p0, p1, p2)) {
@@ -242,6 +243,10 @@ HitData compute_hit_data(bool p_footprint, bool p_gradients, bool p_uv2) {
 			}
 			if (attrs.has_uv2) {
 				h.texture_lod2 = rt_texture_lod_triangle(h.texture_footprint, n, attrs.uv2_corners[0], attrs.uv2_corners[1], attrs.uv2_corners[2]);
+				if (p_gradients && h.texture_lod2 > RT_TEXTURE_LOD_BASE && rt_texture_lod_anisotropic()) {
+					float radius = (cone.x + cone.y * gl_HitTEXT) * exp2(get_rt_param(RT_PARAM_TEXTURE_LOD_BIAS));
+					h.texture_grad2 = rt_texture_grad_triangle(object_to_world * (p1 - p0), object_to_world * (p2 - p0), gl_WorldRayDirectionEXT, radius, attrs.uv2_corners[0], attrs.uv2_corners[1], attrs.uv2_corners[2]);
+				}
 			}
 		}
 	}

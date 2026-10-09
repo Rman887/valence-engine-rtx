@@ -36,6 +36,7 @@ struct HitData {
 	float texture_footprint; // The cone's footprint as a level in metres (D116): a texture of d texels per metre reads at this + log2(d).
 	vec4 texture_grad; // The cone's elliptical footprint as the mesh's UV gradients (g1, g2) (D116), zero when the hit samples at texture_lod.
 	float texture_lod2; // The cone's level at the second UV set (D118), RT_TEXTURE_LOD_BASE when unknown.
+	vec4 texture_grad2; // And its elliptical footprint as the second set's gradients, zero as texture_grad is.
 };
 
 // ============================================================================

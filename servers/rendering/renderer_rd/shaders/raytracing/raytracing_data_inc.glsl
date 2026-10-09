@@ -85,7 +85,7 @@ struct InstanceMotionData {
 };
 
 // ============================================================================
-// MATERIAL DATA (matches C++ layout, 144 bytes)
+// MATERIAL DATA (matches C++ layout, 176 bytes)
 // ============================================================================
 struct MaterialData {
 	uint albedo_texture_idx;
@@ -100,7 +100,7 @@ struct MaterialData {
 	float metallic;
 	float roughness;
 	float ao_strength;
-	uint flags; // Bit 0: has_normal_map, Bit 1: has_emission_tex, Bit 2: point_filter, Bit 3: emission_multiply, Bit 4: emissive_constant (an emissive mesh light, D50), Bit 5: diffuse_transmission (backlight, D103), Bits 8-10 and 11-13: the roughness and metallic textures' channels (D118)
+	uint flags; // Bit 0: has_normal_map, Bit 1: has_emission_tex, Bit 2: point_filter, Bit 3: emission_multiply, Bit 4: emissive_constant (an emissive mesh light, D50), Bit 5: diffuse_transmission (backlight, D103), Bits 8-10 and 11-13: the roughness and metallic textures' channels (D118), Bit 14: detail layer, Bits 15-16: its blend mode, Bit 17: its textures on UV2, Bit 18: the emission texture on UV2 (D118 MM4)
 
 	vec2 uv1_scale; // UV1 scale (default 1,1)
 	vec2 uv1_offset; // UV1 offset (default 0,0)
@@ -118,6 +118,12 @@ struct MaterialData {
 	uint clearcoat_texture_idx; // Its texture, read linear: red scales the strength, green the roughness (0 = none).
 	uint rim_half2; // packHalf2x16(rim, rim_tint), BaseMaterial3D's rim read as a sheen layer (D118 MM3); 0 = no rim.
 	uint rim_texture_idx; // Its texture, read linear: red scales the rim, green the tint (0 = none).
+	vec2 uv2_scale; // BaseMaterial3D's uv2_scale and uv2_offset, read for a detail layer on UV2 (D118 MM4).
+	vec2 uv2_offset;
+	uint detail_albedo_texture_idx; // With flag bit 14: the detail albedo, sRGB (0 = none: the white default).
+	uint detail_normal_texture_idx; // Its normal map, read linear (0 = none: flat).
+	uint detail_mask_texture_idx; // Its mask, red read linear on UV1 (0 = none: the white default, everywhere).
 	uint _reserved0;
 	uint _reserved1;
+	uint _reserved2;
 };

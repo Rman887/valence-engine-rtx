@@ -121,7 +121,7 @@ enum : uint32_t {
 	RT_GEOMETRY_LAYERS_MASK = (1u << 20) - 1, // The scene's layers; the editor's (20 and up) never enter the trace.
 };
 
-// Must match GLSL MaterialData (std430, 144 bytes).
+// Must match GLSL MaterialData (std430, 176 bytes).
 struct alignas(16) RT_MaterialData {
 	uint32_t albedo_texture_idx;
 	uint32_t normal_texture_idx;
@@ -149,9 +149,14 @@ struct alignas(16) RT_MaterialData {
 	uint32_t clearcoat_texture_idx; // Its texture, read linear: red scales the strength, green the roughness (0 = none).
 	uint32_t rim_half2; // packHalf2x16(rim, rim_tint), BaseMaterial3D's rim read as a sheen layer (D118 MM3); 0 = no rim.
 	uint32_t rim_texture_idx; // Its texture, read linear: red scales the rim, green the tint (0 = none).
-	uint32_t _reserved[2];
+	float uv2_scale[2]; // BaseMaterial3D's uv2_scale and uv2_offset, read for a detail layer on UV2 (D118 MM4).
+	float uv2_offset[2];
+	uint32_t detail_albedo_texture_idx; // With RT_MAT_FLAG_DETAIL: the detail albedo, sRGB (0 = none: the white default).
+	uint32_t detail_normal_texture_idx; // Its normal map, read linear (0 = none: flat).
+	uint32_t detail_mask_texture_idx; // Its mask, red read linear on UV1 (0 = none: the white default, everywhere).
+	uint32_t _reserved[3];
 };
-static_assert(sizeof(RT_MaterialData) == 144, "RT_MaterialData must be 144 bytes for std430");
+static_assert(sizeof(RT_MaterialData) == 176, "RT_MaterialData must be 176 bytes for std430");
 
 // Light types for raytracing (matches GLSL RT_LIGHT_TYPE_* defines).
 enum RTLightType : uint32_t {
@@ -319,6 +324,12 @@ enum {
 	// TextureChannel, 0 red to 3 alpha, 4 the grey average (D118).
 	RT_MAT_ROUGHNESS_CHANNEL_SHIFT = 8u,
 	RT_MAT_METALLIC_CHANNEL_SHIFT = 11u,
+	// BaseMaterial3D's detail layer (D118 MM4): bit 14 on, bits 15-16 its blend mode (BlendMode Mix, Add, Subtract,
+	// Multiply), bit 17 its textures on UV2.
+	RT_MAT_FLAG_DETAIL = 1u << 14,
+	RT_MAT_DETAIL_BLEND_SHIFT = 15u,
+	RT_MAT_FLAG_DETAIL_UV2 = 1u << 17,
+	RT_MAT_FLAG_EMISSION_UV2 = 1u << 18, // BaseMaterial3D's emission_on_uv2: the emission texture read on UV2 (D118 MM4).
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).
@@ -1307,7 +1318,7 @@ struct alignas(16) RT_SlotRowWrite {
 	RT_GeometryData geometry;
 	RT_MaterialData material;
 };
-static_assert(sizeof(RT_SlotRowWrite) == 288, "RT_SlotRowWrite must match ptlas_rows.glsl");
+static_assert(sizeof(RT_SlotRowWrite) == 320, "RT_SlotRowWrite must match ptlas_rows.glsl");
 
 /// Per-viewport raytracing state.
 ///

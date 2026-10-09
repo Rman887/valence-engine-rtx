@@ -567,6 +567,9 @@ void BaseMaterial3D::init_shaders() {
 	shader_names->emission = "emission";
 	shader_names->emission_energy = "emission_energy";
 	shader_names->emission_operator = "emission_operator";
+	shader_names->detail_blend_mode = "detail_blend_mode";
+	shader_names->detail_uv_layer = "detail_uv_layer";
+	shader_names->emission_on_uv2 = "emission_on_uv2";
 	shader_names->normal_scale = "normal_scale";
 	shader_names->rim = "rim";
 	shader_names->rim_tint = "rim_tint";
@@ -2321,6 +2324,8 @@ void BaseMaterial3D::set_detail_uv(DetailUV p_detail_uv) {
 	}
 
 	detail_uv = p_detail_uv;
+	// Baked into the shader for the raster; published as a parameter for a renderer that evaluates the material itself.
+	_material_set_param(shader_names->detail_uv_layer, (int)p_detail_uv);
 	_queue_shader_change();
 }
 
@@ -2343,6 +2348,8 @@ BaseMaterial3D::BlendMode BaseMaterial3D::get_blend_mode() const {
 
 void BaseMaterial3D::set_detail_blend_mode(BlendMode p_mode) {
 	detail_blend_mode = p_mode;
+	// Baked into the shader for the raster; published as a parameter for a renderer that evaluates the material itself.
+	_material_set_param(shader_names->detail_blend_mode, (int)p_mode);
 	_queue_shader_change();
 }
 
@@ -2465,6 +2472,11 @@ void BaseMaterial3D::set_flag(Flags p_flag, bool p_enabled) {
 	}
 
 	flags[p_flag] = p_enabled;
+
+	if (p_flag == FLAG_EMISSION_ON_UV2) {
+		// Baked into the shader for the raster; published as a parameter for a renderer that evaluates the material itself.
+		_material_set_param(shader_names->emission_on_uv2, p_enabled);
+	}
 
 	if (
 			p_flag == FLAG_USE_SHADOW_TO_OPACITY ||

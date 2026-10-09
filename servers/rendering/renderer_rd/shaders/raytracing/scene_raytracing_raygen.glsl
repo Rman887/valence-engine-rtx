@@ -207,6 +207,7 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	h.texture_footprint = RT_TEXTURE_LOD_BASE; // And drew its decals.
 	h.texture_grad = vec4(0.0);
 	h.texture_lod2 = RT_TEXTURE_LOD_BASE;
+	h.texture_grad2 = vec4(0.0);
 
 	MaterialResult m;
 	m.albedo = albedo_specular.rgb;
@@ -716,11 +717,16 @@ void main() {
 #else
 	const bool gradients = (materials[gl_InstanceCustomIndexEXT].flags & 64u) != 0u;
 #endif
-	// The second UV set only where it is read (D118): by a custom shader that uses UV2.
-#if defined(RT_CUSTOM_HIT_GROUP) && defined(RT_CUSTOM_UV2_USED)
+	// The second UV set only where it is read (D118): by a custom shader that uses UV2, in HG0 by a detail layer or the
+	// emission on UV2 (flag bits 17 and 18).
+#ifdef RT_CUSTOM_HIT_GROUP
+#ifdef RT_CUSTOM_UV2_USED
 	const bool fetch_uv2 = true;
 #else
 	const bool fetch_uv2 = false;
+#endif
+#else
+	const bool fetch_uv2 = (materials[gl_InstanceCustomIndexEXT].flags & ((1u << 17) | (1u << 18))) != 0u;
 #endif
 #ifdef RT_CUSTOM_PROJECTED_LOD
 	HitData h = compute_hit_data(true, gradients, fetch_uv2);
@@ -820,24 +826,73 @@ void main() {
 	const float lod = rt_texture_lod_enabled() ? material_lod : RT_TEXTURE_LOD_BASE;
 	// And its elliptical footprint, the mesh's gradients through the same scale.
 	const vec4 grad = h.texture_grad * vec4(mat.uv1_scale, mat.uv1_scale);
+	// VAL: the second UV set (D118 MM4), for a detail layer (flag bit 17) or the emission (bit 18) on UV2, through
+	// uv2_scale and uv2_offset, which the packer leaves at the identity unless the detail UV layer is UV2, where
+	// BaseMaterial3D's vertex() applies them, detail on or off; at that set's level and footprint. UV1's otherwise, unread.
+	vec2 uv2 = uv;
+	float lod2 = lod;
+	vec4 grad2 = grad;
+	if ((mat.flags & ((1u << 17) | (1u << 18))) != 0u) {
+		uv2 = h.uv2 * mat.uv2_scale + mat.uv2_offset;
+		float material_lod2 = RT_TEXTURE_LOD_BASE;
+		if (h.texture_lod2 > RT_TEXTURE_LOD_BASE) {
+			material_lod2 = h.texture_lod2 + 0.5 * log2(max(abs(mat.uv2_scale.x * mat.uv2_scale.y), 1e-20));
+		}
+		lod2 = rt_texture_lod_enabled() ? material_lod2 : RT_TEXTURE_LOD_BASE;
+		grad2 = h.texture_grad2 * vec4(mat.uv2_scale, mat.uv2_scale);
+	}
+	const bool detail_on_uv2 = (mat.flags & (1u << 17)) != 0u;
+	const vec2 detail_uv = detail_on_uv2 ? uv2 : uv;
+	const float detail_lod = detail_on_uv2 ? lod2 : lod;
+	const vec4 detail_grad = detail_on_uv2 ? grad2 : grad;
 	// The numbers the five lookups share under stochastic texture filtering (D117), drawn only for a material the
 	// filter applies to (not point-filtered), with the major axis's position for an anisotropic one with the cone's
 	// elliptical footprint (F2), the same test as the lookup's.
-	const vec4 stf_u = (rt_texture_filtering() != 0u && (mat.flags & 4u) == 0u) ? rt_texture_filtering_random((mat.flags & 64u) != 0u && grad != vec4(0.0)) : vec4(0.0);
+	const vec4 stf_u = (rt_texture_filtering() != 0u && (mat.flags & 4u) == 0u) ? rt_texture_filtering_random((mat.flags & 64u) != 0u && (grad != vec4(0.0) || grad2 != vec4(0.0))) : vec4(0.0);
 
-	// Normal mapping.
+	// Normal mapping. The map stays encoded until the detail layer has mixed its own into it, as the raster's
+	// NORMAL_MAP does before the scene shader decodes it once; without a normal map it is the flat 0.5.
 	vec3 tangent_space_normal = vec3(0.0, 0.0, 1.0);
 	vec3 final_normal = h.geometry_normal;
-	if ((mat.flags & 1u) != 0u) {
-		vec3 normal_sample = sample_material_texture(mat.normal_texture_idx, uv, mat.flags, lod, grad, stf_u).rgb;
-		tangent_space_normal.xy = normal_sample.xy * 2.0 - 1.0;
-		tangent_space_normal.z = sqrt(max(0.0, 1.0 - dot(tangent_space_normal.xy, tangent_space_normal.xy)));
-		final_normal = apply_normal_map(h, tangent_space_normal, mat.normal_map_depth);
+	bool normal_mapped = (mat.flags & 1u) != 0u;
+	vec2 normal_sample = vec2(0.5);
+	if (normal_mapped) {
+		normal_sample = sample_material_texture(mat.normal_texture_idx, uv, mat.flags, lod, grad, stf_u).xy;
 	}
 
 	// Texture sampling.
 	vec4 albedo_tex = sample_material_texture(mat.albedo_texture_idx, uv, mat.flags, lod, grad, stf_u);
 	vec3 albedo = albedo_tex.rgb * mat.albedo_color.rgb;
+
+	// VAL: the detail layer (D118 MM4) as BaseMaterial3D's fragment writes it, last: the detail albedo blended by the
+	// material's mode under its alpha, the detail normal mixed into the encoded normal map under the same alpha, both
+	// under the mask's red, which is read on UV1. Unassigned, the albedo and mask read the white default and the
+	// normal the flat one. The blended albedo is kept within 0..1, where the raster's Add and Subtract can leave it.
+	if ((mat.flags & (1u << 14)) != 0u) {
+		const vec4 detail_tex = mat.detail_albedo_texture_idx != 0u ? sample_material_texture(mat.detail_albedo_texture_idx, detail_uv, mat.flags, detail_lod, detail_grad, stf_u) : vec4(1.0);
+		const vec2 detail_normal = mat.detail_normal_texture_idx != 0u ? sample_material_texture(mat.detail_normal_texture_idx, detail_uv, mat.flags, detail_lod, detail_grad, stf_u).xy : vec2(0.5);
+		const float detail_mask = mat.detail_mask_texture_idx != 0u ? sample_material_texture(mat.detail_mask_texture_idx, uv, mat.flags, lod, grad, stf_u).r : 1.0;
+		const uint detail_blend = (mat.flags >> 15u) & 3u;
+		vec3 blended = detail_tex.rgb;
+		if (detail_blend == 1u) {
+			blended = albedo + detail_tex.rgb;
+		} else if (detail_blend == 2u) {
+			blended = albedo - detail_tex.rgb;
+		} else if (detail_blend == 3u) {
+			blended = albedo * detail_tex.rgb;
+		}
+		const vec3 detail = mix(albedo, blended, detail_tex.a);
+		albedo = clamp(mix(albedo, detail, detail_mask), vec3(0.0), vec3(1.0));
+		normal_sample = mix(normal_sample, mix(normal_sample, detail_normal, detail_tex.a), detail_mask);
+		normal_mapped = true;
+	}
+
+	if (normal_mapped) {
+		tangent_space_normal.xy = normal_sample * 2.0 - 1.0;
+		tangent_space_normal.z = sqrt(max(0.0, 1.0 - dot(tangent_space_normal.xy, tangent_space_normal.xy)));
+		final_normal = apply_normal_map(h, tangent_space_normal, mat.normal_map_depth);
+	}
+
 	// VAL: roughness and metallic through their textures' channels (D118): an ORM texture's green and blue, one
 	// lookup when both are one texture; an unassigned texture (index 0) is the white default.
 	const vec4 roughness_tex = mat.orm_texture_idx != 0u ? sample_material_texture(mat.orm_texture_idx, uv, mat.flags, lod, grad, stf_u) : vec4(1.0);
@@ -853,7 +908,9 @@ void main() {
 	// or multiplied with the colour by the material's emission operator, then scaled by the energy.
 	vec3 emission_tex = vec3(0.0);
 	if ((mat.flags & 2u) != 0u) {
-		emission_tex = sample_material_texture(mat.emission_texture_idx, uv, mat.flags, lod, grad, stf_u).rgb;
+		// VAL: on UV2 with flag bit 18 (D118 MM4).
+		const bool emission_on_uv2 = (mat.flags & (1u << 18)) != 0u;
+		emission_tex = sample_material_texture(mat.emission_texture_idx, emission_on_uv2 ? uv2 : uv, mat.flags, emission_on_uv2 ? lod2 : lod, emission_on_uv2 ? grad2 : grad, stf_u).rgb;
 	}
 	vec3 emissive = ((mat.flags & 8u) != 0u) ? mat.emission_color * emission_tex : mat.emission_color + emission_tex;
 	emissive *= mat.emission_strength * scene_data_block.data.emissive_exposure_normalization;

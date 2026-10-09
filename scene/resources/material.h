@@ -469,6 +469,9 @@ private:
 		StringName emission;
 		StringName emission_energy;
 		StringName emission_operator;
+		StringName detail_blend_mode;
+		StringName detail_uv_layer;
+		StringName emission_on_uv2;
 		StringName normal_scale;
 		StringName rim;
 		StringName rim_tint;

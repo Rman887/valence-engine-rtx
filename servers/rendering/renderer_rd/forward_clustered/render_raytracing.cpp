@@ -8740,6 +8740,8 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		s_default_mat.data.uv1_scale[1] = 1.0f;
 		s_default_mat.data.uv1_offset[0] = 0.0f;
 		s_default_mat.data.uv1_offset[1] = 0.0f;
+		s_default_mat.data.uv2_scale[0] = 1.0f;
+		s_default_mat.data.uv2_scale[1] = 1.0f;
 		s_default_mat.data.alpha_threshold = 0.5f;
 		s_default_mat_initialized = true;
 	}
@@ -8817,8 +8819,16 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.clearcoat_texture_idx = 0;
 	mat.rim_half2 = 0;
 	mat.rim_texture_idx = 0;
+	mat.uv2_scale[0] = 1.0f;
+	mat.uv2_scale[1] = 1.0f;
+	mat.uv2_offset[0] = 0.0f;
+	mat.uv2_offset[1] = 0.0f;
+	mat.detail_albedo_texture_idx = 0;
+	mat.detail_normal_texture_idx = 0;
+	mat.detail_mask_texture_idx = 0;
 	mat._reserved[0] = 0;
 	mat._reserved[1] = 0;
+	mat._reserved[2] = 0;
 	bool omm_custom = false;
 	RID omm_custom_alpha_rd; // An opted-in custom shader's hint_alpha texture, with a real bindless slot.
 
@@ -8907,6 +8917,11 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	if (emission_rd.is_valid() && shader_declares("texture_emission")) {
 		mat.emission_texture_idx = bindless_block->add_texture(emission_rd);
 		mat.flags |= RT_MAT_FLAG_HAS_EMISSION_TEX;
+		// VAL: on UV2 (D118 MM4) where BaseMaterial3D's emission_on_uv2 bakes it, published as a parameter.
+		Variant emission_uv2_var = material_storage->material_get_param(p_material_rid, "emission_on_uv2");
+		if (emission_uv2_var.get_type() == Variant::BOOL && bool(emission_uv2_var)) {
+			mat.flags |= RT_MAT_FLAG_EMISSION_UV2;
+		}
 	}
 
 	// Material properties
@@ -9226,6 +9241,66 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 			RID rim_rd = get_material_texture("texture_rim");
 			if (rim_rd.is_valid() && shader_declares("texture_rim")) {
 				mat.rim_texture_idx = bindless_block->add_texture(rim_rd);
+			}
+		}
+	}
+
+	// VAL: the second UV set's transform (D118 MM4). BaseMaterial3D's detail UV layer is baked into the raster's shader
+	// and published as the parameter detail_uv_layer, NIL at its default (UV1). On UV2 the raster's vertex() writes
+	// UV2 * uv2_scale + uv2_offset whether or not the detail feature is on, and the emission on UV2 reads that set too.
+	bool uv2_layer = false;
+	if (!mat_data->is_custom_shader) {
+		Variant uv_layer_var = material_storage->material_get_param(p_material_rid, "detail_uv_layer");
+		uv2_layer = uv_layer_var.get_type() == Variant::INT && int(uv_layer_var) == 1;
+		if (uv2_layer) {
+			Variant uv2_scale_var = material_storage->material_get_param(p_material_rid, "uv2_scale");
+			if (uv2_scale_var.get_type() == Variant::VECTOR3) {
+				Vector3 s = uv2_scale_var;
+				mat.uv2_scale[0] = s.x;
+				mat.uv2_scale[1] = s.y;
+			}
+			Variant uv2_offset_var = material_storage->material_get_param(p_material_rid, "uv2_offset");
+			if (uv2_offset_var.get_type() == Variant::VECTOR3) {
+				Vector3 o = uv2_offset_var;
+				mat.uv2_offset[0] = o.x;
+				mat.uv2_offset[1] = o.y;
+			}
+		}
+	}
+
+	// VAL: the detail layer (D118 MM4). BaseMaterial3D declares its three textures only while the feature is enabled;
+	// its blend mode is baked into the raster's shader and published as the parameter detail_blend_mode, NIL at its
+	// default (Mix). The raster mixes the detail normal into NORMAL_MAP, which it decodes at normal_scale while the
+	// normal map feature is on and at 1 otherwise, so the depth is read here for a detail without a normal map too.
+	// Premultiplied alpha is left without its detail: the raster's shader does not compile in that mode.
+	if (!mat_data->is_custom_shader && shader_declares("texture_detail_albedo")) {
+		int detail_blend = 0;
+		Variant blend_var = material_storage->material_get_param(p_material_rid, "detail_blend_mode");
+		if (blend_var.get_type() == Variant::INT) {
+			detail_blend = blend_var;
+		}
+		if (detail_blend >= 0 && detail_blend <= 3) {
+			mat.flags |= RT_MAT_FLAG_DETAIL | (uint32_t(detail_blend) << RT_MAT_DETAIL_BLEND_SHIFT);
+			RID detail_albedo_rd = get_material_texture("texture_detail_albedo", true);
+			if (detail_albedo_rd.is_valid()) {
+				mat.detail_albedo_texture_idx = bindless_block->add_texture(detail_albedo_rd);
+			}
+			RID detail_normal_rd = get_material_texture("texture_detail_normal");
+			if (detail_normal_rd.is_valid() && shader_declares("texture_detail_normal")) {
+				mat.detail_normal_texture_idx = bindless_block->add_texture(detail_normal_rd);
+			}
+			RID detail_mask_rd = get_material_texture("texture_detail_mask");
+			if (detail_mask_rd.is_valid() && shader_declares("texture_detail_mask")) {
+				mat.detail_mask_texture_idx = bindless_block->add_texture(detail_mask_rd);
+			}
+			if (shader_declares("normal_scale")) {
+				Variant normal_scale_var = material_storage->material_get_param(p_material_rid, "normal_scale");
+				if (normal_scale_var.get_type() == Variant::FLOAT) {
+					mat.normal_map_depth = normal_scale_var;
+				}
+			}
+			if (uv2_layer) {
+				mat.flags |= RT_MAT_FLAG_DETAIL_UV2;
 			}
 		}
 	}

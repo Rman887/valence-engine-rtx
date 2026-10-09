@@ -494,15 +494,30 @@ vec3 subsurface_single_scattering_albedo(vec3 A) {
 	return vec3(1.0) - s * s;
 }
 
-/// The shading normal at a walk's exit (D120): the forms a material's normal map carries (cm-scale, a spine's groove, a
-/// collarbone) belong to the surface the light leaves, not to the mm-scale scattering the walk adds.
-/// - A standard material's normal map (flag bit 0) at the exit's UV1, through the exit's interpolated tangent frame, as the
-///   hit's HG0 fill builds it; read at the entry's ray-cone level, carried over the millimetres the walk moved and taken
-///   through the exit material's UV scale as HG0 takes it, or level 0 without texture LOD.
+/// A texture at a walk's exit, at a ray-cone level carried from the entry for the texture's UV set (level 0 without one).
+vec4 subsurface_exit_sample(uint p_texture_idx, vec2 p_uv, float p_cone_lod, vec2 p_uv_scale) {
+	// The cone's level is per unit of UV; the texture's own size makes it a mip level, as sample_bindless_texture does.
+	float lod = 0.0;
+	if (rt_texture_lod_enabled() && p_cone_lod > RT_TEXTURE_LOD_BASE) {
+		vec2 size = vec2(textureSize(sampler2D(bindless_textures[nonuniformEXT(p_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), 0));
+		lod = max(p_cone_lod + 0.5 * log2(max(abs(p_uv_scale.x * p_uv_scale.y), 1e-20)) + 0.5 * log2(max(size.x * size.y, 1.0)), 0.0);
+	}
+	return textureLod(sampler2D(bindless_textures[nonuniformEXT(p_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), p_uv, lod);
+}
+
+/// The shading normal at a walk's exit (D120): the whole material's normal, as Cycles evaluates it at the exit; the forms
+/// a normal map carries (a spine's groove, a collarbone, a layered overlay's own anatomy) belong to the surface the light
+/// leaves.
+/// - A standard material's normal map (flag bit 0) at the exit's UV1 and its detail layer (flag bit 14) at the layer's UV
+///   set, mixed as the hit's HG0 fill mixes them: the detail normal (the flat one when unassigned, which flattens the base
+///   under an albedo-only layer's alpha) under the detail albedo's alpha and the mask's red, read on UV1; through the
+///   exit's interpolated tangent frame.
+/// - Each map is read at the entry's ray-cone level for its UV set, taken through the exit material's UV scale as HG0
+///   takes it, or level 0 without texture LOD or when the entry carried no level for that set (an entry row that did not
+///   read UV2). The level is the entry mesh's density, carried over the millimetres the walk moved, also across rows.
 /// - Otherwise, from a custom hit group (whose fragment cannot run here), the entry's perturbation: the rotation taking the
 ///   entry's interpolated normal to its shading normal, applied to the exit's when the exit faces the entry's side.
-/// - Otherwise the exit's interpolated normal, also on a row stored without tangents. The detail layer's normal map is not
-///   read at the exit: its pores are the walk's own scale.
+/// - Otherwise the exit's interpolated normal, also on a row stored without tangents.
 /// A result at or below the exit's plane is lifted just above it, as the hit's clamp keeps its shading normal.
 vec3 subsurface_exit_shading_normal(HitData h, vec3 N, uint row, GeometryData geom, uint i0, uint i1, uint i2, vec3 bary, TBNResult tbn, mat3 normal_matrix, float handedness, vec3 n) {
 	vec3 ns = n;
@@ -512,17 +527,24 @@ vec3 subsurface_exit_shading_normal(HitData h, vec3 N, uint row, GeometryData ge
 	// A row stored without tangents carries fetch_tbn's placeholder; the hit derives its frame there instead, which this
 	// include cannot, so such an exit keeps its interpolated normal.
 	const bool has_tangent = (geom.flags & FLAG_COMPRESSED) != 0u || geom.normal_stride >= 8u;
-	if ((mat.flags & 1u) != 0u && has_tangent && dot(t, t) > 1e-10) {
+	const bool base_mapped = (mat.flags & 1u) != 0u;
+	const bool detail_layer = (mat.flags & (1u << 14)) != 0u;
+	if ((base_mapped || (detail_layer && mat.detail_normal_texture_idx != 0u)) && has_tangent && dot(t, t) > 1e-10) {
 		t = normalize(t);
 		vec3 b = cross(n, t) * tbn.bitangent_sign * handedness;
 		vec2 uv = fetch_uv(geom, i0, i1, i2, bary) * mat.uv1_scale + mat.uv1_offset;
-		// The cone's level is per unit of UV; the texture's own size makes it a mip level, as sample_bindless_texture does.
-		float lod = 0.0;
-		if (rt_texture_lod_enabled() && h.texture_lod > RT_TEXTURE_LOD_BASE) {
-			vec2 size = vec2(textureSize(sampler2D(bindless_textures[nonuniformEXT(mat.normal_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), 0));
-			lod = max(h.texture_lod + 0.5 * log2(max(abs(mat.uv1_scale.x * mat.uv1_scale.y), 1e-20)) + 0.5 * log2(max(size.x * size.y, 1.0)), 0.0);
+		// Encoded until the detail layer has mixed its own in, as the hit does; without a base map it is the flat 0.5.
+		vec2 sample_xy = base_mapped ? subsurface_exit_sample(mat.normal_texture_idx, uv, h.texture_lod, mat.uv1_scale).xy : vec2(0.5);
+		if (detail_layer) {
+			const bool detail_on_uv2 = (mat.flags & (1u << 17)) != 0u;
+			const vec2 detail_uv = detail_on_uv2 ? fetch_uv2(geom, i0, i1, i2, bary) * mat.uv2_scale + mat.uv2_offset : uv;
+			const float detail_cone = detail_on_uv2 ? h.texture_lod2 : h.texture_lod;
+			const vec2 detail_scale = detail_on_uv2 ? mat.uv2_scale : mat.uv1_scale;
+			const float detail_alpha = mat.detail_albedo_texture_idx != 0u ? subsurface_exit_sample(mat.detail_albedo_texture_idx, detail_uv, detail_cone, detail_scale).a : 1.0;
+			const float detail_mask = mat.detail_mask_texture_idx != 0u ? subsurface_exit_sample(mat.detail_mask_texture_idx, uv, h.texture_lod, mat.uv1_scale).r : 1.0;
+			const vec2 detail_xy = mat.detail_normal_texture_idx != 0u ? subsurface_exit_sample(mat.detail_normal_texture_idx, detail_uv, detail_cone, detail_scale).xy : vec2(0.5);
+			sample_xy = mix(sample_xy, mix(sample_xy, detail_xy, detail_alpha), detail_mask);
 		}
-		vec2 sample_xy = textureLod(sampler2D(bindless_textures[nonuniformEXT(mat.normal_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, lod).xy;
 		vec3 ts = vec3(sample_xy * 2.0 - 1.0, 0.0);
 		ts.z = sqrt(max(0.0, 1.0 - dot(ts.xy, ts.xy)));
 		ns = normalize(mix(n, t * ts.x + b * ts.y + n * ts.z, mat.normal_map_depth));

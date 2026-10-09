@@ -574,12 +574,14 @@ uint subsurface_walk(HitData h, vec3 p_albedo, bool p_skin, vec3 N, float hit_t,
 
 	uint rng = p_seed;
 	// The walk's position is kept as an offset from the hit, so trace space rounds each query's origin once and the steps
-	// do not accumulate its error: up to 1024 m from the relative origin (rendering/pathtracing/relative_origin_grid) a
+	// do not accumulate its error: 1 km from the relative origin (a 1024 m rendering/pathtracing/relative_origin_grid) a
 	// float's step is about 0.1 mm, a fair share of a mean free path. The walk starts on the hit itself, its first query
 	// stepping over the entered triangle by a few of those steps (offset_ray_origin moves a point 256 of them, about
-	// 1.5 cm there, which started walks centimetres deep); a step past a front face starts again as far beyond it.
+	// 1.5 cm there, which started walks centimetres deep); a step past a front face starts again as far beyond it. The hit
+	// was found as origin + direction * hit_t, so its error follows the larger of the two magnitudes, as in
+	// offset_ray_origin's floor: near a small grid's anchor, a hit seen from further away carries more than its own.
 	vec3 local = vec3(0.0);
-	const float entry_tmin = max(max(abs(h.hit_pos.x), max(abs(h.hit_pos.y), abs(h.hit_pos.z))) * (4.0 / 8388608.0), 1e-6);
+	const float entry_tmin = max(max(max(abs(h.hit_pos.x), max(abs(h.hit_pos.y), abs(h.hit_pos.z))), hit_t) * (4.0 / 8388608.0), 1e-6);
 	vec3 direction = rotatePoint(getRotationFromZAxis(-N), sampleHemisphere(vec2(subsurface_rand(rng), subsurface_rand(rng))));
 	// A shading normal tilted far from the geometry can aim the entry back out; mirror it under the plane.
 	float above = dot(direction, h.geometry_normal);

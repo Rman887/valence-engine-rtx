@@ -494,6 +494,58 @@ vec3 subsurface_single_scattering_albedo(vec3 A) {
 	return vec3(1.0) - s * s;
 }
 
+/// The shading normal at a walk's exit (D120): the forms a material's normal map carries (cm-scale, a spine's groove, a
+/// collarbone) belong to the surface the light leaves, not to the mm-scale scattering the walk adds.
+/// - A standard material's normal map (flag bit 0) at the exit's UV1, through the exit's interpolated tangent frame, as the
+///   hit's HG0 fill builds it; read at the entry's ray-cone level, carried over the millimetres the walk moved and taken
+///   through the exit material's UV scale as HG0 takes it, or level 0 without texture LOD.
+/// - Otherwise, from a custom hit group (whose fragment cannot run here), the entry's perturbation: the rotation taking the
+///   entry's interpolated normal to its shading normal, applied to the exit's when the exit faces the entry's side.
+/// - Otherwise the exit's interpolated normal, also on a row stored without tangents. The detail layer's normal map is not
+///   read at the exit: its pores are the walk's own scale.
+/// A result at or below the exit's plane is lifted just above it, as the hit's clamp keeps its shading normal.
+vec3 subsurface_exit_shading_normal(HitData h, vec3 N, uint row, GeometryData geom, uint i0, uint i1, uint i2, vec3 bary, TBNResult tbn, mat3 normal_matrix, float handedness, vec3 n) {
+	vec3 ns = n;
+	MaterialData mat = materials[row];
+	vec3 t = normal_matrix * tbn.tangent;
+	t -= n * dot(n, t);
+	// A row stored without tangents carries fetch_tbn's placeholder; the hit derives its frame there instead, which this
+	// include cannot, so such an exit keeps its interpolated normal.
+	const bool has_tangent = (geom.flags & FLAG_COMPRESSED) != 0u || geom.normal_stride >= 8u;
+	if ((mat.flags & 1u) != 0u && has_tangent && dot(t, t) > 1e-10) {
+		t = normalize(t);
+		vec3 b = cross(n, t) * tbn.bitangent_sign * handedness;
+		vec2 uv = fetch_uv(geom, i0, i1, i2, bary) * mat.uv1_scale + mat.uv1_offset;
+		// The cone's level is per unit of UV; the texture's own size makes it a mip level, as sample_bindless_texture does.
+		float lod = 0.0;
+		if (rt_texture_lod_enabled() && h.texture_lod > RT_TEXTURE_LOD_BASE) {
+			vec2 size = vec2(textureSize(sampler2D(bindless_textures[nonuniformEXT(mat.normal_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), 0));
+			lod = max(h.texture_lod + 0.5 * log2(max(abs(mat.uv1_scale.x * mat.uv1_scale.y), 1e-20)) + 0.5 * log2(max(size.x * size.y, 1.0)), 0.0);
+		}
+		vec2 sample_xy = textureLod(sampler2D(bindless_textures[nonuniformEXT(mat.normal_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, lod).xy;
+		vec3 ts = vec3(sample_xy * 2.0 - 1.0, 0.0);
+		ts.z = sqrt(max(0.0, 1.0 - dot(ts.xy, ts.xy)));
+		ns = normalize(mix(n, t * ts.x + b * ts.y + n * ts.z, mat.normal_map_depth));
+	}
+#ifdef RT_CUSTOM_HIT_GROUP
+	else if (dot(n, h.geometry_normal) > 0.0) {
+		// Rodrigues: the rotation taking the entry's interpolated normal to its shading normal, about their common axis.
+		vec3 axis = cross(h.geometry_normal, N);
+		float sine = length(axis);
+		if (sine > 1e-6) {
+			axis /= sine;
+			float cosine = dot(h.geometry_normal, N);
+			ns = normalize(n * cosine + cross(axis, n) * sine + axis * dot(axis, n) * (1.0 - cosine));
+		}
+	}
+#endif
+	float above = dot(ns, n);
+	if (above < 0.05) {
+		ns = normalize(ns + n * (0.05 - above));
+	}
+	return ns;
+}
+
 /// A random walk under the surface h (Cycles' shape): in by a cosine direction about -N from the hit, through a
 /// homogeneous medium whose coefficients come from the albedo and the mean free path (the setting times skin's channel
 /// ratios or equal ones), a channel drawn per step by the throughput it carries times its albedo and the step weighed
@@ -503,10 +555,11 @@ vec3 subsurface_single_scattering_albedo(vec3 A) {
 /// another walking surface met from outside inside this body (the head's neck shell from the body, teeth in the gums):
 /// the step goes on past it, at most RT_SUBSURFACE_MAX_SKIPS times, then scatters at its distance. On RT_SUBSURFACE_EXITED the
 /// throughput has carried the walk and r_exit_* name where it left: the point, the interpolated vertex normal facing
-/// out, the step's length. The walk draws from a hash of its own, seeded per vertex.
-uint subsurface_walk(HitData h, vec3 p_albedo, bool p_skin, vec3 N, float hit_t, uint p_seed, inout vec3 throughput, out vec3 r_exit_position, out vec3 r_exit_normal, out float r_exit_t, out uint r_events, out uint r_skips) {
+/// out, the shading normal the exit is lit and leaves about (r_exit_shading_normal), the step's length. The walk draws from a hash of its own, seeded per vertex.
+uint subsurface_walk(HitData h, vec3 p_albedo, bool p_skin, vec3 N, float hit_t, uint p_seed, inout vec3 throughput, out vec3 r_exit_position, out vec3 r_exit_normal, out vec3 r_exit_shading_normal, out float r_exit_t, out uint r_events, out uint r_skips) {
 	r_exit_position = h.hit_pos;
 	r_exit_normal = h.geometry_normal;
+	r_exit_shading_normal = N;
 	r_exit_t = hit_t;
 	r_events = 0u;
 	r_skips = 0u;
@@ -579,7 +632,9 @@ uint subsurface_walk(HitData h, vec3 p_albedo, bool p_skin, vec3 N, float hit_t,
 			vec2 b = rayQueryGetIntersectionBarycentricsEXT(q, true);
 			TBNResult tbn = fetch_tbn(geom, i0, i1, i2, vec3(1.0 - b.x - b.y, b.x, b.y));
 			mat3 basis = rt_instance_basis(geom, mat3(rayQueryGetIntersectionObjectToWorldEXT(q, true)));
-			r_exit_normal = normalize(rt_normal_basis(basis) * tbn.normal);
+			mat3 normal_matrix = rt_normal_basis(basis);
+			r_exit_normal = normalize(normal_matrix * tbn.normal);
+			r_exit_shading_normal = subsurface_exit_shading_normal(h, N, rayQueryGetIntersectionInstanceCustomIndexEXT(q, true), geom, i0, i1, i2, vec3(1.0 - b.x - b.y, b.x, b.y), tbn, normal_matrix, determinant(basis) < 0.0 ? -1.0 : 1.0, r_exit_normal);
 			break;
 		}
 
@@ -1010,6 +1065,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	bool walked = false;
 	vec3 exit_position = h.hit_pos;
 	vec3 exit_normal = h.geometry_normal;
+	vec3 exit_shading_normal = N;
 	MaterialProperties exit_mat = brdf_mat;
 	// Only from outside: a back face (seen from inside an open mesh) keeps the plain diffuse bounce.
 	if (brdfType == DIFFUSE_TYPE && !coat_sampled && !sheen_sampled && !diffuse_transmitted && brdf_mat.subsurface > 0.0 && h.is_front_face) {
@@ -1018,7 +1074,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			float exit_t;
 			uint events, skips;
 			uint seed = pcg_hash(ps.rng_state ^ pcg_hash(rt_pixel_seed() + total_bounces * 0x9e3779b9u));
-			uint status = subsurface_walk(h, m.albedo, m.subsurface_skin, N, hit_t, seed, ps.throughput, exit_position, exit_normal, exit_t, events, skips);
+			uint status = subsurface_walk(h, m.albedo, m.subsurface_skin, N, hit_t, seed, ps.throughput, exit_position, exit_normal, exit_shading_normal, exit_t, events, skips);
 #ifdef RT_SUBSURFACE_STATS
 			if (((gl_LaunchIDEXT.x | gl_LaunchIDEXT.y) & 7u) == 0u) {
 				atomicAdd(subsurface_stats.words[0], 1u);
@@ -1046,19 +1102,26 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			exit_mat.anisotropyT = vec3(0.0);
 			exit_mat.clearcoat = 0.0;
 			exit_mat.clearcoatAlpha = 0.001;
-			exit_mat.clearcoatN = exit_normal;
+			exit_mat.clearcoatN = exit_shading_normal;
 			exit_mat.sheenColor = vec3(0.0);
 			exit_mat.sheenRoughness = 1.0;
 			exit_mat.subsurface = 0.0;
-			// The exit's light sample, viewed along its normal (a Lambert is the same from every side), on its own block. Past
+			// The exit's light sample about its shading normal (D120), viewed along it (a Lambert is the same from every side),
+			// with the interpolated normal as the receiver the densities read and the origin's offset, as at a hit; on its own
+			// block. Past
 			// the walk the path has scattered, so its light is indirect for the clamp (D53).
 			ps.packed_bounces_flags = set_scattered(ps.packed_bounces_flags);
 			path_pack(payload, ps);
 			rng_set_dimension(ps.rng_state, RT_SOBOL_DIM_SUBSURFACE_EXIT_BASE + total_bounces * RT_SOBOL_DIMS_PER_BOUNCE);
-			shade_direct_light(exit_position, exit_normal, exit_t, exit_normal, exit_normal, exit_mat, 0.0, diffuse_bounces, rt_emissive_count, in_medium, ps);
+			shade_direct_light(exit_position, exit_normal, exit_t, exit_shading_normal, exit_shading_normal, exit_mat, 0.0, diffuse_bounces, rt_emissive_count, in_medium, ps);
 			// And its direction: the cosine cancels its density, leaving a weight of 1.
 			rng_set_dimension(ps.rng_state, RT_SOBOL_DIM_SUBSURFACE_EXIT_BASE + total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER);
-			next_dir = rotatePoint(getRotationFromZAxis(exit_normal), sampleHemisphere(rand2(ps.rng_state)));
+			next_dir = rotatePoint(getRotationFromZAxis(exit_shading_normal), sampleHemisphere(rand2(ps.rng_state)));
+			// A direction the shading normal tilts below the exit's plane is mirrored above it, as the hit's recovery does.
+			float exit_below = dot(next_dir, exit_normal);
+			if (exit_below < 0.0) {
+				next_dir = normalize(next_dir - 2.0 * exit_below * exit_normal);
+			}
 		}
 	}
 #endif
@@ -1106,8 +1169,8 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 #ifdef RT_SUBSURFACE_COMPILED
 	if (walked) {
 		// After a walk the direction left the exit by its Lambert (D120).
-		pdf_N = exit_normal;
-		pdf_V = exit_normal;
+		pdf_N = exit_shading_normal;
+		pdf_V = exit_shading_normal;
 		pdf_mat = exit_mat;
 		pdf_unowned = false;
 	}

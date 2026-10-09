@@ -1317,6 +1317,7 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 					bool is_normal_roughness_texture = false;
 					bool texture_lod_rewrite = false;
 					String texture_lod_sampler;
+					String texture_lod_level_function = actions.texture_lod_function;
 					bool texture_grad_rewrite = false;
 					String texture_grad_coordinate;
 					String texture_projected_sampler;
@@ -1487,6 +1488,21 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 										}
 										if (reads_coordinate) {
 											texture_lod_sampler = data_type_name + "(" + node_code + ", " + sampler_name + ")";
+											// A coordinate with its own level function, read alone (D118).
+											for (const KeyValue<StringName, String> &coordinate_function : actions.texture_lod_coordinate_functions) {
+												HashSet<StringName> own;
+												own.insert(coordinate_function.key);
+												HashSet<StringName> others;
+												for (const StringName &name : actions.texture_lod_coordinates) {
+													if (name != coordinate_function.key) {
+														others.insert(name);
+													}
+												}
+												if (_node_reads_any(onode->arguments[2], own) && !_node_reads_any(onode->arguments[2], others)) {
+													texture_lod_level_function = coordinate_function.value;
+													break;
+												}
+											}
 											// Only through a linear anisotropic sampler: the hint this call resolved to.
 											const bool anisotropic = sampler_name == _get_sampler_name(ShaderLanguage::FILTER_LINEAR_MIPMAP_ANISOTROPIC, ShaderLanguage::REPEAT_ENABLE) || sampler_name == _get_sampler_name(ShaderLanguage::FILTER_LINEAR_MIPMAP_ANISOTROPIC, ShaderLanguage::REPEAT_DISABLE);
 											if (anisotropic && !actions.texture_grad_variable.is_empty() && onode->arguments.size() == 3 && _node_reads_any(onode->arguments[2], actions.texture_grad_coordinates)) {
@@ -1561,14 +1577,14 @@ String ShaderCompiler::_dump_node_code(const SL::Node *p_node, int p_level, Gene
 						}
 					}
 					if (!texture_lod_sampler.is_empty()) {
-						code += String(onode->arguments.size() == 4 ? " + " : ", ") + actions.texture_lod_function + "(textureSize(" + texture_lod_sampler + ", 0))";
+						code += String(onode->arguments.size() == 4 ? " + " : ", ") + texture_lod_level_function + "(textureSize(" + texture_lod_sampler + ", 0))";
 					}
 					code += ")";
 					if (!texture_filtering_arguments.is_empty()) {
 						// The stochastic filter's function at the same level, which falls back to this lookup.
 						String level = texture_projected_level;
 						if (!texture_lod_sampler.is_empty()) {
-							level = actions.texture_lod_function + "(textureSize(" + texture_lod_sampler + ", 0))";
+							level = texture_lod_level_function + "(textureSize(" + texture_lod_sampler + ", 0))";
 							if (onode->arguments.size() == 4) {
 								level = "(" + texture_lod_bias + ") + " + level;
 							}

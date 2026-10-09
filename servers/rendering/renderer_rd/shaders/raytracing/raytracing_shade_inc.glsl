@@ -27,6 +27,7 @@ struct HitData {
 	vec3 tangent; // World space.
 	vec3 bitangent; // World space.
 	vec2 uv; // Raw UV (no material scale/offset applied).
+	vec2 uv2; // The raw second UV set (D118), zero unless the hit fetched it.
 	vec4 color; // Vertex color (white if not present).
 	bool is_front_face;
 	uint geometry_idx;
@@ -34,6 +35,7 @@ struct HitData {
 	float texture_lod; // The ray cone's texture-independent level (D116), RT_TEXTURE_LOD_BASE when unknown.
 	float texture_footprint; // The cone's footprint as a level in metres (D116): a texture of d texels per metre reads at this + log2(d).
 	vec4 texture_grad; // The cone's elliptical footprint as the mesh's UV gradients (g1, g2) (D116), zero when the hit samples at texture_lod.
+	float texture_lod2; // The cone's level at the second UV set (D118), RT_TEXTURE_LOD_BASE when unknown.
 };
 
 // ============================================================================

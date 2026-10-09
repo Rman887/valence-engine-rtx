@@ -115,6 +115,9 @@ public:
 		// detail there, and their stages accept no bias form (D116).
 		String texture_lod_function;
 		HashSet<StringName> texture_lod_coordinates;
+		// A coordinate of texture_lod_coordinates mapped here takes this function in place of texture_lod_function
+		// when the lookup reads it and none of the others: a second UV set has its own density (D118).
+		HashMap<StringName, String> texture_lod_coordinate_functions;
 		// When set, the lookups above through a linear anisotropic sampler, without a bias, whose coordinate reads one
 		// of texture_grad_coordinates and none of the other texture_lod_coordinates become
 		// (v.on ? textureGrad(s, uv, v.x, v.y) : <the level form>), v being this variable: the hit's UV gradients

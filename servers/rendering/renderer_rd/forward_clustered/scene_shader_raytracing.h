@@ -420,6 +420,7 @@ public:
 		bool uses_texture_grad = false; // A lookup the compiler rewrote to textureGrad: the hit computes the cone's elliptical footprint (D116)
 		bool uses_texture_filtering = false; // A lookup the compiler sent through the stochastic texture filter: the hit draws its random numbers (D117)
 		bool writes_uv = false; // Writes UV or UV2, whose density the mesh's UVs no longer tell: every texture() call reads level 0 (D116)
+		bool uses_uv2 = false; // Reads or writes UV2: the hits fetch the mesh's second UV set (D118)
 		bool is_procedural = false; // Uses intersection shader instead of triangle geometry
 		uint32_t alpha_texture_buffer_offset = UINT32_MAX; // Byte offset of hint_alpha texture index in CustomMaterialUniforms UBO; UINT32_MAX if absent
 		// render_mode opacity_micromap with a hint_alpha texture (D96): the trace's alpha test is the standard

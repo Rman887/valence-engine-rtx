@@ -631,6 +631,8 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	actions.write_flag_pointers["UV"] = &detected_uv_write;
 	bool detected_uv2_write = false;
 	actions.write_flag_pointers["UV2"] = &detected_uv2_write;
+	bool detected_uv2 = false;
+	actions.usage_flag_pointers["UV2"] = &detected_uv2;
 
 	HashMap<StringName, ShaderLanguage::ShaderNode::Uniform> uniform_sink;
 	actions.uniforms = &uniform_sink;
@@ -649,6 +651,7 @@ bool SceneShaderRaytracing::_preprocess_shader(RID p_material, bool p_is_procedu
 	const RendererRD::MaterialStorage::ShaderData *label_shader = RendererRD::MaterialStorage::get_singleton()->material_get_shader_data(p_material);
 	r_entry.label = (label_shader && !label_shader->path.is_empty()) ? label_shader->path : vformat("material %d", p_material.get_id());
 	r_entry.writes_uv = detected_uv_write || detected_uv2_write;
+	r_entry.uses_uv2 = detected_uv2;
 	r_entry.uses_projected = detected_projected;
 	r_entry.uses_texture_grad = detected_texture_grad;
 	r_entry.uses_texture_filtering = detected_texture_filtering;
@@ -1191,6 +1194,10 @@ SceneShaderRaytracing::PipelineBuildTask *SceneShaderRaytracing::_make_pipeline_
 		if (entry.uses_texture_filtering) {
 			// A lookup goes through the stochastic texture filter: the hit draws its random numbers (D117).
 			tex_defines += "#define RT_CUSTOM_TEXTURE_FILTERING\n";
+		}
+		if (entry.uses_uv2) {
+			// UV2 reads the mesh's second set, which the hits fetch only for a shader that reads it (D118).
+			tex_defines += "#define RT_CUSTOM_UV2_USED\n";
 		}
 		String uniform_members = entry.uniform_members.is_empty() ? String("float _rt_pad;") : entry.uniform_members;
 
@@ -1889,10 +1896,11 @@ void SceneShaderRaytracing::init(const String p_defines) {
 		actions.default_filter = ShaderLanguage::FILTER_LINEAR_MIPMAP;
 		actions.default_repeat = ShaderLanguage::REPEAT_ENABLE;
 		// texture() at the mesh's UVs reads at the ray cone's level, or over its elliptical footprint at UV
-		// (D116, raytracing_custom_texture_inc.glsl).
+		// (D116, raytracing_custom_texture_inc.glsl); at UV2 alone, at the second set's level (D118).
 		actions.texture_lod_function = "rt_texture_lod";
 		actions.texture_lod_coordinates.insert("UV");
 		actions.texture_lod_coordinates.insert("UV2");
+		actions.texture_lod_coordinate_functions["UV2"] = "rt_texture_lod2";
 		actions.texture_grad_variable = "rt_grad_t";
 		actions.texture_grad_coordinates.insert("UV");
 		actions.texture_projected_function = "rt_texture_projected_lod";

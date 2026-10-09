@@ -198,6 +198,7 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	h.tangent = vec3(0.0);
 	h.bitangent = vec3(0.0);
 	h.uv = vec2(0.0);
+	h.uv2 = vec2(0.0);
 	h.color = vec4(1.0);
 	h.is_front_face = transmission_flags.a > 0.5;
 	h.geometry_idx = 0u;
@@ -205,6 +206,7 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	h.texture_lod = RT_TEXTURE_LOD_BASE; // The raster sampled the surface's textures.
 	h.texture_footprint = RT_TEXTURE_LOD_BASE; // And drew its decals.
 	h.texture_grad = vec4(0.0);
+	h.texture_lod2 = RT_TEXTURE_LOD_BASE;
 
 	MaterialResult m;
 	m.albedo = albedo_specular.rgb;
@@ -714,10 +716,16 @@ void main() {
 #else
 	const bool gradients = (materials[gl_InstanceCustomIndexEXT].flags & 64u) != 0u;
 #endif
-#ifdef RT_CUSTOM_PROJECTED_LOD
-	HitData h = compute_hit_data(true, gradients);
+	// The second UV set only where it is read (D118): by a custom shader that uses UV2.
+#if defined(RT_CUSTOM_HIT_GROUP) && defined(RT_CUSTOM_UV2_USED)
+	const bool fetch_uv2 = true;
 #else
-	HitData h = compute_hit_data(false, gradients);
+	const bool fetch_uv2 = false;
+#endif
+#ifdef RT_CUSTOM_PROJECTED_LOD
+	HitData h = compute_hit_data(true, gradients, fetch_uv2);
+#else
+	HitData h = compute_hit_data(false, gradients, fetch_uv2);
 #endif
 	write_primary_hit_depth(h.hit_pos);
 	write_primary_hit_velocity(h.hit_pos);
@@ -726,6 +734,7 @@ void main() {
 	uint rt_geometry_idx = h.geometry_idx;
 	vec3 rt_hit_pos = h.hit_pos;
 	vec2 rt_uv = h.uv;
+	vec2 rt_uv2 = h.uv2;
 	vec4 rt_color = h.color;
 	vec3 rt_normal = h.geometry_normal;
 	vec3 rt_tangent = h.tangent;
@@ -736,6 +745,7 @@ void main() {
 	float rt_hit_texture_lod = rt_texture_lod_enabled() ? h.texture_lod : RT_TEXTURE_LOD_BASE;
 	float rt_hit_texture_footprint = rt_texture_lod_enabled() ? h.texture_footprint : RT_TEXTURE_LOD_BASE;
 	vec4 rt_hit_texture_grad = h.texture_grad; // Zero unless the anisotropic switch is on.
+	float rt_hit_texture_lod2 = rt_texture_lod_enabled() ? h.texture_lod2 : RT_TEXTURE_LOD_BASE; // At UV2 (D118).
 
 #include "raytracing_custom_fragment_inc.glsl"
 
@@ -1018,6 +1028,11 @@ void main() {
 	// Compute hit data inline (cannot include closest_hit_common_inc here).
 	uint rt_geometry_idx = geometry_idx;
 	vec2 rt_uv = fetch_uv(geom, i0, i1, i2, bary);
+#ifdef RT_CUSTOM_UV2_USED
+	vec2 rt_uv2 = fetch_uv2(geom, i0, i1, i2, bary);
+#else
+	vec2 rt_uv2 = vec2(0.0);
+#endif
 	TBNResult ah_tbn = fetch_tbn(geom, i0, i1, i2, bary);
 
 	mat3 basis = rt_instance_basis(geom, mat3(gl_ObjectToWorldEXT));

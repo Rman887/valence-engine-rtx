@@ -5,6 +5,7 @@
 //   uint  rt_geometry_idx   -- geometry/material index
 //   vec3  rt_hit_pos        -- world-space hit position
 //   vec2  rt_uv             -- interpolated UV
+//   vec2  rt_uv2            -- interpolated second UV set, zero when the mesh has none or the shader reads no UV2
 //   vec3  rt_normal         -- world-space geometry normal (flipped for back-face)
 //   vec3  rt_tangent        -- world-space tangent
 //   vec3  rt_bitangent      -- world-space bitangent
@@ -52,7 +53,7 @@ normal = normalize(transpose(rt_model_basis) * rt_normal);
 tangent = normalize(transpose(rt_model_basis) * rt_tangent);
 binormal = normalize(transpose(rt_model_basis) * rt_bitangent);
 uv_interp = rt_uv;
-uv2_interp = rt_uv;
+uv2_interp = rt_uv2;
 color_interp = rt_color;
 view = -gl_WorldRayDirectionEXT;
 rt_front_facing = rt_front_face;
@@ -66,6 +67,7 @@ rt_frag_coord = vec4(gl_LaunchIDEXT.xy, 0.0, 1.0);
 // The fragment's texture() calls at the mesh's UVs read at the ray cone's level, or over its elliptical
 // footprint (D116); the vertex function's, before this, and the any-hit's alpha test read level 0.
 rt_lod_t = rt_hit_texture_lod;
+rt_lod2_t = rt_hit_texture_lod2;
 rt_grad_t = RtTextureGrad(rt_hit_texture_grad != vec4(0.0), rt_hit_texture_grad.xy, rt_hit_texture_grad.zw);
 #endif
 #ifdef RT_STAGE_CLOSEST_HIT

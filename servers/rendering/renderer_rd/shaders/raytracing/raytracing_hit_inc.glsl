@@ -9,11 +9,14 @@
 struct VertexAttributes {
 	vec2 uv;
 	vec2 uv_corners[3]; // The triangle's three UVs the blend came from (D116), with FETCH_UV.
+	vec2 uv2; // The second UV set and its corners (D118), with FETCH_UV2.
+	vec2 uv2_corners[3];
 	vec3 normal;
 	vec3 tangent;
 	float bitangent_sign;
 	vec4 color;
 	bool has_uv;
+	bool has_uv2;
 	bool has_normal;
 	bool has_tangent;
 	bool has_color;
@@ -150,9 +153,10 @@ uint rt_resolve_hit_triangle(inout GeometryData geom, out uint i0, out uint i1, 
 // ============================================================================
 // UV FETCHING
 // ============================================================================
-/// The triangle's three UVs; false, with zero UVs, when the surface has none.
-bool fetch_uv_vertices(in GeometryData geom, uint i0, uint i1, uint i2, out vec2 uv0, out vec2 uv1, out vec2 uv2) {
-	if (geom.uv_byte_offset == OFFSET_NONE || geom.attribute_address == 0ul) {
+/// The triangle's three UVs of the set at p_byte_offset, a compressed one decompressed by p_scale where p_scaled; false,
+/// with zero UVs, when the surface has no such set.
+bool fetch_uv_set_vertices(in GeometryData geom, uint p_byte_offset, vec2 p_scale, bool p_scaled, uint i0, uint i1, uint i2, out vec2 uv0, out vec2 uv1, out vec2 uv2) {
+	if (p_byte_offset == OFFSET_NONE || geom.attribute_address == 0ul) {
 		uv0 = vec2(0.0);
 		uv1 = vec2(0.0);
 		uv2 = vec2(0.0);
@@ -160,7 +164,7 @@ bool fetch_uv_vertices(in GeometryData geom, uint i0, uint i1, uint i2, out vec2
 	}
 
 	uint stride_words = geom.attribute_stride >> 2;
-	uint uv_word_off = geom.uv_byte_offset >> 2;
+	uint uv_word_off = p_byte_offset >> 2;
 	bool compressed = (geom.flags & FLAG_COMPRESSED) != 0u;
 
 	if (compressed) {
@@ -173,16 +177,15 @@ bool fetch_uv_vertices(in GeometryData geom, uint i0, uint i1, uint i2, out vec2
 		uv1 = vec2(float(p1 & 0xFFFFu), float(p1 >> 16)) / 65535.0;
 		uv2 = vec2(float(p2 & 0xFFFFu), float(p2 >> 16)) / 65535.0;
 
-		vec2 scale = unpackHalf2x16(geom.uv_scale_packed);
-		if (scale.x != 0.0 || scale.y != 0.0) {
-			uv0 = (uv0 - 0.5) * scale;
-			uv1 = (uv1 - 0.5) * scale;
-			uv2 = (uv2 - 0.5) * scale;
+		if (p_scaled) {
+			uv0 = (uv0 - 0.5) * p_scale;
+			uv1 = (uv1 - 0.5) * p_scale;
+			uv2 = (uv2 - 0.5) * p_scale;
 		}
 	} else {
 		FloatBuffer attr_f = FloatBuffer(geom.attribute_address);
 		uint stride_floats = geom.attribute_stride >> 2;
-		uint uv_float_off = geom.uv_byte_offset >> 2;
+		uint uv_float_off = p_byte_offset >> 2;
 
 		uv0 = vec2(attr_f.v[i0 * stride_floats + uv_float_off],
 				attr_f.v[i0 * stride_floats + uv_float_off + 1u]);
@@ -194,9 +197,28 @@ bool fetch_uv_vertices(in GeometryData geom, uint i0, uint i1, uint i2, out vec2
 	return true;
 }
 
+/// The triangle's three UVs; false, with zero UVs, when the surface has none. A compressed set is decompressed when
+/// either set has a scale, as the raster does.
+bool fetch_uv_vertices(in GeometryData geom, uint i0, uint i1, uint i2, out vec2 uv0, out vec2 uv1, out vec2 uv2) {
+	return fetch_uv_set_vertices(geom, geom.uv_byte_offset, unpackHalf2x16(geom.uv_scale_packed), geom.uv_scale_packed != 0u || geom.uv2_scale_packed != 0u, i0, i1, i2, uv0, uv1, uv2);
+}
+
+/// The triangle's three UVs of the second set (D118); false, with zero UVs, when the surface has none, which is what
+/// the raster's UV2 reads then.
+bool fetch_uv2_vertices(in GeometryData geom, uint i0, uint i1, uint i2, out vec2 uv0, out vec2 uv1, out vec2 uv2) {
+	vec2 scale = unpackHalf2x16(geom.uv2_scale_packed);
+	return fetch_uv_set_vertices(geom, geom.uv2_byte_offset, scale, geom.uv2_scale_packed != 0u || geom.uv_scale_packed != 0u, i0, i1, i2, uv0, uv1, uv2);
+}
+
 vec2 fetch_uv(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
 	vec2 uv0, uv1, uv2;
 	fetch_uv_vertices(geom, i0, i1, i2, uv0, uv1, uv2);
+	return bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
+}
+
+vec2 fetch_uv2(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
+	vec2 uv0, uv1, uv2;
+	fetch_uv2_vertices(geom, i0, i1, i2, uv0, uv1, uv2);
 	return bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
 }
 
@@ -340,6 +362,7 @@ mat3 rt_normal_basis(mat3 basis) {
 #define FETCH_TBN (1u << 1)
 #define FETCH_COLOR (1u << 2)
 #define FETCH_ALL (FETCH_UV | FETCH_TBN | FETCH_COLOR)
+#define FETCH_UV2 (1u << 3) // The second UV set, only where something reads it (D118).
 
 #ifdef RT_HIT_ATTRIBS_DECLARED
 /// geom and the indices as rt_resolve_hit_triangle returned them.
@@ -349,11 +372,16 @@ VertexAttributes fetch_vertex_attributes(in GeometryData geom, uint i0, uint i1,
 	attrs.uv_corners[0] = vec2(0.0);
 	attrs.uv_corners[1] = vec2(0.0);
 	attrs.uv_corners[2] = vec2(0.0);
+	attrs.uv2 = vec2(0.0);
+	attrs.uv2_corners[0] = vec2(0.0);
+	attrs.uv2_corners[1] = vec2(0.0);
+	attrs.uv2_corners[2] = vec2(0.0);
 	attrs.normal = vec3(0.0, 1.0, 0.0);
 	attrs.tangent = vec3(1.0, 0.0, 0.0);
 	attrs.bitangent_sign = 1.0;
 	attrs.color = vec4(1.0);
 	attrs.has_uv = false;
+	attrs.has_uv2 = false;
 	attrs.has_normal = false;
 	attrs.has_tangent = false;
 	attrs.has_color = false;
@@ -363,6 +391,11 @@ VertexAttributes fetch_vertex_attributes(in GeometryData geom, uint i0, uint i1,
 	if ((fetch_flags & FETCH_UV) != 0u && geom.uv_byte_offset != OFFSET_NONE) {
 		attrs.has_uv = fetch_uv_vertices(geom, i0, i1, i2, attrs.uv_corners[0], attrs.uv_corners[1], attrs.uv_corners[2]);
 		attrs.uv = bary.x * attrs.uv_corners[0] + bary.y * attrs.uv_corners[1] + bary.z * attrs.uv_corners[2];
+	}
+
+	if ((fetch_flags & FETCH_UV2) != 0u && geom.uv2_byte_offset != OFFSET_NONE) {
+		attrs.has_uv2 = fetch_uv2_vertices(geom, i0, i1, i2, attrs.uv2_corners[0], attrs.uv2_corners[1], attrs.uv2_corners[2]);
+		attrs.uv2 = bary.x * attrs.uv2_corners[0] + bary.y * attrs.uv2_corners[1] + bary.z * attrs.uv2_corners[2];
 	}
 
 	if ((fetch_flags & FETCH_COLOR) != 0u && geom.color_byte_offset != OFFSET_NONE) {

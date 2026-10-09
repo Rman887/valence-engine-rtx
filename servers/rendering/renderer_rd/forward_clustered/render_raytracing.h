@@ -102,7 +102,11 @@ struct alignas(16) RT_GeometryData {
 	uint32_t cluster_record_base;
 	// _pad[RT_GEOMETRY_LAYERS_WORD]: the instance's visual layers, stamped on the frame's copy of the
 	// row, never the cached one (D104); the hit shaders test a decal's cull mask against them.
-	uint32_t _pad[4];
+	uint32_t _pad[2];
+	// The second UV set's byte offset inside `attribute_stride`, RT_OFFSET_NONE without one, and its
+	// decompression scale (fp16 x, fp16 y) for a compressed surface (D118).
+	uint32_t uv2_byte_offset;
+	uint32_t uv2_scale_packed;
 };
 static_assert(sizeof(RT_GeometryData) == 128, "RT_GeometryData must be 128 bytes for std430");
 

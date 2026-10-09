@@ -152,7 +152,8 @@ vec3 rt_derived_tangent(GeometryData geom, uint i0, uint i1, uint i2, VertexAttr
 /// Requires hitAttributeEXT HitAttribs and GeometryBuffer/MaterialBuffer bindings.
 /// p_footprint: the cone's footprint is wanted whether or not the mesh has UVs or the frame decals.
 /// p_gradients: a fetch reads the elliptical footprint's UV gradients (D116), with the anisotropic switch on.
-HitData compute_hit_data(bool p_footprint, bool p_gradients) {
+/// p_uv2: a fetch reads the second UV set, which the hit fetches with its level (D118).
+HitData compute_hit_data(bool p_footprint, bool p_gradients, bool p_uv2) {
 	HitData h;
 	h.geometry_idx = gl_InstanceCustomIndexEXT;
 	GeometryData geom = geometries[h.geometry_idx];
@@ -169,11 +170,12 @@ HitData compute_hit_data(bool p_footprint, bool p_gradients) {
 	// Custom hit groups may reference vertex color in their fragment code, so
 	// pull all attributes; default HGs can skip color for perf.
 #ifdef RT_CUSTOM_HIT_GROUP
-	VertexAttributes attrs = fetch_vertex_attributes(geom, i0, i1, i2, attribs, FETCH_ALL);
+	VertexAttributes attrs = fetch_vertex_attributes(geom, i0, i1, i2, attribs, FETCH_ALL | (p_uv2 ? FETCH_UV2 : 0u));
 #else
-	VertexAttributes attrs = fetch_vertex_attributes(geom, i0, i1, i2, attribs, FETCH_UV | FETCH_TBN);
+	VertexAttributes attrs = fetch_vertex_attributes(geom, i0, i1, i2, attribs, FETCH_UV | FETCH_TBN | (p_uv2 ? FETCH_UV2 : 0u));
 #endif
 	h.uv = attrs.uv;
+	h.uv2 = attrs.uv2;
 	h.color = attrs.color;
 
 	mat3 basis = rt_instance_basis(geom, mat3(gl_ObjectToWorldEXT));
@@ -222,7 +224,8 @@ HitData compute_hit_data(bool p_footprint, bool p_gradients) {
 	h.texture_lod = RT_TEXTURE_LOD_BASE;
 	h.texture_footprint = RT_TEXTURE_LOD_BASE;
 	h.texture_grad = vec4(0.0);
-	if (rt_texture_lod_wanted() && (geom.flags & FLAG_PROCEDURAL) == 0u && (p_footprint || attrs.has_uv || get_rt_param(RT_PARAM_DECAL_COUNT) > 0.5)) {
+	h.texture_lod2 = RT_TEXTURE_LOD_BASE;
+	if (rt_texture_lod_wanted() && (geom.flags & FLAG_PROCEDURAL) == 0u && (p_footprint || attrs.has_uv || attrs.has_uv2 || get_rt_param(RT_PARAM_DECAL_COUNT) > 0.5)) {
 		vec3 p0, p1, p2;
 		if (rt_hit_triangle_positions(geom, i0, i1, i2, p0, p1, p2)) {
 			mat3 object_to_world = mat3(gl_ObjectToWorldEXT);
@@ -236,6 +239,9 @@ HitData compute_hit_data(bool p_footprint, bool p_gradients) {
 					float radius = (cone.x + cone.y * gl_HitTEXT) * exp2(get_rt_param(RT_PARAM_TEXTURE_LOD_BIAS));
 					h.texture_grad = rt_texture_grad_triangle(object_to_world * (p1 - p0), object_to_world * (p2 - p0), gl_WorldRayDirectionEXT, radius, attrs.uv_corners[0], attrs.uv_corners[1], attrs.uv_corners[2]);
 				}
+			}
+			if (attrs.has_uv2) {
+				h.texture_lod2 = rt_texture_lod_triangle(h.texture_footprint, n, attrs.uv2_corners[0], attrs.uv2_corners[1], attrs.uv2_corners[2]);
 			}
 		}
 	}

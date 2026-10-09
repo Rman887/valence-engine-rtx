@@ -2433,6 +2433,7 @@ void RendererSceneRenderImplementation::_fill_surface_geometry_data(
 	// Attribute buffer layout
 	uint32_t attrib_offset = 0;
 	geom.uv_byte_offset = RT_OFFSET_NONE;
+	geom.uv2_byte_offset = RT_OFFSET_NONE;
 	geom.color_byte_offset = RT_OFFSET_NONE;
 
 	if (surface_format & RSE::ARRAY_FORMAT_COLOR) {
@@ -2444,6 +2445,7 @@ void RendererSceneRenderImplementation::_fill_surface_geometry_data(
 		attrib_offset += compressed ? sizeof(uint16_t) * 2 : sizeof(float) * 2;
 	}
 	if (surface_format & RSE::ARRAY_FORMAT_TEX_UV2) {
+		geom.uv2_byte_offset = attrib_offset;
 		attrib_offset += compressed ? sizeof(uint16_t) * 2 : sizeof(float) * 2;
 	}
 	for (int ci = 0; ci < RSE::ARRAY_CUSTOM_COUNT; ci++) {
@@ -2459,6 +2461,7 @@ void RendererSceneRenderImplementation::_fill_surface_geometry_data(
 	// UV scale (fp16 packed, matches GLSL unpackHalf2x16)
 	Vector4 uv_scale = mesh_storage->mesh_surface_get_uv_scale(p_mesh_surface);
 	geom.uv_scale_packed = (uint32_t(Math::make_half_float(uv_scale.y)) << 16) | Math::make_half_float(uv_scale.x);
+	geom.uv2_scale_packed = (uint32_t(Math::make_half_float(uv_scale.w)) << 16) | Math::make_half_float(uv_scale.z);
 
 	// Index format (no device address — caller fills those in)
 	if (index_buffer.is_valid() && index_count > 0) {

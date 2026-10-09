@@ -25,6 +25,21 @@ float rt_texture_lod(ivec3 p_size) {
 	return rt_texture_lod(p_size.xy);
 }
 
+// A lookup whose coordinate reads UV2 and not UV reads at the second set's level, rt_lod2_t, set where rt_lod_t is
+// (D118). It takes no gradients: such a lookup keeps the isotropic level.
+float rt_lod2_t = RT_TEXTURE_LOD_BASE;
+
+float rt_texture_lod2(ivec2 p_size) {
+	if (rt_lod2_t <= RT_TEXTURE_LOD_BASE) {
+		return 0.0;
+	}
+	return rt_lod2_t + 0.5 * log2(max(float(p_size.x) * float(p_size.y), 1.0));
+}
+
+float rt_texture_lod2(ivec3 p_size) {
+	return rt_texture_lod2(p_size.xy);
+}
+
 // Such a lookup through a linear anisotropic sampler (the uniform's filter_linear_mipmap_anisotropic hint), without
 // a bias, whose coordinate reads UV and not UV2, becomes
 // (rt_grad_t.on ? textureGrad(s, uv, rt_grad_t.x, rt_grad_t.y) : <the level form above>): the cone's elliptical

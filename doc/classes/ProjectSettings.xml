@@ -3363,7 +3363,7 @@
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracing/cluster_lod_stream_geometry_ram_check" type="bool" setter="" getter="" default="false">
-			If [code]true[/code], as each surface whose geometry [member rendering/pathtracing/cluster_lod_stream_geometry] streams is created, the arrays it returns from system memory are compared with those it was created from, and its buffers, read back from the GPU, with the level rasterization draws; the result is printed. A debugging aid: the readback stalls the GPU, which changes when streaming results arrive.
+			If [code]true[/code], as each surface whose geometry [member rendering/pathtracing/cluster_lod_stream_geometry] streams is created, the arrays it returns from system memory are compared with those it was created from, and its buffers, read back from the GPU, with the level rasterization draws; the result is printed. Only surfaces created on the rendering thread are checked: one a loader thread creates is skipped, since the GPU readback is refused there. A debugging aid: the readback stalls the GPU, which changes when streaming results arrive.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracing/cluster_lod_stream_min_age_frames" type="int" setter="" getter="" default="30">

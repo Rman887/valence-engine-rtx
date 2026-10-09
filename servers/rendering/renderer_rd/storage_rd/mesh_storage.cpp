@@ -775,7 +775,9 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	if (mesh_surface_is_geometry_streamed(s)) {
 		cluster_geometry_ram_bytes.add(_mesh_surface_ram_bytes(*s));
 		cluster_geometry_fallback_bytes.add(uint64_t(s->vertex_buffer_size) + s->attribute_buffer_size + s->index_buffer_size);
-		if (_is_cluster_geometry_ram_check_wanted()) {
+		// The check reads the buffers back, which RenderingDevice refuses off the render thread, so a
+		// surface a loader thread adds (mesh_create_from_surfaces) goes unchecked.
+		if (_is_cluster_geometry_ram_check_wanted() && RenderingServer::get_singleton()->is_on_render_thread()) {
 			_mesh_surface_check_ram(*s, new_surface, buffer_vertex_data, buffer_attribute_data, buffer_index_data);
 		}
 	}

@@ -2416,7 +2416,10 @@ void RendererSceneRenderImplementation::_fill_surface_geometry_data(
 	}
 	geom.normal_stride = normal_stride;
 	geom.tangent_stride = tangent_stride;
-	geom.flags = compressed ? RT_GEOM_FLAG_COMPRESSED : 0;
+	// p_force_uncompressed covers the vertex side only: the attribute buffer is the mesh's own, read in
+	// place, so its layout follows the surface's flag, as the raster's instanced vertex format does.
+	const bool attributes_compressed = surface_format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES;
+	geom.flags = (compressed ? RT_GEOM_FLAG_COMPRESSED : 0) | (attributes_compressed ? RT_GEOM_FLAG_ATTRIBUTES_COMPRESSED : 0);
 
 	// The surface's box for every surface: the shader decodes compressed positions through it
 	// (gated on the flag) and the emissive gather (D50) reads it as an area proxy for both.
@@ -2442,11 +2445,11 @@ void RendererSceneRenderImplementation::_fill_surface_geometry_data(
 	}
 	if (surface_format & RSE::ARRAY_FORMAT_TEX_UV) {
 		geom.uv_byte_offset = attrib_offset;
-		attrib_offset += compressed ? sizeof(uint16_t) * 2 : sizeof(float) * 2;
+		attrib_offset += attributes_compressed ? sizeof(uint16_t) * 2 : sizeof(float) * 2;
 	}
 	if (surface_format & RSE::ARRAY_FORMAT_TEX_UV2) {
 		geom.uv2_byte_offset = attrib_offset;
-		attrib_offset += compressed ? sizeof(uint16_t) * 2 : sizeof(float) * 2;
+		attrib_offset += attributes_compressed ? sizeof(uint16_t) * 2 : sizeof(float) * 2;
 	}
 	for (int ci = 0; ci < RSE::ARRAY_CUSTOM_COUNT; ci++) {
 		const uint32_t fmt_shift[RSE::ARRAY_CUSTOM_COUNT] = { RSE::ARRAY_FORMAT_CUSTOM0_SHIFT, RSE::ARRAY_FORMAT_CUSTOM1_SHIFT, RSE::ARRAY_FORMAT_CUSTOM2_SHIFT, RSE::ARRAY_FORMAT_CUSTOM3_SHIFT };
@@ -10733,8 +10736,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				} else if (surf->rt_deformed_handle.is_valid()) {
 					// A deformed triangle BLAS is the instance's own (OMMc), and so are a deformed
 					// cluster BLAS's CLAS (OMMd): it carries the micromap itself. Not a compressed
-					// surface: the deformed row reads its attributes as uncompressed
-					// (force_uncompressed), the bake as they are, so the two would not agree. Not an
+					// surface: no importer makes a deformed one and the skinning compute reads its
+					// source as uncompressed, so none deforms correctly to witness a micromap on. Not an
 					// entry with a hierarchy (D87): its selection builds coarser levels the micromap
 					// is not baked over. A cluster entry built for an earlier viewport of this frame
 					// keeps that build (nothing is rebuilt in place twice in a frame, D82).

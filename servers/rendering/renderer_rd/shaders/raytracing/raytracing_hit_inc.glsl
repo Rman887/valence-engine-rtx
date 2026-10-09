@@ -165,7 +165,7 @@ bool fetch_uv_set_vertices(in GeometryData geom, uint p_byte_offset, vec2 p_scal
 
 	uint stride_words = geom.attribute_stride >> 2;
 	uint uv_word_off = p_byte_offset >> 2;
-	bool compressed = (geom.flags & FLAG_COMPRESSED) != 0u;
+	bool compressed = (geom.flags & FLAG_ATTRIBUTES_COMPRESSED) != 0u;
 
 	if (compressed) {
 		Uint32Buffer attr = Uint32Buffer(geom.attribute_address);

@@ -347,6 +347,9 @@ enum {
 	// Geometry residency (D93): the surface's CLAS carry their cluster's index as their ID, and a hit
 	// reads its triangle from the cluster's blob through the records at cluster_record_base.
 	RT_GEOM_FLAG_CLUSTER_GEOMETRY = 8u,
+	// The attribute buffer holds compressed UVs (UNORM16). The surface's own flag: a deformed row lays out
+	// its vertex side uncompressed but reads the mesh's attribute buffer in place.
+	RT_GEOM_FLAG_ATTRIBUTES_COMPRESSED = 16u,
 };
 
 /// Per-instance state for procedural RT geometry. Heap-allocated, only exists for procedural instances.

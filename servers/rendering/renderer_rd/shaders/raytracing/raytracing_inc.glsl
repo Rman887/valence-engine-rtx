@@ -264,6 +264,9 @@ const uint FLAG_DEFORMED = 4u;
 // Geometry residency (D93b): the surface's CLAS carry their cluster's index, and a hit reads its
 // triangle from the cluster's blob (rt_resolve_triangle).
 const uint FLAG_CLUSTER_GEOMETRY = 8u;
+// The attribute buffer holds compressed UVs; set apart from FLAG_COMPRESSED on a deformed row, whose
+// vertex side is uncompressed.
+const uint FLAG_ATTRIBUTES_COMPRESSED = 16u;
 
 // ============================================================================
 // RANDOM NUMBER GENERATION

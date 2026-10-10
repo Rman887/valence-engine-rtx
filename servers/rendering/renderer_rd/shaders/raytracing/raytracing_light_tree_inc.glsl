@@ -543,13 +543,7 @@ float light_tree_analytic_target(RTLightData light, vec3 hit_pos, vec3 N, bool p
 		float spot_rim = clamp((1.0 - scos) / (1.0 - light.cos_spot_angle), 1e-4, 1.0);
 		spot_atten = max(1.0 - pow(spot_rim, light.inv_spot_attenuation), RT_LIGHT_TREE_RECEIVER_FLOOR);
 	}
-	LightSample ls;
-	ls.cone_axis = L;
-	ls.cos_theta_max = 1.0;
-	ls.emission = light.emission;
-	ls.distance_sq = dist_sq;
-	ls.max_distance = dist;
-	float atten = lights_get_attenuation(ls, light.inv_max_range, light.attenuation, light.radius) * spot_atten;
+	float atten = lights_get_attenuation(dist_sq, light.inv_max_range, light.attenuation, light.radius) * spot_atten;
 	float n_dot = dot(N, L);
 	float above = max((p_two_sided ? abs(n_dot) : n_dot) + light.radius / max(dist, light.radius), RT_LIGHT_TREE_RECEIVER_FLOOR);
 	return lum * atten * above;
@@ -577,7 +571,7 @@ float light_tree_leaf_target(RTLightTreeNode n, vec3 hit_pos, vec3 N, bool p_two
 	}
 	float dist = max(d, 1e-4);
 	float above = max(n_dot / dist + n.radius / max(dist, n.radius), RT_LIGHT_TREE_RECEIVER_FLOOR);
-	float atten = pow(max(dist, max(n.radius, RT_LIGHT_MIN_DISTANCE)), -n.decay);
+	float atten = lights_falloff(max(dist, max(n.radius, RT_LIGHT_MIN_DISTANCE)), n.decay);
 	if (n.max_range > 0.0) {
 		float nd = dist / n.max_range;
 		nd *= nd;

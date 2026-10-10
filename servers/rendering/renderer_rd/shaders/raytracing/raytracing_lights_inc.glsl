@@ -73,37 +73,34 @@ vec3 lights_local_to_world(vec3 local_dir, vec3 axis) {
 }
 
 // Prepare unified cone sample from any light type.
+// VAL: the directional and the sphere cone are separate branches (the light's type is uniform per light), where both
+// were computed and mixed by the type for every sample; the values are the same.
 LightSample lights_prepare_sample(vec3 hit_pos, RTLightData light) {
 	LightSample s;
+	s.emission = light.emission;
+
+	if (light.type == RT_LIGHT_TYPE_DIRECTIONAL) {
+		// The direction toward the light, its angular radius as the cone, no falloff and no end.
+		s.cone_axis = -normalize(light.position);
+		s.distance_sq = 0.0;
+		s.cos_theta_max = min(cos(light.radius), 0.999999);
+		s.max_distance = 10000.0;
+		return s;
+	}
 
 	vec3 to_light = light.position - hit_pos;
 	float dist_sq = dot(to_light, to_light);
 	float inv_dist = inversesqrt(dist_sq + 1e-10);
 	float dist = dist_sq * inv_dist;
 
-	float is_directional = (light.type == RT_LIGHT_TYPE_DIRECTIONAL) ? 1.0 : 0.0;
-
-	// Cone axis.
-	vec3 sphere_axis = to_light * inv_dist;
-	vec3 dir_axis = -normalize(light.position);
-	s.cone_axis = mix(sphere_axis, dir_axis, is_directional);
-
-	// Distance (0 for directional = no falloff).
-	s.distance_sq = mix(dist_sq, 0.0, is_directional);
-
-	// Cone angle from subtended solid angle.
+	// The cone the sphere subtends.
+	s.cone_axis = to_light * inv_dist;
+	s.distance_sq = dist_sq;
 	float sin_theta_sphere = clamp(light.radius * inv_dist, 0.0, 1.0);
-	float cos_theta_sphere = sqrt(max(0.0, 1.0 - sin_theta_sphere * sin_theta_sphere));
-	float cos_theta_dir = cos(light.radius);
-	s.cos_theta_max = mix(cos_theta_sphere, cos_theta_dir, is_directional);
-	s.cos_theta_max = min(s.cos_theta_max, 0.999999);
-
-	s.emission = light.emission;
+	s.cos_theta_max = min(sqrt(max(0.0, 1.0 - sin_theta_sphere * sin_theta_sphere)), 0.999999);
 
 	// Max shadow ray distance.
-	float sphere_max = dist + light.radius;
-	float dir_max = 10000.0;
-	s.max_distance = mix(sphere_max, dir_max, is_directional);
+	s.max_distance = dist + light.radius;
 
 	return s;
 }
@@ -130,19 +127,31 @@ vec3 lights_sample_cone(LightSample ls, vec2 u, out float pdf) {
 // VAL (D123): the nearest a receiver is taken to be to an omni or spot light's centre, in metres.
 #define RT_LIGHT_MIN_DISTANCE 0.01
 
+// VAL: pow(d, -decay), with Godot's default decay of 1 and the inverse square as divisions rather than a logarithm and
+// an exponential (light_tree_node_falloff's three forms).
+float lights_falloff(float d, float decay) {
+	if (decay == 1.0) {
+		return 1.0 / d;
+	}
+	if (decay == 2.0) {
+		return 1.0 / (d * d);
+	}
+	return pow(d, -decay);
+}
+
 // Godot-style windowed distance attenuation.
 // window = (1 - (d/range)^4)^2, combined with pow(d, -decay).
 // VAL (D123): the falloff is the raster's outside the light's radius, uncapped: NVIDIA's min(pow(d, -decay), 1) held a light at its
 // 1 m value for every receiver inside a metre (0.09 of the inverse square at 0.3 m). The distance is
 // floored at the light's radius instead (a sphere's falloff outside it is exactly the inverse square
 // of the centre distance), and at 1 cm for a point light, which keeps a receiver touching it finite.
-float lights_get_attenuation(LightSample ls, float inv_max_range, float decay, float radius) {
-	if (ls.distance_sq <= 0.0) {
+float lights_get_attenuation(float distance_sq, float inv_max_range, float decay, float radius) {
+	if (distance_sq <= 0.0) {
 		return 1.0; // Directional: no distance attenuation.
 	}
 
-	float distance = sqrt(ls.distance_sq);
-	float atten = pow(max(distance, max(radius, RT_LIGHT_MIN_DISTANCE)), -decay);
+	float distance = sqrt(distance_sq);
+	float atten = lights_falloff(max(distance, max(radius, RT_LIGHT_MIN_DISTANCE)), decay);
 
 	// Windowed falloff if range is finite (inv_max_range >= 0).
 	if (inv_max_range >= 0.0) {
@@ -656,9 +665,7 @@ bool lights_sample_light(
 		}
 
 		// Distance attenuation.
-		LightSample ls_atten;
-		ls_atten.distance_sq = dist_sq;
-		float atten = lights_get_attenuation(ls_atten, light.inv_max_range, light.attenuation, light.radius) * spot_atten;
+		float atten = lights_get_attenuation(dist_sq, light.inv_max_range, light.attenuation, light.radius) * spot_atten;
 
 		r_sample.radiance = light.emission * atten * sphere_norm * indirect_mul;
 		return lights_sample_reaches_brdf(N, material, L, indirect_mul);

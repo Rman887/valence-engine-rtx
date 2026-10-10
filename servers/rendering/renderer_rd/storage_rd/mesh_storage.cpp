@@ -1686,7 +1686,12 @@ void MeshStorage::_mesh_instance_add_surface(MeshInstance *mi, Mesh *mesh, uint3
 		for (float &weight : mi->blend_weights) {
 			weight = 0;
 		}
-		mi->blend_weights_buffer = RD::get_singleton()->storage_buffer_create(sizeof(float) * mi->blend_weights.size(), mi->blend_weights.span().reinterpret<uint8_t>());
+		mi->blend_active.resize(mesh->blend_shape_count * 2);
+		for (uint32_t &word : mi->blend_active) {
+			word = 0;
+		}
+		mi->blend_active_count = 0;
+		mi->blend_weights_buffer = RD::get_singleton()->storage_buffer_create(sizeof(uint32_t) * mi->blend_active.size(), mi->blend_active.span().reinterpret<uint8_t>());
 		mi->weights_dirty = true;
 	}
 
@@ -1754,6 +1759,8 @@ void MeshStorage::_mesh_instance_remove_surface(MeshInstance *mi, int p_surface)
 		}
 
 		mi->blend_weights.clear();
+		mi->blend_active.clear();
+		mi->blend_active_count = 0;
 		mi->weights_dirty = false;
 		mi->skeleton_version = 0;
 	}
@@ -1796,7 +1803,22 @@ void MeshStorage::update_mesh_instances() {
 		MeshInstance *mi = dirty_mesh_instance_weights.first()->self();
 
 		if (mi->blend_weights_buffer.is_valid()) {
-			RD::get_singleton()->buffer_update(mi->blend_weights_buffer, 0, mi->blend_weights.size() * sizeof(float), mi->blend_weights.ptr());
+			// VAL (P1g): the shapes the skeleton shader adds, by its own test and in its order.
+			uint32_t active = 0;
+			for (uint32_t i = 0; i < mi->blend_weights.size(); i++) {
+				const float w = mi->blend_weights[i];
+				if (Math::abs(w) > 0.0001f) {
+					uint32_t bits;
+					memcpy(&bits, &w, sizeof(bits));
+					mi->blend_active[active * 2 + 0] = i;
+					mi->blend_active[active * 2 + 1] = bits;
+					active++;
+				}
+			}
+			mi->blend_active_count = active;
+			if (active > 0) {
+				RD::get_singleton()->buffer_update(mi->blend_weights_buffer, 0, active * 2 * sizeof(uint32_t), mi->blend_active.ptr());
+			}
 		}
 		dirty_mesh_instance_weights.remove(&mi->weight_update_list);
 		mi->weights_dirty = false;
@@ -1888,7 +1910,7 @@ void MeshStorage::update_mesh_instances() {
 			push_constant.inverse_transform_offset[0] = inverse_transform.columns[2][0];
 			push_constant.inverse_transform_offset[1] = inverse_transform.columns[2][1];
 
-			push_constant.blend_shape_count = mi->mesh->blend_shape_count;
+			push_constant.blend_shape_count = mi->blend_active_count; // VAL (P1g): the active shapes the weights buffer lists.
 			push_constant.normalized_blend_shapes = mi->mesh->blend_shape_mode == RSE::BLEND_SHAPE_MODE_NORMALIZED;
 			push_constant.pad1 = 0;
 

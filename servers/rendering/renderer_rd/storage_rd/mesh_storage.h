@@ -236,6 +236,10 @@ private:
 		};
 		LocalVector<Surface> surfaces;
 		LocalVector<float> blend_weights;
+		// VAL (P1g): what blend_weights_buffer holds, the shapes skeleton.glsl adds (its own |w| > 0.0001 test)
+		// as (index, weight bits) pairs in ascending index, and their count, the shader's blend_shape_count.
+		LocalVector<uint32_t> blend_active;
+		uint32_t blend_active_count = 0;
 
 		RID blend_weights_buffer;
 		List<MeshInstance *>::Element *I = nullptr; //used to erase itself

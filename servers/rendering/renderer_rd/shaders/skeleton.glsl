@@ -11,8 +11,10 @@ layout(set = 0, binding = 1, std430) buffer restrict writeonly DstVertexData {
 }
 dst_vertices;
 
+// VAL (P1g): the active blend shapes only, as (shape index, weight bits) pairs in ascending index, which
+// params.blend_shape_count counts: a vertex loops over the shapes the host found weighted, not over every shape.
 layout(set = 0, binding = 2, std430) buffer restrict readonly BlendShapeWeights {
-	float data[];
+	uint data[];
 }
 blend_shape_weights;
 
@@ -135,8 +137,9 @@ void main() {
 		float blend_total = 0.0;
 		vec2 blend_vertex = vec2(0.0);
 
-		for (uint i = 0; i < params.blend_shape_count; i++) {
-			float w = blend_shape_weights.data[i];
+		for (uint entry = 0; entry < params.blend_shape_count; entry++) {
+			uint i = blend_shape_weights.data[entry * 2u];
+			float w = uintBitsToFloat(blend_shape_weights.data[entry * 2u + 1u]);
 			if (abs(w) > 0.0001) {
 				uint base_offset = (params.vertex_count * i + index) * params.vertex_stride;
 
@@ -212,8 +215,9 @@ void main() {
 		vec3 blend_normal = vec3(0.0);
 		vec3 blend_tangent = vec3(0.0);
 
-		for (uint i = 0; i < params.blend_shape_count; i++) {
-			float w = blend_shape_weights.data[i];
+		for (uint entry = 0; entry < params.blend_shape_count; entry++) {
+			uint i = blend_shape_weights.data[entry * 2u];
+			float w = uintBitsToFloat(blend_shape_weights.data[entry * 2u + 1u]);
 			if (abs(w) > 0.0001) {
 				uint base_offset = params.vertex_count * i * (params.vertex_stride + params.normal_tangent_stride) + index * params.vertex_stride;
 

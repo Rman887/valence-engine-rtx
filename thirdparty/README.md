@@ -890,6 +890,23 @@ Patches:
 - `0001-remove-unused-save-features.patch` ([GH-113965](https://github.com/godotengine/godot/issues/113965))
 
 
+## opensubdiv
+
+- Upstream: https://github.com/PixarAnimationStudios/OpenSubdiv
+- Version: 3.7.0 (9dab8a47bfbb1388ec8388fe61f5f916e6123f38, 2025)
+- License: Tomorrow Open Source Technology License 1.0 (Apache 2.0 with a different section 6)
+
+Files extracted from upstream repository:
+
+- `opensubdiv/sdc/`, `opensubdiv/vtr/`, `opensubdiv/far/` (the CPU core: subdivision rules,
+  refinement, stencil tables), without their `CMakeLists.txt`
+- `opensubdiv/version.h`, `opensubdiv/version.cpp`
+- `LICENSE.txt`, `NOTICE.txt`
+
+Not yet compiled: it is the stencil builder for runtime character subdivision (D122,
+`docs/character-subdivision.md` in the Valence repository), which a later commit wires in.
+
+
 ## openxr
 
 - Upstream: https://github.com/KhronosGroup/OpenXR-SDK

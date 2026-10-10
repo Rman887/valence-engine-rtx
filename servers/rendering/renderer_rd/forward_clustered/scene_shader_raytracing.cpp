@@ -841,11 +841,11 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_e
 	// The setting alone asks the driver for the extension; the feature says whether it came.
 	if (RD::get_singleton()->has_feature(RD::SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE)) {
 		flags |= RT_FLAG_CLUSTER_AS;
-		if (RenderRaytracing::is_position_fetch_enabled()) {
-			flags |= RT_FLAG_POSITION_FETCH;
-			if (OS::get_singleton()->is_stdout_verbose()) {
-				flags |= RT_FLAG_POSITION_FETCH_CHECK;
-			}
+	}
+	if (RenderRaytracing::is_position_fetch_enabled()) {
+		flags |= RT_FLAG_POSITION_FETCH;
+		if (RenderRaytracing::is_position_fetch_check_enabled() && OS::get_singleton()->is_stdout_verbose()) {
+			flags |= RT_FLAG_POSITION_FETCH_CHECK;
 		}
 	}
 

@@ -156,6 +156,12 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		print_line(vformat("RT: build timer on (D98d): writing %s, phase marks %s, compute submits %s.", path, build_timer.marks ? "on" : "off", build_timer.compute ? "timed" : "not timed"));
 	}
 
+	// Every triangle and cluster build allows data access where the device has position fetch (P1d): the hit stages
+	// read the hit triangle's corners from the structure rather than the vertex buffer. Set before any size query.
+	build_data_access = RD::get_singleton()->has_feature(RD::SUPPORTS_RAYTRACING_POSITION_FETCH);
+	if (build_data_access) {
+		print_line("RT: position fetch on: triangle and cluster builds allow data access, hits read the triangle's corners from the structure (P1d).");
+	}
 	cluster_blas_enabled = RD::get_singleton()->has_feature(RD::SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE);
 	if (cluster_blas_enabled) {
 		cluster_compaction_enabled = GLOBAL_GET("rendering/pathtracing/cluster_blas_compaction");
@@ -176,15 +182,14 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		// CLAS residency (D92) needs the traversal (its requests), the cached levels (the finest
 		// level is one) and the compaction (a load is its two steps).
 		const bool stream_wanted = cluster_lod_traversal_enabled && cluster_lod_cache_enabled && cluster_compaction_enabled && GLOBAL_GET("rendering/pathtracing/cluster_lod_stream");
-		// Geometry residency (D93) takes a cluster hit's positions from its CLAS, so every cluster
-		// build carries the data access flag while it is on: one build operation batches surfaces,
-		// static and deformed alike, and the BLAS over the clusters carries it too, as the
-		// position-fetch rule names the structure of the intersection. Set before any size query.
+		// Geometry residency (D93) takes a cluster hit's positions from its CLAS, which every cluster build allows
+		// where the device has position fetch (build_data_access, above).
+		bool stream_geometry = false;
 		if (GLOBAL_GET("rendering/pathtracing/cluster_lod_stream_geometry")) {
 			if (RD::get_singleton()->has_feature(RD::SUPPORTS_RAYTRACING_POSITION_FETCH)) {
 				// The mesh storage's own test, which keeps the RAM copy the blobs come from (D93b): stream_wanted and support.
-				cluster_build_data_access = RendererRD::MeshStorage::is_cluster_geometry_streaming_wanted();
-				DEV_ASSERT(cluster_build_data_access == stream_wanted);
+				stream_geometry = RendererRD::MeshStorage::is_cluster_geometry_streaming_wanted();
+				DEV_ASSERT(stream_geometry == stream_wanted);
 			} else {
 				print_verbose("rendering/pathtracing/cluster_lod_stream_geometry is on but the device has no VK_KHR_ray_tracing_position_fetch; surfaces keep their geometry resident.");
 			}
@@ -267,7 +272,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 				cluster_lod_stream_enabled = false;
 			}
 		}
-		cluster_lod_stream_geometry_enabled = cluster_lod_stream_enabled && cluster_build_data_access;
+		cluster_lod_stream_geometry_enabled = cluster_lod_stream_enabled && stream_geometry;
 		if (cluster_lod_stream_geometry_enabled && OS::get_singleton()->is_stdout_verbose()) {
 			Vector<uint8_t> zeros;
 			zeros.resize_initialized(sizeof(uint32_t) * RT_POSITION_FETCH_CHECK_WORDS);
@@ -277,7 +282,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		// One line on the console: the harness reads it as proof the path is active.
 		print_line(vformat("RT: static BLAS built from clusters of up to %d triangles and %d vertices (D79), compaction %s, deformed meshes %s, cluster LOD selection %s, deformed selection %s, CLAS streaming %s.", caps.max_triangles_per_cluster, caps.max_vertices_per_cluster, cluster_compaction_enabled ? "on" : "off", cluster_deformed_enabled ? (deformed_cluster_templates_enabled ? "instantiated from cluster templates (D107)" : "rebuilt from clusters (D82)") : "refit as triangle BLAS", cluster_lod_select_enabled ? vformat("on at %.2f px (D86), traversal %s (D91), BLAS sharing %s", cluster_lod_pixel_error, cluster_lod_traversal_enabled ? "on" : "off", cluster_lod_share_enabled ? vformat("on within %d levels (D89), cached levels %s (D90)", cluster_lod_share_tolerance, cluster_lod_cache_enabled ? "on" : "off") : String("off (D89)")) : "off", cluster_lod_deformed_enabled ? vformat("on, %d byte slots (D87)%s", cluster_lod_clas_slot_size, cluster_lod_deformed_templated ? ", instantiated from templates (D108)" : "") : "off", cluster_lod_stream_enabled ? vformat("on within %d MB, %d clusters a frame, unused %d frames before unloading, %d bytes a CLAS at worst (D92)", cluster_lod_stream_budget / (1024 * 1024), cluster_lod_stream_builds_per_frame, cluster_lod_stream_min_age, cluster_lod_stream_cluster_worst) : "off"));
 		if (cluster_lod_stream_geometry_enabled) {
-			print_line(vformat("RT: geometry residency on: cluster builds allow data access, hits fetch CLAS positions (D93), blobs load with their groups within %d MB of uploads a frame (D93c).", cluster_lod_stream_upload_cap / (1024 * 1024)));
+			print_line(vformat("RT: geometry residency on: cluster blobs hold no positions, hits read them from the CLAS (D93), blobs load with their groups within %d MB of uploads a frame (D93c).", cluster_lod_stream_upload_cap / (1024 * 1024)));
 		}
 	} else if (GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
 		print_verbose("rendering/pathtracing/cluster_blas is on but the device has no VK_NV_cluster_acceleration_structure; static BLAS stay triangle BLAS.");
@@ -2608,9 +2613,9 @@ void RenderRaytracing::_populate_surface_blas(
 		_fill_surface_triangle_geometry(vertex_buffer, index_buffer, geom, is_2d, compressed, as_geom);
 		const bool omm_attached = p_omm != nullptr && _omm_deformed_geometry(p_omm, geom, as_geom);
 
-		BitField<RD::AccelerationStructureFlagBits> as_flags = p_prefer_fast_build
-				? RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT
-				: RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
+		BitField<RD::AccelerationStructureFlagBits> as_flags = _cluster_build_flags(p_prefer_fast_build
+						? RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT
+						: RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
 		if (p_allow_update) {
 			as_flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
 		}
@@ -10165,9 +10170,9 @@ bool RenderRaytracing::_build_merged_mm_blas(
 		}
 		_omm_merged_geometry(entry, p_mm_count, prim_count, as_geom); // Its micromap, when it carries one (D96).
 
-		BitField<RD::AccelerationStructureFlagBits> as_flags =
+		BitField<RD::AccelerationStructureFlagBits> as_flags = _cluster_build_flags(
 				RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT |
-				RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT;
+				RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
 		entry.blas = rd->blas_create({ &as_geom, 1 }, as_flags);
 		ERR_FAIL_COND_V(!entry.blas.is_valid(), false);
 		rd->set_resource_name(entry.blas, "RT MM merged BLAS [" + itos(cache_key) + "]");

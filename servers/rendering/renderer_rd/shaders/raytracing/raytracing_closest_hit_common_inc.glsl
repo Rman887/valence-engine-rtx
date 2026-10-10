@@ -96,22 +96,22 @@ void cluster_geometry_check_hit(GeometryData p_surface, GeometryData p_blob, uin
 // HIT DATA
 // ============================================================================
 
-/// The hit triangle's corners in object space (a compressed surface's unorm box, which the instance transform maps),
-/// from the vertex buffer, or on a cluster geometry hit from the CLAS (D93b), whose blob holds no positions; false
-/// where neither has them.
+/// The hit triangle's corners in object space (a compressed surface's unorm box, which the instance transform maps):
+/// from the acceleration structure where the device has position fetch, which every triangle and cluster build then
+/// allows (P1d; the build's input is the vertex buffer a geometry row names, so the corners are the same); otherwise
+/// from the vertex buffer, or nothing on a cluster geometry hit, whose blob holds no positions (D93b).
 bool rt_hit_triangle_positions(GeometryData geom, uint i0, uint i1, uint i2, out vec3 r_p0, out vec3 r_p1, out vec3 r_p2) {
+#ifdef USE_POSITION_FETCH
+	r_p0 = gl_HitTriangleVertexPositionsEXT[0];
+	r_p1 = gl_HitTriangleVertexPositionsEXT[1];
+	r_p2 = gl_HitTriangleVertexPositionsEXT[2];
+	return true;
+#else
 	r_p0 = vec3(0.0);
 	r_p1 = vec3(0.0);
 	r_p2 = vec3(0.0);
 	if ((geom.flags & FLAG_CLUSTER_GEOMETRY) != 0u && rt_hit_cluster_id() != RT_CLUSTER_ID_NONE) {
-#ifdef USE_POSITION_FETCH
-		r_p0 = gl_HitTriangleVertexPositionsEXT[0];
-		r_p1 = gl_HitTriangleVertexPositionsEXT[1];
-		r_p2 = gl_HitTriangleVertexPositionsEXT[2];
-		return true;
-#else
 		return false;
-#endif
 	}
 	if (geom.vertex_address == 0ul) {
 		return false;
@@ -120,6 +120,7 @@ bool rt_hit_triangle_positions(GeometryData geom, uint i0, uint i1, uint i2, out
 	r_p1 = emissive_fetch_position(geom, i1);
 	r_p2 = emissive_fetch_position(geom, i2);
 	return true;
+#endif
 }
 
 /// A tangent for a surface stored without one (D118): the triangle's dP/du from its corners and UVs, in the object

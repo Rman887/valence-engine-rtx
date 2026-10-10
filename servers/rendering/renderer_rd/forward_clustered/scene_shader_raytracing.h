@@ -94,8 +94,8 @@ public:
 		RT_FLAG_SKY_LIGHT_VARIANCE_SHARE = (1 << 9), // The sky's share by the variance it removes (D62); clear, by its concentrated light (D54). Set only with RT_FLAG_SKY_LIGHT.
 		RT_FLAG_RUSSIAN_ROULETTE = (1 << 10), // Paths end by Russian roulette on their throughput once a vertex has scattered (D73); clear, only at the bounce limits.
 		RT_FLAG_CLUSTER_AS = (1 << 13), // Static BLAS built from triangle clusters (D79): hit shaders add gl_ClusterIDNV to gl_PrimitiveID. Set when rendering/pathtracing/cluster_blas is on and the device has the extension.
-		RT_FLAG_POSITION_FETCH = (1 << 14), // Cluster builds allow data access and the hit stages enable position fetch (D93). Set while geometry residency is on.
-		RT_FLAG_POSITION_FETCH_CHECK = (1 << 15), // A verbose run's closest hit compares fetched positions with the vertex buffer's (D93). Set only with RT_FLAG_POSITION_FETCH.
+		RT_FLAG_POSITION_FETCH = (1 << 14), // Triangle and cluster builds allow data access and the hit stages read the hit triangle's corners from the structure (D93, P1d). Set where the device reports SUPPORTS_RAYTRACING_POSITION_FETCH.
+		RT_FLAG_POSITION_FETCH_CHECK = (1 << 15), // A verbose run's closest hit compares fetched positions with the vertex buffer's (D93). Set only with RT_FLAG_POSITION_FETCH and geometry residency on.
 		RT_FLAG_OMM_INDIRECT_2_STATE = (1 << 16), // Rays past the path's first diffuse bounce resolve unknown micro-triangles by their side (D96 OMMe). Set while micromaps are on with rendering/pathtracing/opacity_micromap_indirect_2_state.
 		RT_FLAG_TEXTURE_FILTERING = (1 << 17), // The hit shaders compile stochastic texture filtering in (D117). Set while rendering/pathtracing/texture_filtering is not off; the filter itself is RT_PARAM_TEXTURE_FILTERING.
 		RT_FLAG_SUBSURFACE = (1 << 18), // The hit shaders compile the subsurface walk in (D120). Set while rendering/pathtracing/subsurface is on.

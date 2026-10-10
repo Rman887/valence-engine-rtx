@@ -772,7 +772,7 @@ RID RenderRaytracing::_omm_surface_blas(RTOmmEntry *p_entry, void *p_mesh_surfac
 	RD::AccelerationStructureGeometry as_geom;
 	_fill_surface_triangle_geometry(vertex_buffer, index_buffer, meta.geometry, false, meta.is_compressed, as_geom);
 	_omm_geometry_attach(p_entry, p_entry->index_buffer, p_entry->index_usages, as_geom);
-	p_entry->static_blas = rd->blas_create({ &as_geom, 1 }, RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+	p_entry->static_blas = rd->blas_create({ &as_geom, 1 }, _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT));
 	if (p_entry->static_blas.is_null()) {
 		return RID();
 	}

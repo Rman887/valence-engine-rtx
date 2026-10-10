@@ -61,6 +61,10 @@ layout(constant_id = 0) const uint RT_FLAGS = 0u;
 #define RT_MASK_PROCEDURAL 0x04u
 #define RT_MASK_SUBSURFACE 0x08u // Instances whose material walks under its surface (D120), the walk's own rays select them alone.
 
+// The hit SBT record of the standard hit group's walking variant (D120 SS2), SceneShaderRaytracing::HIT_SBT_WALK_RECORD:
+// an instance's record is its material's hit group slot, 0 the standard group, so 0 and this are the standard any-hit.
+#define RT_HIT_SBT_WALK_RECORD 4095u
+
 layout(set = 0, binding = 2, std140) uniform SceneDataBlock {
 	SceneData data;
 	SceneData prev_data;

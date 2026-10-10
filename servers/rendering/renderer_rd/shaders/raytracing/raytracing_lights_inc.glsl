@@ -315,41 +315,20 @@ bool ray_query_alpha_test(uint geometry_idx, int cluster_id, uint primitive, vec
 	float alpha = textureLod(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, 0.0).a;
 	alpha *= mat.albedo_color.a;
 
-	return alpha >= mat.alpha_threshold;
+	// As the any-hit's `alpha < threshold` ignores: a NaN alpha stays a hit in both.
+	return !(alpha < mat.alpha_threshold);
 }
 
 // ============================================================================
-// Shadow Ray (traceRayEXT pipeline)
+// Shadow Ray (an inline ray query, or the traceRayEXT pipeline)
 // ============================================================================
 
-/// Returns true if light is visible.
-/// Uses SkipClosestHitShader so only any_hit (alpha test) and miss are invoked.
+/// The shadow ray through the pipeline: every candidate is decided by its hit group's any-hit (an alpha
+/// test) or intersection shader. Returns true if the light is visible.
+/// SkipClosestHitShader: only any_hit (alpha test) and miss are invoked.
 /// TerminateOnFirstHit causes early exit on first confirmed opaque hit.
-/// omm_flags: RT_OMM_RAY_FLAGS of the vertex's arriving diffuse count (D96 OMMe).
-bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, uint omm_flags, inout uint rng_state) {
-#ifdef USE_RAY_QUERY_SHADOWS
-	// Ray queries are significantly faster, but can not handle complex alpha materials
-	rayQueryEXT shadow_rq;
-	rayQueryInitializeEXT(shadow_rq, tlas,
-			gl_RayFlagsTerminateOnFirstHitEXT | omm_flags,
-			RT_MASK_SHADOW, origin, 0.001, direction, max_dist - 0.001);
-
-	while (rayQueryProceedEXT(shadow_rq)) {
-		if (rayQueryGetIntersectionTypeEXT(shadow_rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
-			// quick and dirty way to check transparency by sampling the alpha texture
-			// this completely ignores the actual material, so might not be accurate
-			if (ray_query_alpha_test(
-						rayQueryGetIntersectionInstanceCustomIndexEXT(shadow_rq, false),
-						rt_ray_query_cluster_id(shadow_rq),
-						uint(rayQueryGetIntersectionPrimitiveIndexEXT(shadow_rq, false)),
-						rayQueryGetIntersectionBarycentricsEXT(shadow_rq, false))) {
-				rayQueryConfirmIntersectionEXT(shadow_rq);
-			}
-		}
-	}
-
-	return rayQueryGetIntersectionTypeEXT(shadow_rq, true) == gl_RayQueryCommittedIntersectionNoneEXT;
-#elif defined(USE_SER)
+bool lights_trace_shadow_ray_pipeline(vec3 origin, vec3 direction, float max_dist, uint omm_flags) {
+#if defined(USE_SER)
 	hitObjectEXT hitObject;
 	hitObjectTraceRayEXT(hitObject, tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT | omm_flags,
@@ -393,6 +372,76 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, uint o
 
 	return visible;
 #endif
+}
+
+#ifdef RT_SHADOW_STATS
+// The inline shadow ray's counters (P1k), one pixel in 64: rays, rays that met a candidate the inline test cannot
+// decide, rays traced through the pipeline for it (nothing committed). The host reads and clears them on the verbose
+// report's cadence.
+layout(set = 0, binding = 53, std430) buffer ShadowStats {
+	uint words[];
+}
+shadow_stats;
+#endif
+
+#ifdef USE_RAY_QUERY_SHADOWS
+/// Whether the inline test decides a ray query's candidate as the pipeline would: a triangle of the standard
+/// hit group, whose any-hit ray_query_alpha_test mirrors. An AABB needs its intersection shader and a custom
+/// group's triangle its own any-hit, which run the material's code.
+bool lights_shadow_candidate_inline(rayQueryEXT p_query) {
+	if (rayQueryGetIntersectionTypeEXT(p_query, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
+		return false;
+	}
+	const uint record = rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT(p_query, false);
+	return record == 0u || record == RT_HIT_SBT_WALK_RECORD;
+}
+#endif
+
+/// Returns true if light is visible.
+/// omm_flags: RT_OMM_RAY_FLAGS of the vertex's arriving diffuse count (D96 OMMe).
+bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, uint omm_flags, inout uint rng_state) {
+#ifdef USE_RAY_QUERY_SHADOWS
+	// VAL (P1k, docs/gpu-audit-2026-10.md): an inline query, which spills nothing of the hit's shading state around a
+	// nested trace. Opaque instances commit without a candidate, and a standard material's alpha is tested here as its
+	// any-hit tests it. A candidate the inline test cannot decide (a procedural AABB, a custom hit group's alpha) is
+	// passed over: occlusion is an OR, so any committed hit settles the ray, and only a ray with such a candidate and
+	// nothing committed is traced through the pipeline, whose shaders decide it. The same visibility as the
+	// pipeline's for every ray; a ray that falls back pays both traversals.
+	rayQueryEXT shadow_rq;
+	rayQueryInitializeEXT(shadow_rq, tlas,
+			gl_RayFlagsTerminateOnFirstHitEXT | omm_flags,
+			RT_MASK_SHADOW, origin, 0.001, direction, max_dist - 0.001);
+
+	bool unresolved = false;
+	while (rayQueryProceedEXT(shadow_rq)) {
+		if (!lights_shadow_candidate_inline(shadow_rq)) {
+			unresolved = true;
+		} else if (ray_query_alpha_test(
+						   rayQueryGetIntersectionInstanceCustomIndexEXT(shadow_rq, false),
+						   rt_ray_query_cluster_id(shadow_rq),
+						   uint(rayQueryGetIntersectionPrimitiveIndexEXT(shadow_rq, false)),
+						   rayQueryGetIntersectionBarycentricsEXT(shadow_rq, false))) {
+			rayQueryConfirmIntersectionEXT(shadow_rq);
+		}
+	}
+
+	const bool occluded = rayQueryGetIntersectionTypeEXT(shadow_rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+#ifdef RT_SHADOW_STATS
+	if (((gl_LaunchIDEXT.x | gl_LaunchIDEXT.y) & 7u) == 0u) {
+		atomicAdd(shadow_stats.words[0], 1u);
+		if (unresolved) {
+			atomicAdd(shadow_stats.words[1], 1u);
+			if (!occluded) {
+				atomicAdd(shadow_stats.words[2], 1u);
+			}
+		}
+	}
+#endif
+	if (occluded || !unresolved) {
+		return !occluded;
+	}
+#endif
+	return lights_trace_shadow_ray_pipeline(origin, direction, max_dist, omm_flags);
 }
 
 #endif // !RT_STAGE_MISS

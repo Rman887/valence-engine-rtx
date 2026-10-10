@@ -803,7 +803,9 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_e
 			flags |= RT_FLAG_DEBUG_VIS_ENABLED;
 		}
 
-		if (GLOBAL_GET("rendering/pathtracing/use_simple_shadows")) {
+		// Shadow rays as inline queries need the device's ray queries; without them every shadow ray is traced
+		// through the pipeline, which gives the same visibility (P1k).
+		if (GLOBAL_GET("rendering/pathtracing/use_simple_shadows") && RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY)) {
 			flags |= RT_FLAG_RAY_QUERY_SHADOWS_ENABLED;
 		}
 
@@ -947,6 +949,10 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 		if (p_rt_flags & RT_FLAG_SUBSURFACE_STATS) {
 			inject_define(sources, "#define RT_SUBSURFACE_STATS\n");
 		}
+	}
+	// The inline shadow ray's counters (P1k) in a verbose run: verbosity is fixed for the process, so no flag bit.
+	if ((p_rt_flags & RT_FLAG_RAY_QUERY_SHADOWS_ENABLED) && OS::get_singleton()->is_stdout_verbose()) {
+		inject_define(sources, "#define RT_SHADOW_STATS\n");
 	}
 
 	// Procedural templates come from intersection stage; strip from base HG0 path.

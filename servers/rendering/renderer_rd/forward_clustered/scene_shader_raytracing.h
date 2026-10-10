@@ -131,6 +131,7 @@ public:
 	// is the plain standard hit group. Custom slots stop short of it.
 	static constexpr uint32_t HIT_SBT_CAPACITY = 4096;
 	static constexpr uint32_t HIT_SBT_WALK_RECORD = HIT_SBT_CAPACITY - 1;
+	static_assert(HIT_SBT_WALK_RECORD == 4095, "raytracing_common_inc.glsl's RT_HIT_SBT_WALK_RECORD repeats this record.");
 
 	// Pathtracing parameter indices for the float[20] params buffer.
 	// Must match RT_PARAM_* defines in raytracing_inc.glsl.

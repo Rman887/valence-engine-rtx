@@ -385,6 +385,10 @@ RenderRaytracing::~RenderRaytracing() {
 		RD::get_singleton()->free_rid(subsurface_stats_buffer);
 		subsurface_stats_buffer = RID();
 	}
+	if (shadow_stats_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(shadow_stats_buffer);
+		shadow_stats_buffer = RID();
+	}
 
 	if (mat_ubo_pool_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(mat_ubo_pool_buffer);
@@ -1377,6 +1381,11 @@ void RenderRaytracing::prepare_frame() {
 	if (subsurface_stats_buffer.is_valid() && RD::get_singleton()->get_frames_drawn() % 300 == 0) {
 		RD::get_singleton()->buffer_get_data_async(subsurface_stats_buffer, callable_mp_static(&RenderRaytracing::_on_subsurface_stats_read));
 		RD::get_singleton()->buffer_clear(subsurface_stats_buffer, 0, sizeof(uint32_t) * RT_SUBSURFACE_STATS_WORDS);
+	}
+	// The inline shadow ray's counts (P1k), on the same cadence.
+	if (shadow_stats_buffer.is_valid() && RD::get_singleton()->get_frames_drawn() % 300 == 0) {
+		RD::get_singleton()->buffer_get_data_async(shadow_stats_buffer, callable_mp_static(&RenderRaytracing::_on_shadow_stats_read));
+		RD::get_singleton()->buffer_clear(shadow_stats_buffer, 0, sizeof(uint32_t) * RT_SHADOW_STATS_WORDS);
 	}
 	if (async_probe.enabled) {
 		_async_probe_step();
@@ -8594,6 +8603,19 @@ void RenderRaytracing::_on_subsurface_stats_read(const PackedByteArray &p_bytes)
 	print_line(vformat("RT: subsurface walk (D120), the last 300 frames, one pixel in 64: %d walks, %.1f steps a walk, %d at most; %.2f %% left the surface, %.2f %% ended by roulette or a zero throughput, %.2f %% by the cap of 256; %d front faces stepped past.", words[0], double(words[1]) / walks, words[2], 100.0 * words[3] / walks, 100.0 * words[4] / walks, 100.0 * words[5] / walks, words[6]));
 }
 
+void RenderRaytracing::_on_shadow_stats_read(const PackedByteArray &p_bytes) {
+	if (p_bytes.size() < int64_t(sizeof(uint32_t) * RT_SHADOW_STATS_WORDS)) {
+		return;
+	}
+	uint32_t words[RT_SHADOW_STATS_WORDS];
+	memcpy(words, p_bytes.ptr(), sizeof(words));
+	if (words[0] == 0) {
+		return; // No shadow ray in the sampled pixels.
+	}
+	const double rays = words[0];
+	print_line(vformat("RT: inline shadow rays (P1k), the last 300 frames, one pixel in 64: %d rays; %.3f %% met a candidate the inline test cannot decide, %.3f %% traced through the pipeline for it.", words[0], 100.0 * words[1] / rays, 100.0 * words[2] / rays));
+}
+
 void RenderRaytracing::_on_position_fetch_check_read(const PackedByteArray &p_bytes) {
 	if (p_bytes.size() < int64_t(sizeof(uint32_t) * RT_POSITION_FETCH_CHECK_WORDS)) {
 		return;
@@ -13034,6 +13056,21 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		u.binding = 52;
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
 		u.append_id(subsurface_stats_buffer);
+		uniforms.push_back(u);
+	}
+
+	// Binding 53: the inline shadow ray's counters (P1k), declared only by a verbose run's shaders that trace shadow rays as queries.
+	if ((p_rt_flags & SceneShaderRaytracing::RT_FLAG_RAY_QUERY_SHADOWS_ENABLED) && OS::get_singleton()->is_stdout_verbose()) {
+		if (!shadow_stats_buffer.is_valid()) {
+			Vector<uint8_t> zeros;
+			zeros.resize_initialized(sizeof(uint32_t) * RT_SHADOW_STATS_WORDS);
+			shadow_stats_buffer = RD::get_singleton()->storage_buffer_create(zeros.size(), zeros);
+			RD::get_singleton()->set_resource_name(shadow_stats_buffer, "RT shadow stats");
+		}
+		RD::Uniform u;
+		u.binding = 53;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.append_id(shadow_stats_buffer);
 		uniforms.push_back(u);
 	}
 

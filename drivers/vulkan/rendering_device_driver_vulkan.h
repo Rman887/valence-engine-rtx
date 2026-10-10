@@ -107,6 +107,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 		uint32_t shader_group_handle_size_aligned = 0;
 		uint32_t shader_group_base_alignment = 0;
 		bool validation = false;
+		bool position_fetch = false; // VK_KHR_ray_tracing_position_fetch enabled (SUPPORTS_RAYTRACING_POSITION_FETCH).
 	};
 
 	struct DescriptorIndexingCapabilities {

@@ -49,7 +49,7 @@ bool MeshStorage::is_cluster_geometry_streaming_wanted() {
 	static int wanted = -1;
 	if (wanted < 0) {
 		RD *rd = RD::get_singleton();
-		const bool supported = rd->has_feature(RD::SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE) && rd->get_cluster_acceleration_structure_capabilities().position_fetch;
+		const bool supported = rd->has_feature(RD::SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE) && rd->has_feature(RD::SUPPORTS_RAYTRACING_POSITION_FETCH);
 		// CLAS streaming (D92) needs the selection, its traversal, the cached levels (with the sharing
 		// they belong to) and the compaction.
 		const bool stream = GLOBAL_GET("rendering/pathtracing/cluster_lod") && GLOBAL_GET("rendering/pathtracing/cluster_lod_select") && GLOBAL_GET("rendering/pathtracing/cluster_lod_traversal") &&

@@ -592,6 +592,8 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 	_register_requested_device_extension(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME, false);
 	_register_requested_device_extension(VK_KHR_RAY_QUERY_EXTENSION_NAME, false);
 	_register_requested_device_extension(VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME, false);
+	// VAL: hit shaders read the hit triangle's positions from the acceleration structure wherever the device has it (P1d0).
+	_register_requested_device_extension(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME, false);
 	if (Engine::get_singleton()->is_raytracing_validation_enabled()) {
 		_register_requested_device_extension(VK_NV_RAY_TRACING_VALIDATION_EXTENSION_NAME, false);
 	}
@@ -599,10 +601,6 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 	// pipeline opting into cluster traversal.
 	if (GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
 		_register_requested_device_extension(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME, false);
-		// Geometry residency (D93) takes a cluster hit's positions from its CLAS.
-		if (GLOBAL_GET("rendering/pathtracing/cluster_lod_stream_geometry")) {
-			_register_requested_device_extension(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME, false);
-		}
 	}
 	// Off, likewise: every acceleration structure binding stays a plain TLAS binding.
 	if (GLOBAL_GET("rendering/pathtracing/partitioned_tlas")) {
@@ -1181,9 +1179,12 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			ray_query_support = ray_query_features.rayQuery;
 		}
 
+		if (enabled_device_extension_names.has(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME)) {
+			raytracing_capabilities.position_fetch = acceleration_structure_features.accelerationStructure && position_fetch_features.rayTracingPositionFetch;
+		}
+
 		if (enabled_device_extension_names.has(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
 			cluster_acceleration_structure_capabilities.supported = acceleration_structure_features.accelerationStructure && cluster_acceleration_structure_features.clusterAccelerationStructure;
-			cluster_acceleration_structure_capabilities.position_fetch = cluster_acceleration_structure_capabilities.supported && enabled_device_extension_names.has(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME) && position_fetch_features.rayTracingPositionFetch;
 		}
 
 		if (enabled_device_extension_names.has(VK_NV_PARTITIONED_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
@@ -1407,6 +1408,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		} else {
 			print_verbose("- Vulkan Raytracing not supported");
 		}
+		print_verbose(String("- Vulkan Ray Tracing Position Fetch ") + (raytracing_capabilities.position_fetch ? "supported" : "not supported"));
 
 		if (cluster_acceleration_structure_capabilities.supported) {
 			cluster_acceleration_structure_capabilities.max_vertices_per_cluster = cluster_acceleration_structure_properties.maxVerticesPerCluster;
@@ -1427,7 +1429,6 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			print_verbose("  cluster byte alignment: " + itos(cluster_acceleration_structure_capabilities.cluster_byte_alignment));
 			print_verbose("  cluster bottom level byte alignment: " + itos(cluster_acceleration_structure_capabilities.cluster_bottom_level_byte_alignment));
 			print_verbose("  cluster scratch byte alignment: " + itos(cluster_acceleration_structure_capabilities.cluster_scratch_byte_alignment));
-			print_verbose(String("  position fetch: ") + (cluster_acceleration_structure_capabilities.position_fetch ? "yes" : "no"));
 		}
 
 		if (partitioned_acceleration_structure_capabilities.supported) {
@@ -1638,7 +1639,7 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 	}
 
 	VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR position_fetch_features = {};
-	if (cluster_acceleration_structure_capabilities.position_fetch) {
+	if (raytracing_capabilities.position_fetch) {
 		position_fetch_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR;
 		position_fetch_features.pNext = create_info_next;
 		position_fetch_features.rayTracingPositionFetch = VK_TRUE;
@@ -8495,6 +8496,8 @@ bool RenderingDeviceDriverVulkan::has_feature(Features p_feature) {
 			return acceleration_structure_capabilities.acceleration_structure_support && raytracing_capabilities.raytracing_pipeline_support;
 		case SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE:
 			return cluster_acceleration_structure_capabilities.supported && raytracing_capabilities.raytracing_pipeline_support;
+		case SUPPORTS_RAYTRACING_POSITION_FETCH:
+			return raytracing_capabilities.position_fetch;
 		case SUPPORTS_HDR_OUTPUT:
 #if defined(WINDOWS_ENABLED)
 			// When using a Vulkan swapchain on Windows, some configurations

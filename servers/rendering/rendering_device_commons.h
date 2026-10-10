@@ -922,7 +922,7 @@ public:
 		ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT = (1 << 3),
 		ACCELERATION_STRUCTURE_LOW_MEMORY_BIT = (1 << 4),
 		// VK_KHR_ray_tracing_position_fetch: hit shaders may read the hit triangle's positions
-		// from the structure (D93). Valid only where the device reports position fetch.
+		// from the structure (D93). Valid only where SUPPORTS_RAYTRACING_POSITION_FETCH is reported.
 		ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT = (1 << 11),
 		// VK_NV_cluster_acceleration_structure with VK_EXT_opacity_micromap: a triangle cluster build
 		// may reference an opacity micromap (D96). Cluster builds only.
@@ -964,7 +964,6 @@ public:
 		uint32_t cluster_template_byte_alignment = 0;
 		uint32_t triangle_template_build_info_size = 0;
 		uint32_t instantiate_info_size = 0;
-		bool position_fetch = false; // VK_KHR_ray_tracing_position_fetch enabled: ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT is valid (D93).
 	};
 
 	struct ClusterAccelerationStructureInput {
@@ -1233,6 +1232,10 @@ public:
 		SUPPORTS_RAYTRACING_PIPELINE,
 		SUPPORTS_HDR_OUTPUT,
 		SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE,
+		// VK_KHR_ray_tracing_position_fetch enabled: ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT is valid
+		// and shaders may read a hit triangle's positions from the structure. Internal: not bound, as
+		// scripts cannot build a structure with that flag.
+		SUPPORTS_RAYTRACING_POSITION_FETCH,
 	};
 
 	enum SubgroupOperations {

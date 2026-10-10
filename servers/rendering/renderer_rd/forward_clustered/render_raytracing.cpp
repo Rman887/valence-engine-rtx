@@ -181,7 +181,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		// static and deformed alike, and the BLAS over the clusters carries it too, as the
 		// position-fetch rule names the structure of the intersection. Set before any size query.
 		if (GLOBAL_GET("rendering/pathtracing/cluster_lod_stream_geometry")) {
-			if (caps.position_fetch) {
+			if (RD::get_singleton()->has_feature(RD::SUPPORTS_RAYTRACING_POSITION_FETCH)) {
 				// The mesh storage's own test, which keeps the RAM copy the blobs come from (D93b): stream_wanted and support.
 				cluster_build_data_access = RendererRD::MeshStorage::is_cluster_geometry_streaming_wanted();
 				DEV_ASSERT(cluster_build_data_access == stream_wanted);

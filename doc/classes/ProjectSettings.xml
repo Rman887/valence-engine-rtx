@@ -3463,7 +3463,7 @@
 		<member name="rendering/pathtracing/use_shader_execution_reordering" type="bool" setter="" getter="" default="true">
 			If [code]true[/code], enables NVIDIA Shader Execution Reordering in the path tracer. SET reorders ray tracing shader invocations at runtime to improve GPU occupancy and reduce divergence between threads executing different materials. This can significantly improve path tracing performance on NVIDIA Ada Lovelace and later GPUs. Has no effect on hardware that does not support SET.
 		</member>
-		<member name="rendering/pathtracing/use_simple_shadows" type="bool" setter="" getter="" default="false">
+		<member name="rendering/pathtracing/use_simple_shadows" type="bool" setter="" getter="" default="true">
 			If [code]true[/code], shadow rays are inline ray queries instead of traced rays, which is cheaper. A standard material's alpha test runs inline, as its any-hit shader would; a ray that meets a candidate only a hit group's own shaders can decide (a procedural instance, or a custom shader's alpha) is traced through the pipeline as well, but only when nothing the inline test can decide blocks it, so both settings give the same shadows. A device without ray queries traces every shadow ray through the pipeline. If [code]false[/code], every shadow ray is traced through the pipeline.
 			[b]Note:[/b] Only has an effect when path tracing is enabled on the active [Environment].
 		</member>

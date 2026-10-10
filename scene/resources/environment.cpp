@@ -1704,7 +1704,7 @@ void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_pathtracing_sky_light_variance_share"), &Environment::is_pathtracing_sky_light_variance_share);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_russian_roulette", "enable"), &Environment::set_pathtracing_russian_roulette);
 	ClassDB::bind_method(D_METHOD("is_pathtracing_russian_roulette"), &Environment::is_pathtracing_russian_roulette);
-	GLOBAL_DEF("rendering/pathtracing/use_simple_shadows", false);
+	GLOBAL_DEF("rendering/pathtracing/use_simple_shadows", true);
 
 	ADD_GROUP("Pathtracing", "pathtracing_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_pathtracing_enabled", "is_pathtracing_enabled");

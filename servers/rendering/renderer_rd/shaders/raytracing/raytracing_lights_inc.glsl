@@ -126,15 +126,22 @@ vec3 lights_sample_cone(LightSample ls, vec2 u, out float pdf) {
 // Attenuation
 // ============================================================================
 
+// VAL (D123): the nearest a receiver is taken to be to an omni or spot light's centre, in metres.
+#define RT_LIGHT_MIN_DISTANCE 0.01
+
 // Godot-style windowed distance attenuation.
 // window = (1 - (d/range)^4)^2, combined with pow(d, -decay).
-float lights_get_attenuation(LightSample ls, float inv_max_range, float decay) {
+// VAL (D123): the falloff is the raster's outside the light's radius, uncapped: NVIDIA's min(pow(d, -decay), 1) held a light at its
+// 1 m value for every receiver inside a metre (0.09 of the inverse square at 0.3 m). The distance is
+// floored at the light's radius instead (a sphere's falloff outside it is exactly the inverse square
+// of the centre distance), and at 1 cm for a point light, which keeps a receiver touching it finite.
+float lights_get_attenuation(LightSample ls, float inv_max_range, float decay, float radius) {
 	if (ls.distance_sq <= 0.0) {
 		return 1.0; // Directional: no distance attenuation.
 	}
 
 	float distance = sqrt(ls.distance_sq);
-	float atten = min(pow(max(distance, 0.0001), -decay), 1.0);
+	float atten = pow(max(distance, max(radius, RT_LIGHT_MIN_DISTANCE)), -decay);
 
 	// Windowed falloff if range is finite (inv_max_range >= 0).
 	if (inv_max_range >= 0.0) {
@@ -392,6 +399,7 @@ bool lights_sample_light(
 		float dist = sqrt(dist_sq);
 		vec3 L;
 		float shadow_dist;
+		float sphere_norm = 1.0;
 
 		if (light.radius <= 0.01) {
 			// True point light: exact direction.
@@ -402,6 +410,10 @@ bool lights_sample_light(
 			LightSample ls = lights_prepare_sample(hit_pos, light);
 			float light_pdf;
 			L = lights_sample_cone(ls, u, light_pdf);
+			// VAL (D123): a direction drawn uniformly in the subtended cone and charged the centre's falloff
+			// delivers (1 + cos(theta_max)) / 2 of a uniform sphere's irradiance (half at contact); this
+			// restores it, exact outside the sphere and continuous with the radius floor inside it.
+			sphere_norm = 2.0 / (1.0 + ls.cos_theta_max);
 			float t_center = dot(to_light, L);
 			vec3 perp = to_light - t_center * L;
 			float perp_sq = dot(perp, perp);
@@ -427,9 +439,9 @@ bool lights_sample_light(
 		// Distance attenuation.
 		LightSample ls_atten;
 		ls_atten.distance_sq = dist_sq;
-		float atten = lights_get_attenuation(ls_atten, light.inv_max_range, light.attenuation) * spot_atten;
+		float atten = lights_get_attenuation(ls_atten, light.inv_max_range, light.attenuation, light.radius) * spot_atten;
 
-		r_sample.radiance = light.emission * atten * indirect_mul;
+		r_sample.radiance = light.emission * atten * sphere_norm * indirect_mul;
 		return true;
 	}
 	// === CONE LIGHT PATH (directional) ===

@@ -11547,7 +11547,8 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		ld.emission[1] = linear_col.g * energy;
 		ld.emission[2] = linear_col.b * energy;
 		ld.radius = ls->light_get_param(base, RSE::LIGHT_PARAM_SIZE);
-		ld.attenuation = ls->light_get_param(base, RSE::LIGHT_PARAM_ATTENUATION);
+		// VAL (D123): bounded so the uncapped falloff's pow(1 cm, -decay) stays finite in float.
+		ld.attenuation = CLAMP(ls->light_get_param(base, RSE::LIGHT_PARAM_ATTENUATION), -16.0f, 16.0f);
 		float range = ls->light_get_param(base, RSE::LIGHT_PARAM_RANGE);
 		if (range > 0.0f) {
 			ld.inv_max_range = 1.0f / range;
@@ -12073,7 +12074,8 @@ uint32_t RenderRaytracing::_build_light_tree_node(uint32_t p_begin, uint32_t p_e
 	n.analytic_share = power_sum > 0.0 ? (float)(analytic_power / power_sum) : 0.0f;
 	n.emissive_share = power_sum > 0.0 ? (float)(emissive_power / power_sum) : 0.0f;
 	// The analytic lights' falloff over the children that carry them: the slowest decay, so no such
-	// light falls off faster than its node reads past a metre, and the widest range.
+	// light falls off faster than its node reads past a metre (inside one, uncapped since D123, the
+	// faster lights read under: variance only), and the widest range.
 	if (l.analytic_share > 0.0f && r.analytic_share > 0.0f) {
 		n.decay = MIN(l.decay, r.decay);
 		n.analytic_range = (l.analytic_range > 0.0f && r.analytic_range > 0.0f) ? MAX(l.analytic_range, r.analytic_range) : 0.0f;
@@ -12083,8 +12085,8 @@ uint32_t RenderRaytracing::_build_light_tree_node(uint32_t p_begin, uint32_t p_e
 		n.analytic_range = a.analytic_range;
 	}
 	// A node is read at its centre's distance and a light inside it can be far nearer: never steeper
-	// than the inverse square, and a negative decay (capped at 1 by the light) reads flat. A leaf's
-	// distance is its light's own, so a leaf keeps its decay.
+	// than the inverse square, and a negative decay (a light growing with distance to its range) reads
+	// flat, an under-read inside its range. A leaf's distance is its light's own, so a leaf keeps its decay.
 	n.decay = CLAMP(n.decay, 0.0f, 2.0f);
 	return node_index;
 }

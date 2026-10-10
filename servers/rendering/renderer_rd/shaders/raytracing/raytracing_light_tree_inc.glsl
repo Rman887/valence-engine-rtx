@@ -127,20 +127,21 @@ uint light_tree_emissive_slot(uint entry, bool indirect) {
 /// The distance falloff of a node's power at d2, the squared distance from its centre (D63), its two
 /// kinds weighed by their shares of the power. The emitters fall off as the inverse square floored
 /// by the sphere, as they always have; the omni and spot lights by the curve lights_get_attenuation
-/// charges them: their slowest decay exponent over the distance floored by the sphere, capped at 1,
-/// inside the quartic window of their widest range taken from the sphere's near side. The inverse
-/// square read Godot's default decay of 1 as up to the distance times too dim past a metre (and too
-/// bright inside one), so the proposal and the sky's share by variance (D62) understated every such
-/// light in reach. A node of emitters alone reads inv_d2 exactly, as before; the analytic curve costs
-/// a square root for the window and a reciprocal square root at a decay of 1, or a logarithm and an
-/// exponential at a decay but 1 or 2.
+/// charges them: their slowest decay exponent over the distance floored by the sphere and by 1 cm
+/// (D123: uncapped), inside the quartic window of their widest range taken from the sphere's near
+/// side. The inverse square read Godot's default decay of 1 as up to the distance times too dim past a
+/// metre (and too bright inside one), so the proposal and the sky's share by variance (D62)
+/// understated every such light in reach. The slowest exponent bounds a node's lights past a metre and
+/// under-reads its faster ones inside one, by max(d, r) to the spread of their exponents: variance
+/// only, since leaves and probabilities are exact (open: carry both extremes). A node of emitters
+/// alone reads inv_d2 exactly, as before; the analytic curve costs a square root for the window, and
+/// a reciprocal square root at a decay of 1, or a logarithm and an exponential at a decay but 1 or 2.
 float light_tree_node_falloff(RTLightTreeNode n, float d2, float r2, float inv_d2) {
 	if (!(n.analytic_share > 0.0)) {
 		return inv_d2;
 	}
-	float dd = max(max(d2, r2), 1e-8);
-	float decayed = (n.decay == 2.0) ? inv_d2 : ((n.decay == 1.0) ? inversesqrt(dd) : exp2(-0.5 * n.decay * log2(dd)));
-	float analytic = min(decayed, 1.0);
+	float dd = max(max(d2, r2), RT_LIGHT_MIN_DISTANCE * RT_LIGHT_MIN_DISTANCE);
+	float analytic = (n.decay == 2.0) ? min(inv_d2, 1.0 / (RT_LIGHT_MIN_DISTANCE * RT_LIGHT_MIN_DISTANCE)) : ((n.decay == 1.0) ? inversesqrt(dd) : exp2(-0.5 * n.decay * log2(dd)));
 	if (n.analytic_range > 0.0) {
 		float nd = max(sqrt(d2) - n.radius, 0.0) / n.analytic_range;
 		nd *= nd;
@@ -526,7 +527,7 @@ float light_tree_analytic_target(RTLightData light, vec3 hit_pos, vec3 N, bool p
 	ls.emission = light.emission;
 	ls.distance_sq = dist_sq;
 	ls.max_distance = dist;
-	float atten = lights_get_attenuation(ls, light.inv_max_range, light.attenuation) * spot_atten;
+	float atten = lights_get_attenuation(ls, light.inv_max_range, light.attenuation, light.radius) * spot_atten;
 	float n_dot = dot(N, L);
 	float above = max((p_two_sided ? abs(n_dot) : n_dot) + light.radius / max(dist, light.radius), RT_LIGHT_TREE_RECEIVER_FLOOR);
 	return lum * atten * above;
@@ -554,7 +555,7 @@ float light_tree_leaf_target(RTLightTreeNode n, vec3 hit_pos, vec3 N, bool p_two
 	}
 	float dist = max(d, 1e-4);
 	float above = max(n_dot / dist + n.radius / max(dist, n.radius), RT_LIGHT_TREE_RECEIVER_FLOOR);
-	float atten = min(pow(dist, -n.decay), 1.0);
+	float atten = pow(max(dist, max(n.radius, RT_LIGHT_MIN_DISTANCE)), -n.decay);
 	if (n.max_range > 0.0) {
 		float nd = dist / n.max_range;
 		nd *= nd;

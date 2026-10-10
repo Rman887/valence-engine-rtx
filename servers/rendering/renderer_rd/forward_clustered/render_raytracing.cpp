@@ -8009,38 +8009,26 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 	// cluster pass reads the dispatch buffer as its indirect arguments, so it runs in a list of its
 	// own with the arguments bound in its place (the graph takes one usage of a buffer per list).
 	{
-		Vector<RD::Uniform> uniforms;
-		{
-			RD::Uniform u;
-			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
-			u.binding = 0;
-			u.append_id(args_buffer);
-			uniforms.push_back(u);
-		}
-		{
-			RD::Uniform u;
-			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
-			u.binding = 1;
-			u.append_id(cluster_lod_table);
-			uniforms.push_back(u);
-		}
-		{
-			RD::Uniform u;
-			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
-			u.binding = 2;
-			u.append_id(batch.dispatch_buffer);
-			uniforms.push_back(u);
-		}
-		RID uniform_set = rd->uniform_set_create(uniforms, lod_select_shader.version_shader, 0, /*p_linear_pool=*/true);
+		RD::Uniform args_uniform;
+		args_uniform.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		args_uniform.binding = 0;
+		args_uniform.append_id(args_buffer);
+		RD::Uniform table_uniform;
+		table_uniform.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		table_uniform.binding = 1;
+		table_uniform.append_id(cluster_lod_table);
+		RD::Uniform dispatch_uniform;
+		dispatch_uniform.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		dispatch_uniform.binding = 2;
+		dispatch_uniform.append_id(batch.dispatch_buffer);
+		// VAL (P1f): cached by their buffers, which live across frames; a grown buffer's free invalidates them.
+		RID uniform_set = UniformSetCacheRD::get_singleton()->get_cache(lod_select_shader.version_shader, 0, args_uniform, table_uniform, dispatch_uniform);
 		ERR_FAIL_COND_V(!uniform_set.is_valid(), false);
 		RID cluster_set;
 		if (tree_levels > 0) {
-			uniforms.write[2].set_id(0, args_buffer);
-			cluster_set = rd->uniform_set_create(uniforms, lod_select_shader.version_shader, 0, /*p_linear_pool=*/true);
-			if (!cluster_set.is_valid()) {
-				rd->free_rid(uniform_set);
-				ERR_FAIL_V(false);
-			}
+			dispatch_uniform.set_id(0, args_buffer);
+			cluster_set = UniformSetCacheRD::get_singleton()->get_cache(lod_select_shader.version_shader, 0, args_uniform, table_uniform, dispatch_uniform);
+			ERR_FAIL_COND_V(!cluster_set.is_valid(), false);
 		}
 		RD::ComputeListID compute_list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(compute_list, lod_select_shader.pipeline);
@@ -8087,7 +8075,6 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 			rd->compute_list_set_push_constant(compute_list, &cluster_pc, sizeof(SelectPC));
 			rd->compute_list_dispatch_indirect(compute_list, batch.dispatch_buffer, 0);
 			rd->compute_list_end();
-			rd->free_rid(cluster_set);
 		}
 		const uint32_t digest_count = static_persistent ? cache_first : persistent_count;
 		if (digest_count > 0) {
@@ -8122,7 +8109,6 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 			rd->compute_list_dispatch_threads(compute_list, digest_count, 1, 1);
 			rd->compute_list_end();
 		}
-		rd->free_rid(uniform_set);
 	}
 	if (select_timer) {
 		rd->capture_timestamp("RT cluster LOD selection end");
@@ -12440,7 +12426,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 	RenderSceneBuffersRD *rb = p_render_data->render_buffers.ptr();
 
 	// SET 0 indices must match raytracing_common_inc.glsl / scene_raytracing_raygen.glsl / samplers includes.
-	Vector<RD::Uniform> uniforms;
+	LocalVector<RD::Uniform> uniforms;
 
 	{
 		RD::Uniform u;
@@ -13104,25 +13090,12 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 
 	RID result;
 	if (shader_rd.is_valid()) {
-		// Release the previous frame's scene uniform set now (before allocating
-		// this frame's). Disposal is deferred by RenderingDevice until the frame
-		// that used it has finished on the GPU, so this is safe and prevents the
-		// uniform_set_owner pool from leaking one RID per accumulated frame.
-		//
-		// The set references render-buffer resources, so RenderingDevice may have
-		// already auto-freed it via its dependency cascade (e.g. a texture/buffer
-		// it referenced was recreated). RID::is_valid() only checks for non-null,
-		// so we must query uniform_set_is_valid() to avoid a double free.
-		if (p_state->scene_uniform_set.is_valid() && RD::get_singleton()->uniform_set_is_valid(p_state->scene_uniform_set)) {
-			RD::get_singleton()->free_rid(p_state->scene_uniform_set);
-		}
-		p_state->scene_uniform_set = RID();
-
-		result = RD::get_singleton()->uniform_set_create(
-				uniforms,
-				shader_rd,
-				RenderForwardClustered::SCENE_UNIFORM_SET,
-				/*p_linear_pool=*/true);
+		// VAL (P1f): the set is looked up by its bindings rather than created every frame: the same
+		// resources give the same set, which the cache keeps until one of them is freed (RenderingDevice's
+		// dependency cascade invalidates it), so a resized buffer, a new TLAS, a recreated render buffer,
+		// the bindless block's grown texel table (binding 54) or a pipeline variant's other shader each
+		// give a new one.
+		result = UniformSetCacheRD::get_singleton()->get_cache_vec(shader_rd, RenderForwardClustered::SCENE_UNIFORM_SET, uniforms);
 		p_state->scene_uniform_set = result;
 
 		// === SET 1: Bindless textures ===

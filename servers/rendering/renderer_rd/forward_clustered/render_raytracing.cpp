@@ -10323,6 +10323,15 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		}
 		return p_mat->data.subsurface_strength > 0.0f ? RT_INSTANCE_MASK_SUBSURFACE : 0;
 	};
+	// The hit SBT record an instance traces with (D120 SS2): a standard material that can walk (its mask carries the
+	// walk's bit) takes the standard hit group's walking variant, every other instance its material's slot, so the walk
+	// costs only the hits that can take it. Readiness stays the material slot's.
+	auto instance_sbt = [](const RTMaterialData *p_mat, uint8_t p_inst_mask) -> uint32_t {
+		if (p_mat->rt_sbt_offset == 0 && (p_inst_mask & RT_INSTANCE_MASK_SUBSURFACE)) {
+			return SceneShaderRaytracing::HIT_SBT_WALK_RECORD;
+		}
+		return p_mat->rt_sbt_offset;
+	};
 
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
@@ -10955,7 +10964,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				const uint32_t slot = slot_ranges[range].first;
 				const uint64_t geometry_generation = _layer_row_generation(_surface_row_generation(surf_data), inst->layer_mask);
 				const uint64_t material_generation = _material_row_generation(mat_data);
-				if (!slot_rebuilt && !_slot_moved(inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED, prev_instance_transform, instance_transform) && _slot_unchanged(state, slot, blas_handle, final_transform, inst_flags, inst_mask, mat_data->rt_sbt_offset, geometry_generation, material_generation)) {
+				if (!slot_rebuilt && !_slot_moved(inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED, prev_instance_transform, instance_transform) && _slot_unchanged(state, slot, blas_handle, final_transform, inst_flags, inst_mask, instance_sbt(mat_data, inst_mask), geometry_generation, material_generation)) {
 					surf = surf->next;
 					continue;
 				}
@@ -10981,7 +10990,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				motion_indices.push_back(-1);
 			}
 
-			sbt_offsets.push_back(mat_data->rt_sbt_offset);
+			sbt_offsets.push_back(instance_sbt(mat_data, inst_mask));
 			material_data.push_back(mat_data->data);
 			instance_flags.push_back(inst_flags);
 			instance_masks.push_back(inst_mask);
@@ -11067,7 +11076,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				const uint64_t geometry_generation = _local_row_generation(range, merged_sd.geometry);
 				const uint64_t material_generation = _material_row_generation(pending.mat_data);
 				const bool rebuilt = dirty_blas_list.size() != mm_slot_build_size || dirty_blas_update_list.size() != mm_slot_refit_size;
-				if (!rebuilt && _slot_unchanged(state, slot, merged_sd.blas, pending.instance_transform, pending.inst_flags, pending.inst_mask, pending.mat_data->rt_sbt_offset, geometry_generation, material_generation)) {
+				if (!rebuilt && _slot_unchanged(state, slot, merged_sd.blas, pending.instance_transform, pending.inst_flags, pending.inst_mask, instance_sbt(pending.mat_data, pending.inst_mask), geometry_generation, material_generation)) {
 					continue;
 				}
 				_slot_emit(slot, geometry_generation, material_generation);
@@ -11075,7 +11084,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			blass.push_back(merged_sd.blas);
 			blas_transforms.push_back(pending.instance_transform);
 			geometry_data.push_back(merged_sd.geometry);
-			sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
+			sbt_offsets.push_back(instance_sbt(pending.mat_data, pending.inst_mask));
 			material_data.push_back(pending.mat_data->data);
 			motion_indices.push_back(-1);
 			instance_flags.push_back(pending.inst_flags);
@@ -11108,6 +11117,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			bool slot_rebuilt = false;
 			bool slot_moved = false;
 			bool skip_range = false;
+			// The range's hit group record, once for all its elements.
+			const uint32_t mm_sbt = instance_sbt(pending.mat_data, pending.inst_mask);
 			if (ptlas_slots_enabled) {
 				const uint32_t range = _slot_range_acquire(state, pending.mm_surf->owner->rt_slots, pending.surface_index, pending.mm_count);
 				slot_first = slot_ranges[range].first;
@@ -11124,7 +11135,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				key.geometry_generation = slot_geometry_generation;
 				key.material_generation = slot_material_generation;
 				key.count = pending.mm_count;
-				key.sbt_offset = pending.mat_data->rt_sbt_offset;
+				key.sbt_offset = mm_sbt;
 				key.flags = pending.inst_flags;
 				key.mask = pending.inst_mask;
 				// The key is stored whenever it changed, so a rebuilt or moved range is walked whole now
@@ -11155,7 +11166,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				}
 
 				if (ptlas_slots_enabled) {
-					if (!slot_rebuilt && !slot_moved && _slot_unchanged(state, slot_first + mi, slot_blas, final_transform, pending.inst_flags, pending.inst_mask, pending.mat_data->rt_sbt_offset, slot_geometry_generation, slot_material_generation)) {
+					if (!slot_rebuilt && !slot_moved && _slot_unchanged(state, slot_first + mi, slot_blas, final_transform, pending.inst_flags, pending.inst_mask, mm_sbt, slot_geometry_generation, slot_material_generation)) {
 						continue;
 					}
 					_slot_emit(slot_first + mi, slot_geometry_generation, slot_material_generation);
@@ -11167,7 +11178,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				blas_transforms.push_back(final_transform);
 				geometry_data.push_back(surf_data->geometry);
 				geometry_data[geometry_data.size() - 1]._pad[RT_GEOMETRY_LAYERS_WORD] = pending.mm_surf->owner->layer_mask & RT_GEOMETRY_LAYERS_MASK; // D104.
-				sbt_offsets.push_back(pending.mat_data->rt_sbt_offset);
+				sbt_offsets.push_back(mm_sbt);
 				material_data.push_back(pending.mat_data->data);
 
 				if (pending.transform_moved) {
@@ -11618,7 +11629,9 @@ uint32_t RenderRaytracing::gather_emissive(const RenderDataRD *p_render_data, co
 		const RT_GeometryData &geom = record ? record->geometry : geometry_data[i];
 		const uint32_t sbt_offset = record ? record->sbt_offset : sbt_offsets[i];
 		const uint32_t flags = record ? record->flags : instance_flags[i];
-		if (!(mat.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT) || sbt_offset != 0 || (geom.flags & RT_GEOM_FLAG_PROCEDURAL) || geom.primitive_count == 0) {
+		// The walk record is the standard material too (D120 SS2): an emissive walker stays in the list.
+		const bool custom_hit_group = sbt_offset != 0 && sbt_offset != SceneShaderRaytracing::HIT_SBT_WALK_RECORD;
+		if (!(mat.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT) || custom_hit_group || (geom.flags & RT_GEOM_FLAG_PROCEDURAL) || geom.primitive_count == 0) {
 			continue;
 		}
 		if (geom.vertex_buffer_address == 0 || (geom.index_format != RT_INDEX_FORMAT_NONE && geom.index_buffer_address == 0)) {

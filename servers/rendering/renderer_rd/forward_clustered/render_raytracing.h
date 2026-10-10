@@ -2126,7 +2126,7 @@ class RenderRaytracing {
 	static constexpr uint8_t RT_INSTANCE_MASK_SHADOW = 0x02;
 	static constexpr uint8_t RT_INSTANCE_MASK_PROCEDURAL = 0x04;
 	static constexpr uint8_t RT_INSTANCE_MASK_SUBSURFACE = 0x08; // A material whose diffuse lobe walks (D120); the walk's rays select it alone.
-	LocalVector<uint32_t> sbt_offsets; // 0 = default material hit group
+	LocalVector<uint32_t> sbt_offsets; // 0 = default material hit group, SceneShaderRaytracing::HIT_SBT_WALK_RECORD its walking variant
 
 	// Slot-resident instances (D94b): on with every TLAS a PTLAS (D94a). The arrays above then hold
 	// only the instances the walk could not prove unchanged, with their slots and row generations

@@ -557,6 +557,12 @@ uint32_t SceneShaderRaytracing::_register_slot(uint32_t /*p_shader_id*/, RID p_m
 		return it->value;
 	}
 
+	// The last SBT record is the standard hit group's walking variant (D120 SS2); a slot there would take it over.
+	if (hit_group_slots.size() >= HIT_SBT_WALK_RECORD) {
+		ERR_PRINT_ONCE(vformat("RT: more than %d custom hit groups; further custom shaders shade as the standard material, and procedural instances are not traced.", HIT_SBT_WALK_RECORD - 1));
+		return 0;
+	}
+
 	// New slot: preprocess here; heavy compile is on worker.
 	CustomShaderEntry entry;
 	entry.is_procedural = p_is_procedural;
@@ -1064,6 +1070,22 @@ const SceneShaderRaytracing::PipelineBundle &SceneShaderRaytracing::ensure_pipel
 	return bundle;
 }
 
+// The standard hit group's walking variant (D120 SS2): the same closest hit, specialized with
+// RT_FLAG_SUBSURFACE_WALK_GROUP so its walk does not fold away, and the plain any-hit. Built only
+// while the bundle compiles the walk in; HIT_SBT_WALK_RECORD selects it.
+static RD::HitGroup _walk_hit_group(const RD::PipelineShader &p_base) {
+	RD::PipelineShader walk = p_base;
+	for (int i = 0; i < walk.specialization_constants.size(); i++) {
+		if (walk.specialization_constants[i].constant_id == 0) {
+			walk.specialization_constants.write[i].int_value |= SceneShaderRaytracing::RT_FLAG_SUBSURFACE_WALK_GROUP;
+		}
+	}
+	RD::HitGroup hg;
+	hg.closest_hit_shader = walk;
+	hg.any_hit_shader = p_base;
+	return hg;
+}
+
 // Minimal HG0 + empty sentinel pipeline/SBT for first use of a variant.
 
 bool SceneShaderRaytracing::_build_initial_bundle(uint32_t p_rt_flags, PipelineBundle &r_bundle) {
@@ -1086,10 +1108,14 @@ bool SceneShaderRaytracing::_build_initial_bundle(uint32_t p_rt_flags, PipelineB
 	hg0_default.any_hit_shader = base_ps;
 	const RD::HitGroup empty_hg;
 
-	// HG[0]=default, HG[1]=empty until rebuild maps custom slots.
+	// HG[0]=default, HG[1]=empty until rebuild maps custom slots, HG[2] the walking variant while the walk is compiled in.
+	const bool walk_group = (p_rt_flags & RT_FLAG_SUBSURFACE) != 0;
 	LocalVector<RD::HitGroup> hit_groups;
 	hit_groups.push_back(hg0_default);
 	hit_groups.push_back(empty_hg);
+	if (walk_group) {
+		hit_groups.push_back(_walk_hit_group(base_ps));
+	}
 
 	RID new_pipeline = RD::get_singleton()->raytracing_pipeline_create(
 			{ &base_ps, 1 }, { &base_ps, 1 },
@@ -1101,7 +1127,6 @@ bool SceneShaderRaytracing::_build_initial_bundle(uint32_t p_rt_flags, PipelineB
 	}
 	RD::get_singleton()->set_resource_name(new_pipeline, String("RT Pipeline initial [flags=") + itos(p_rt_flags) + "]");
 
-	static constexpr uint32_t HIT_SBT_CAPACITY = 4096;
 	uint32_t sbt_size = HIT_SBT_CAPACITY;
 
 	RID new_sbt = RD::get_singleton()->hit_sbt_create(new_pipeline, sbt_size);
@@ -1120,12 +1145,14 @@ bool SceneShaderRaytracing::_build_initial_bundle(uint32_t p_rt_flags, PipelineB
 		return false;
 	}
 
-	// Instance slot i maps to HG min(i,1) until full rebuild (custom TLAS-skipped meanwhile).
+	// Instance slot i maps to HG min(i,1) until full rebuild (custom TLAS-skipped meanwhile); the walk record to the
+	// walking variant, or to the plain group without the walk.
 	LocalVector<uint32_t> indices;
 	indices.resize(sbt_size);
 	for (uint32_t i = 0; i < sbt_size; i++) {
 		indices[i] = (i == 0) ? 0 : 1;
 	}
+	indices[HIT_SBT_WALK_RECORD] = walk_group ? 2 : 0;
 	RD::get_singleton()->hit_sbt_range_update(new_sbt, sbt_range, 0, indices);
 
 	r_bundle.pipeline = new_pipeline;
@@ -1443,9 +1470,10 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 	// No-op HG: failed / pending slots + trailing SBT sentinel (never default material).
 	const RD::HitGroup empty_hg;
 
-	// Layout: [0] default [1..n-1] custom or empty [n] sentinel.
+	// Layout: [0] default [1..n-1] custom or empty [n] sentinel [n+1] the walking variant while the walk is compiled in.
+	const bool walk_group = (p_task->rt_flags & RT_FLAG_SUBSURFACE) != 0;
 	LocalVector<RD::HitGroup> hit_groups;
-	hit_groups.resize(n + 1);
+	hit_groups.resize(n + (walk_group ? 2 : 1));
 	hit_groups[0] = hg0_default;
 	for (uint32_t i = 1; i < n; i++) {
 		if (!p_task->new_ready_mask[i] || p_task->new_per_hg_shaders[i].is_null()) {
@@ -1462,6 +1490,9 @@ void SceneShaderRaytracing::_build_pipeline_worker(PipelineBuildTask *p_task) {
 		hit_groups[i] = hg;
 	}
 	hit_groups[n] = empty_hg;
+	if (walk_group) {
+		hit_groups[n + 1] = _walk_hit_group(base_ps);
+	}
 
 	RID new_pipeline = RD::get_singleton()->raytracing_pipeline_create(
 			{ &base_ps, 1 }, { &base_ps, 1 },
@@ -1510,7 +1541,6 @@ void SceneShaderRaytracing::_finalize_pipeline_build(PipelineBuildTask *p_task) 
 	}
 
 	uint32_t n = (uint32_t)p_task->slots.size();
-	static constexpr uint32_t HIT_SBT_CAPACITY = 4096;
 	uint32_t sbt_size = MAX(n, HIT_SBT_CAPACITY);
 
 	RID new_sbt = RD::get_singleton()->hit_sbt_create(p_task->new_pipeline, sbt_size);
@@ -1550,12 +1580,14 @@ void SceneShaderRaytracing::_finalize_pipeline_build(PipelineBuildTask *p_task) 
 		}
 	}
 
-	// Slots i >= n map to sentinel HG n.
+	// Slots i >= n map to sentinel HG n; the walk record to the walking variant (n + 1), or to the plain group without
+	// the walk (D120 SS2).
 	LocalVector<uint32_t> indices;
 	indices.resize(sbt_size);
 	for (uint32_t i = 0; i < sbt_size; i++) {
 		indices[i] = (i < n) ? i : n;
 	}
+	indices[HIT_SBT_WALK_RECORD] = ((p_task->rt_flags & RT_FLAG_SUBSURFACE) != 0) ? n + 1 : 0;
 	RD::get_singleton()->hit_sbt_range_update(new_sbt, sbt_range, 0, indices);
 
 	if (bundle.hit_sbt.is_valid()) {

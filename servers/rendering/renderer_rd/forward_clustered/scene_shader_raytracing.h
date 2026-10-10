@@ -77,7 +77,7 @@ public:
 	// Bit 17:    Stochastic texture filtering (D117)
 	// Bit 18:    Subsurface walk (D120)
 	// Bit 19:    Its counters (D120)
-	// Bit 20:    Free
+	// Bit 20:    The standard hit group's walking variant, set only in its closest-hit specialization (D120 SS2)
 	// Bits 21-28: Sample count
 	// Bits 29-31: Max bounce count (offset by 1: 0=1 bounce, 7=8 bounces)
 	enum RaytracingFlags {
@@ -100,6 +100,7 @@ public:
 		RT_FLAG_TEXTURE_FILTERING = (1 << 17), // The hit shaders compile stochastic texture filtering in (D117). Set while rendering/pathtracing/texture_filtering is not off; the filter itself is RT_PARAM_TEXTURE_FILTERING.
 		RT_FLAG_SUBSURFACE = (1 << 18), // The hit shaders compile the subsurface walk in (D120). Set while rendering/pathtracing/subsurface is on.
 		RT_FLAG_SUBSURFACE_STATS = (1 << 19), // A verbose run's walks count themselves (D120, binding 52). Set only with RT_FLAG_SUBSURFACE.
+		RT_FLAG_SUBSURFACE_WALK_GROUP = (1 << 20), // The standard hit group's walking variant (D120 SS2): only in that group's closest-hit specialization, never in a bundle's flags.
 	};
 
 	// The coherence hint the raygen hands reorderThreadEXT beside the hit's shader (D75), the
@@ -110,6 +111,7 @@ public:
 		RT_SER_HINT_TERMINATION = 2, // The default: one bit, the path ends at this hit, a bounce limit being reached there.
 		RT_SER_HINT_TERMINATION_DISTANCE = 3, // The termination bit above a 3-bit bin of the hit distance in factors of 4.
 	};
+
 	constexpr static uint32_t RT_SER_HINT_SHIFT = 11;
 	constexpr static uint32_t RT_SER_HINT_MASK = 0x3;
 
@@ -123,6 +125,12 @@ public:
 	// 1: primary/bounce from raygen
 	// 2: shadow ray from closest_hit (NEE)
 	constexpr static uint32_t RT_MAX_RECURSION_DEPTH = 2;
+
+	// The hit SBT's records: record i is hit group slot i, and the last record the standard hit group's walking variant
+	// (D120 SS2), which an instance whose standard material can walk selects; without the walk compiled in, that record
+	// is the plain standard hit group. Custom slots stop short of it.
+	static constexpr uint32_t HIT_SBT_CAPACITY = 4096;
+	static constexpr uint32_t HIT_SBT_WALK_RECORD = HIT_SBT_CAPACITY - 1;
 
 	// Pathtracing parameter indices for the float[20] params buffer.
 	// Must match RT_PARAM_* defines in raytracing_inc.glsl.

@@ -483,6 +483,15 @@ bool lights_sample_direct(
 	return have_sample;
 }
 
+// VAL: whether a light sample can deliver anything, so a sample that cannot traces no shadow ray. Behind
+// the receiver only a thin surface's transmission (D103) or a coat above it (D118 MM2) takes light, as
+// evalCombinedBRDFSeparate decides on the same shading normal; a light with zero indirect energy delivers
+// nothing at an indirect vertex. Tested after the sample's random numbers are drawn, so the sequence is
+// the same either way and the image is bit-identical.
+bool lights_sample_reaches_brdf(vec3 N, MaterialProperties material, vec3 L, float indirect_mul) {
+	return indirect_mul != 0.0 && (dot(N, L) > 0.0 || brdfTakesLightBelowN(material, L));
+}
+
 // One analytic light's sample from its pair of random numbers: an omni or spot light's point or
 // cone with its attenuation, a directional light's cone, a rectangle's point by solid angle (area
 // when that is degenerate) with the raster's closest-point attenuation (D124); the weight is left at
@@ -545,7 +554,7 @@ bool lights_sample_light(
 		r_sample.shadow_distance = dist;
 		r_sample.leg_distance = dist;
 		r_sample.radiance = light.emission * (atten * inv_pdf * indirect_mul);
-		return true;
+		return lights_sample_reaches_brdf(N, material, r_sample.direction, indirect_mul);
 	}
 	// === POSITIONAL LIGHT PATH (omni + spot) ===
 	if (light.type == RT_LIGHT_TYPE_OMNI || light.type == RT_LIGHT_TYPE_SPOT) {
@@ -603,7 +612,7 @@ bool lights_sample_light(
 		float atten = lights_get_attenuation(ls_atten, light.inv_max_range, light.attenuation, light.radius) * spot_atten;
 
 		r_sample.radiance = light.emission * atten * sphere_norm * indirect_mul;
-		return true;
+		return lights_sample_reaches_brdf(N, material, L, indirect_mul);
 	}
 	// === CONE LIGHT PATH (directional) ===
 	else {
@@ -614,13 +623,7 @@ bool lights_sample_light(
 		r_sample.shadow_distance = ls.max_distance;
 		r_sample.leg_distance = 1e30;
 
-		// Behind the receiver only a thin surface's transmission (D103) or a coat above it (D118 MM2) takes it.
-		float NdotL = dot(N, L);
-		if (NdotL <= 0.0 && !brdfTakesLightBelowN(material, L)) {
-			return false;
-		}
-
 		r_sample.radiance = light.emission * indirect_mul;
-		return true;
+		return lights_sample_reaches_brdf(N, material, L, indirect_mul);
 	}
 }

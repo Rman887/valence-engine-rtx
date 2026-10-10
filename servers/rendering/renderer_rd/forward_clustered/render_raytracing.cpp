@@ -11794,6 +11794,11 @@ static void _rt_cone_union(const Vector3 &p_a1, float p_cos1, const Vector3 &p_a
 	}
 	float tr = to - t1;
 	Vector3 rot_axis = a1.cross(a2);
+	if (rot_axis.length_squared() <= 1.0e-12f && a1.dot(a2) < 0.0f) {
+		// Exactly opposite axes have no cross product, but the bound still has to turn toward the second
+		// one: about any perpendicular, every one of which is a great circle through both.
+		rot_axis = a1.get_any_perpendicular();
+	}
 	if (rot_axis.length_squared() > 1.0e-12f) {
 		a1 = Basis(rot_axis.normalized(), tr).xform(a1).normalized();
 	}

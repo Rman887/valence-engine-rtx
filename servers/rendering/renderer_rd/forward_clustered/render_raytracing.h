@@ -199,10 +199,10 @@ enum {
 struct alignas(16) RT_EmissiveInstance {
 	float xform[12]; // Object-to-world, trace space (mat3x4, transposed 3x4).
 	float radiance[3]; // Linear emission before the exposure normalisation.
-	float cdf; // Inclusive; the last entry reads 1.0.
+	float alias_threshold; // VAL (P1i): Vose's alias table over the pdfs: a pick of this entry's position keeps it below this.
 	uint32_t instance_index; // The TLAS instance: its geometries[] entry.
 	uint32_t primitive_count;
-	uint32_t flags;
+	uint32_t flags; // RT_EMISSIVE_FLAG_*, and from RT_EMISSIVE_ALIAS_SHIFT on the alias a pick above the threshold goes to (P1i).
 	float pdf; // This entry's selection probability.
 	float center[3]; // The instance's bounding sphere in trace space (D51): the resampler's proximity proxy.
 	float radius;
@@ -213,6 +213,7 @@ enum {
 	RT_EMISSIVE_MAX = 1024,
 	RT_EMISSIVE_FLAG_TWO_SIDED = 1u,
 	RT_EMISSIVE_FLAG_FLIP_FACING = 2u, // The instance flips the winding: its lit face winds clockwise as seen (Godot front faces).
+	RT_EMISSIVE_ALIAS_SHIFT = 8u, // The alias's entry in a flags word (P1i); RT_EMISSIVE_MAX fits above it.
 };
 
 // A decal as the hit shaders apply it (D104): the raster's DecalData with its transforms in trace
@@ -2122,6 +2123,7 @@ class RenderRaytracing {
 	LocalVector<uint32_t> light_tree_emissive_leaf; ///< Each emissive entry's position in the leaf list (D60), RT_LIGHT_TREE_NO_NODE without a leaf.
 	LocalVector<RT_LightTreeAlias> light_tree_leaf_alias; ///< Each leaf-list position's alias-table entry inside its cut node (D60, D61): the primary cut's, then the indirect's at RT_LIGHT_TREE_LEAVES_MAX.
 	LocalVector<double> light_tree_alias_scaled; ///< The alias build's scratch: each leaf's share times its node's count, indexed by leaf-list position.
+	LocalVector<double> emissive_alias_scaled; ///< The emissive alias table's scratch (P1i): each entry's pdf times the count; its lists are the tree's.
 	LocalVector<uint32_t> light_tree_alias_small; ///< The alias build's scratch: positions whose scaled share is below 1.
 	LocalVector<uint32_t> light_tree_alias_large; ///< The alias build's scratch: positions whose scaled share is 1 or more.
 	// Camera and bounce rays select all geometry. Shadow rays select bit 1;

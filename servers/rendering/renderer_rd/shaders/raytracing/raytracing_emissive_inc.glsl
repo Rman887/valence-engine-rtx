@@ -31,6 +31,8 @@
 // The instance flips the winding (as Godot's front faces, which wind clockwise as seen, need):
 // its lit face is the one from which the corners wind clockwise.
 #define RT_EMISSIVE_FLAG_FLIP_FACING 2u
+// VAL (P1i): the flags word carries, from this bit on, the entry a pick above the alias threshold goes to.
+#define RT_EMISSIVE_ALIAS_SHIFT 8u
 
 // Must match C++ RT_EmissiveInstance (std430, 96 bytes).
 struct RTEmissiveInstance {
@@ -38,10 +40,10 @@ struct RTEmissiveInstance {
 	float radiance_r; // Linear emission before the exposure normalisation.
 	float radiance_g;
 	float radiance_b;
-	float cdf; // Inclusive; the last entry reads 1.0.
+	float alias_threshold; // VAL (P1i): a pick of this entry's position keeps it below this, else goes to its alias.
 	uint instance_index; // gl_InstanceCustomIndexEXT of the instance: its geometries[] entry.
 	uint primitive_count;
-	uint flags;
+	uint flags; // RT_EMISSIVE_FLAG_*, and the alias from RT_EMISSIVE_ALIAS_SHIFT on.
 	float pdf; // This entry's selection probability.
 	float center_x; // The instance's bounding sphere in trace space (D51).
 	float center_y;
@@ -107,19 +109,14 @@ float emissive_mis_weight(float p_this, float p_other) {
 	return a / max(a + b, 1e-20);
 }
 
-/// One entry of the inclusive CDF by binary search: the first whose cdf reaches u.
-uint emissive_search_cdf(float u, uint count) {
-	uint lo = 0u;
-	uint hi = count - 1u;
-	while (lo < hi) {
-		uint mid = (lo + hi) >> 1u;
-		if (rt_emissive[mid].cdf < u) {
-			lo = mid + 1u;
-		} else {
-			hi = mid;
-		}
-	}
-	return lo;
+/// VAL (P1i): one entry drawn with its pdf by the list's alias table (Vose's construction, built with the list):
+/// u picks a position uniformly, whose entry is kept below its threshold by the rest of u and sent to its alias
+/// above it. One read where the CDF took a binary search; the stratified u still spreads the candidates.
+uint emissive_pick(float u, uint count) {
+	float u_count = min(u, 0.99999994) * float(count);
+	uint at = min(uint(u_count), count - 1u);
+	bool keep = clamp(u_count - float(at), 0.0, 0.99999994) < rt_emissive[at].alias_threshold;
+	return keep ? at : min(rt_emissive[at].flags >> RT_EMISSIVE_ALIAS_SHIFT, count - 1u);
 }
 
 /// How much of an entry's power can reach a receiver at hit_pos facing N, judged from the entry's
@@ -172,7 +169,7 @@ bool emissive_sample_direct(
 
 	candidates = clamp(candidates, 1u, 16u);
 	// Weighted reservoir over the candidates on one random number, rescaled after every
-	// decision so it stays uniform; the candidates are stratified over the CDF. Each candidate
+	// decision so it stays uniform; the candidates' numbers are stratified. Each candidate
 	// is drawn with probability pdf and targeted at pdf times its proximity, so its resampling
 	// weight is the proximity alone.
 	// rand() can round to 1.0, which would refuse the first candidate below.
@@ -182,7 +179,7 @@ bool emissive_sample_direct(
 	float w_selected = 0.0;
 	for (uint i = 0u; i < candidates; i++) {
 		float u_sel = (float(i) + rand(rng_state)) / float(candidates);
-		uint idx = emissive_search_cdf(u_sel, count);
+		uint idx = emissive_pick(u_sel, count);
 		RTEmissiveInstance c = rt_emissive[idx];
 		float w = emissive_proximity(c, hit_pos, N, hasDiffuseTransmission(material));
 		if (w <= 0.0) {

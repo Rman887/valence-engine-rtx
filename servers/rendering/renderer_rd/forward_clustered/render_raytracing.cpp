@@ -11643,11 +11643,40 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 // Emissive mesh lights (D50)
 // ---------------------------------------------------------------------------
 
+/// Vose's alias table (D61), shared by the light tree's power pick and the emissive list (P1i): r_scaled holds each
+/// position's probability times p_count over [p_first, p_first + p_count) and is consumed. Each position under 1 is
+/// filled up to 1 by one position over it, which gives away the difference; p_set_alias(position, threshold, alias)
+/// records it. What is left on either list is 1 up to rounding and keeps every pick: the threshold 1 and the
+/// position's own alias, which the caller writes first.
+template <typename SetAlias>
+static void _rt_build_alias_table(LocalVector<double> &r_scaled, uint32_t p_first, uint32_t p_count, LocalVector<uint32_t> &r_small, LocalVector<uint32_t> &r_large, SetAlias p_set_alias) {
+	r_small.clear();
+	r_large.clear();
+	for (uint32_t i = p_first; i < p_first + p_count; i++) {
+		if (r_scaled[i] < 1.0) {
+			r_small.push_back(i);
+		} else {
+			r_large.push_back(i);
+		}
+	}
+	while (!r_small.is_empty() && !r_large.is_empty()) {
+		const uint32_t s = r_small[r_small.size() - 1];
+		r_small.resize(r_small.size() - 1);
+		const uint32_t l = r_large[r_large.size() - 1];
+		p_set_alias(s, (float)r_scaled[s], l);
+		r_scaled[l] -= 1.0 - r_scaled[s];
+		if (r_scaled[l] < 1.0) {
+			r_large.resize(r_large.size() - 1);
+			r_small.push_back(l);
+		}
+	}
+}
+
 /// Lists the frame's emissive mesh lights from the TLAS instances build_tlas just pushed: every
 /// triangle instance on the standard hit group whose material carries RT_MAT_FLAG_EMISSIVE_CONSTANT.
 /// The selection weight is the emission's luminance times an area proxy, half the surface area of
 /// the instance's box in the trace (a quad reads about its area, a sphere within a factor of two);
-/// it only shapes the importance, since the shader divides by the probability the CDF assigns.
+/// it only shapes the importance, since the shader divides by the entry's pdf.
 /// Over the cap the entries weighted nearest the camera are kept; the list is sorted by instance
 /// index so a hit can find its entry by binary search.
 uint32_t RenderRaytracing::gather_emissive(const RenderDataRD *p_render_data, const RTViewportState *p_state, RT_EmissiveInstance *r_emissive_data, uint32_t p_max_emissive, float &r_score_sum) {
@@ -11749,7 +11778,6 @@ uint32_t RenderRaytracing::gather_emissive(const RenderDataRD *p_render_data, co
 		return 0;
 	}
 
-	double running = 0.0;
 	uint32_t count = candidates.size();
 	for (uint32_t n = 0; n < count; n++) {
 		const EmissiveCandidate &c = candidates[n];
@@ -11769,8 +11797,6 @@ uint32_t RenderRaytracing::gather_emissive(const RenderDataRD *p_render_data, co
 		e.radiance[0] = mat.emission_color[0] * mat.emission_strength;
 		e.radiance[1] = mat.emission_color[1] * mat.emission_strength;
 		e.radiance[2] = mat.emission_color[2] * mat.emission_strength;
-		running += c.weight;
-		e.cdf = (n + 1 == count) ? 1.0f : (float)(running / total);
 		e.instance_index = c.index;
 		e.primitive_count = c.record ? c.record->geometry.primitive_count : geometry_data[c.index].primitive_count;
 		e.flags = 0;
@@ -11791,6 +11817,22 @@ uint32_t RenderRaytracing::gather_emissive(const RenderDataRD *p_render_data, co
 		e.center[2] = (float)c.center.z;
 		e.radius = c.radius;
 	}
+
+	// VAL (P1i): the alias table over the pdfs (D61's builder), so a candidate is drawn in one read where the CDF
+	// took a binary search: a uniform position keeps its entry below the entry's threshold and goes to its alias
+	// above it, which gives every entry its pdf. The pdf the MIS weight is written in is the entry's own, unchanged.
+	emissive_alias_scaled.resize(count);
+	for (uint32_t n = 0; n < count; n++) {
+		r_emissive_data[n].alias_threshold = 1.0f;
+		r_emissive_data[n].flags |= n << RT_EMISSIVE_ALIAS_SHIFT;
+		emissive_alias_scaled[n] = candidates[n].weight / total * count;
+	}
+	const uint32_t flag_mask = (1u << RT_EMISSIVE_ALIAS_SHIFT) - 1u;
+	_rt_build_alias_table(emissive_alias_scaled, 0, count, light_tree_alias_small, light_tree_alias_large, [&](uint32_t p_position, float p_threshold, uint32_t p_alias) {
+		RT_EmissiveInstance &e = r_emissive_data[p_position];
+		e.alias_threshold = p_threshold;
+		e.flags = (e.flags & flag_mask) | (p_alias << RT_EMISSIVE_ALIAS_SHIFT);
+	});
 	return count;
 }
 
@@ -12018,8 +12060,6 @@ void RenderRaytracing::_build_light_tree_cut(uint32_t p_cut_size, LocalVector<RT
 				}
 				const double floor_share = node_power > 0.0 ? RT_LIGHT_TREE_PICK_FLOOR / count : 1.0 / count;
 				const double power_scale = node_power > 0.0 ? (1.0 - RT_LIGHT_TREE_PICK_FLOOR) / node_power : 0.0;
-				light_tree_alias_small.clear();
-				light_tree_alias_large.clear();
 				for (uint32_t i = first; i < first + count; i++) {
 					const double share = floor_share + light_tree_nodes[light_tree_leaf_list[i]].power * power_scale;
 					RT_LightTreeAlias &e = light_tree_leaf_alias[p_alias_base + i];
@@ -12027,27 +12067,12 @@ void RenderRaytracing::_build_light_tree_cut(uint32_t p_cut_size, LocalVector<RT
 					e.alias = i;
 					e.share = (float)share;
 					light_tree_alias_scaled[i] = share * count;
-					if (light_tree_alias_scaled[i] < 1.0) {
-						light_tree_alias_small.push_back(i);
-					} else {
-						light_tree_alias_large.push_back(i);
-					}
 				}
-				// Each position under 1 is filled up to 1 by one position over it, which gives away the difference.
-				while (!light_tree_alias_small.is_empty() && !light_tree_alias_large.is_empty()) {
-					const uint32_t s = light_tree_alias_small[light_tree_alias_small.size() - 1];
-					light_tree_alias_small.resize(light_tree_alias_small.size() - 1);
-					const uint32_t l = light_tree_alias_large[light_tree_alias_large.size() - 1];
-					RT_LightTreeAlias &e = light_tree_leaf_alias[p_alias_base + s];
-					e.threshold = (float)light_tree_alias_scaled[s];
-					e.alias = l;
-					light_tree_alias_scaled[l] -= 1.0 - light_tree_alias_scaled[s];
-					if (light_tree_alias_scaled[l] < 1.0) {
-						light_tree_alias_large.resize(light_tree_alias_large.size() - 1);
-						light_tree_alias_small.push_back(l);
-					}
-				}
-				// What is left on either list is 1 up to rounding and keeps every pick (threshold 1, its own alias).
+				_rt_build_alias_table(light_tree_alias_scaled, first, count, light_tree_alias_small, light_tree_alias_large, [&](uint32_t p_position, float p_threshold, uint32_t p_alias) {
+					RT_LightTreeAlias &e = light_tree_leaf_alias[p_alias_base + p_position];
+					e.threshold = p_threshold;
+					e.alias = p_alias;
+				});
 				for (uint32_t i = first; i < first + count; i++) {
 					RT_LightTreeAlias &e = light_tree_leaf_alias[p_alias_base + i];
 					e.alias_share = light_tree_leaf_alias[p_alias_base + e.alias].share;

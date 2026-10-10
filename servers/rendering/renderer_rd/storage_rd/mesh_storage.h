@@ -441,9 +441,12 @@ public:
 	static MeshStorage *get_singleton();
 
 	// Geometry residency (D93): rendering/pathtracing/cluster_lod_stream_geometry is effective, from
-	// the settings and the device: CLAS streaming with what it needs, and position fetch. The path
+	// the settings and the device: CLAS streaming with what it needs (the selection's subgroup operations among it, P1h), and position fetch. The path
 	// tracer streams geometry by it and surfaces keep their RAM copy by it, so both decide alike.
 	static bool is_cluster_geometry_streaming_wanted();
+	// VAL (P1h): the device runs the cluster LOD selection, whose same-address atomics go through the subgroup:
+	// ballots, votes and arithmetic in compute shaders. The path tracer and the residency test above both read it.
+	static bool is_cluster_lod_select_supported();
 
 	MeshStorage();
 	virtual ~MeshStorage();

@@ -4,6 +4,11 @@
 
 #VERSION_DEFINES
 
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 // Cluster LOD selection (D86): one thread per cluster of one instance, the instances along y.
@@ -261,8 +266,42 @@ uint digest_hash_b(uint p_x) {
 
 // Appends a selected cluster to its item's list: its CLAS address, or for a deformed item the
 // destination its build gets and the build info it is made from.
+// VAL (P1h): atomicAdd(frame.v[p_word], 1u) for each active invocation. Where every active invocation of the
+// subgroup adds to the same word (the lanes of one group or item), one invocation adds the subgroup's count and
+// each takes the old value plus the active invocations below it: the same values as one atomic each, in lane
+// order where the hardware gave them in no defined order. Nothing reads that order but the slot each value
+// names: the list positions, the build indices and the digests (sums and XORs) do not depend on it. A subgroup
+// spanning two items (wider than 32 lanes) adds one atomic per invocation.
+uint frame_increment(uint p_word) {
+	if (subgroupAllEqual(p_word)) {
+		uvec4 ballot = subgroupBallot(true);
+		uint base = 0u;
+		if (subgroupElect()) {
+			base = atomicAdd(frame.v[p_word], subgroupBallotBitCount(ballot));
+		}
+		return subgroupBroadcastFirst(base) + subgroupBallotExclusiveBitCount(ballot);
+	}
+	return atomicAdd(frame.v[p_word], 1u);
+}
+
+// VAL (P1h): an item's digest (D109, D113), atomicAdd(p_add) and atomicXor(p_xor) at its two words; a subgroup
+// whose active invocations share the item adds and XORs once (wrapping sums and XORs, the same words).
+void frame_digest(uint p_inst, uint p_add, uint p_xor) {
+	if (subgroupAllEqual(p_inst)) {
+		uint add = subgroupAdd(p_add);
+		uint x = subgroupXor(p_xor);
+		if (subgroupElect()) {
+			atomicAdd(frame.v[p_inst + 26u], add);
+			atomicXor(frame.v[p_inst + 27u], x);
+		}
+		return;
+	}
+	atomicAdd(frame.v[p_inst + 26u], p_add);
+	atomicXor(frame.v[p_inst + 27u], p_xor);
+}
+
 void select_cluster(uint p_entry, uint p_inst, uint p_cluster, uint p_table_offset, uint p_list_offset, uint p_instance_flags) {
-	uint slot = atomicAdd(frame.v[pc.blas_infos_offset + p_entry * pc.blas_info_stride], 1u);
+	uint slot = frame_increment(pc.blas_infos_offset + p_entry * pc.blas_info_stride);
 	bool persistent_deformed = (p_instance_flags & (INSTANCE_FLAG_PERSISTENT | INSTANCE_FLAG_DEFORMED)) == (INSTANCE_FLAG_PERSISTENT | INSTANCE_FLAG_DEFORMED);
 	if (((p_instance_flags & INSTANCE_FLAG_LEVEL) != 0u && slot >= frame.v[p_inst + 18u]) || (persistent_deformed && slot >= frame.v[p_inst + 25u])) {
 		// Past the slot's count, or a persistent item's slots (D109, which its layout bounded):
@@ -278,8 +317,7 @@ void select_cluster(uint p_entry, uint p_inst, uint p_cluster, uint p_table_offs
 		frame.v[p_list_offset + slot * 2u] = dst_lo;
 		frame.v[p_list_offset + slot * 2u + 1u] = frame.v[p_inst + 19u] + carry;
 		frame.v[frame.v[p_inst + 28u] + slot] = p_cluster;
-		atomicAdd(frame.v[p_inst + 26u], digest_hash_a(p_cluster));
-		atomicXor(frame.v[p_inst + 27u], digest_hash_b(p_cluster));
+		frame_digest(p_inst, digest_hash_a(p_cluster), digest_hash_b(p_cluster));
 		return;
 	}
 	if ((p_instance_flags & INSTANCE_FLAG_DEFORMED) == 0u) {
@@ -290,8 +328,7 @@ void select_cluster(uint p_entry, uint p_inst, uint p_cluster, uint p_table_offs
 		if ((p_instance_flags & INSTANCE_FLAG_PERSISTENT) != 0u) {
 			// A static item's digest (D113) over the cluster and its CLAS address (where it lives), each
 			// accumulator fed its own projection of the three.
-			atomicAdd(frame.v[p_inst + 26u], digest_hash_a(lo ^ digest_hash_b(hi ^ p_cluster)));
-			atomicXor(frame.v[p_inst + 27u], digest_hash_b(hi ^ digest_hash_a(lo + p_cluster)));
+			frame_digest(p_inst, digest_hash_a(lo ^ digest_hash_b(hi ^ p_cluster)), digest_hash_b(hi ^ digest_hash_a(lo + p_cluster)));
 		}
 		return;
 	}
@@ -304,7 +341,7 @@ void select_cluster(uint p_entry, uint p_inst, uint p_cluster, uint p_table_offs
 	uint dst_hi = frame.v[p_inst + 19u] + carry;
 	frame.v[p_list_offset + slot * 2u] = dst_lo;
 	frame.v[p_list_offset + slot * 2u + 1u] = dst_hi;
-	uint k = atomicAdd(frame.v[pc.clas_count_offset], 1u);
+	uint k = frame_increment(pc.clas_count_offset);
 	frame.v[pc.clas_dst_offset + k * 2u] = dst_lo;
 	frame.v[pc.clas_dst_offset + k * 2u + 1u] = dst_hi;
 	uint src = infos_offset + p_cluster * pc.clas_info_words;
@@ -543,7 +580,7 @@ void commit_main() {
 		return;
 	}
 	if (slot < count && (instance_flags & INSTANCE_FLAG_DEFORMED) != 0u) {
-		uint k = atomicAdd(frame.v[pc.clas_count_offset], 1u);
+		uint k = frame_increment(pc.clas_count_offset);
 		uint carry = 0u;
 		frame.v[pc.clas_dst_offset + k * 2u] = uaddCarry(frame.v[inst + 18u], slot * frame.v[inst + 24u], carry);
 		frame.v[pc.clas_dst_offset + k * 2u + 1u] = frame.v[inst + 19u] + carry;

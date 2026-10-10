@@ -49,7 +49,7 @@ bool MeshStorage::is_cluster_geometry_streaming_wanted() {
 	static int wanted = -1;
 	if (wanted < 0) {
 		RD *rd = RD::get_singleton();
-		const bool supported = rd->has_feature(RD::SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE) && rd->has_feature(RD::SUPPORTS_RAYTRACING_POSITION_FETCH);
+		const bool supported = rd->has_feature(RD::SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE) && rd->has_feature(RD::SUPPORTS_RAYTRACING_POSITION_FETCH) && is_cluster_lod_select_supported();
 		// CLAS streaming (D92) needs the selection, its traversal, the cached levels (with the sharing
 		// they belong to) and the compaction.
 		const bool stream = GLOBAL_GET("rendering/pathtracing/cluster_lod") && GLOBAL_GET("rendering/pathtracing/cluster_lod_select") && GLOBAL_GET("rendering/pathtracing/cluster_lod_traversal") &&
@@ -58,6 +58,12 @@ bool MeshStorage::is_cluster_geometry_streaming_wanted() {
 		wanted = supported && stream && GLOBAL_GET("rendering/pathtracing/cluster_lod_stream_geometry") ? 1 : 0;
 	}
 	return wanted == 1;
+}
+
+bool MeshStorage::is_cluster_lod_select_supported() {
+	RD *rd = RD::get_singleton();
+	const uint64_t needed = RD::SUBGROUP_BASIC_BIT | RD::SUBGROUP_VOTE_BIT | RD::SUBGROUP_BALLOT_BIT | RD::SUBGROUP_ARITHMETIC_BIT;
+	return (rd->limit_get(RD::LIMIT_SUBGROUP_IN_SHADERS) & RD::SHADER_STAGE_COMPUTE_BIT) && (rd->limit_get(RD::LIMIT_SUBGROUP_OPERATIONS) & needed) == needed;
 }
 
 float MeshStorage::_cluster_geometry_fallback_ratio() {

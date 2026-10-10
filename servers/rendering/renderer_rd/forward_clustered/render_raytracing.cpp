@@ -170,6 +170,11 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		const RD::ClusterAccelerationStructureCapabilities &template_caps = RD::get_singleton()->get_cluster_acceleration_structure_capabilities();
 		deformed_cluster_templates_enabled = cluster_deformed_enabled && template_caps.instantiate_info_size > 0 && template_caps.triangle_template_build_info_size > 0 && template_caps.cluster_template_byte_alignment > 0;
 		cluster_lod_select_enabled = GLOBAL_GET("rendering/pathtracing/cluster_lod") && GLOBAL_GET("rendering/pathtracing/cluster_lod_select");
+		// The selection's same-address atomics go through the subgroup (P1h).
+		if (cluster_lod_select_enabled && !RendererRD::MeshStorage::is_cluster_lod_select_supported()) {
+			cluster_lod_select_enabled = false;
+			print_verbose("rendering/pathtracing/cluster_lod_select is on but the device runs no subgroup ballots, votes and arithmetic in compute shaders; cluster LOD selection is off.");
+		}
 		cluster_lod_pixel_error = MAX(0.0f, float(GLOBAL_GET("rendering/pathtracing/cluster_lod_pixel_error")));
 		cluster_lod_share_enabled = cluster_lod_select_enabled && GLOBAL_GET("rendering/pathtracing/cluster_lod_share");
 		cluster_lod_share_tolerance = uint32_t(CLAMP(int(GLOBAL_GET("rendering/pathtracing/cluster_lod_share_tolerance")), 0, 16));
@@ -317,13 +322,15 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 		print_verbose(vformat("RT: slot bookkeeping (D94b): %d bytes a slot's shadow, %d a range, %d a range's view, %d a MultiMesh range's key, %d a local row.", int(sizeof(RTSlotShadow)), int(sizeof(RTSlotRange)), int(sizeof(RTSlotRangeView)), int(sizeof(RTSlotMultiMeshKey)), int(sizeof(RTSlotLocalRow))));
 	}
 
-	// The cluster LOD selection compute (D86).
-	Vector<String> lod_select_modes;
-	lod_select_modes.push_back("\n");
-	lod_select_shader.shader.initialize(lod_select_modes);
-	lod_select_shader.version = lod_select_shader.shader.version_create();
-	lod_select_shader.version_shader = lod_select_shader.shader.version_get_shader(lod_select_shader.version, 0);
-	lod_select_shader.pipeline = RD::get_singleton()->compute_pipeline_create(lod_select_shader.version_shader);
+	// The cluster LOD selection compute (D86), on a device with the subgroup operations it takes (P1h).
+	if (RendererRD::MeshStorage::is_cluster_lod_select_supported()) {
+		Vector<String> lod_select_modes;
+		lod_select_modes.push_back("\n");
+		lod_select_shader.shader.initialize(lod_select_modes);
+		lod_select_shader.version = lod_select_shader.shader.version_create();
+		lod_select_shader.version_shader = lod_select_shader.shader.version_get_shader(lod_select_shader.version, 0);
+		lod_select_shader.pipeline = RD::get_singleton()->compute_pipeline_create(lod_select_shader.version_shader);
+	}
 
 	// The sky's sampling table (D54): the pyramid's leaves, a level from the one below, the top
 	// levels with the header (D69), and its moments per receiver normal in both forms of the radiance
@@ -410,7 +417,9 @@ RenderRaytracing::~RenderRaytracing() {
 	}
 
 	mm_merge_shader.shader.version_free(mm_merge_shader.version);
-	lod_select_shader.shader.version_free(lod_select_shader.version);
+	if (lod_select_shader.version.is_valid()) {
+		lod_select_shader.shader.version_free(lod_select_shader.version);
+	}
 	if (omm_shader.version.is_valid()) {
 		omm_shader.shader.version_free(omm_shader.version);
 	}

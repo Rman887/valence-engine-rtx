@@ -30,6 +30,8 @@
 
 #include "bindless_block.h"
 
+#include "core/math/math_funcs.h"
+#include "core/math/math_funcs_binary.h"
 #include "servers/rendering/renderer_rd/storage_rd/texture_storage.h"
 
 void BindlessBlock::initialize(RenderingDevice *p_rd) {
@@ -40,7 +42,31 @@ void BindlessBlock::initialize(RenderingDevice *p_rd) {
 	default_texture = RendererRD::TextureStorage::get_singleton()->texture_rd_get_default(
 			RendererRD::TextureStorage::DEFAULT_RD_TEXTURE_WHITE);
 	textures.push_back(default_texture);
+	texel_log.push_back(_texel_log(default_texture));
 	texture_to_index[default_texture] = 0;
+}
+
+float BindlessBlock::_texel_log(RID p_texture) const {
+	const RD::TextureFormat format = rd->texture_get_format(p_texture);
+	return 0.5f * Math::log2(MAX(float(format.width) * float(format.height), 1.0f));
+}
+
+RID BindlessBlock::get_texel_log_buffer() {
+	ERR_FAIL_COND_V(!is_initialized(), RID());
+	if (!texel_log_dirty && texel_log_buffer.is_valid()) {
+		return texel_log_buffer;
+	}
+	if (texel_log_capacity < texel_log.size() || !texel_log_buffer.is_valid()) {
+		if (texel_log_buffer.is_valid()) {
+			rd->free_rid(texel_log_buffer);
+		}
+		texel_log_capacity = Math::next_power_of_2(MAX(texel_log.size(), 1024u));
+		texel_log_buffer = rd->storage_buffer_create(texel_log_capacity * sizeof(float));
+		rd->set_resource_name(texel_log_buffer, "Bindless Texel Log");
+	}
+	rd->buffer_update(texel_log_buffer, 0, texel_log.size() * sizeof(float), texel_log.ptr());
+	texel_log_dirty = false;
+	return texel_log_buffer;
 }
 
 void BindlessBlock::begin_frame() {
@@ -63,6 +89,8 @@ void BindlessBlock::begin_frame() {
 	for (uint32_t i = 1; i < textures.size(); i++) {
 		if (!rd->texture_is_valid(textures[i])) {
 			textures[i] = default_texture;
+			texel_log[i] = texel_log[0];
+			texel_log_dirty = true;
 			if (free_indices_count < free_indices.size()) {
 				free_indices[free_indices_count] = i;
 			} else {
@@ -104,10 +132,13 @@ uint32_t BindlessBlock::add_texture(RID p_texture) {
 		--free_indices_count;
 		index = free_indices[free_indices_count];
 		textures[index] = p_texture;
+		texel_log[index] = _texel_log(p_texture);
 	} else {
 		index = textures.size();
 		textures.push_back(p_texture);
+		texel_log.push_back(_texel_log(p_texture));
 	}
+	texel_log_dirty = true;
 
 	texture_to_index[p_texture] = index;
 	return index;
@@ -149,6 +180,13 @@ void BindlessBlock::clear() {
 		rd->free_rid(uniform_set);
 	}
 	uniform_set = RID();
+	if (texel_log_buffer.is_valid() && rd) {
+		rd->free_rid(texel_log_buffer);
+	}
+	texel_log_buffer = RID();
+	texel_log_capacity = 0;
+	texel_log_dirty = true;
+	texel_log.clear();
 	textures.clear();
 	texture_to_index.clear();
 	free_indices.clear();

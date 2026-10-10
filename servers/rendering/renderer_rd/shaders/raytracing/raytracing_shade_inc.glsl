@@ -499,8 +499,7 @@ vec4 subsurface_exit_sample(uint p_texture_idx, vec2 p_uv, float p_cone_lod, vec
 	// The cone's level is per unit of UV; the texture's own size makes it a mip level, as sample_bindless_texture does.
 	float lod = 0.0;
 	if (rt_texture_lod_enabled() && p_cone_lod > RT_TEXTURE_LOD_BASE) {
-		vec2 size = vec2(textureSize(sampler2D(bindless_textures[nonuniformEXT(p_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), 0));
-		lod = max(p_cone_lod + 0.5 * log2(max(abs(p_uv_scale.x * p_uv_scale.y), 1e-20)) + 0.5 * log2(max(size.x * size.y, 1.0)), 0.0);
+		lod = max(p_cone_lod + 0.5 * log2(max(abs(p_uv_scale.x * p_uv_scale.y), 1e-20)) + bindless_texel_log[p_texture_idx], 0.0);
 	}
 	return textureLod(sampler2D(bindless_textures[nonuniformEXT(p_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), p_uv, lod);
 }

@@ -48,6 +48,9 @@ public:
 
 	RID get_uniform_set() const { return uniform_set; }
 	uint32_t get_texture_count() const { return textures.size(); }
+	// VAL: half the log2 of each slot's texel count, the term a ray-cone level adds per texture (D116), so a hit
+	// reads one float instead of querying the texture's size per lookup. Uploaded when a slot changes.
+	RID get_texel_log_buffer();
 	bool is_initialized() const { return rd != nullptr; }
 	bool is_finalized() const { return uniform_set.is_valid(); }
 
@@ -57,10 +60,16 @@ public:
 private:
 	RenderingDevice *rd = nullptr;
 	LocalVector<RID> textures;
+	LocalVector<float> texel_log;
+	RID texel_log_buffer;
+	uint32_t texel_log_capacity = 0;
+	bool texel_log_dirty = true;
 	HashMap<RID, uint32_t> texture_to_index;
 	LocalVector<uint32_t> free_indices;
 	uint32_t free_indices_count = 0; // logical top to avoid resize of free_indices array
 	RID default_texture;
 	RID uniform_set;
 	bool needs_refinalize = false;
+
+	float _texel_log(RID p_texture) const;
 };

@@ -281,8 +281,7 @@ vec4 sample_bindless_texture(uint tex_idx, vec2 uv, float p_lod_t) {
 	if (p_lod_t <= RT_TEXTURE_LOD_BASE) {
 		return sample_bindless_texture(tex_idx, uv);
 	}
-	vec2 size = vec2(textureSize(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), 0));
-	return textureLod(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, p_lod_t + 0.5 * log2(max(size.x * size.y, 1.0)));
+	return textureLod(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, p_lod_t + bindless_texel_log[tex_idx]);
 }
 
 /// Nearest filtering with mipmaps at the ray cone's level, as sample_bindless_texture's linear form; level 0 where
@@ -290,8 +289,7 @@ vec4 sample_bindless_texture(uint tex_idx, vec2 uv, float p_lod_t) {
 vec4 sample_bindless_texture_point(uint tex_idx, vec2 uv, float p_lod_t) {
 	float level = 0.0;
 	if (p_lod_t > RT_TEXTURE_LOD_BASE) {
-		vec2 size = vec2(textureSize(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_NEAREST_WITH_MIPMAPS_REPEAT), 0));
-		level = p_lod_t + 0.5 * log2(max(size.x * size.y, 1.0));
+		level = p_lod_t + bindless_texel_log[tex_idx];
 	}
 	return textureLod(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_NEAREST_WITH_MIPMAPS_REPEAT), uv, level);
 }

@@ -13074,6 +13074,20 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		uniforms.push_back(u);
 	}
 
+	// Binding 54: half the log2 of each bindless slot's texel count, the ray-cone level's per-texture term (D116), so a
+	// hit reads one float instead of querying the texture's size per lookup.
+	{
+		RD::Uniform u;
+		u.binding = 54;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		if (bindless_block && bindless_block->is_initialized()) {
+			u.append_id(bindless_block->get_texel_log_buffer());
+		} else {
+			u.append_id(RendererRD::MeshStorage::get_singleton()->get_default_rd_storage_buffer());
+		}
+		uniforms.push_back(u);
+	}
+
 	// Binding 46: the position-fetch check (D93a), declared only by a verbose run's shaders.
 	if (position_fetch_check_buffer.is_valid()) {
 		RD::Uniform u;

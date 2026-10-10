@@ -12,6 +12,12 @@
 // (Environment.RT_DEBUG_TEXTURE_LOD).
 #define RT_VIS_MODE_TEXTURE_LOD 23
 
+// VAL: half the log2 of each bindless slot's texel count, written by the host when a slot changes, so a lookup at the
+// cone's level reads one float instead of querying its texture's size.
+layout(set = 0, binding = 54, std430) restrict readonly buffer BindlessTexelLog {
+	float bindless_texel_log[];
+};
+
 bool rt_texture_lod_enabled() {
 	return get_rt_param(RT_PARAM_TEXTURE_LOD) > 0.5;
 }

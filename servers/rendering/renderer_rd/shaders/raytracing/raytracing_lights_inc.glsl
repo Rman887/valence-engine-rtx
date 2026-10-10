@@ -8,6 +8,7 @@
 
 #define RT_LIGHT_TYPE_OMNI 0 // Point light with radius (soft shadows)
 #define RT_LIGHT_TYPE_DIRECTIONAL 1 // Sun/moon with angular size
+#define RT_LIGHT_TYPE_RECT 2 // VAL (D124): AreaLight3D, a one-sided rectangle (the raster's)
 #define RT_LIGHT_TYPE_SPOT 3 // Spot light with cone falloff
 
 // Reservoir sampling batch size for stochastic light selection.
@@ -22,18 +23,18 @@
 struct RTLightData {
 	vec3 position; // World pos (omni/spot) or direction (directional).
 	uint type; // RT_LIGHT_TYPE_*.
-	vec3 emission; // HDR emission color (color * energy).
-	float radius; // Light size (omni/spot) or angular radius (directional).
+	vec3 emission; // HDR emission color (color * energy). RECT: the rectangle's radiance.
+	float radius; // Light size (omni/spot) or angular radius (directional). RECT: the half diagonal.
 	float attenuation; // Attenuation exponent (2=inverse-square, 1=linear).
 	float inv_max_range; // 1/range (-1 = infinite).
 	float max_range_squared; // range^2 (0 = infinite).
 	float specular_amount; // Godot specular multiplier [0..1].
 	float indirect_energy; // Godot indirect energy multiplier.
-	float inv_spot_attenuation; // Spot cone softness.
-	float cos_spot_angle; // Cosine of spot cone half-angle.
-	float _pad0;
-	vec3 spot_direction; // Spot direction (normalized, world space).
-	float _pad1;
+	float inv_spot_attenuation; // Spot cone softness. RECT: the half height axis, x.
+	float cos_spot_angle; // Cosine of spot cone half-angle. RECT: y.
+	float _pad0; // RECT: z.
+	vec3 spot_direction; // Spot direction (normalized, world space). RECT: the half width axis.
+	float _pad1; // RECT: the sign turning cross(width axis, height axis) into the emitting normal.
 };
 
 // Light buffer SSBO (binding provided by the including shader via RT_LIGHT_BUFFER_BINDING).
@@ -154,6 +155,121 @@ float lights_get_attenuation(LightSample ls, float inv_max_range, float decay, f
 	}
 
 	return atten;
+}
+
+// ============================================================================
+// Rectangle lights (VAL, D124)
+// ============================================================================
+
+// A rectangle light's half axes and the normal it emits along (the light's -Z, as the raster's).
+vec3 lights_rect_half_x(RTLightData light) {
+	return light.spot_direction;
+}
+
+vec3 lights_rect_half_y(RTLightData light) {
+	return vec3(light.inv_spot_attenuation, light.cos_spot_angle, light._pad0);
+}
+
+vec3 lights_rect_normal(RTLightData light) {
+	return normalize(cross(light.spot_direction, lights_rect_half_y(light))) * light._pad1;
+}
+
+// The raster's area-light attenuation (light_process_area): the range window and the decay taken from the
+// distance to the rectangle's closest point, relative to the inverse square the solid angle already falls
+// off by (d^(2 - decay): 1 at the default decay of 2). Floored at 1 cm, as the omni falloff (D123).
+float lights_rect_attenuation(RTLightData light, vec3 hit_pos, vec3 half_x, vec3 half_y, vec3 normal) {
+	vec3 rel = hit_pos - light.position;
+	float hx = length(half_x);
+	float hy = length(half_y);
+	vec2 local = vec2(dot(rel, half_x) / max(hx, 1e-8), dot(rel, half_y) / max(hy, 1e-8));
+	vec2 closest = clamp(local, -vec2(hx, hy), vec2(hx, hy));
+	float d = length(vec3(local - closest, dot(rel, normal)));
+	float atten = pow(max(d, RT_LIGHT_MIN_DISTANCE), 2.0 - light.attenuation);
+	if (light.inv_max_range >= 0.0) {
+		float nd = d * light.inv_max_range;
+		nd *= nd;
+		nd *= nd;
+		nd = max(1.0 - nd, 0.0);
+		atten *= nd * nd;
+	}
+	return atten;
+}
+
+// Urena, Fajardo and King 2013, "An Area-Preserving Parametrization for Spherical Rectangles": a point on the
+// rectangle (corner p_corner, edges p_ex and p_ey) drawn uniformly in the solid angle it subtends from p_o,
+// and that solid angle. False where the rectangle is too small or too oblique to set up in float; the caller
+// samples its area instead.
+bool lights_rect_sample_solid_angle(vec3 p_o, vec3 p_corner, vec3 p_ex, vec3 p_ey, vec2 p_u, out vec3 r_point, out float r_solid_angle) {
+	r_point = p_corner;
+	r_solid_angle = 0.0;
+	float exl = length(p_ex);
+	float eyl = length(p_ey);
+	if (!(exl > 0.0) || !(eyl > 0.0)) {
+		return false;
+	}
+	vec3 x = p_ex / exl;
+	vec3 y = p_ey / eyl;
+	vec3 z = cross(x, y);
+	vec3 d = p_corner - p_o;
+	float z0 = dot(d, z);
+	if (z0 > 0.0) {
+		z = -z;
+		z0 = -z0;
+	}
+	float x0 = dot(d, x);
+	float y0 = dot(d, y);
+	float x1 = x0 + exl;
+	float y1 = y0 + eyl;
+	vec3 v00 = vec3(x0, y0, z0);
+	vec3 v01 = vec3(x0, y1, z0);
+	vec3 v10 = vec3(x1, y0, z0);
+	vec3 v11 = vec3(x1, y1, z0);
+	vec3 c0 = cross(v00, v10);
+	vec3 c1 = cross(v10, v11);
+	vec3 c2 = cross(v11, v01);
+	vec3 c3 = cross(v01, v00);
+	float l0 = length(c0);
+	float l1 = length(c1);
+	float l2 = length(c2);
+	float l3 = length(c3);
+	if (!(min(min(l0, l1), min(l2, l3)) > 1e-12)) {
+		return false;
+	}
+	vec3 n0 = c0 / l0;
+	vec3 n1 = c1 / l1;
+	vec3 n2 = c2 / l2;
+	vec3 n3 = c3 / l3;
+	float g0 = acos(clamp(-dot(n0, n1), -1.0, 1.0));
+	float g1 = acos(clamp(-dot(n1, n2), -1.0, 1.0));
+	float g2 = acos(clamp(-dot(n2, n3), -1.0, 1.0));
+	float g3 = acos(clamp(-dot(n3, n0), -1.0, 1.0));
+	float b0 = n0.z;
+	float b1 = n2.z;
+	float k = 2.0 * PI - g2 - g3;
+	float S = g0 + g1 - k;
+	// A solid angle the acos sums cannot resolve (a small or edge-on rectangle) is sampled by area.
+	if (!(S > 1e-4)) {
+		return false;
+	}
+	float au = p_u.x * S + k;
+	float sin_au = sin(au);
+	if (abs(sin_au) < 1e-7) {
+		return false;
+	}
+	float fu = (cos(au) * b0 - b1) / sin_au;
+	float cu = clamp((fu > 0.0 ? 1.0 : -1.0) / sqrt(fu * fu + b0 * b0), -1.0, 1.0);
+	float xu = -(cu * z0) / max(sqrt(1.0 - cu * cu), 1e-12);
+	xu = clamp(xu, x0, x1);
+	float dd = sqrt(xu * xu + z0 * z0);
+	float h0 = y0 / sqrt(dd * dd + y0 * y0);
+	float h1 = y1 / sqrt(dd * dd + y1 * y1);
+	float hv = h0 + p_u.y * (h1 - h0);
+	float hv2 = hv * hv;
+	float yv = (hv2 < 1.0 - 1e-6) ? (hv * dd) / sqrt(1.0 - hv2) : y1;
+	yv = clamp(yv, y0, y1);
+	r_point = p_o + xu * x + yv * y + z0 * z;
+	r_solid_angle = S;
+	return !any(isnan(r_point)) && !any(isinf(r_point));
 }
 
 // Per-light specular multiplier.
@@ -334,12 +450,14 @@ bool lights_sample_direct(
 		RTLightData test_light = rt_lights[idx];
 
 		// Range check for positional lights.
-		bool is_positional = (test_light.type == RT_LIGHT_TYPE_OMNI || test_light.type == RT_LIGHT_TYPE_SPOT);
+		bool is_positional = (test_light.type == RT_LIGHT_TYPE_OMNI || test_light.type == RT_LIGHT_TYPE_SPOT || test_light.type == RT_LIGHT_TYPE_RECT);
 		bool is_valid = !is_positional;
 		if (!is_valid) {
 			vec3 to_l = test_light.position - hit_pos;
 			float d2 = dot(to_l, to_l);
-			is_valid = (test_light.max_range_squared == 0.0 || d2 <= test_light.max_range_squared);
+			// A rectangle's range is from its closest point (D124): bounded here by its half diagonal.
+			float reach = test_light.type == RT_LIGHT_TYPE_RECT ? sqrt(test_light.max_range_squared) + test_light.radius : 0.0;
+			is_valid = (test_light.max_range_squared == 0.0 || d2 <= (test_light.type == RT_LIGHT_TYPE_RECT ? reach * reach : test_light.max_range_squared));
 		}
 
 		if (is_valid) {
@@ -366,10 +484,11 @@ bool lights_sample_direct(
 }
 
 // One analytic light's sample from its pair of random numbers: an omni or spot light's point or
-// cone with its attenuation, a directional light's cone; the weight is left at 1 for the caller's
-// selection density (the reservoir's estimate above, the light tree's exact probability, D55).
-// Returns false when the sample carries nothing (out of range, outside the spot cone, below the
-// horizon).
+// cone with its attenuation, a directional light's cone, a rectangle's point by solid angle (area
+// when that is degenerate) with the raster's closest-point attenuation (D124); the weight is left at
+// 1 for the caller's selection density (the reservoir's estimate above, the light tree's exact
+// probability, D55). Returns false when the sample carries nothing (out of range, outside the spot
+// cone, behind the rectangle, below the horizon).
 bool lights_sample_light(
 		RTLightData light,
 		vec3 hit_pos,
@@ -386,6 +505,48 @@ bool lights_sample_light(
 	float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 	r_sample.specular_multiplier = lights_get_specular_multiplier(light.specular_amount, material.roughness);
 
+	// === RECTANGLE LIGHT PATH (AreaLight3D, VAL D124) ===
+	// One-sided toward its normal, its colour a radiance, as the raster's. A point drawn uniformly in the
+	// solid angle the rectangle subtends (Urena 2013) carries the radiance over that density, the solid
+	// angle; where that cannot be set up, a point drawn by area carries it over the area density. The
+	// shadow ray ends at the point. Attenuation as the raster's (lights_rect_attenuation).
+	if (light.type == RT_LIGHT_TYPE_RECT) {
+		vec3 half_x = lights_rect_half_x(light);
+		vec3 half_y = lights_rect_half_y(light);
+		vec3 normal = lights_rect_normal(light);
+		if (dot(normal, hit_pos - light.position) <= 0.0) {
+			return false; // Behind the light.
+		}
+		float atten = lights_rect_attenuation(light, hit_pos, half_x, half_y, normal);
+		if (!(atten > 0.0)) {
+			return false; // Beyond the range.
+		}
+		vec3 point;
+		float solid_angle;
+		float inv_pdf;
+		if (lights_rect_sample_solid_angle(hit_pos, light.position - half_x - half_y, 2.0 * half_x, 2.0 * half_y, u, point, solid_angle)) {
+			inv_pdf = solid_angle;
+		} else {
+			point = light.position + (2.0 * u.x - 1.0) * half_x + (2.0 * u.y - 1.0) * half_y;
+			vec3 to_p = point - hit_pos;
+			float d2 = dot(to_p, to_p);
+			float cos_l = dot(normal, -to_p) * inversesqrt(max(d2, 1e-20));
+			if (!(cos_l > 0.0)) {
+				return false;
+			}
+			inv_pdf = 4.0 * length(half_x) * length(half_y) * cos_l / max(d2, 1e-20);
+		}
+		vec3 to_point = point - hit_pos;
+		float dist = length(to_point);
+		if (!(dist > 0.0)) {
+			return false;
+		}
+		r_sample.direction = to_point / dist;
+		r_sample.shadow_distance = dist;
+		r_sample.leg_distance = dist;
+		r_sample.radiance = light.emission * (atten * inv_pdf * indirect_mul);
+		return true;
+	}
 	// === POSITIONAL LIGHT PATH (omni + spot) ===
 	if (light.type == RT_LIGHT_TYPE_OMNI || light.type == RT_LIGHT_TYPE_SPOT) {
 		vec3 to_light = light.position - hit_pos;

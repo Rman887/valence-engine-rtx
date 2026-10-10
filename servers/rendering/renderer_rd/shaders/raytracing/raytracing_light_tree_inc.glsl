@@ -485,7 +485,9 @@ void light_tree_reservoir_offer(LightTreeCandidate c, float w, inout float w_sum
 /// times the cosine at the receiver raised by the light's angular size and floored (a sphere light
 /// on the horizon still delivers). Exactly zero only beyond the range and outside the cone, where
 /// the sample would carry nothing. A thin surface's receiver (p_two_sided, D103) takes every kind
-/// from either side: the receiver's cosine is its absolute value.
+/// from either side: the receiver's cosine is its absolute value. A rectangle (D124) is zero behind
+/// its plane; in front, its radiance under the closest-point attenuation times its solid angle,
+/// approximated as area times cosine over the squared distance and capped at a hemisphere.
 float light_tree_analytic_target(RTLightData light, vec3 hit_pos, vec3 N, bool p_two_sided) {
 	float lum = abs(dot(light.emission, vec3(0.2126, 0.7152, 0.0722)));
 	if (light.type == RT_LIGHT_TYPE_DIRECTIONAL) {
@@ -495,6 +497,26 @@ float light_tree_analytic_target(RTLightData light, vec3 hit_pos, vec3 N, bool p
 	}
 	vec3 to_l = light.position - hit_pos;
 	float dist_sq = dot(to_l, to_l);
+	if (light.type == RT_LIGHT_TYPE_RECT) {
+		// D124: one-sided, its radiance over the solid angle the rectangle subtends (its area times the
+		// cosine at the light over the distance squared, at most a hemisphere), under the raster's
+		// attenuation; the receiver's cosine raised by the angular size and floored, as the other kinds.
+		vec3 half_x = lights_rect_half_x(light);
+		vec3 half_y = lights_rect_half_y(light);
+		vec3 normal = lights_rect_normal(light);
+		float above_plane = dot(normal, hit_pos - light.position);
+		if (above_plane <= 0.0) {
+			return 0.0;
+		}
+		float atten = lights_rect_attenuation(light, hit_pos, half_x, half_y, normal);
+		float rect_dist = sqrt(dist_sq);
+		float cos_l = above_plane / max(rect_dist, 1e-4);
+		float solid = min(4.0 * length(half_x) * length(half_y) * max(cos_l, 1e-3) / max(dist_sq, light.radius * light.radius), 2.0 * PI);
+		vec3 L_rect = to_l / max(rect_dist, 1e-4);
+		float n_dot_rect = dot(N, L_rect);
+		float above_rect = max((p_two_sided ? abs(n_dot_rect) : n_dot_rect) + light.radius / max(rect_dist, light.radius), RT_LIGHT_TREE_RECEIVER_FLOOR);
+		return lum * solid * atten * above_rect;
+	}
 	if (light.max_range_squared != 0.0 && dist_sq > light.max_range_squared) {
 		return 0.0;
 	}

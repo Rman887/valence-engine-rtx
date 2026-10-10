@@ -164,6 +164,7 @@ static_assert(sizeof(RT_MaterialData) == 176, "RT_MaterialData must be 176 bytes
 enum RTLightType : uint32_t {
 	RT_LIGHT_TYPE_OMNI = 0,
 	RT_LIGHT_TYPE_DIRECTIONAL = 1,
+	RT_LIGHT_TYPE_RECT = 2, // VAL (D124): AreaLight3D, a one-sided rectangle.
 	RT_LIGHT_TYPE_SPOT = 3,
 };
 
@@ -171,18 +172,18 @@ enum RTLightType : uint32_t {
 struct alignas(16) RT_LightData {
 	float position[3]; // World position (omni/spot) or direction (directional, normalized).
 	uint32_t type;
-	float emission[3];
-	float radius;
+	float emission[3]; // RECT: the rectangle's radiance.
+	float radius; // RECT: the half diagonal.
 	float attenuation;
 	float inv_max_range; // 1.0/range, or -1.0 for infinite.
 	float max_range_squared; // range*range, or 0.0 for infinite.
 	float specular_amount;
 	float indirect_energy;
-	float inv_spot_attenuation;
-	float cos_spot_angle;
-	float _pad0;
-	float spot_direction[3];
-	float _pad1;
+	float inv_spot_attenuation; // RECT: the half height axis, x.
+	float cos_spot_angle; // RECT: y.
+	float _pad0; // RECT: z.
+	float spot_direction[3]; // RECT: the half width axis (the light's local X times half its width).
+	float _pad1; // RECT: the sign that turns cross(width axis, height axis) into the emitting normal.
 };
 static_assert(sizeof(RT_LightData) == 80, "RT_LightData must be 80 bytes for std430");
 

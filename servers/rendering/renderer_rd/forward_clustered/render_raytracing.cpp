@@ -11397,8 +11397,8 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 			if (p_type == RSE::LIGHT_OMNI) {
 				e *= 1.0f / (Math::PI * 4.0f);
 			} else if (p_type == RSE::LIGHT_AREA) {
-				// As the raster's LightStorage. The trace still samples it as an omni light, without the
-				// raster's surface-area normalization or its one-sided emission (R3).
+				// As the raster's LightStorage. The colour is the rectangle's radiance either way (D124):
+				// with normalized energy the trace divides this power by the area, without it it is one.
 				e *= 1.0f / (Math::PI * 2.0f);
 			} else if (p_type == RSE::LIGHT_SPOT) {
 				e *= 1.0f / Math::PI;
@@ -11438,7 +11438,13 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		// The light's power as the shader gets it (under physical light units the lumens live in the
 		// intensity, not the energy); the camera's factor is common to every light, so the order is
 		// the power's, and a negative light ranks by its magnitude.
-		const float power = compute_light_energy(base, ls->light_get_type(base));
+		const RSE::LightType light_type = ls->light_get_type(base);
+		float power = compute_light_energy(base, light_type);
+		if (light_type == RSE::LIGHT_AREA && !ls->light_area_get_normalize_energy(base)) {
+			// VAL (D124): without normalized energy the colour is the rectangle's radiance, its power that times the area.
+			const Vector2 size = ls->light_area_get_size(base);
+			power *= size.x * size.y;
+		}
 		float energy = Math::abs(power);
 		float lum = color.r * 0.2126f + color.g * 0.7152f + color.b * 0.0722f;
 
@@ -11539,7 +11545,7 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		ld.position[0] = relative_pos.x;
 		ld.position[1] = relative_pos.y;
 		ld.position[2] = relative_pos.z;
-		ld.type = (type == RSE::LIGHT_SPOT) ? RT_LIGHT_TYPE_SPOT : RT_LIGHT_TYPE_OMNI;
+		ld.type = (type == RSE::LIGHT_SPOT) ? RT_LIGHT_TYPE_SPOT : ((type == RSE::LIGHT_AREA) ? RT_LIGHT_TYPE_RECT : RT_LIGHT_TYPE_OMNI);
 
 		Color linear_col = ls->light_get_color(base).srgb_to_linear();
 		float energy = compute_light_energy(base, type);
@@ -11568,6 +11574,36 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 			ld.spot_direction[0] = spot_dir.x;
 			ld.spot_direction[1] = spot_dir.y;
 			ld.spot_direction[2] = spot_dir.z;
+		} else if (type == RSE::LIGHT_AREA) {
+			// VAL (D124): the raster's rectangle (LightStorage::update_light_buffers): full extents along the
+			// light's X and Y in world units, whatever the node's scale, emitting one-sided toward its -Z; its
+			// colour is a radiance, divided by the area when the light normalizes its energy.
+			const Vector2 size = ls->light_area_get_size(base);
+			// Y is made orthogonal to X: a sheared node would otherwise give a parallelogram, which the
+			// solid-angle sampling of a rectangle does not cover.
+			const Vector3 dir_x = xform.basis.get_column(0).normalized();
+			const Vector3 col_y = xform.basis.get_column(1);
+			const Vector3 dir_y = (col_y - dir_x * dir_x.dot(col_y)).normalized();
+			const Vector3 normal = -xform.basis.get_column(2).normalized();
+			const Vector3 half_x = dir_x * (size.x * 0.5f);
+			const Vector3 half_y = dir_y * (size.y * 0.5f);
+			ld.spot_direction[0] = half_x.x;
+			ld.spot_direction[1] = half_x.y;
+			ld.spot_direction[2] = half_x.z;
+			ld.inv_spot_attenuation = half_y.x;
+			ld.cos_spot_angle = half_y.y;
+			ld._pad0 = half_y.z;
+			ld._pad1 = dir_x.cross(dir_y).dot(normal) >= 0.0f ? 1.0f : -1.0f;
+			ld.radius = Math::sqrt(half_x.length_squared() + half_y.length_squared()); // The half diagonal.
+			const float area = size.x * size.y;
+			// A collapsed frame (zero scale, or Y along X) has no plane: its normal would be a normalized zero vector in the shader.
+			if (!(area > 0.0f) || !(dir_x.cross(dir_y).length_squared() > 0.0f)) {
+				ld.emission[0] = ld.emission[1] = ld.emission[2] = 0.0f; // The raster draws nothing either.
+			} else if (ls->light_area_get_normalize_energy(base)) {
+				ld.emission[0] /= area;
+				ld.emission[1] /= area;
+				ld.emission[2] /= area;
+			}
 		} else {
 			ld.inv_spot_attenuation = 0.0f;
 			ld.cos_spot_angle = 0.0f;
@@ -11839,6 +11875,13 @@ uint32_t RenderRaytracing::build_light_tree(const RT_LightData *p_lights, uint32
 		const RT_LightData &l = p_lights[i];
 		// A negative light subtracts; its importance is its magnitude.
 		float power = Math::abs(_rt_luminance(l.emission));
+		// A rectangle's emission is a radiance (D124): its intensity on the axis, the unit every leaf's power
+		// is in, is the radiance times the area.
+		if (l.type == RT_LIGHT_TYPE_RECT) {
+			const Vector3 rect_x = Vector3(l.spot_direction[0], l.spot_direction[1], l.spot_direction[2]);
+			const Vector3 rect_y = Vector3(l.inv_spot_attenuation, l.cos_spot_angle, l._pad0);
+			power *= 4.0f * rect_x.length() * rect_y.length();
+		}
 		if (!(power > 0.0f)) {
 			continue;
 		}
@@ -11846,7 +11889,14 @@ uint32_t RenderRaytracing::build_light_tree(const RT_LightData *p_lights, uint32
 		leaf.center = Vector3(l.position[0], l.position[1], l.position[2]);
 		leaf.radius = MAX(l.radius, 0.0f);
 		// Keyed on the cone the shader keys on: a spot opened to a half turn has cos -1 and is an omni here.
-		if (l.type == RT_LIGHT_TYPE_SPOT && l.cos_spot_angle > -1.0f) {
+		if (l.type == RT_LIGHT_TYPE_RECT) {
+			// One-sided: its emission cone is the normal alone (theta_o 0), the node bound's right angle the
+			// rest, so a receiver behind it reads nothing.
+			const Vector3 rect_x = Vector3(l.spot_direction[0], l.spot_direction[1], l.spot_direction[2]);
+			const Vector3 rect_y = Vector3(l.inv_spot_attenuation, l.cos_spot_angle, l._pad0);
+			leaf.axis = rect_x.cross(rect_y).normalized() * l._pad1;
+			leaf.cos_theta_o = 1.0f;
+		} else if (l.type == RT_LIGHT_TYPE_SPOT && l.cos_spot_angle > -1.0f) {
 			leaf.axis = Vector3(l.spot_direction[0], l.spot_direction[1], l.spot_direction[2]);
 			leaf.cos_theta_o = l.cos_spot_angle;
 		} else {

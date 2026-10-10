@@ -2,8 +2,8 @@
 // Include AFTER raytracing_inc.glsl and scene_data_inc.glsl.
 // The includer must set exactly one of RT_STAGE_{RAYGEN,MISS,CLOSEST_HIT,ANY_HIT,INTERSECTION}.
 
-// Specialization constant (bits 0-10: flags, 11-12: the SER hint, 13: cluster BLAS, 14-15: position fetch, 16: 2-state micromaps, 17: stochastic texture filtering, 18: the subsurface walk, 19: its counters, 20: the standard hit group's walking variant (closest hit only, never a bundle key), 21-28: samples, 29-31: bounces).
-// Bit 13 is read at compile time as USE_CLUSTER_AS (D79), bits 14-15 as USE_POSITION_FETCH and RT_POSITION_FETCH_CHECK (D93), bit 16 as USE_OMM_INDIRECT_2_STATE (D96), never from RT_FLAGS.
+// Specialization constant (bits 0-10: flags, 11-12: the SER hint, 13: cluster BLAS, 14: position fetch, 15: the G-buffer primary, 16: 2-state micromaps, 17: stochastic texture filtering, 18: the subsurface walk, 19: its counters, 20: the standard hit group's walking variant (closest hit only, never a bundle key), 21-28: samples, 29-31: bounces).
+// Bit 13 is read at compile time as USE_CLUSTER_AS (D79), bit 14 as USE_POSITION_FETCH (D93), bit 15 as RT_GBUFFER_PRIMARY (P1e), bit 16 as USE_OMM_INDIRECT_2_STATE (D96), never from RT_FLAGS.
 layout(constant_id = 0) const uint RT_FLAGS = 0u;
 
 #define RT_FLAG_DLSS_RR_ENABLED (1u << 1)

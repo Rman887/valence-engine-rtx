@@ -229,6 +229,9 @@ void RenderForwardClusteredPT::_render_scene(RenderDataRD *p_render_data, const 
 		RID rt_environment = p_render_data->environment.is_valid() ? p_render_data->environment : RID();
 		const bool fog_enabled = rt_environment.is_valid() && environment_get_fog_enabled(rt_environment);
 		rt_flags = SceneShaderRaytracing::compute_rt_flags(rt_environment, fog_enabled);
+		if (use_gbuffer) {
+			rt_flags |= SceneShaderRaytracing::RT_FLAG_GBUFFER_PRIMARY;
+		}
 
 		const bool dlss_rr_enabled = (rt_flags & SceneShaderRaytracing::RT_FLAG_DLSS_RR_ENABLED) != 0;
 		if (dlss_rr_enabled) {

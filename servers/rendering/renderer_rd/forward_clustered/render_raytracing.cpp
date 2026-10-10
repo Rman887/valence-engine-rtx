@@ -12566,8 +12566,6 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 				rt_ubo.camera_medium_scatter[3] = (float)((real_t)env_storage->environment_get_camera_medium_height(env) - p_state->rt_origin.y);
 			}
 		}
-		// The frame decides (the Environment's choice, unless MSAA forced the traced primary ray).
-		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_PRIMARY_SURFACE] = p_primary_from_gbuffer ? (float)RSE::PT_PRIMARY_SURFACE_GBUFFER : (float)RSE::PT_PRIMARY_SURFACE_TRACED;
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_HAS_PROCEDURAL_INSTANCES] = p_state->has_procedural_instances ? 1.0f : 0.0f;
 
 		// Texture LOD by ray cones (D116): the bias the raster's samplers carry for these buffers (the

@@ -83,6 +83,7 @@ static constexpr RaygenShaderOption RAYGEN_SHADER_OPTIONS[] = {
 	{ SceneShaderRaytracing::RT_FLAG_DLSS_RR_ENABLED, "#define DLSS_RR_ENABLED\n" },
 	{ SceneShaderRaytracing::RT_FLAG_SER_ENABLED, "#define USE_SER\n" },
 	{ SceneShaderRaytracing::RT_FLAG_RAY_QUERY_SHADOWS_ENABLED, "#define USE_RAY_QUERY_SHADOWS\n" },
+	{ SceneShaderRaytracing::RT_FLAG_GBUFFER_PRIMARY, "#define RT_GBUFFER_PRIMARY\n" },
 
 };
 
@@ -844,9 +845,6 @@ uint32_t SceneShaderRaytracing::compute_rt_flags(RID p_environment, bool p_fog_e
 	}
 	if (RenderRaytracing::is_position_fetch_enabled()) {
 		flags |= RT_FLAG_POSITION_FETCH;
-		if (RenderRaytracing::is_position_fetch_check_enabled() && OS::get_singleton()->is_stdout_verbose()) {
-			flags |= RT_FLAG_POSITION_FETCH_CHECK;
-		}
 	}
 
 	if (RenderRaytracing::is_omm_indirect_2_state_enabled()) {
@@ -934,7 +932,8 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 	// Defines for the same reason: the position-fetch capability is legal only with the extension (D93).
 	if (p_rt_flags & RT_FLAG_POSITION_FETCH) {
 		inject_define(sources, "#define USE_POSITION_FETCH\n");
-		if (p_rt_flags & RT_FLAG_POSITION_FETCH_CHECK) {
+		// A verbose run's position check (D93) under geometry residency: fixed for the process, so no flag bit.
+		if (RenderRaytracing::is_position_fetch_check_enabled() && OS::get_singleton()->is_stdout_verbose()) {
 			inject_define(sources, "#define RT_POSITION_FETCH_CHECK\n");
 		}
 	}

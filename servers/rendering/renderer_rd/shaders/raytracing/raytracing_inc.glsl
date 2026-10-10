@@ -19,7 +19,7 @@
 #define RT_PARAM_SAMPLE_COUNT 1 // rt_params[0].y - Samples per pixel
 #define RT_PARAM_MAX_BOUNCES 2 // rt_params[0].z - Maximum ray bounces
 #define RT_PARAM_DENOISER 3 // rt_params[0].w - Denoiser selection (0=none, 1=DLSS RR)
-#define RT_PARAM_PRIMARY_SURFACE 4 // rt_params[1].x - Primary surface (0=G-buffer, 1=traced)
+#define RT_PARAM_PRIMARY_SURFACE 4 // rt_params[1].x - VAL: unused since P1e (the raygen variant RT_GBUFFER_PRIMARY), kept for the layout
 // The froxel volumetric fog composed over the camera segment (D37).
 #define RT_PARAM_VFOG_ENABLED 5 // rt_params[1].y - 1 when the frame carries a froxel volume
 #define RT_PARAM_VFOG_INV_LENGTH 6 // rt_params[1].z - 1 / volumetric_fog_length

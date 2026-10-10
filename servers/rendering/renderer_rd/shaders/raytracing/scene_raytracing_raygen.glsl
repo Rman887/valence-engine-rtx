@@ -321,9 +321,13 @@ void main() {
 
 	const uint max_bounces = RT_GET_MAX_BOUNCES();
 
-	// The primary surface comes from the G-buffer unless the Environment asks
-	// for the traced reference (RT_PARAM_PRIMARY_SURFACE, 0 = G-buffer).
-	const bool primary_from_gbuffer = get_rt_param(RT_PARAM_PRIMARY_SURFACE) < 0.5;
+	// The primary surface comes from the G-buffer in that raygen variant (RT_GBUFFER_PRIMARY, P1e), so the
+	// default raygen carries no G-buffer path; the traced primary ray otherwise.
+#ifdef RT_GBUFFER_PRIMARY
+	const bool primary_from_gbuffer = true;
+#else
+	const bool primary_from_gbuffer = false;
+#endif
 
 	// The camera's medium (D49), the same for every sample: its in-scatter at a horizontal
 	// interface, charged over the light's leg from the medium's top down to the camera (the

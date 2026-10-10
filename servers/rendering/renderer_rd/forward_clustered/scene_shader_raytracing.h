@@ -72,7 +72,8 @@ public:
 	// Bits 0-10:  Feature flags
 	// Bits 11-12: The SER coherence hint (RT_SER_HINT_*)
 	// Bit 13:    Cluster BLAS (RT_FLAG_CLUSTER_AS)
-	// Bits 14-15: Position fetch and its verbose check (D93)
+	// Bit 14:    Position fetch (D93, P1d)
+	// Bit 15:    The primary surface from the G-buffer, a raygen variant (P1e)
 	// Bit 16:    Opacity micromaps in 2-state on indirect rays (D96 OMMe)
 	// Bit 17:    Stochastic texture filtering (D117)
 	// Bit 18:    Subsurface walk (D120)
@@ -95,7 +96,7 @@ public:
 		RT_FLAG_RUSSIAN_ROULETTE = (1 << 10), // Paths end by Russian roulette on their throughput once a vertex has scattered (D73); clear, only at the bounce limits.
 		RT_FLAG_CLUSTER_AS = (1 << 13), // Static BLAS built from triangle clusters (D79): hit shaders add gl_ClusterIDNV to gl_PrimitiveID. Set when rendering/pathtracing/cluster_blas is on and the device has the extension.
 		RT_FLAG_POSITION_FETCH = (1 << 14), // Triangle and cluster builds allow data access and the hit stages read the hit triangle's corners from the structure (D93, P1d). Set where the device reports SUPPORTS_RAYTRACING_POSITION_FETCH.
-		RT_FLAG_POSITION_FETCH_CHECK = (1 << 15), // A verbose run's closest hit compares fetched positions with the vertex buffer's (D93). Set only with RT_FLAG_POSITION_FETCH and geometry residency on.
+		RT_FLAG_GBUFFER_PRIMARY = (1 << 15), // Paths start from the G-buffer's surface (Environment.pathtracing_primary_surface, D35): a raygen variant, so the default raygen carries no G-buffer path (P1e). Set per frame by the path-traced frame.
 		RT_FLAG_OMM_INDIRECT_2_STATE = (1 << 16), // Rays past the path's first diffuse bounce resolve unknown micro-triangles by their side (D96 OMMe). Set while micromaps are on with rendering/pathtracing/opacity_micromap_indirect_2_state.
 		RT_FLAG_TEXTURE_FILTERING = (1 << 17), // The hit shaders compile stochastic texture filtering in (D117). Set while rendering/pathtracing/texture_filtering is not off; the filter itself is RT_PARAM_TEXTURE_FILTERING.
 		RT_FLAG_SUBSURFACE = (1 << 18), // The hit shaders compile the subsurface walk in (D120). Set while rendering/pathtracing/subsurface is on.
@@ -139,7 +140,7 @@ public:
 	static constexpr int RT_PARAM_SAMPLE_COUNT = 1;
 	static constexpr int RT_PARAM_MAX_BOUNCES = 2;
 	static constexpr int RT_PARAM_DENOISER = 3;
-	static constexpr int RT_PARAM_PRIMARY_SURFACE = 4;
+	static constexpr int RT_PARAM_PRIMARY_SURFACE = 4; // VAL: unused since P1e (the raygen variant RT_FLAG_GBUFFER_PRIMARY), kept for the layout.
 	// The froxel volumetric fog the raygen composes over the camera segment (D37).
 	static constexpr int RT_PARAM_VFOG_ENABLED = 5;
 	static constexpr int RT_PARAM_VFOG_INV_LENGTH = 6;

@@ -928,7 +928,6 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// =================================================================
 	// NEE: Next Event Estimation (direct light sampling)
 	// =================================================================
-	path_pack(payload, ps);
 
 	// This bounce's block of Sobol dimensions (D52): the light sampling below draws a variable
 	// count, so the scatter's draws are pinned again after it. The analytic path draws the two
@@ -1143,7 +1142,6 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			// block. Past
 			// the walk the path has scattered, so its light is indirect for the clamp (D53).
 			ps.packed_bounces_flags = set_scattered(ps.packed_bounces_flags);
-			path_pack(payload, ps);
 			rng_set_dimension(ps.rng_state, RT_SOBOL_DIM_SUBSURFACE_EXIT_BASE + total_bounces * RT_SOBOL_DIMS_PER_BOUNCE);
 			shade_direct_light(exit_position, exit_normal, exit_t, exit_shading_normal, exit_shading_normal, exit_mat, 0.0, diffuse_bounces, rt_emissive_count, in_medium, ps);
 			// And its direction: the cosine cancels its density, leaving a weight of 1.

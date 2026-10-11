@@ -63,7 +63,8 @@ const float RT_TEXTURE_LOD_BASE = -128.0;
 // offset_normal, hit_t)`. The offset normal and next direction are stored as
 // 16-bit unorm octahedral pairs (effective angular error <~0.001 deg,
 // below the 8-bit normal quantization baked into offset_ray_origin).
-// Use PathState + path_pack/path_unpack for fp32 working copies.
+// Use PathState + path_pack/path_unpack for fp32 working copies; the medium stays packed in the
+// working copy too (path_medium_absorption, path_medium_inscatter, path_set_medium).
 
 struct PathPayload {
 	uint packed_rt[3]; // 12 bytes - radiance+throughput interleaved as fp16
@@ -115,8 +116,10 @@ struct PathState {
 	float hit_t;
 	vec3 offset_normal;
 	vec3 next_ray_dir;
-	vec3 medium_absorption;
-	vec3 medium_inscatter;
+	// The medium as the payload packs it (D49, GPU audit P3e): read through path_medium_absorption and
+	// path_medium_inscatter, written through path_set_medium. Most hits never touch it, and three packed words
+	// live through the shading cost the closest hit fewer registers than six floats.
+	uint packed_medium[3];
 	float medium_entry_height;
 	float bsdf_pdf;
 	float cone_width;
@@ -140,11 +143,7 @@ PathState path_unpack(PathPayload p) {
 	s.hit_t = p.hit_t;
 	s.offset_normal = oct_to_vec3(unpackUnorm2x16(p.oct_offset_nrm) * 2.0 - 1.0);
 	s.next_ray_dir = oct_to_vec3(unpackUnorm2x16(p.oct_next_dir) * 2.0 - 1.0);
-	vec2 ab = unpackHalf2x16(p.packed_medium[0]);
-	vec2 bi = unpackHalf2x16(p.packed_medium[1]);
-	vec2 gb = unpackHalf2x16(p.packed_medium[2]);
-	s.medium_absorption = max(vec3(ab.x, ab.y, bi.x), vec3(0.0));
-	s.medium_inscatter = max(vec3(bi.y, gb.x, gb.y), vec3(0.0));
+	s.packed_medium = p.packed_medium;
 	s.medium_entry_height = p.medium_entry_height;
 	s.bsdf_pdf = p.bsdf_pdf;
 	vec2 cone = unpackHalf2x16(p.packed_cone);
@@ -178,11 +177,7 @@ void path_pack(inout PathPayload p, PathState s) {
 	p.hit_t = s.hit_t;
 	p.oct_offset_nrm = packUnorm2x16(vec3_to_oct(s.offset_normal));
 	p.oct_next_dir = packUnorm2x16(vec3_to_oct(s.next_ray_dir));
-	vec3 a = clamp(s.medium_absorption, vec3(0.0), vec3(FP16_MAX));
-	vec3 i = clamp(s.medium_inscatter, vec3(0.0), vec3(FP16_MAX));
-	p.packed_medium[0] = packHalf2x16(vec2(a.r, a.g));
-	p.packed_medium[1] = packHalf2x16(vec2(a.b, i.r));
-	p.packed_medium[2] = packHalf2x16(vec2(i.g, i.b));
+	p.packed_medium = s.packed_medium;
 	p.medium_entry_height = s.medium_entry_height;
 	p.bsdf_pdf = s.bsdf_pdf;
 	p.packed_cone = packHalf2x16(clamp(vec2(s.cone_width, s.cone_spread), vec2(0.0), vec2(FP16_MAX)));
@@ -197,11 +192,33 @@ void path_pack(inout PathPayload p, PathState s) {
 #endif
 }
 
+/// The medium's per-metre extinction (D49), unpacked where it is read.
+vec3 path_medium_absorption(PathState s) {
+	vec2 ab = unpackHalf2x16(s.packed_medium[0]);
+	return max(vec3(ab.x, ab.y, unpackHalf2x16(s.packed_medium[1]).x), vec3(0.0));
+}
+
+/// The radiance the medium in-scatters along a segment (D49), unpacked where it is read.
+vec3 path_medium_inscatter(PathState s) {
+	vec2 gb = unpackHalf2x16(s.packed_medium[2]);
+	return max(vec3(unpackHalf2x16(s.packed_medium[1]).y, gb.x, gb.y), vec3(0.0));
+}
+
+/// Enters a medium (D49): clamped to fp16's range and packed as the payload carries it.
+void path_set_medium(inout PathState s, vec3 p_absorption, vec3 p_inscatter, float p_entry_height) {
+	const float FP16_MAX = 65504.0;
+	vec3 a = clamp(p_absorption, vec3(0.0), vec3(FP16_MAX));
+	vec3 i = clamp(p_inscatter, vec3(0.0), vec3(FP16_MAX));
+	s.packed_medium[0] = packHalf2x16(vec2(a.r, a.g));
+	s.packed_medium[1] = packHalf2x16(vec2(a.b, i.r));
+	s.packed_medium[2] = packHalf2x16(vec2(i.g, i.b));
+	s.medium_entry_height = p_entry_height;
+}
+
 /// A path state with no medium: the fields every fresh path (a sample's start, a shadow ray)
 /// carries before a refracted bounce sets them.
 void path_clear_medium(inout PathState s) {
-	s.medium_absorption = vec3(0.0);
-	s.medium_inscatter = vec3(0.0);
+	s.packed_medium = uint[3](0u, 0u, 0u);
 	s.medium_entry_height = 0.0;
 }
 

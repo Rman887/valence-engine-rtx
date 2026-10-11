@@ -348,8 +348,8 @@ vec3 medium_irradiance(vec3 p_normal) {
 /// The segment inside a medium: Beer-Lambert over its length with the payload's extinction, and
 /// the in-scatter the medium adds in place of what it took (the closed form the segment fog uses).
 void apply_segment_medium(float segment_length, inout PathState ps) {
-	vec3 transmittance = exp(-ps.medium_absorption * segment_length);
-	ps.radiance += ps.throughput * ps.medium_inscatter * (vec3(1.0) - transmittance);
+	vec3 transmittance = exp(-path_medium_absorption(ps) * segment_length);
+	ps.radiance += ps.throughput * path_medium_inscatter(ps) * (vec3(1.0) - transmittance);
 	ps.throughput *= transmittance;
 }
 
@@ -457,7 +457,7 @@ void shade_direct_light(vec3 p_hit_pos, vec3 p_geometry_normal, float p_hit_t, v
 				// nearer. The shadow ray is a visibility test that does not resolve the interface, so
 				// the leg is this estimate (a named limit); a light under the plane takes its distance.
 				float leg = min(light_sample.leg_distance, max(ps.medium_entry_height - p_hit_pos.y, 0.0) / max(light_sample.direction.y, 0.1));
-				direct_light *= exp(-ps.medium_absorption * leg);
+				direct_light *= exp(-path_medium_absorption(ps) * leg);
 			}
 			// The clamp (D53): direct at the surface the camera sees, indirect after a scatter.
 			ps.radiance += rt_clamp_contribution(ps.throughput * direct_light, get_rt_param(is_scattered(ps.packed_bounces_flags) ? RT_PARAM_CLAMP_INDIRECT : RT_PARAM_CLAMP_DIRECT));
@@ -986,9 +986,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 			bool enters_medium = any(greaterThan(m.absorption, vec3(0.0)));
 			ps.packed_bounces_flags = set_in_medium(ps.packed_bounces_flags, enters_medium);
 			if (enters_medium) {
-				ps.medium_absorption = m.absorption;
-				ps.medium_inscatter = m.scattering * medium_irradiance(N);
-				ps.medium_entry_height = h.hit_pos.y;
+				path_set_medium(ps, m.absorption, m.scattering * medium_irradiance(N), h.hit_pos.y);
 			} else {
 				path_clear_medium(ps);
 			}

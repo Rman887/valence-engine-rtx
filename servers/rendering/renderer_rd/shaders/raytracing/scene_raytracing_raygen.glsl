@@ -380,9 +380,7 @@ void main() {
 			// The camera is inside a medium (D49): the path starts in it and leaves it through the
 			// first back face it refracts out of.
 			ps.packed_bounces_flags = set_in_medium(ps.packed_bounces_flags, true);
-			ps.medium_absorption = camera_medium_absorption.xyz;
-			ps.medium_inscatter = camera_medium_inscatter;
-			ps.medium_entry_height = camera_medium_scatter.w;
+			path_set_medium(ps, camera_medium_absorption.xyz, camera_medium_inscatter, camera_medium_scatter.w);
 		}
 
 		vec3 ray_origin = origin.xyz;
@@ -582,9 +580,10 @@ void main() {
 		// A miss inside a medium (D49): the segment is charged over the trace's own reach (the
 		// 10000 m tmax), so a channel the medium does not extinguish stays continuous with a far
 		// hit and every other one takes the full column; the guides below carry the result.
-		vec3 t = exp(-ps.medium_absorption * 10000.0);
-		sky_color = mix(ps.medium_inscatter, sky_color, t);
-		sky_add = mix(ps.throughput * ps.medium_inscatter, sky_add, t);
+		vec3 medium_inscatter = path_medium_inscatter(ps);
+		vec3 t = exp(-path_medium_absorption(ps) * 10000.0);
+		sky_color = mix(medium_inscatter, sky_color, t);
+		sky_add = mix(ps.throughput * medium_inscatter, sky_add, t);
 	}
 
 #ifdef DLSS_RR_ENABLED

@@ -1278,6 +1278,9 @@ struct RTSlotShadow {
 	uint32_t write_frame = 0; // The viewport's build count at the last instance write.
 	uint32_t motion_frame = 0; // The build count its motion row was last written >= 0 at.
 	uint32_t global_index = UINT32_MAX; // Its position in the global partition's list (D94b part 2).
+	// The viewport's build count at which `transform` was last written or compared equal to its
+	// instance's; 0 for never.
+	uint32_t verified_build = 0;
 	Vector3i cell; // The world cell its last write placed it in, which its transform is relative to.
 	uint8_t flags = 0;
 	uint8_t mask = 0;
@@ -1403,6 +1406,8 @@ struct RTViewportState {
 	LocalVector<uint32_t> motion_slots_next;
 	uint32_t slot_capacity = 0;
 	uint32_t slot_build = 0; // Builds of this viewport's slots, from 1.
+	uint64_t slot_build_frame = 0; // The rasterizer's frame of the last build.
+	bool slot_build_follows = false; // The last build came the frame after the one before it.
 	uint64_t slot_commit_frame = 0; // frames_drawn at its last commit; 0 when it holds nothing.
 	bool slot_rebuild = false; // The next build writes every enabled slot from scratch.
 	Vector3 slot_origin; // The rt_origin of the last commit.
@@ -2203,15 +2208,29 @@ class RenderRaytracing {
 		return Vector3(real_t(double(p_cell.x) * ptlas_cell_size), real_t(0), real_t(double(p_cell.z) * ptlas_cell_size));
 	}
 	// The walk's change test. The transform is narrowed as the shadow holds it, relative to the
-	// shadow's cell (D94c), so an rt_origin shift alone changes nothing here.
-	_FORCE_INLINE_ bool _slot_unchanged(const RTViewportState *p_state, uint32_t p_slot, RID p_blas, const Transform3D &p_transform, uint32_t p_flags, uint8_t p_mask, uint32_t p_sbt_offset, uint64_t p_geometry_generation, uint64_t p_material_generation) const {
-		const RTSlotShadow &shadow = p_state->slots[p_slot];
+	// shadow's cell (D94c), so an rt_origin shift alone changes nothing here. `p_static`: the
+	// instance's transform has not been set since the frame before (TransformStatus::NONE), so where
+	// the viewport built that frame too and the slot's transform was verified then, it still holds.
+	// The procedural and MultiMesh call sites leave it false on purpose: the skip covers the mesh walk alone.
+	_FORCE_INLINE_ bool _slot_unchanged(RTViewportState *p_state, uint32_t p_slot, RID p_blas, const Transform3D &p_transform, uint32_t p_flags, uint8_t p_mask, uint32_t p_sbt_offset, uint64_t p_geometry_generation, uint64_t p_material_generation, bool p_static = false) const {
+		RTSlotShadow &shadow = p_state->slots[p_slot];
 		if (!(shadow.blas == p_blas && shadow.rows_valid && shadow.geometry_generation == p_geometry_generation && shadow.material_generation == p_material_generation && shadow.flags == uint8_t(p_flags) && shadow.mask == p_mask && shadow.sbt_offset == p_sbt_offset)) {
 			return false;
 		}
-		float rows[12];
-		_slot_relative_transform(p_transform, _slot_cell_origin(shadow.cell), rows);
-		return memcmp(shadow.transform, rows, sizeof(rows)) == 0;
+		if (!(p_static && p_state->slot_build_follows && shadow.verified_build != 0 && shadow.verified_build + 1 == p_state->slot_build)) {
+			float rows[12];
+			_slot_relative_transform(p_transform, _slot_cell_origin(shadow.cell), rows);
+			if (memcmp(shadow.transform, rows, sizeof(rows)) != 0) {
+				return false;
+			}
+		}
+#ifdef DEV_ENABLED
+		float dev_rows[12];
+		_slot_relative_transform(p_transform, _slot_cell_origin(shadow.cell), dev_rows);
+		DEV_ASSERT(memcmp(shadow.transform, dev_rows, sizeof(dev_rows)) == 0);
+#endif
+		shadow.verified_build = p_state->slot_build;
+		return true;
 	}
 	Vector3 _slot_cell_translation(const RTViewportState *p_state, const Vector3i &p_cell) const;
 	Transform3D _slot_traced_transform(const RTViewportState *p_state, const RTSlotShadow &p_shadow) const;

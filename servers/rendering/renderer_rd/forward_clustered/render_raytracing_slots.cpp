@@ -796,6 +796,7 @@ bool RenderRaytracing::_commit_slots(RTViewportState *p_state) {
 			shadow.partition = 0;
 		}
 		shadow.blas = RID();
+		shadow.verified_build = 0;
 		write_slot(p_slot, shadow);
 		counters.disables++;
 		counters.enabled--;
@@ -893,6 +894,7 @@ bool RenderRaytracing::_commit_slots(RTViewportState *p_state) {
 			}
 			write_slot(slot, shadow);
 		}
+		shadow.verified_build = build; // Written, or compared equal, above.
 		if (rows_changed || motion_index >= 0) {
 			SlotRowRef ref;
 			ref.slot = slot;

@@ -10346,6 +10346,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	state->has_procedural_instances = false;
 	if (ptlas_slots_enabled) {
 		state->slot_build++; // The walk stamps the ranges it reaches with it (D94b).
+		const uint64_t frame = RSG::rasterizer->get_frame_number();
+		state->slot_build_follows = state->slot_build_frame + 1 == frame;
+		state->slot_build_frame = frame;
 	}
 
 	// The cluster LOD selection (D86) belongs to the traced primary ray (D84): under the G-buffer
@@ -11016,7 +11019,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				const uint32_t slot = slot_ranges[range].first;
 				const uint64_t geometry_generation = _layer_row_generation(_surface_row_generation(surf_data), inst->layer_mask);
 				const uint64_t material_generation = _material_row_generation(mat_data);
-				if (!slot_rebuilt && !_slot_moved(inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED, prev_instance_transform, instance_transform) && _slot_unchanged(state, slot, blas_handle, final_transform, inst_flags, inst_mask, instance_sbt(mat_data, inst_mask), geometry_generation, material_generation)) {
+				if (!slot_rebuilt && !_slot_moved(inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED, prev_instance_transform, instance_transform) && _slot_unchanged(state, slot, blas_handle, final_transform, inst_flags, inst_mask, instance_sbt(mat_data, inst_mask), geometry_generation, material_generation, instance_static)) {
 					surf = surf->next;
 					continue;
 				}

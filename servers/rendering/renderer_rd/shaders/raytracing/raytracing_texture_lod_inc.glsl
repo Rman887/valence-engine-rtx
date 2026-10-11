@@ -12,11 +12,18 @@
 // (Environment.RT_DEBUG_TEXTURE_LOD).
 #define RT_VIS_MODE_TEXTURE_LOD 23
 
-// VAL: half the log2 of each bindless slot's texel count, written by the host when a slot changes, so a lookup at the
-// cone's level reads one float instead of querying its texture's size.
+// VAL: the log2 of each bindless slot's width and height, written by the host when a slot changes, so a lookup at the
+// cone's level reads two floats instead of querying its texture's size (half their sum is the level's per-texture
+// term, the pair a fetch's per-axis gradients, GPU audit hot 5).
 layout(set = 0, binding = 54, std430) restrict readonly buffer BindlessTexelLog {
-	float bindless_texel_log[];
+	vec2 bindless_texel_log2[];
 };
+
+/// Half the log2 of a slot's texel count: what a ray-cone level adds for this texture (D116).
+float rt_texel_log(uint p_texture_idx) {
+	const vec2 l = bindless_texel_log2[p_texture_idx];
+	return 0.5 * (l.x + l.y);
+}
 
 bool rt_texture_lod_enabled() {
 	return get_rt_param(RT_PARAM_TEXTURE_LOD) > 0.5;

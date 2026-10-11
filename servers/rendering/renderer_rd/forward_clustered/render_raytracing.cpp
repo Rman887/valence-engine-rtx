@@ -13409,8 +13409,28 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 				material_storage->samplers_rd_free(p_state->samplers);
 			}
 			p_state->samplers = material_storage->samplers_rd_allocate(0.0f, (RSE::ViewportAnisotropicFiltering)anisotropy);
+			// Binding 56: the same twelve as one array, in the order of bindings 16-27 (GPU audit hot 5), which the
+			// standard hit group's fetch indexes from the material's flags. Built here, so a frame copies it.
+			const RSE::CanvasItemTextureFilter filters[6] = {
+				RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST,
+				RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR,
+				RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST_WITH_MIPMAPS,
+				RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS,
+				RSE::CANVAS_ITEM_TEXTURE_FILTER_NEAREST_WITH_MIPMAPS_ANISOTROPIC,
+				RSE::CANVAS_ITEM_TEXTURE_FILTER_LINEAR_WITH_MIPMAPS_ANISOTROPIC,
+			};
+			RD::Uniform u;
+			u.binding = 56;
+			u.uniform_type = RD::UNIFORM_TYPE_SAMPLER;
+			for (const RSE::CanvasItemTextureRepeat repeat : { RSE::CANVAS_ITEM_TEXTURE_REPEAT_DISABLED, RSE::CANVAS_ITEM_TEXTURE_REPEAT_ENABLED }) {
+				for (const RSE::CanvasItemTextureFilter filter : filters) {
+					u.append_id(p_state->samplers.get_sampler(filter, repeat));
+				}
+			}
+			p_state->sampler_array_uniform = u;
 		}
 		p_state->samplers.append_uniforms(uniforms, 16);
+		uniforms.push_back(p_state->sampler_array_uniform);
 	}
 
 	// Binding 28: Velocity output (RG16F). Past the 16-27 sampler range.
@@ -13627,8 +13647,8 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		uniforms.push_back(u);
 	}
 
-	// Binding 54: half the log2 of each bindless slot's texel count, the ray-cone level's per-texture term (D116), so a
-	// hit reads one float instead of querying the texture's size per lookup.
+	// Binding 54: the log2 of each bindless slot's width and height, the ray-cone level's per-texture term (D116, half
+	// their sum) and a fetch's per-axis gradients (GPU audit hot 5), so a hit never queries the texture's size per lookup.
 	{
 		RD::Uniform u;
 		u.binding = 54;

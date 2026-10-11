@@ -1444,6 +1444,8 @@ struct RTViewportState {
 	// The material samplers the hit shaders read through (D116): the viewport's anisotropy, as the raster's, but no
 	// mipmap bias, which the trace adds to its own levels and gradients.
 	RendererRD::MaterialStorage::Samplers samplers;
+	// Binding 56: the same twelve as one array (GPU audit hot 5), built when the samplers are made.
+	RD::Uniform sampler_array_uniform;
 
 	// Camera-relative tracing: the anchor every position uploaded to the trace
 	// is relative to (world minus rt_origin), and the scene UBO copy whose

@@ -560,10 +560,10 @@ vec3 subsurface_single_scattering_albedo(vec3 A) {
 
 /// A texture at a walk's exit, at a ray-cone level carried from the entry for the texture's UV set (level 0 without one).
 vec4 subsurface_exit_sample(uint p_texture_idx, vec2 p_uv, float p_cone_lod, vec2 p_uv_scale) {
-	// The cone's level is per unit of UV; the texture's own size makes it a mip level, as sample_bindless_texture does.
+	// The cone's level is per unit of UV; the texture's own size makes it a mip level, as sample_material_texture does.
 	float lod = 0.0;
 	if (rt_texture_lod_enabled() && p_cone_lod > RT_TEXTURE_LOD_BASE) {
-		lod = max(p_cone_lod + 0.5 * log2(max(abs(p_uv_scale.x * p_uv_scale.y), 1e-20)) + bindless_texel_log[p_texture_idx], 0.0);
+		lod = max(p_cone_lod + 0.5 * log2(max(abs(p_uv_scale.x * p_uv_scale.y), 1e-20)) + rt_texel_log(p_texture_idx), 0.0);
 	}
 	return textureLod(sampler2D(bindless_textures[nonuniformEXT(p_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), p_uv, lod);
 }

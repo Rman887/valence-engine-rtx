@@ -48,8 +48,9 @@ public:
 
 	RID get_uniform_set() const { return uniform_set; }
 	uint32_t get_texture_count() const { return textures.size(); }
-	// VAL: half the log2 of each slot's texel count, the term a ray-cone level adds per texture (D116), so a hit
-	// reads one float instead of querying the texture's size per lookup. Uploaded when a slot changes.
+	// VAL: the log2 of each slot's width and height (TexelLog), the term a ray-cone level adds per texture (D116, half
+	// their sum) and the per-axis sizes a fetch's gradients need (GPU audit hot 5), so a hit reads two floats instead of
+	// querying the texture's size per lookup. Uploaded when a slot changes.
 	RID get_texel_log_buffer();
 	bool is_initialized() const { return rd != nullptr; }
 	bool is_finalized() const { return uniform_set.is_valid(); }
@@ -60,7 +61,13 @@ public:
 private:
 	RenderingDevice *rd = nullptr;
 	LocalVector<RID> textures;
-	LocalVector<float> texel_log;
+	// The shaders' vec2 per slot (std430: 8 bytes, no padding): floats, not Vector2, whose real_t is a double in a
+	// double build.
+	struct TexelLog {
+		float width = 0.0f;
+		float height = 0.0f;
+	};
+	LocalVector<TexelLog> texel_log;
 	RID texel_log_buffer;
 	uint32_t texel_log_capacity = 0;
 	bool texel_log_dirty = true;
@@ -71,5 +78,5 @@ private:
 	RID uniform_set;
 	bool needs_refinalize = false;
 
-	float _texel_log(RID p_texture) const;
+	TexelLog _texel_log(RID p_texture) const;
 };

@@ -11,3 +11,12 @@ layout(set = 0, binding = 24) uniform sampler SAMPLER_NEAREST_WITH_MIPMAPS_REPEA
 layout(set = 0, binding = 25) uniform sampler SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT;
 layout(set = 0, binding = 26) uniform sampler SAMPLER_NEAREST_WITH_MIPMAPS_ANISOTROPIC_REPEAT;
 layout(set = 0, binding = 27) uniform sampler SAMPLER_LINEAR_WITH_MIPMAPS_ANISOTROPIC_REPEAT;
+
+// VAL (GPU audit hot 5): the same twelve samplers as one array, in the order above (clamp then repeat; nearest, linear,
+// with mipmaps, with mipmaps and anisotropy), which the standard hit group's fetch indexes from the material's flags.
+#define RT_MATERIAL_SAMPLER_NEAREST_REPEAT 6u
+#define RT_MATERIAL_SAMPLER_LINEAR_REPEAT 7u
+#define RT_MATERIAL_SAMPLER_NEAREST_WITH_MIPMAPS_REPEAT 8u
+#define RT_MATERIAL_SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT 9u
+#define RT_MATERIAL_SAMPLER_LINEAR_WITH_MIPMAPS_ANISOTROPIC_REPEAT 11u
+layout(set = 0, binding = 56) uniform sampler rt_material_samplers[12];

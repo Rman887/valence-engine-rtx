@@ -6,7 +6,8 @@
 //
 // Required bindings (before this file):
 //   tlas, payload, scene_data_block, geometries[], motion_indices[], materials[], motion_transforms[], bindless_textures[],
-//   SAMPLER_* (12 material samplers), rt_params, rt_depth_image,
+//   SAMPLER_* (12 material samplers), rt_material_samplers[] (the same twelve as one array), bindless_texel_log2[],
+//   rt_params, rt_depth_image,
 //   DLSS-RR images (ifdef DLSS_RR_ENABLED)
 //
 // The shading itself (HitData, fog, debug views, shade_and_bounce) lives in
@@ -288,51 +289,28 @@ vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags) {
 	return sample_bindless_texture(tex_idx, uv);
 }
 
-/// The texture at the ray cone's level (D116): p_lod_t, the hit's texture-independent level, plus half
-/// the log2 of this texture's texel count; its base level where p_lod_t is RT_TEXTURE_LOD_BASE.
-vec4 sample_bindless_texture(uint tex_idx, vec2 uv, float p_lod_t) {
-	if (p_lod_t <= RT_TEXTURE_LOD_BASE) {
-		return sample_bindless_texture(tex_idx, uv);
-	}
-	return textureLod(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, p_lod_t + bindless_texel_log[tex_idx]);
-}
-
-/// Nearest filtering with mipmaps at the ray cone's level, as sample_bindless_texture's linear form; level 0 where
-/// p_lod_t is RT_TEXTURE_LOD_BASE.
-vec4 sample_bindless_texture_point(uint tex_idx, vec2 uv, float p_lod_t) {
-	float level = 0.0;
-	if (p_lod_t > RT_TEXTURE_LOD_BASE) {
-		level = p_lod_t + bindless_texel_log[tex_idx];
-	}
-	return textureLod(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_NEAREST_WITH_MIPMAPS_REPEAT), uv, level);
-}
-
-/// The texture over the cone's elliptical footprint (D116): textureGrad at the material's UV gradients (g1, g2)
-/// through the anisotropic sampler, where the material's filter is anisotropic. A material filtered without
-/// anisotropy, or a hit without gradients, reads at the isotropic level p_lod_t, which beats the long axis's
-/// trilinear level the raster would take.
-vec4 sample_bindless_texture(uint tex_idx, vec2 uv, float p_lod_t, vec4 p_grad, bool p_anisotropic) {
-	if (!p_anisotropic || p_grad == vec4(0.0)) {
-		return sample_bindless_texture(tex_idx, uv, p_lod_t);
-	}
-	return textureGrad(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_ANISOTROPIC_REPEAT), uv, p_grad.xy, p_grad.zw);
-}
-
 /// A material's texture through the filter it asks for: nearest (bit 2) or linear, without mipmaps (bit 7) at the
 /// base level as the raster's mip-less samplers read, with them at the ray cone's level or over its elliptical
-/// footprint (bit 6, D116).
+/// footprint (bit 6, D116). One fetch (GPU audit hot 5): the sampler is picked from the material's flags in the
+/// sampler array and the level is given as gradients, where a branch per form issued one of four fetches through four
+/// bindings. At the cone's level the gradients are that level's length along each axis, from the slot's log2 width and
+/// height, so the hardware's level is the level (a non-square texture included); without a level they are zero, the
+/// base level; over the footprint they are the material's own, through the anisotropic sampler.
 vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags, float p_lod_t, vec4 p_grad) {
 	const bool nearest = (mat_flags & 4u) != 0u;
-	if ((mat_flags & 128u) != 0u) {
-		if (nearest) {
-			return sample_bindless_texture_point(tex_idx, uv);
+	const bool mipmaps = (mat_flags & 128u) == 0u;
+	const bool footprint = mipmaps && !nearest && (mat_flags & 64u) != 0u && p_grad != vec4(0.0);
+	const uint sampler_index = !mipmaps ? (nearest ? RT_MATERIAL_SAMPLER_NEAREST_REPEAT : RT_MATERIAL_SAMPLER_LINEAR_REPEAT) : (nearest ? RT_MATERIAL_SAMPLER_NEAREST_WITH_MIPMAPS_REPEAT : (footprint ? RT_MATERIAL_SAMPLER_LINEAR_WITH_MIPMAPS_ANISOTROPIC_REPEAT : RT_MATERIAL_SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT));
+	vec4 grad = p_grad;
+	if (!footprint) {
+		grad = vec4(0.0);
+		if (mipmaps && p_lod_t > RT_TEXTURE_LOD_BASE) {
+			const vec2 size_log = bindless_texel_log2[tex_idx];
+			const float level = p_lod_t + 0.5 * (size_log.x + size_log.y);
+			grad = vec4(exp2(level - size_log.x), 0.0, 0.0, exp2(level - size_log.y));
 		}
-		return textureLod(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], SAMPLER_LINEAR_REPEAT), uv, 0.0);
 	}
-	if (nearest) {
-		return sample_bindless_texture_point(tex_idx, uv, p_lod_t);
-	}
-	return sample_bindless_texture(tex_idx, uv, p_lod_t, p_grad, (mat_flags & 64u) != 0u);
+	return textureGrad(sampler2D(bindless_textures[nonuniformEXT(tex_idx)], rt_material_samplers[nonuniformEXT(sampler_index)]), uv, grad.xy, grad.zw);
 }
 
 /// The stochastic texture filter the hit shaders use (D117): 0 for none, else the STF_FILTER_TYPE_* of
@@ -438,7 +416,7 @@ float rt_texture_filtering_level(uvec2 p_size, vec4 p_grad) {
 /// the filter's footprint at one of the two levels around the cone's, picked by p_stf_u
 /// (rt_texture_filtering_position), unless the hardware's filter keeps the lookup (rt_texture_filtering_magnified).
 /// Point-filtered materials already read one texel. An anisotropic material without gradients is filtered as an
-/// isotropic one, as sample_bindless_texture does.
+/// isotropic one, as sample_material_texture above does.
 vec4 sample_material_texture(uint tex_idx, vec2 uv, uint mat_flags, float p_lod_t, vec4 p_grad, vec4 p_stf_u) {
 	const uint stf_filter = rt_texture_filtering();
 	if (stf_filter == 0u || (mat_flags & 4u) != 0u) {

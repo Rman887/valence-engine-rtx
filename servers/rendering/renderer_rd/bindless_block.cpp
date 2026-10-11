@@ -46,9 +46,12 @@ void BindlessBlock::initialize(RenderingDevice *p_rd) {
 	texture_to_index[default_texture] = 0;
 }
 
-float BindlessBlock::_texel_log(RID p_texture) const {
+BindlessBlock::TexelLog BindlessBlock::_texel_log(RID p_texture) const {
 	const RD::TextureFormat format = rd->texture_get_format(p_texture);
-	return 0.5f * Math::log2(MAX(float(format.width) * float(format.height), 1.0f));
+	TexelLog texel;
+	texel.width = Math::log2(MAX(float(format.width), 1.0f));
+	texel.height = Math::log2(MAX(float(format.height), 1.0f));
+	return texel;
 }
 
 RID BindlessBlock::get_texel_log_buffer() {
@@ -61,10 +64,10 @@ RID BindlessBlock::get_texel_log_buffer() {
 			rd->free_rid(texel_log_buffer);
 		}
 		texel_log_capacity = Math::next_power_of_2(MAX(texel_log.size(), 1024u));
-		texel_log_buffer = rd->storage_buffer_create(texel_log_capacity * sizeof(float));
+		texel_log_buffer = rd->storage_buffer_create(texel_log_capacity * sizeof(TexelLog));
 		rd->set_resource_name(texel_log_buffer, "Bindless Texel Log");
 	}
-	rd->buffer_update(texel_log_buffer, 0, texel_log.size() * sizeof(float), texel_log.ptr());
+	rd->buffer_update(texel_log_buffer, 0, texel_log.size() * sizeof(TexelLog), texel_log.ptr());
 	texel_log_dirty = false;
 	return texel_log_buffer;
 }

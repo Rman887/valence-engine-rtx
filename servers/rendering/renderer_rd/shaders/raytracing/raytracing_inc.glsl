@@ -88,6 +88,12 @@ struct PathPayload {
 	// the next ray there in place of the point it reconstructs from hit_t. 68 bytes in all while the walk is compiled in.
 	vec3 exit_position; // 12 bytes
 #endif
+#ifdef RT_SKY_LIGHT_COMPILED
+	// The probability with which the vertex the ray left chose the sky for its light sample (D54, GPU audit
+	// 4a): the miss and the emitter found next weigh against it as drawn, rather than deriving it again from
+	// the payload's normal and the ray's origin. 4 bytes more while the sky light is on.
+	float sky_probability; //  4 bytes
+#endif
 };
 
 const float RT_BSDF_PDF_DELTA = -1.0;
@@ -110,6 +116,7 @@ struct PathState {
 #ifdef RT_SUBSURFACE_COMPILED
 	vec3 exit_position;
 #endif
+	float sky_probability; // 0 while the sky light is not compiled in.
 };
 
 PathState path_unpack(PathPayload p) {
@@ -137,6 +144,11 @@ PathState path_unpack(PathPayload p) {
 #ifdef RT_SUBSURFACE_COMPILED
 	s.exit_position = p.exit_position;
 #endif
+#ifdef RT_SKY_LIGHT_COMPILED
+	s.sky_probability = p.sky_probability;
+#else
+	s.sky_probability = 0.0;
+#endif
 	return s;
 }
 
@@ -162,6 +174,9 @@ void path_pack(inout PathPayload p, PathState s) {
 	p.packed_cone = packHalf2x16(clamp(vec2(s.cone_width, s.cone_spread), vec2(0.0), vec2(FP16_MAX)));
 #ifdef RT_SUBSURFACE_COMPILED
 	p.exit_position = s.exit_position;
+#endif
+#ifdef RT_SKY_LIGHT_COMPILED
+	p.sky_probability = s.sky_probability;
 #endif
 }
 

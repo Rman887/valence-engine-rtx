@@ -383,6 +383,8 @@ void shade_direct_light(vec3 p_hit_pos, vec3 p_geometry_normal, float p_hit_t, v
 	// The sky's share of the light samples (D54), 0 without a sky light; the surface lights
 	// split the rest, so their densities carry the remainder on both sides of the weight.
 	float p_sky = light_tree_enabled() ? 0.0 : sky_light_probability(N_select);
+	// What the next vertex weighs a sky or an emitter it finds against (GPU audit 4a); the tree sets its own below.
+	ps.sky_probability = p_sky;
 	// Under the tree (D55) the sky's share is per hit, so a frame whose only light is the sky still
 	// takes its sample here (the miss weighs against it either way).
 	bool tree_sky = light_tree_enabled() && sky_light_enabled() && sky_total > 0.0;
@@ -420,7 +422,7 @@ void shade_direct_light(vec3 p_hit_pos, vec3 p_geometry_normal, float p_hit_t, v
 			if (is_indirect) {
 				ps.packed_bounces_flags = set_light_tree_indirect(ps.packed_bounces_flags);
 			}
-			have_sample = light_tree_sample_direct(hit_pos_offset, N_select, N, V, brdf_mat, ps.rng_state, is_indirect, tree_candidates, light_sample, strategy_probability);
+			have_sample = light_tree_sample_direct(hit_pos_offset, N_select, N, V, brdf_mat, ps.rng_state, is_indirect, tree_candidates, light_sample, strategy_probability, ps.sky_probability);
 		} else if (sample_sky) {
 			have_sample = sky_sample_direct(N, V, brdf_mat, ps.rng_state, strategy_probability, light_sample);
 		} else if (sample_emissive) {
@@ -758,9 +760,8 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 		} else {
 			// The sky's share of the light samples (D54), 0 without a sky light; the surface lights
 			// split the rest, so their densities carry the remainder on both sides of the weight. It is
-			// the previous vertex's share, for its receiver as the payload carried it (D65).
-			float p_sky_previous = sky_light_probability(ps.offset_normal);
-			pdf_light = (1.0 - p_sky_previous) * get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY) * emissive_hit_pdf(h.geometry_idx, h.primitive_id, ray_dir, hit_t, h.is_front_face, rt_emissive_count);
+			// the previous vertex's share as drawn there, carried in the payload (GPU audit 4a).
+			pdf_light = (1.0 - ps.sky_probability) * get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY) * emissive_hit_pdf(h.geometry_idx, h.primitive_id, ray_dir, hit_t, h.is_front_face, rt_emissive_count);
 		}
 		emissive_weight = emissive_mis_weight(ps.bsdf_pdf, pdf_light);
 	}

@@ -316,10 +316,9 @@ bool light_tree_sky_only(LightTreeTop t) {
 	return sky_light_enabled() && sky_total > 0.0 && get_rt_param(RT_PARAM_LIGHT_COUNT) == 0.0 && get_rt_param(RT_PARAM_EMISSIVE_COUNT) == 0.0;
 }
 
-/// The probability with which the sky was chosen at the previous vertex (x, N, over the cut the
-/// payload says it scored): what the miss weighs the sky it found against.
-float light_tree_sky_probability(vec3 x, vec3 N, bool indirect) {
-	LightTreeTop t = light_tree_top(x, N, indirect);
+/// The probability with which a pick from the top t chooses the sky: what the miss weighs the sky
+/// it finds against, carried there in the payload (GPU audit 4a).
+float light_tree_sky_probability(LightTreeTop t) {
 	if (light_tree_sky_only(t)) {
 		return 1.0;
 	}
@@ -626,7 +625,8 @@ bool light_tree_sample_direct(
 		bool is_indirect_bounce,
 		uint candidates,
 		out LightSampleNEE r_sample,
-		out float r_probability) {
+		out float r_probability,
+		out float r_sky_probability) {
 	r_sample.direction = vec3(0.0, 1.0, 0.0);
 	r_sample.shadow_distance = 0.0;
 	r_sample.leg_distance = 0.0;
@@ -636,6 +636,7 @@ bool light_tree_sample_direct(
 	r_probability = 1.0;
 
 	LightTreeTop t = light_tree_top(hit_pos, N_select, is_indirect_bounce);
+	r_sky_probability = light_tree_sky_probability(t);
 	if (light_tree_sky_only(t)) {
 		return sky_sample_direct(N, V, material, rng_state, 1.0, r_sample);
 	}

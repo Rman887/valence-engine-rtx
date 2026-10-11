@@ -960,6 +960,11 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 			inject_define(sources, "#define RT_SUBSURFACE_STATS\n");
 		}
 	}
+	// A define as well as the flag: the payload carries the sky's probability to the next vertex only while the sky light
+	// is on (GPU audit 4a), so a frame without it keeps its payload.
+	if (p_rt_flags & RT_FLAG_SKY_LIGHT) {
+		inject_define(sources, "#define RT_SKY_LIGHT_COMPILED\n");
+	}
 	// The inline shadow ray's counters (P1k) in a verbose run: verbosity is fixed for the process, so no flag bit.
 	if ((p_rt_flags & RT_FLAG_RAY_QUERY_SHADOWS_ENABLED) && OS::get_singleton()->is_stdout_verbose()) {
 		inject_define(sources, "#define RT_SHADOW_STATS\n");

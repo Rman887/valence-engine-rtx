@@ -1919,6 +1919,10 @@ class RenderRaytracing {
 	uint64_t lod_tree_checks = 0;
 	uint64_t lod_tree_mismatches = 0;
 	uint64_t lod_select_timer_frame = 0; // The captured frame last read for the selection's timing.
+	// A verbose run's GPU spans bracketing the sky table's build and its moments (GPU audit 5), per frame that built them.
+	LocalVector<float> sky_table_gpu_us;
+	LocalVector<float> sky_moments_gpu_us;
+	uint64_t sky_timer_frame = 0; // The captured frame last read for them.
 	LocalVector<float> lod_select_gpu_us; // The GPU span bracketing the selection per frame on a verbose run.
 	struct LodSelectShader {
 		ClusterLodSelectShaderRD shader;

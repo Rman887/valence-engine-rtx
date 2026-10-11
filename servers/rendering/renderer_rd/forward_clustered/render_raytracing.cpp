@@ -13665,6 +13665,38 @@ void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDa
 		return;
 	}
 	RD *rd = RD::get_singleton();
+	// A verbose run brackets the table's build and the moments with timestamps (GPU audit 5) and reads the spans of the
+	// frame the device captured last. Like the cluster LOD selection's, a span includes any wait on work still in flight.
+	const bool sky_timer = OS::get_singleton()->is_stdout_verbose();
+	if (sky_timer) {
+		const uint64_t timer_frame = rd->get_captured_timestamps_frame();
+		if (timer_frame != sky_timer_frame) {
+			sky_timer_frame = timer_frame;
+			uint64_t begin = 0;
+			for (uint32_t i = 0; i < rd->get_captured_timestamps_count(); i++) {
+				const String name = rd->get_captured_timestamp_name(i);
+				if (name == "RT sky table" || name == "RT sky moments") {
+					begin = rd->get_captured_timestamp_gpu_time(i);
+				} else if (name == "RT sky table end" && sky_table_gpu_us.size() < 65536) {
+					sky_table_gpu_us.push_back(float(double(rd->get_captured_timestamp_gpu_time(i) - begin) / 1000.0));
+				} else if (name == "RT sky moments end" && sky_moments_gpu_us.size() < 65536) {
+					sky_moments_gpu_us.push_back(float(double(rd->get_captured_timestamp_gpu_time(i) - begin) / 1000.0));
+				}
+			}
+		}
+		if (RSG::rasterizer->get_frame_number() % 300 == 0 && (!sky_table_gpu_us.is_empty() || !sky_moments_gpu_us.is_empty())) {
+			const auto span = [](LocalVector<float> &r_spans) -> String {
+				if (r_spans.is_empty()) {
+					return "none built";
+				}
+				r_spans.sort();
+				const String line = vformat("p50 %.1f us, p90 %.1f us, max %.1f us over %d builds", r_spans[r_spans.size() / 2], r_spans[r_spans.size() * 9 / 10], r_spans[r_spans.size() - 1], r_spans.size());
+				r_spans.clear();
+				return line;
+			};
+			print_verbose(vformat("RT: sky light (GPU audit 5), GPU span bracketing each build (includes waits on work in flight): table %s; moments %s.", span(sky_table_gpu_us), span(sky_moments_gpu_us)));
+		}
+	}
 	RID sky_rid;
 	if (p_render_data && p_render_data->environment.is_valid()) {
 		sky_rid = owner->environment_get_sky(p_render_data->environment);
@@ -13818,8 +13850,12 @@ void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDa
 	// The table and the moments in compute lists of their own: a compute list is one command of RenderingDevice's graph,
 	// and in array mode the leaves bind the octmap's sharpest layer as a 2D view, a slice of the array the moments bind,
 	// which one command cannot hold (the graph can link the command to itself, as one uniform set holding both did). The
-	// graph orders the moments after the table through the table buffer's tracker.
+	// graph orders the moments after the table through the table buffer's tracker. A verbose run's timestamps bracket each
+	// list (GPU audit 5).
 	if (build_table) {
+		if (sky_timer) {
+			rd->capture_timestamp("RT sky table");
+		}
 		RD::ComputeListID compute_list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline[SkyLightShader::MODE_LEAF]);
 		rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[SkyLightShader::MODE_LEAF], 0, u_octmap, u_sampler, u_table), 0);
@@ -13841,14 +13877,23 @@ void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDa
 		rd->compute_list_set_push_constant(compute_list, &pc, sizeof(SkyLightPC));
 		rd->compute_list_dispatch(compute_list, 1, 1, 1);
 		rd->compute_list_end();
+		if (sky_timer) {
+			rd->capture_timestamp("RT sky table end");
+		}
 	}
 	if (build_moments) {
+		if (sky_timer) {
+			rd->capture_timestamp("RT sky moments");
+		}
 		RD::ComputeListID compute_list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline[moments_mode]);
 		rd->compute_list_bind_uniform_set(compute_list, moments_set, 0);
 		rd->compute_list_set_push_constant(compute_list, &pc, sizeof(SkyLightPC));
 		rd->compute_list_dispatch(compute_list, RT_SKY_LIGHT_NORMALS, 1, 1);
 		rd->compute_list_end();
+		if (sky_timer) {
+			rd->capture_timestamp("RT sky moments end");
+		}
 	}
 
 	if (build_table) {

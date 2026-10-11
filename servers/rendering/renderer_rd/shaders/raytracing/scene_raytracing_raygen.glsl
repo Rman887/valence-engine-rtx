@@ -570,8 +570,9 @@ void main() {
 	// for it (D54): the camera ray and a delta lobe keep the whole weight, as with an emitter.
 	if (sky_light_enabled() && get_total_bounces(ps.packed_bounces_flags) > 0u && ps.bsdf_pdf != RT_BSDF_PDF_DELTA) {
 		// The sky's share as the previous vertex drew it (GPU audit 4a), carried in the payload: the tree's
-		// (D55) or the share's (D65) for the receiver it was judged at.
-		sky_add *= sky_mis_weight(ps.bsdf_pdf, ps.sky_probability * sky_pdf(sky_dir));
+		// (D55) or the share's (D65) for the receiver it was judged at. A vertex that gave the sky no share
+		// reads no leaf (4c): its density is 0 whatever the leaf, and most vertices take the share 0 (D62).
+		sky_add *= sky_mis_weight(ps.bsdf_pdf, (ps.sky_probability > 0.0) ? ps.sky_probability * sky_pdf(sky_dir) : 0.0);
 	}
 	if (is_scattered(ps.packed_bounces_flags)) {
 		sky_add = rt_clamp_contribution(sky_add, get_rt_param(RT_PARAM_CLAMP_INDIRECT));

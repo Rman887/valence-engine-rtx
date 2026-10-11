@@ -9481,6 +9481,11 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	entry->cached_counter = p_material_invalidation_counter;
 	entry->cached_rid_version = mat_version;
 	entry->last_used_frame = current_frame;
+	// The row's only writer (D94b): a rebuild that changed it takes a new generation here.
+	if (mat_data->row_generation != 0 && memcmp(&mat_data->row_snapshot, &mat, sizeof(RT_MaterialData)) != 0) {
+		mat_data->row_snapshot = mat;
+		mat_data->row_generation = ++row_generation_counter;
+	}
 
 	return mat_data;
 }

@@ -265,8 +265,9 @@ void RenderRaytracing::_reclaim_idle_viewports(RTViewportState *p_current) {
 }
 
 // ---------------------------------------------------------------------------
-// Row generations: a source's row compared with what it held when its generation was last
-// taken, so every writer of a row is covered without each having to bump it.
+// Row generations. A surface's row is compared with what it held when its generation was last
+// taken, so every writer of a geometry row is covered without each having to bump it. A material's
+// row has one writer, process_material's rebuild, which takes its new generation there.
 // ---------------------------------------------------------------------------
 
 uint64_t RenderRaytracing::_surface_row_generation(RTSurfaceData *p_surf_data) {
@@ -278,10 +279,11 @@ uint64_t RenderRaytracing::_surface_row_generation(RTSurfaceData *p_surf_data) {
 }
 
 uint64_t RenderRaytracing::_material_row_generation(RTMaterialData *p_mat_data) {
-	if (p_mat_data->row_generation == 0 || memcmp(&p_mat_data->row_snapshot, &p_mat_data->data, sizeof(RT_MaterialData)) != 0) {
+	if (p_mat_data->row_generation == 0) {
 		p_mat_data->row_snapshot = p_mat_data->data;
 		p_mat_data->row_generation = ++row_generation_counter;
 	}
+	DEV_ASSERT(memcmp(&p_mat_data->row_snapshot, &p_mat_data->data, sizeof(RT_MaterialData)) == 0);
 	return p_mat_data->row_generation;
 }
 

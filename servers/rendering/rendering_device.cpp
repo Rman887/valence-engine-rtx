@@ -1087,7 +1087,7 @@ Error RenderingDevice::ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p
 	// Validate every write before anything changes. VUID-...-argData-10565: a slot is written
 	// once a build; VUID-...-10568/10569: slots and partitions in range. Occupancy counts the
 	// enabled slots of each partition; a build from scratch starts from none.
-	thread_local HashMap<uint32_t, int64_t> occupancy_delta;
+	thread_local AHashMap<uint32_t, int64_t> occupancy_delta;
 	occupancy_delta.clear();
 	uint32_t high_water = ptlas->slot_high_water;
 	for (uint32_t i = 0; i < p_writes.size(); i++) {
@@ -1456,9 +1456,13 @@ Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAcceler
 	// index data) under INDIRECT_COMMAND_READ at the build stage and writes the destinations
 	// under ACCELERATION_STRUCTURE_WRITE there; a buffer used two ways by one command takes the
 	// usage that carries both (an argument buffer whose infos are read and addresses written).
-	LocalVector<RDG::ResourceTracker *> trackers;
-	LocalVector<RDG::ResourceUsage> usages;
-	HashMap<RDG::ResourceTracker *, uint32_t> tracker_slots; // A batched build lists thousands of buffers (D82).
+	// Kept from build to build, cleared (P2c): a frame records several builds.
+	thread_local LocalVector<RDG::ResourceTracker *> trackers;
+	thread_local LocalVector<RDG::ResourceUsage> usages;
+	thread_local AHashMap<RDG::ResourceTracker *, uint32_t> tracker_slots; // A batched build lists thousands of buffers (D82).
+	trackers.clear();
+	usages.clear();
+	tracker_slots.clear();
 	auto track_tracker = [&](RDG::ResourceTracker *p_tracker, RDG::ResourceUsage p_usage) {
 		if (p_tracker == nullptr) {
 			return;
@@ -1576,7 +1580,8 @@ Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAcceler
 		ERR_FAIL_COND_V_MSG(!p_build.input.flags.has_flag(ACCELERATION_STRUCTURE_ALLOW_CLUSTER_OPACITY_MICROMAPS_BIT), ERR_INVALID_PARAMETER, "A cluster build that reads micromaps needs ACCELERATION_STRUCTURE_ALLOW_CLUSTER_OPACITY_MICROMAPS_BIT.");
 		track_tracker(micromap->storage.draw_tracker, RDG::RESOURCE_USAGE_CLUSTER_ACCELERATION_STRUCTURE_INPUT_READ);
 	}
-	LocalVector<Pair<AccelerationStructure *, RID>> destination_handles;
+	thread_local LocalVector<Pair<AccelerationStructure *, RID>> destination_handles;
+	destination_handles.clear();
 	for (const RID &handle : p_build.dst_acceleration_structures) {
 		AccelerationStructure *acceleration_structure = acceleration_structure_owner.get_or_null(handle);
 		ERR_FAIL_NULL_V_MSG(acceleration_structure, ERR_INVALID_PARAMETER, "A destination acceleration structure is not a valid acceleration structure.");

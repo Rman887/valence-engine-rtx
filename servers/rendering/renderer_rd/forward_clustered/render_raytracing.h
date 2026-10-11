@@ -1113,6 +1113,10 @@ struct RTDeformedClusterBatch {
 	LocalVector<RTDeformedClusterRegion> regions;
 	LocalVector<RID> dropped_handles; // Handles a failed flush left without a build, to leave this frame's TLAS.
 	LocalVector<uint64_t> pending_templates; // Templates made since the last flush, built first by it (D107).
+	// The flush's distinct micromaps, their index buffers and the templates its instantiations read; grow-only (P2c).
+	LocalVector<RID> build_micromaps;
+	LocalVector<RID> build_micromap_index_buffers;
+	LocalVector<RID> build_templates;
 	uint64_t frames_flushed = 0;
 };
 
@@ -1830,6 +1834,7 @@ class RenderRaytracing {
 		bool operator<(const RTLodSlotEvictCandidate &p_other) const { return last_built < p_other.last_built; }
 	};
 	LocalVector<RTLodSlotEvictCandidate> cluster_lod_slot_evict_scratch;
+	LocalVector<RID> pool_owned_scratch; // prepare_frame's TTL sweeps: a pool's RIDs, grow-only (P2c).
 	uint64_t cluster_lod_clas_slot_size = 0;
 	uint32_t cluster_lod_clas_ceiling_clusters = 0; // RT_LOD_CLAS_REGION_CEILING in slots, less the region's alignment.
 	float cluster_lod_pixel_error = 1.0f;
@@ -2375,6 +2380,20 @@ class RenderRaytracing {
 	// selection (D87) share the pool.
 	int32_t _deformed_cluster_region_acquire(uint64_t p_alloc, uint64_t p_alignment);
 	bool _record_deformed_cluster_batch();
+	// The RID lists the frame's cluster builds take, kept from frame to frame (P2c).
+	enum ClusterBuildList {
+		CLUSTER_BUILD_LIST_SOURCES,
+		CLUSTER_BUILD_LIST_STORAGE,
+		CLUSTER_BUILD_LIST_TEMPLATES,
+		CLUSTER_BUILD_LIST_HANDLES,
+		CLUSTER_BUILD_LIST_MICROMAPS,
+		CLUSTER_BUILD_LIST_SLICE_STORAGE,
+		CLUSTER_BUILD_LIST_SLICE_HANDLES,
+		CLUSTER_BUILD_LIST_SLICE_SOURCES,
+		CLUSTER_BUILD_LIST_MAX,
+	};
+	Vector<RID> cluster_build_lists[CLUSTER_BUILD_LIST_MAX];
+	const Vector<RID> &_cluster_build_list(ClusterBuildList p_list, const RID *p_rids, uint32_t p_count, const RID *p_more = nullptr, uint32_t p_more_count = 0);
 	void _flush_deformed_cluster_batch();
 	void _release_deformed_cluster_storage(RTDeformedCacheEntry &p_entry);
 	// The templates of this version of the mesh surface (D107), made on first use and queued for

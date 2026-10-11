@@ -1426,7 +1426,9 @@ void RenderRaytracing::prepare_frame() {
 	// TTL-evict stale deformed-surface entries.
 	{
 		static const uint32_t DEFORMED_CACHE_TTL = (uint32_t)GLOBAL_GET("rendering/pathtracing/deformed_mesh_cache_ttl_frames");
-		LocalVector<RID> live = deformed_pool.get_owned_list();
+		LocalVector<RID> &live = pool_owned_scratch;
+		live.resize(deformed_pool.get_rid_count());
+		deformed_pool.fill_owned_buffer(live.ptr());
 		for (uint32_t i = 0; i < live.size(); i++) {
 			RTDeformedCacheEntry *e = deformed_pool.get_or_null(live[i]);
 			if (!e) {
@@ -1462,7 +1464,9 @@ void RenderRaytracing::prepare_frame() {
 	// handle and arena region go past the frames in flight, as any slot's.
 	{
 		static const uint32_t LOD_SLOT_TTL = (uint32_t)GLOBAL_GET("rendering/pathtracing/deformed_mesh_cache_ttl_frames");
-		LocalVector<RID> live = lod_pool.get_owned_list();
+		LocalVector<RID> &live = pool_owned_scratch;
+		live.resize(lod_pool.get_rid_count());
+		lod_pool.fill_owned_buffer(live.ptr());
 		LocalVector<RTLodSlotEvictCandidate> &slot_candidates = cluster_lod_slot_evict_scratch;
 		slot_candidates.clear();
 		uint64_t slot_protected_bytes = 0;
@@ -1548,7 +1552,9 @@ void RenderRaytracing::prepare_frame() {
 	// TTL-evict stale merged-MultiMesh entries.
 	{
 		static const uint32_t MM_BLAS_CACHE_TTL = (uint32_t)GLOBAL_GET("rendering/pathtracing/multimesh_blas_cache_ttl_frames");
-		LocalVector<RID> live = merged_mm_pool.get_owned_list();
+		LocalVector<RID> &live = pool_owned_scratch;
+		live.resize(merged_mm_pool.get_rid_count());
+		merged_mm_pool.fill_owned_buffer(live.ptr());
 		for (uint32_t i = 0; i < live.size(); i++) {
 			RTMergedMMEntry *e = merged_mm_pool.get_or_null(live[i]);
 			if (!e) {
@@ -3918,6 +3924,24 @@ int32_t RenderRaytracing::_deformed_cluster_region_acquire(uint64_t p_alloc, uin
 	return region_index;
 }
 
+// A cluster build's RID list (RD's build struct takes Vectors): two runs, in one of the lists kept
+// from frame to frame (P2c). A list is filled right before the builds that take it, with no other
+// fill of it in between: a reference taken earlier would see the later fill. A fill writes the list
+// in place unless something still shares its buffer (a build struct a population captured, D98c),
+// which keeps the old contents and leaves the fill a copy.
+const Vector<RID> &RenderRaytracing::_cluster_build_list(ClusterBuildList p_list, const RID *p_rids, uint32_t p_count, const RID *p_more, uint32_t p_more_count) {
+	Vector<RID> &list = cluster_build_lists[p_list];
+	list.resize(p_count + p_more_count);
+	RID *w = list.ptrw();
+	for (uint32_t i = 0; i < p_count; i++) {
+		w[i] = p_rids[i];
+	}
+	for (uint32_t i = 0; i < p_more_count; i++) {
+		w[p_count + i] = p_more[i];
+	}
+	return list;
+}
+
 // Records the frame's builds, two a group. Returns false when one could not be recorded, the
 // builds before it recorded; the caller puts the path in its fallback either way.
 bool RenderRaytracing::_record_deformed_cluster_batch() {
@@ -3974,8 +3998,10 @@ bool RenderRaytracing::_record_deformed_cluster_batch() {
 			info_offset += batch.entries[e]->cluster_infos.size(); // Build or instantiation infos.
 		}
 	}
-	Vector<RID> source_micromaps;
-	LocalVector<RID> micromap_index_buffers;
+	LocalVector<RID> &source_micromaps = batch.build_micromaps;
+	LocalVector<RID> &micromap_index_buffers = batch.build_micromap_index_buffers;
+	source_micromaps.clear();
+	micromap_index_buffers.clear();
 	uint32_t built_info_total = 0;
 	uint32_t templated_info_total = 0;
 	uint32_t cluster_total = 0;
@@ -4096,11 +4122,15 @@ bool RenderRaytracing::_record_deformed_cluster_batch() {
 	}
 	uint8_t *args = batch.args_host.ptr();
 	memset(args, 0, args_size);
-	// The build takes its lists as Vectors: these, the groups' slices of them below, and
-	// RenderingDevice's own per-build map, lists and scratch are the flush's allocations.
-	Vector<RID> storage_buffers, source_buffers, blas_handles, template_buffers;
+	// The build takes its lists as Vectors: these and the groups' slices of them below are kept
+	// from frame to frame (P2c), as RenderingDevice keeps its per-build map and lists; its scratch is
+	// still allocated per build.
+	Vector<RID> &storage_buffers = cluster_build_lists[CLUSTER_BUILD_LIST_STORAGE];
+	Vector<RID> &blas_handles = cluster_build_lists[CLUSTER_BUILD_LIST_HANDLES];
+	LocalVector<RID> &template_list = batch.build_templates;
 	storage_buffers.resize(entry_count);
 	blas_handles.resize(entry_count);
+	template_list.clear();
 	for (const Group &group : groups) {
 		uint32_t first_cluster = group.cluster_begin;
 		uint32_t built_info = group.built_info_begin;
@@ -4118,8 +4148,8 @@ bool RenderRaytracing::_record_deformed_cluster_batch() {
 				}
 				const RTDeformedClusterTemplate *cluster_template = deformed_cluster_templates.getptr(entry->cluster_template_key);
 				ERR_FAIL_COND_V_MSG(cluster_template == nullptr || !cluster_template->built, false, "RT: a templated deformed cluster entry's templates are gone or unbuilt.");
-				if (!template_buffers.has(cluster_template->storage)) {
-					template_buffers.push_back(cluster_template->storage); // A few meshes, many instances.
+				if (!template_list.has(cluster_template->storage)) {
+					template_list.push_back(cluster_template->storage); // A few meshes, many instances.
 				}
 			} else {
 				memcpy(args + clas_infos_offset + uint64_t(built_info) * clas_info_stride, batch.clas_infos.ptr() + batch.info_offsets[e], uint64_t(entry_clusters) * clas_info_stride);
@@ -4138,11 +4168,9 @@ bool RenderRaytracing::_record_deformed_cluster_batch() {
 	}
 	rd->buffer_update(args_buffer, 0, uint32_t(args_size), args);
 
-	source_buffers.resize(batch.source_buffers.size());
-	memcpy(source_buffers.ptrw(), batch.source_buffers.ptr(), sizeof(RID) * batch.source_buffers.size());
-	for (const RID &index_buffer : micromap_index_buffers) {
-		source_buffers.push_back(index_buffer);
-	}
+	const Vector<RID> &source_buffers = _cluster_build_list(CLUSTER_BUILD_LIST_SOURCES, batch.source_buffers.ptr(), batch.source_buffers.size(), micromap_index_buffers.ptr(), micromap_index_buffers.size());
+	const Vector<RID> &template_buffers = _cluster_build_list(CLUSTER_BUILD_LIST_TEMPLATES, template_list.ptr(), template_list.size());
+	const Vector<RID> &micromap_list = _cluster_build_list(CLUSTER_BUILD_LIST_MICROMAPS, source_micromaps.ptr(), source_micromaps.size());
 
 	// Per group, the built CLAS in one build into its part of the region, the driver writing
 	// their addresses; the templated CLAS instantiated in one build into the entries' own storage;
@@ -4164,7 +4192,7 @@ bool RenderRaytracing::_record_deformed_cluster_batch() {
 			build.src_infos_stride = clas_info_stride;
 			build.source_buffers = source_buffers;
 			if (group.omm) {
-				build.source_micromaps = source_micromaps;
+				build.source_micromaps = micromap_list;
 			}
 			if (rd->cluster_acceleration_structure_build(build) != OK) {
 				return false;
@@ -4186,7 +4214,7 @@ bool RenderRaytracing::_record_deformed_cluster_batch() {
 			build.input.max_cluster_vertex_count = group.templated_max_vertices;
 			build.input.max_total_triangle_count = group.templated_triangles;
 			build.input.max_total_vertex_count = group.templated_vertices;
-			build.dst_storage_buffers = storage_buffers.slice(templated_begin, group_end);
+			build.dst_storage_buffers = _cluster_build_list(CLUSTER_BUILD_LIST_SLICE_STORAGE, storage_buffers.ptr() + templated_begin, group_end - templated_begin);
 			build.dst_addresses_buffer = args_buffer;
 			build.dst_addresses_offset = clas_addresses_offset + sizeof(uint64_t) * (group.cluster_begin + group.built_clusters);
 			build.dst_addresses_stride = sizeof(uint64_t);
@@ -4195,7 +4223,7 @@ bool RenderRaytracing::_record_deformed_cluster_batch() {
 			build.src_infos_stride = instantiate_info_stride;
 			build.source_buffers = source_buffers;
 			build.source_acceleration_structure_buffers = template_buffers;
-			build.dst_acceleration_structures = blas_handles.slice(templated_begin, group_end);
+			build.dst_acceleration_structures = _cluster_build_list(CLUSTER_BUILD_LIST_SLICE_HANDLES, blas_handles.ptr() + templated_begin, group_end - templated_begin);
 			if (rd->cluster_acceleration_structure_build(build) != OK) {
 				return false;
 			}
@@ -4208,7 +4236,7 @@ bool RenderRaytracing::_record_deformed_cluster_batch() {
 			build.input.flags = _cluster_build_flags_omm(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT, group.omm);
 			build.input.max_total_cluster_count = group.cluster_count;
 			build.input.max_cluster_count_per_acceleration_structure = batch.max_clusters_per_blas;
-			build.dst_storage_buffers = storage_buffers.slice(group.entry_begin, group_end);
+			build.dst_storage_buffers = _cluster_build_list(CLUSTER_BUILD_LIST_SLICE_STORAGE, storage_buffers.ptr() + group.entry_begin, group_end - group.entry_begin);
 			build.dst_addresses_buffer = args_buffer;
 			build.dst_addresses_offset = blas_addresses_offset + sizeof(uint64_t) * group.entry_begin;
 			build.dst_addresses_stride = sizeof(uint64_t);
@@ -4217,13 +4245,8 @@ bool RenderRaytracing::_record_deformed_cluster_batch() {
 			build.src_infos_stride = blas_info_stride;
 			// The CLAS each BLAS references, read through its info: the region's, and the templated
 			// entries' own, in the storage each BLAS is written to.
-			if (group.built_entries > 0) {
-				build.source_acceleration_structure_buffers.push_back(region->buffer);
-			}
-			if (group.templated_entries > 0) {
-				build.source_acceleration_structure_buffers.append_array(storage_buffers.slice(templated_begin, group_end));
-			}
-			build.dst_acceleration_structures = blas_handles.slice(group.entry_begin, group_end);
+			build.source_acceleration_structure_buffers = _cluster_build_list(CLUSTER_BUILD_LIST_SLICE_SOURCES, group.built_entries > 0 ? &region->buffer : nullptr, group.built_entries > 0 ? 1 : 0, storage_buffers.ptr() + templated_begin, group.templated_entries > 0 ? group_end - templated_begin : 0);
+			build.dst_acceleration_structures = _cluster_build_list(CLUSTER_BUILD_LIST_SLICE_HANDLES, blas_handles.ptr() + group.entry_begin, group_end - group.entry_begin);
 			if (rd->cluster_acceleration_structure_build(build) != OK) {
 				return false;
 			}
@@ -6690,10 +6713,12 @@ void RenderRaytracing::_process_lod_stream() {
 			return order < p_other.order;
 		}
 	};
-	LocalVector<Want> wants;
-	LocalVector<RTLodStreamRead> reads;
-	reads = cluster_lod_stream_reads;
-	cluster_lod_stream_reads.clear();
+	// Kept from frame to frame (P2c): the reads change places with the arrivals' list, each keeping its storage.
+	static thread_local LocalVector<Want> wants;
+	static thread_local LocalVector<RTLodStreamRead> reads;
+	wants.clear();
+	reads.clear();
+	SWAP(reads, cluster_lod_stream_reads);
 	for (const RTLodStreamRead &read : reads) {
 		const uint32_t words = uint32_t(read.bytes.size() / sizeof(uint32_t));
 		if (words < 4) {
@@ -8153,15 +8178,10 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		}
 		uint32_t max_triangles = 0, max_vertices = 0;
 		_deformed_cluster_maxima(caps, max_triangles, max_vertices);
-		Vector<RID> source_buffers, storage_buffers, template_buffers, blas_handles;
-		source_buffers.resize(batch.clas_source_buffers.size());
-		memcpy(source_buffers.ptrw(), batch.clas_source_buffers.ptr(), sizeof(RID) * batch.clas_source_buffers.size());
-		storage_buffers.resize(batch.deformed_storage_buffers.size());
-		memcpy(storage_buffers.ptrw(), batch.deformed_storage_buffers.ptr(), sizeof(RID) * batch.deformed_storage_buffers.size());
-		template_buffers.resize(batch.clas_template_buffers.size());
-		memcpy(template_buffers.ptrw(), batch.clas_template_buffers.ptr(), sizeof(RID) * batch.clas_template_buffers.size());
-		blas_handles.resize(persistent_count);
-		memcpy(blas_handles.ptrw(), batch.blas_handles.ptr(), sizeof(RID) * persistent_count);
+		const Vector<RID> &source_buffers = _cluster_build_list(CLUSTER_BUILD_LIST_SOURCES, batch.clas_source_buffers.ptr(), batch.clas_source_buffers.size());
+		const Vector<RID> &storage_buffers = _cluster_build_list(CLUSTER_BUILD_LIST_STORAGE, batch.deformed_storage_buffers.ptr(), batch.deformed_storage_buffers.size());
+		const Vector<RID> &template_buffers = _cluster_build_list(CLUSTER_BUILD_LIST_TEMPLATES, batch.clas_template_buffers.ptr(), batch.clas_template_buffers.size());
+		const Vector<RID> &blas_handles = _cluster_build_list(CLUSTER_BUILD_LIST_HANDLES, batch.blas_handles.ptr(), persistent_count);
 		{
 			RD::ClusterAccelerationStructureBuild build;
 			build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_INSTANTIATE_TRIANGLE_CLUSTER;
@@ -8226,18 +8246,13 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 	if (clas_bound > 0 && persistent_count == 0) {
 		uint32_t max_triangles = 0, max_vertices = 0;
 		_deformed_cluster_maxima(caps, max_triangles, max_vertices);
-		Vector<RID> source_buffers;
-		source_buffers.resize(batch.clas_source_buffers.size());
-		memcpy(source_buffers.ptrw(), batch.clas_source_buffers.ptr(), sizeof(RID) * batch.clas_source_buffers.size());
 		RD::ClusterAccelerationStructureBuild build;
 		if (cluster_lod_deformed_templated) {
 			if (!_build_deformed_cluster_templates()) {
 				return false;
 			}
 			build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_INSTANTIATE_TRIANGLE_CLUSTER;
-			for (const RID &template_buffer : batch.clas_template_buffers) {
-				build.source_acceleration_structure_buffers.push_back(template_buffer);
-			}
+			build.source_acceleration_structure_buffers = _cluster_build_list(CLUSTER_BUILD_LIST_TEMPLATES, batch.clas_template_buffers.ptr(), batch.clas_template_buffers.size());
 		} else {
 			build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER;
 		}
@@ -8249,7 +8264,7 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		build.input.max_cluster_vertex_count = max_vertices;
 		build.input.max_total_triangle_count = batch.clas_total_triangles;
 		build.input.max_total_vertex_count = batch.clas_total_vertices;
-		build.dst_storage_buffers.push_back(deformed_cluster_batch.regions[region_index].buffer);
+		build.dst_storage_buffer = deformed_cluster_batch.regions[region_index].buffer;
 		build.dst_addresses_buffer = args_buffer;
 		build.dst_addresses_offset = clas_dst_offset;
 		build.dst_addresses_stride = sizeof(uint64_t);
@@ -8258,7 +8273,7 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		build.src_infos_stride = clas_info_stride;
 		build.src_infos_count_buffer = args_buffer;
 		build.src_infos_count_offset = clas_count_offset;
-		build.source_buffers = source_buffers;
+		build.source_buffers = _cluster_build_list(CLUSTER_BUILD_LIST_SOURCES, batch.clas_source_buffers.ptr(), batch.clas_source_buffers.size());
 		if (rd->cluster_acceleration_structure_build(build) != OK) {
 			return false;
 		}
@@ -8278,14 +8293,9 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 				}
 			}
 		}
-		Vector<RID> storage_buffers, source_buffers;
-		storage_buffers.resize(batch.storage_buffers.size());
-		source_buffers.resize(batch.source_buffers.size() + (region_index >= 0 ? 1 : 0));
-		memcpy(storage_buffers.ptrw(), batch.storage_buffers.ptr(), sizeof(RID) * batch.storage_buffers.size());
-		memcpy(source_buffers.ptrw(), batch.source_buffers.ptr(), sizeof(RID) * batch.source_buffers.size());
-		if (region_index >= 0) {
-			source_buffers.write[batch.source_buffers.size()] = deformed_cluster_batch.regions[region_index].buffer;
-		}
+		const Vector<RID> &storage_buffers = _cluster_build_list(CLUSTER_BUILD_LIST_STORAGE, batch.storage_buffers.ptr(), batch.storage_buffers.size());
+		const RID *region_buffer = region_index >= 0 ? &deformed_cluster_batch.regions[region_index].buffer : nullptr;
+		const Vector<RID> &source_buffers = _cluster_build_list(CLUSTER_BUILD_LIST_SOURCES, batch.source_buffers.ptr(), batch.source_buffers.size(), region_buffer, region_buffer != nullptr ? 1 : 0);
 		const uint32_t frame_total = cluster_total - batch.cache_list_clusters;
 		for (int pass = 0; pass < 2; pass++) {
 			// The persistent items' BLAS were built above (D109); the rest as before.
@@ -8294,9 +8304,7 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 			if (count == 0) {
 				continue;
 			}
-			Vector<RID> blas_handles;
-			blas_handles.resize(count);
-			memcpy(blas_handles.ptrw(), batch.blas_handles.ptr() + first, sizeof(RID) * count);
+			const Vector<RID> &blas_handles = _cluster_build_list(CLUSTER_BUILD_LIST_HANDLES, batch.blas_handles.ptr() + first, count);
 
 			RD::ClusterAccelerationStructureBuild build;
 			build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_CLUSTERS_BOTTOM_LEVEL;
@@ -10427,8 +10435,11 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
-	LocalVector<RID> dirty_blas_list;
-	LocalVector<RID> dirty_blas_update_list;
+	// The walk's lists keep their storage from frame to frame: cleared, never freed (P2c).
+	static thread_local LocalVector<RID> dirty_blas_list;
+	static thread_local LocalVector<RID> dirty_blas_update_list;
+	dirty_blas_list.clear();
+	dirty_blas_update_list.clear();
 
 #ifdef TOOLS_ENABLED
 	uint32_t tlas_instance_count = 0;
@@ -10479,7 +10490,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		RTSurfaceData *source = nullptr; // A surface whose geometry streams: its population, holding the upload of its arrays (D93d).
 		bool omm_eligible = false; // An alpha-tested standard material, or a custom shader with render_mode opacity_micromap, on a surface whose geometry is resident (D96).
 	};
-	LocalVector<PendingMMSurface> pending_mm_surfaces;
+	static thread_local LocalVector<PendingMMSurface> pending_mm_surfaces;
+	pending_mm_surfaces.clear();
 
 	// The build budget (D97): this frame's new surfaces and merges admitted or left waiting, once,
 	// before the first viewport's walk, which publishes the frame's budget counters.
@@ -11070,7 +11082,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	// transparent states cull even where FORCE_OPAQUE is set, so the merge carries the base surface's
 	// micromap, once baked, only when every instance of it this frame asks for the same one. Otherwise
 	// it stays plain and the any-hit decides for all of them.
-	HashMap<uint64_t, const RTOmmEntry *> mm_omm_agreed;
+	static thread_local AHashMap<uint64_t, const RTOmmEntry *> mm_omm_agreed;
+	mm_omm_agreed.clear();
 	if (omm_enabled) {
 		for (const PendingMMSurface &pending : pending_mm_surfaces) {
 			const RTOmmEntry *omm = nullptr;
@@ -11483,7 +11496,8 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		float share; // The light's weight in the split between the analytic and the emissive list (D50).
 	};
 
-	LocalVector<LightScore> positional_lights;
+	static thread_local LocalVector<LightScore> positional_lights; // Grow-only (P2c).
+	positional_lights.clear();
 
 	// Lights behind the camera are deprioritized. The penalty ramps in linearly
 	// over BEHIND_FRUSTUM_BUFFER_M so nearby behind-camera lights aren't punished harshly.

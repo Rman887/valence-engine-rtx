@@ -1970,6 +1970,9 @@ class RenderRaytracing {
 	// The surface record's codec check (P3a, RT_SURFACE_CODEC_CHECK_WORDS words, binding 55), made by an asserts build's
 	// first frame, read and cleared on the verbose report's cadence.
 	RID surface_codec_check_buffer;
+	// Binding 43 while a frame has no sky light (GPU audit 4e): the table's fixed part alone, cleared, which the shaders
+	// read as no sky, shared by every viewport in place of a 5.6 MB table each.
+	RID sky_light_placeholder;
 	HashMap<uint32_t, RTSurfaceData *> cluster_lod_stream_surfaces;
 	LocalVector<RTLodStreamRead> cluster_lod_stream_reads;
 	LocalVector<RTLodStreamLoad> cluster_lod_stream_loads;
@@ -2082,6 +2085,8 @@ class RenderRaytracing {
 	// its largest.
 	static constexpr uint32_t RT_SKY_LIGHT_MOMENT_FLOATS = RT_SKY_LIGHT_NORMALS * RT_SKY_LIGHT_CLIP_LEVELS * RT_SKY_LIGHT_SHARES * 4;
 	static constexpr uint32_t RT_SKY_LIGHT_BUFFER_SIZE = (RT_SKY_LIGHT_HEADER_WORDS + RT_SKY_LIGHT_SHARES + RT_SKY_LIGHT_MOMENT_FLOATS + RT_SKY_LIGHT_PYRAMID_FLOATS) * sizeof(float);
+	// Everything before the pyramid's runtime array: the least a binding of the table's block may hold.
+	static constexpr uint32_t RT_SKY_LIGHT_FIXED_SIZE = (RT_SKY_LIGHT_HEADER_WORDS + RT_SKY_LIGHT_SHARES + RT_SKY_LIGHT_MOMENT_FLOATS) * sizeof(float);
 	static_assert((RT_SKY_LIGHT_HEADER_WORDS + RT_SKY_LIGHT_SHARES) % 4 == 0, "The moments' vec4 array must start 16-byte aligned in std430, or the shaders pad where the size does not.");
 	static_assert((RT_SKY_LIGHT_HEADER_WORDS + RT_SKY_LIGHT_SHARES + RT_SKY_LIGHT_MOMENT_FLOATS) % 4 == 0, "The pyramid's vec4 array must start 16-byte aligned in std430, or the shaders pad where the size does not.");
 

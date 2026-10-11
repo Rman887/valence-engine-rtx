@@ -401,6 +401,10 @@ RenderRaytracing::~RenderRaytracing() {
 		RD::get_singleton()->free_rid(shadow_stats_buffer);
 		shadow_stats_buffer = RID();
 	}
+	if (sky_light_placeholder.is_valid()) {
+		RD::get_singleton()->free_rid(sky_light_placeholder);
+		sky_light_placeholder = RID();
+	}
 	if (surface_codec_check_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(surface_codec_check_buffer);
 		surface_codec_check_buffer = RID();
@@ -13428,17 +13432,39 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 	}
 
 	// Binding 43: the sky's sampling table (D54), filled by update_sky_light once the octmap is
-	// rendered; zero until then, which the shader reads as no sky light.
+	// rendered; zero until then, which the shader reads as no sky light. Only while the frame has the sky light
+	// (GPU audit 4e): otherwise the shared placeholder, and a viewport's table is released when it turns the sky
+	// light off, so turning it on again builds a new one.
 	{
-		if (!p_state->sky_light_buffer.is_valid()) {
-			p_state->sky_light_buffer = RD::get_singleton()->storage_buffer_create(RT_SKY_LIGHT_BUFFER_SIZE);
-			RD::get_singleton()->set_resource_name(p_state->sky_light_buffer, "RT Sky Light Buffer");
-			RD::get_singleton()->buffer_clear(p_state->sky_light_buffer, 0, RT_SKY_LIGHT_BUFFER_SIZE);
+		RD *rd = RD::get_singleton();
+		RID table;
+		if (p_rt_flags & SceneShaderRaytracing::RT_FLAG_SKY_LIGHT) {
+			if (!p_state->sky_light_buffer.is_valid()) {
+				p_state->sky_light_buffer = rd->storage_buffer_create(RT_SKY_LIGHT_BUFFER_SIZE);
+				rd->set_resource_name(p_state->sky_light_buffer, "RT Sky Light Buffer");
+				rd->buffer_clear(p_state->sky_light_buffer, 0, RT_SKY_LIGHT_BUFFER_SIZE);
+			}
+			table = p_state->sky_light_buffer;
+		} else {
+			if (p_state->sky_light_buffer.is_valid()) {
+				rd->free_rid(p_state->sky_light_buffer);
+				p_state->sky_light_buffer = RID();
+				p_state->sky_light_sky = RID();
+				p_state->sky_light_version = 0;
+				p_state->sky_light_moments_built = false;
+				p_state->sky_light_mix_valid = false;
+			}
+			if (!sky_light_placeholder.is_valid()) {
+				sky_light_placeholder = rd->storage_buffer_create(RT_SKY_LIGHT_FIXED_SIZE);
+				rd->set_resource_name(sky_light_placeholder, "RT Sky Light Placeholder");
+				rd->buffer_clear(sky_light_placeholder, 0, RT_SKY_LIGHT_FIXED_SIZE);
+			}
+			table = sky_light_placeholder;
 		}
 		RD::Uniform u;
 		u.binding = 43;
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
-		u.append_id(p_state->sky_light_buffer);
+		u.append_id(table);
 		uniforms.push_back(u);
 	}
 

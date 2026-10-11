@@ -281,6 +281,49 @@ Error RenderingDevice::_acceleration_structure_scratch_buffer_create(Acceleratio
 	return OK;
 }
 
+// P2d: a region of the frame's build scratch, p_size bytes at a multiple of 256. The driver aligns
+// the address it is given to the build's own alignment, so p_size carries that slack, as it did
+// when every build had a buffer of its own.
+Error RenderingDevice::_build_scratch_take(uint64_t p_size, RDD::BufferID &r_buffer, uint64_t &r_offset) {
+	Frame &f = frames[frame];
+	const uint64_t size = STEPIFY(MAX(p_size, uint64_t(4)), uint64_t(256));
+	if (f.build_scratch_blocks.is_empty() || f.build_scratch_used + size > f.build_scratch_blocks[f.build_scratch_blocks.size() - 1].size) {
+		uint64_t block_size = MAX(f.build_scratch_reserve, uint64_t(1024 * 1024));
+		if (!f.build_scratch_blocks.is_empty()) {
+			block_size = MAX(block_size, uint64_t(f.build_scratch_blocks[f.build_scratch_blocks.size() - 1].size) * 2);
+		}
+		block_size = MIN(MAX(block_size, Math::next_power_of_2(size)), uint64_t(UINT32_MAX));
+		ERR_FAIL_COND_V_MSG(size > block_size, ERR_CANT_CREATE, "A build's scratch is 4 GB or more.");
+		Buffer block;
+		block.driver_id = driver->buffer_create(block_size, RDD::BUFFER_USAGE_STORAGE_BIT | RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
+		ERR_FAIL_COND_V(!block.driver_id, ERR_CANT_CREATE);
+		block.size = uint32_t(block_size);
+		buffer_memory.add(block.size);
+		f.build_scratch_blocks.push_back(block);
+		f.build_scratch_used = 0;
+	}
+	r_buffer = f.build_scratch_blocks[f.build_scratch_blocks.size() - 1].driver_id;
+	r_offset = f.build_scratch_used;
+	f.build_scratch_used += size;
+	f.build_scratch_taken += size;
+	return OK;
+}
+
+// The frame's fences have passed: its scratch is free again.
+void RenderingDevice::_build_scratch_reset(uint32_t p_frame) {
+	Frame &f = frames[p_frame];
+	if (f.build_scratch_blocks.size() > 1) {
+		for (const Buffer &block : f.build_scratch_blocks) {
+			driver->buffer_free(block.driver_id);
+			buffer_memory.sub(block.size);
+		}
+		f.build_scratch_blocks.clear();
+		f.build_scratch_reserve = Math::next_power_of_2(f.build_scratch_taken);
+	}
+	f.build_scratch_used = 0;
+	f.build_scratch_taken = 0;
+}
+
 void RenderingDevice::_blas_remove_tlas_dependencies(AccelerationStructure *p_blas, RID p_blas_id, bool p_freed) {
 	thread_local LocalVector<RID> kept;
 	kept.clear();
@@ -964,21 +1007,16 @@ Error RenderingDevice::micromap_build(RID p_micromap, RID p_data_buffer, uint64_
 	_check_transfer_worker_buffer(data_buffer);
 	_check_transfer_worker_buffer(triangle_buffer);
 
-	// The scratch lives for this frame's build alone; its size includes the driver's alignment.
-	Buffer scratch = Buffer();
-	scratch.size = MAX(micromap->scratch_size, uint64_t(4));
-	scratch.driver_id = driver->buffer_create(scratch.size, RDD::BUFFER_USAGE_STORAGE_BIT | RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
-	ERR_FAIL_COND_V(!scratch.driver_id, ERR_CANT_CREATE);
-	buffer_memory.add(scratch.size);
-	frames[frame].buffers_to_dispose_of.push_back(scratch);
-
+	// A region of the frame's build scratch (P2d); its size includes the driver's alignment.
 	RDD::MicromapBuild build;
+	Error err = _build_scratch_take(micromap->scratch_size, build.scratch_buffer, build.scratch_offset);
+	ERR_FAIL_COND_V(err != OK, err);
+
 	build.micromap = micromap->driver_id;
 	build.data_buffer = data_buffer->driver_id;
 	build.data_offset = p_data_offset;
 	build.triangle_buffer = triangle_buffer->driver_id;
 	build.triangle_offset = p_triangle_offset;
-	build.scratch_buffer = scratch.driver_id;
 
 	thread_local LocalVector<RDG::ResourceTracker *> sources;
 	sources.clear();
@@ -1590,7 +1628,7 @@ Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAcceler
 		destination_handles.push_back(Pair<AccelerationStructure *, RID>(acceleration_structure, handle));
 	}
 
-	// The scratch lives for this frame's build alone.
+	// The scratch is a region of the frame's build scratch (P2d).
 	uint64_t acceleration_structure_size = 0;
 	uint64_t scratch_size = 0;
 	driver->cluster_acceleration_structure_get_build_sizes(p_build.input, acceleration_structure_size, scratch_size);
@@ -1599,15 +1637,8 @@ Error RenderingDevice::cluster_acceleration_structure_build(const ClusterAcceler
 		ERR_FAIL_COND_V_MSG(p_build.dst_implicit_offset + acceleration_structure_size > implicit_buffer->size, ERR_INVALID_PARAMETER, "The implicit destination is smaller than the build needs.");
 	}
 	const ClusterAccelerationStructureCapabilities &caps = driver->get_cluster_acceleration_structure_capabilities();
-	uint64_t scratch_alloc_size = MAX(scratch_size + caps.cluster_scratch_byte_alignment, uint64_t(caps.cluster_scratch_byte_alignment));
-	Buffer scratch = Buffer();
-	scratch.driver_id = driver->buffer_create(scratch_alloc_size, RDD::BUFFER_USAGE_STORAGE_BIT | RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT, RDD::MEMORY_ALLOCATION_TYPE_GPU, frames_drawn);
-	ERR_FAIL_COND_V(!scratch.driver_id, ERR_CANT_CREATE);
-	DEV_ASSERT(scratch_alloc_size <= UINT32_MAX);
-	scratch.size = scratch_alloc_size;
-	buffer_memory.add(scratch.size);
-	frames[frame].buffers_to_dispose_of.push_back(scratch);
-	rdd_build.scratch_buffer = scratch.driver_id;
+	Error err = _build_scratch_take(scratch_size + caps.cluster_scratch_byte_alignment, rdd_build.scratch_buffer, rdd_build.scratch_offset);
+	ERR_FAIL_COND_V(err != OK, err);
 
 	build_graph->add_cluster_acceleration_structure_build(rdd_build, trackers, usages);
 
@@ -9275,6 +9306,8 @@ void RenderingDevice::_free_pending_resources(int p_frame) {
 		frames[p_frame].buffers_to_dispose_of.pop_front();
 	}
 
+	_build_scratch_reset(p_frame);
+
 	if (frames_pending_resources_for_processing > 0u) {
 		--frames_pending_resources_for_processing;
 	}
@@ -10436,6 +10469,11 @@ void RenderingDevice::finalize() {
 	for (uint32_t i = 0; i < frames.size(); i++) {
 		int f = (frame + i) % frames.size();
 		_free_pending_resources(f);
+		for (const Buffer &block : frames[i].build_scratch_blocks) {
+			driver->buffer_free(block.driver_id);
+			buffer_memory.sub(block.size);
+		}
+		frames[i].build_scratch_blocks.clear();
 		driver->command_pool_free(frames[i].command_pool);
 		driver->timestamp_query_pool_free(frames[i].timestamp_pool);
 		driver->semaphore_free(frames[i].semaphore);

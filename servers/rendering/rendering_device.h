@@ -1414,6 +1414,8 @@ private:
 	};
 
 	Error _acceleration_structure_scratch_buffer_create(AccelerationStructure *p_acceleration_structure);
+	Error _build_scratch_take(uint64_t p_size, RDD::BufferID &r_buffer, uint64_t &r_offset);
+	void _build_scratch_reset(uint32_t p_frame);
 	void _blas_remove_tlas_dependencies(AccelerationStructure *p_blas, RID p_blas_id, bool p_freed = false);
 	void _ptlas_set_slot(AccelerationStructure *p_ptlas, RID p_ptlas_id, uint32_t p_slot, RID p_blas, uint32_t p_partition);
 	void _tlas_remove_blas_dependencies(AccelerationStructure *p_tlas, RID p_tlas_id);
@@ -2142,6 +2144,15 @@ private:
 		RDD::QueryPoolID compute_timestamp_pool; // D98d: created when the timing run asks for it.
 		bool compute_timestamps_written = false;
 		uint64_t compute_timestamp_frame = 0;
+
+		// P2d: the scratch of the frame's cluster and micromap builds, taken in disjoint regions
+		// (so builds on either queue need no ordering on it) and reused once the frame's fences
+		// have passed. A frame that outgrows its block takes another; the next use of the frame
+		// replaces them with one block of the power of two that held them all.
+		LocalVector<Buffer> build_scratch_blocks;
+		uint64_t build_scratch_used = 0; // In the last block.
+		uint64_t build_scratch_taken = 0; // This frame, over every block.
+		uint64_t build_scratch_reserve = 0; // The size of the next first block.
 
 		// Extra command buffer pool used for driver workarounds or to reduce GPU bubbles by
 		// splitting the final render pass to the swapchain into its own cmd buffer.

@@ -833,6 +833,7 @@ public:
 	struct ClusterAccelerationStructureBuild {
 		ClusterAccelerationStructureInput input;
 		BufferID scratch_buffer;
+		uint64_t scratch_offset = 0;
 		// CLUSTER_OP_MODE_IMPLICIT_DESTINATIONS: the region every structure is sub-allocated from.
 		BufferID dst_implicit_buffer;
 		uint64_t dst_implicit_offset = 0;
@@ -924,7 +925,8 @@ public:
 		uint64_t data_offset = 0;
 		BufferID triangle_buffer;
 		uint64_t triangle_offset = 0;
-		BufferID scratch_buffer; // At least the build's scratch size; aligned by the driver.
+		BufferID scratch_buffer; // At least the build's scratch size from scratch_offset on; aligned by the driver.
+		uint64_t scratch_offset = 0;
 	};
 
 	virtual const OpacityMicromapCapabilities &get_opacity_micromap_capabilities() {

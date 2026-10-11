@@ -7491,7 +7491,7 @@ void RenderingDeviceDriverVulkan::command_build_cluster_acceleration_structures(
 	if (p_build.dst_implicit_buffer) {
 		commands_info.dstImplicitData = buffer_get_device_address(p_build.dst_implicit_buffer) + p_build.dst_implicit_offset;
 	}
-	commands_info.scratchData = _align_up_address(buffer_get_device_address(p_build.scratch_buffer), cluster_acceleration_structure_capabilities.cluster_scratch_byte_alignment);
+	commands_info.scratchData = _align_up_address(buffer_get_device_address(p_build.scratch_buffer) + p_build.scratch_offset, cluster_acceleration_structure_capabilities.cluster_scratch_byte_alignment);
 	if (p_build.dst_addresses_buffer) {
 		commands_info.dstAddressesArray.deviceAddress = buffer_get_device_address(p_build.dst_addresses_buffer) + p_build.dst_addresses_offset;
 		commands_info.dstAddressesArray.stride = p_build.dst_addresses_stride;
@@ -7558,7 +7558,7 @@ void RenderingDeviceDriverVulkan::command_build_micromap(CommandBufferID p_cmd_b
 	build_info.data.deviceAddress = buffer_get_device_address(p_build.data_buffer) + p_build.data_offset;
 	build_info.triangleArray.deviceAddress = buffer_get_device_address(p_build.triangle_buffer) + p_build.triangle_offset;
 	// The acceleration structure scratch alignment applies to micromap builds as well.
-	build_info.scratchData.deviceAddress = _align_up_address(buffer_get_device_address(p_build.scratch_buffer), acceleration_structure_capabilities.min_acceleration_structure_scratch_offset_alignment);
+	build_info.scratchData.deviceAddress = _align_up_address(buffer_get_device_address(p_build.scratch_buffer) + p_build.scratch_offset, acceleration_structure_capabilities.min_acceleration_structure_scratch_offset_alignment);
 	vkCmdBuildMicromapsEXT(command_buffer->vk_command_buffer, 1, &build_info);
 
 	vkCmdPipelineBarrier(command_buffer->vk_command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &memory_barrier, 0, nullptr, 0, nullptr);

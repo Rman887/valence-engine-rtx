@@ -369,12 +369,38 @@ vec3 shade_previous_origin(HitData h, vec3 ray_dir, float hit_t) {
 #endif
 }
 
+#ifdef RT_STAGE_CLOSEST_HIT
+// VAL (GPU audit P3e): a shadow ray the inline test leaves unresolved is traced through the pipeline at the end of the
+// closest hit (shade_resolve_shadows), after the payload is packed, rather than where its light sample is drawn: a
+// trace in the middle of the shading split the hit into continuations that saved and restored everything live across
+// it. A hit draws at most two light samples, slot 0 at the hit and slot 1 at a subsurface walk's exit, and nothing
+// writes the radiance between or after them, so the radiance each outcome would have is formed here in the original
+// order, in fp32 (rt_nee_radiance1 with slot 0's light, 2 with slot 1's, 3 with both, ps.radiance with neither), and
+// rounded once by path_pack_radiance, as path_pack rounds the radiance: the same bits. A sum is read only for a set of
+// slots whose bits are pending, so one left unset is never chosen; both slots pass the hit's arriving diffuse count, so
+// one set of opacity micromap flags serves both.
+uint rt_shadow_pending = 0u; // Bit s: slot s's ray waits for the pipeline.
+vec3 rt_nee_radiance1;
+vec3 rt_nee_radiance2;
+vec3 rt_nee_radiance3;
+vec3 rt_shadow_origin0;
+vec3 rt_shadow_dir0;
+float rt_shadow_distance0;
+vec3 rt_shadow_origin1;
+vec3 rt_shadow_dir1;
+float rt_shadow_distance1;
+uint rt_shadow_omm_flags;
+#endif
+
 /// One light sample at a surface for its next-event estimate (D50 to D72): the strategy split, the sample,
-/// the shadow ray and the BSDF, added to ps.radiance at the path's throughput. The caller pins the
-/// sampler's dimension first. p_hit_pos and p_geometry_normal are the vertex and its normal facing the side
+/// the shadow ray and the BSDF, added to ps.radiance at the path's throughput (in a closest hit, a ray the inline test
+/// cannot decide waits for the end of the hit with the sum it would make, GPU audit P3e). The caller pins the
+/// sampler's dimension first. p_slot is the sample's place at its hit, 0 at the surface and 1 at a subsurface walk's
+/// exit.
+/// p_hit_pos and p_geometry_normal are the vertex and its normal facing the side
 /// the path arrived from, p_hit_t the length of the segment that reached it (for the origin's offset);
 /// diffuse_transmit_max a thin surface's transmission (D103), whose samples below N leave from the back.
-void shade_direct_light(vec3 p_hit_pos, vec3 p_geometry_normal, float p_hit_t, vec3 N, vec3 V, MaterialProperties brdf_mat, float diffuse_transmit_max, uint diffuse_bounces, uint rt_emissive_count, bool in_medium, inout PathState ps) {
+void shade_direct_light(vec3 p_hit_pos, vec3 p_geometry_normal, float p_hit_t, vec3 N, vec3 V, MaterialProperties brdf_mat, float diffuse_transmit_max, uint diffuse_bounces, uint rt_emissive_count, bool in_medium, uint p_slot, inout PathState ps) {
 	uint rt_light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
 	// The selection's receiver: the geometry normal as the payload carries it to the next vertex,
 	// so the chance-hit and miss densities there read the same function of the same normal (the
@@ -445,7 +471,12 @@ void shade_direct_light(vec3 p_hit_pos, vec3 p_geometry_normal, float p_hit_t, v
 			shadow_distance = length(to_light);
 			shadow_dir = to_light / max(shadow_distance, 1e-6);
 		}
-		if (have_sample && lights_trace_shadow_ray(shadow_origin, shadow_dir, shadow_distance, RT_OMM_RAY_FLAGS(diffuse_bounces), ps.rng_state)) {
+#ifdef RT_STAGE_CLOSEST_HIT
+		uint shadow = have_sample ? lights_shadow_ray_inline(shadow_origin, shadow_dir, shadow_distance, RT_OMM_RAY_FLAGS(diffuse_bounces)) : RT_SHADOW_OCCLUDED;
+#else
+		uint shadow = (have_sample && lights_trace_shadow_ray(shadow_origin, shadow_dir, shadow_distance, RT_OMM_RAY_FLAGS(diffuse_bounces), ps.rng_state)) ? RT_SHADOW_VISIBLE : RT_SHADOW_OCCLUDED;
+#endif
+		if (shadow != RT_SHADOW_OCCLUDED) {
 			// Evaluate BRDF (diffuse + specular separately for specular_amount control).
 			vec3 brdf_diffuse, brdf_specular;
 			evalCombinedBRDFSeparate(N, light_sample.direction, V, brdf_mat, brdf_diffuse, brdf_specular);
@@ -460,7 +491,33 @@ void shade_direct_light(vec3 p_hit_pos, vec3 p_geometry_normal, float p_hit_t, v
 				direct_light *= exp(-path_medium_absorption(ps) * leg);
 			}
 			// The clamp (D53): direct at the surface the camera sees, indirect after a scatter.
-			ps.radiance += rt_clamp_contribution(ps.throughput * direct_light, get_rt_param(is_scattered(ps.packed_bounces_flags) ? RT_PARAM_CLAMP_INDIRECT : RT_PARAM_CLAMP_DIRECT));
+			vec3 contribution = rt_clamp_contribution(ps.throughput * direct_light, get_rt_param(is_scattered(ps.packed_bounces_flags) ? RT_PARAM_CLAMP_INDIRECT : RT_PARAM_CLAMP_DIRECT));
+#ifdef RT_STAGE_CLOSEST_HIT
+			if (shadow == RT_SHADOW_UNRESOLVED) {
+				// The ray waits for the end of the hit; the radiance it would bring is formed now, in order.
+				if (p_slot == 0u) {
+					rt_nee_radiance1 = ps.radiance + contribution;
+					rt_shadow_origin0 = shadow_origin;
+					rt_shadow_dir0 = shadow_dir;
+					rt_shadow_distance0 = shadow_distance;
+				} else {
+					rt_nee_radiance2 = ps.radiance + contribution;
+					rt_nee_radiance3 = rt_nee_radiance1 + contribution;
+					rt_shadow_origin1 = shadow_origin;
+					rt_shadow_dir1 = shadow_dir;
+					rt_shadow_distance1 = shadow_distance;
+				}
+				rt_shadow_pending |= 1u << p_slot;
+				rt_shadow_omm_flags = RT_OMM_RAY_FLAGS(diffuse_bounces);
+			} else {
+				ps.radiance += contribution;
+				if (p_slot == 1u) {
+					rt_nee_radiance1 += contribution; // Slot 0's outcome, if it waits, gains the exit's light after it.
+				}
+			}
+#else
+			ps.radiance += contribution;
+#endif
 		}
 	}
 }
@@ -951,7 +1008,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 #error RT_SOBOL_DIM_SCATTER must exceed the light sampling paths' draw counts
 #endif
 	rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE);
-	shade_direct_light(h.hit_pos, h.geometry_normal, hit_t, N, V, brdf_mat, diffuse_transmit_max, diffuse_bounces, rt_emissive_count, in_medium, ps);
+	shade_direct_light(h.hit_pos, h.geometry_normal, hit_t, N, V, brdf_mat, diffuse_transmit_max, diffuse_bounces, rt_emissive_count, in_medium, 0u, ps);
 
 	// =================================================================
 	// Transmission: refract through the surface with probability transmit_p
@@ -1148,7 +1205,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 			// the walk the path has scattered, so its light is indirect for the clamp (D53).
 			ps.packed_bounces_flags = set_scattered(ps.packed_bounces_flags);
 			rng_set_dimension(ps.rng_state, RT_SOBOL_DIM_SUBSURFACE_EXIT_BASE + total_bounces * RT_SOBOL_DIMS_PER_BOUNCE);
-			shade_direct_light(exit_position, exit_normal, exit_t, exit_shading_normal, exit_shading_normal, exit_mat, 0.0, diffuse_bounces, rt_emissive_count, in_medium, ps);
+			shade_direct_light(exit_position, exit_normal, exit_t, exit_shading_normal, exit_shading_normal, exit_mat, 0.0, diffuse_bounces, rt_emissive_count, in_medium, 1u, ps);
 			// And its direction: the cosine cancels its density, leaving a weight of 1.
 			rng_set_dimension(ps.rng_state, RT_SOBOL_DIM_SUBSURFACE_EXIT_BASE + total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER);
 			next_dir = rotatePoint(getRotationFromZAxis(exit_shading_normal), sampleHemisphere(rand2(ps.rng_state)));

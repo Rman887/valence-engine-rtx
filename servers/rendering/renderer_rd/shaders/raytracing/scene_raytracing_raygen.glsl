@@ -732,6 +732,34 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 #include "raytracing_surface_inc.glsl"
 // clang-format on
 
+/// The shadow rays shade_direct_light left to the pipeline (GPU audit P3e), traced at the end of the hit with the payload
+/// packed, one call site whatever their count; the payload's radiance becomes the outcome's, rounded as the pack rounds.
+void shade_resolve_shadows() {
+	uint pending = rt_shadow_pending;
+	if (pending == 0u) {
+		return;
+	}
+	uvec2 radiance1 = path_pack_radiance(rt_nee_radiance1);
+	uvec2 radiance2 = path_pack_radiance(rt_nee_radiance2);
+	uvec2 radiance3 = path_pack_radiance(rt_nee_radiance3);
+	uint visible = 0u;
+	// A loop over the waiting slots, its count the data's, so the trace is one call site.
+	uint left = pending;
+	while (left != 0u) {
+		uint s = uint(findLSB(left));
+		left &= left - 1u;
+		bool first = s == 0u;
+		if (lights_trace_shadow_ray_pipeline(first ? rt_shadow_origin0 : rt_shadow_origin1, first ? rt_shadow_dir0 : rt_shadow_dir1, first ? rt_shadow_distance0 : rt_shadow_distance1, rt_shadow_omm_flags)) {
+			visible |= 1u << s;
+		}
+	}
+	if (visible != 0u) {
+		uvec2 r = (visible == 3u) ? radiance3 : ((visible == 1u) ? radiance1 : radiance2);
+		payload.packed_rt[0] = r.x;
+		payload.packed_rt[1] = (payload.packed_rt[1] & 0xFFFF0000u) | r.y;
+	}
+}
+
 /// Shades the evaluated surface and hands the path back to the raygen in the payload. A function of its own, so a custom
 /// hit group's fragment code, spliced into main, cannot shadow its names.
 void shade_hit(HitData h, MaterialResult m) {
@@ -741,6 +769,7 @@ void shade_hit(HitData h, MaterialResult m) {
 	PathState ps = path_unpack(payload);
 	shade_and_bounce(h, m, gl_WorldRayDirectionEXT, gl_HitTEXT, ps);
 	path_pack(payload, ps);
+	shade_resolve_shadows();
 }
 
 // ============================================================================

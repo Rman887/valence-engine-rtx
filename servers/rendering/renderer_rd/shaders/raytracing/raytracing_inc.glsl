@@ -165,12 +165,19 @@ PathState path_unpack(PathPayload p) {
 	return s;
 }
 
+/// The radiance as the payload carries it: red and green in packed_rt[0], blue in the low half of packed_rt[1]. One
+/// function for path_pack and the closest hit's deferred shadow rays (shade_resolve_shadows), so both round alike.
+uvec2 path_pack_radiance(vec3 p_radiance) {
+	vec3 r = clamp(p_radiance, vec3(0.0), vec3(65504.0));
+	return uvec2(packHalf2x16(r.rg), packHalf2x16(vec2(r.b, 0.0)));
+}
+
 void path_pack(inout PathPayload p, PathState s) {
 	const float FP16_MAX = 65504.0;
-	vec3 r = clamp(s.radiance, vec3(0.0), vec3(FP16_MAX));
+	uvec2 r = path_pack_radiance(s.radiance);
 	vec3 t = clamp(s.throughput, vec3(0.0), vec3(FP16_MAX));
-	p.packed_rt[0] = packHalf2x16(vec2(r.r, r.g));
-	p.packed_rt[1] = packHalf2x16(vec2(r.b, t.r));
+	p.packed_rt[0] = r.x;
+	p.packed_rt[1] = r.y | (packHalf2x16(vec2(0.0, t.r)) & 0xFFFF0000u);
 	p.packed_rt[2] = packHalf2x16(vec2(t.g, t.b));
 	p.packed_bounces_flags = s.packed_bounces_flags;
 	p.rng_state = s.rng_state;

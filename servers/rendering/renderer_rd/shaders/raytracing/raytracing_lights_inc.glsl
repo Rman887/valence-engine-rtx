@@ -408,9 +408,13 @@ bool lights_shadow_candidate_inline(rayQueryEXT p_query) {
 }
 #endif
 
-/// Returns true if light is visible.
+#define RT_SHADOW_OCCLUDED 0u
+#define RT_SHADOW_VISIBLE 1u
+#define RT_SHADOW_UNRESOLVED 2u // A candidate only the pipeline's shaders can decide, and nothing committed.
+
+/// The shadow ray's inline decision: occluded, visible, or unresolved (always, without USE_RAY_QUERY_SHADOWS).
 /// omm_flags: RT_OMM_RAY_FLAGS of the vertex's arriving diffuse count (D96 OMMe).
-bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, uint omm_flags, inout uint rng_state) {
+uint lights_shadow_ray_inline(vec3 origin, vec3 direction, float max_dist, uint omm_flags) {
 #ifdef USE_RAY_QUERY_SHADOWS
 	// VAL (P1k, docs/gpu-audit-2026-10.md): an inline query, which spills nothing of the hit's shading state around a
 	// nested trace. Opaque instances commit without a candidate, and a standard material's alpha is tested here as its
@@ -449,9 +453,19 @@ bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, uint o
 	}
 #endif
 	if (occluded || !unresolved) {
-		return !occluded;
+		return occluded ? RT_SHADOW_OCCLUDED : RT_SHADOW_VISIBLE;
 	}
 #endif
+	return RT_SHADOW_UNRESOLVED;
+}
+
+/// Returns true if light is visible: the inline decision, and the pipeline for a ray it leaves unresolved.
+/// omm_flags: RT_OMM_RAY_FLAGS of the vertex's arriving diffuse count (D96 OMMe).
+bool lights_trace_shadow_ray(vec3 origin, vec3 direction, float max_dist, uint omm_flags, inout uint rng_state) {
+	uint status = lights_shadow_ray_inline(origin, direction, max_dist, omm_flags);
+	if (status != RT_SHADOW_UNRESOLVED) {
+		return status == RT_SHADOW_VISIBLE;
+	}
 	return lights_trace_shadow_ray_pipeline(origin, direction, max_dist, omm_flags);
 }
 

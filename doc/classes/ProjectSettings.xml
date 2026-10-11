@@ -3585,6 +3585,9 @@
 			Enable the pipeline cache that is saved to disk if the graphics API supports it.
 			[b]Note:[/b] This property is unable to control the pipeline caching the GPU driver itself does. Only turn this off along with deleting the contents of the driver's cache if you wish to simulate the experience a user will get when starting the game for the first time.
 		</member>
+		<member name="rendering/rendering_device/pipeline_cache/max_size_mb" type="int" setter="" getter="" default="1024">
+			The largest pipeline cache file, in mebibytes, kept on disk; held to 1 to 1024, read at start-up. A Vulkan pipeline cache cannot be trimmed, so a cache whose file would grow past this size is not saved again for the rest of the session and its file is deleted: the next session starts with an empty cache and keeps only the pipelines it compiles. A cache file already larger than this is discarded when the project starts. The cache file's format cannot exceed 2 GiB.
+		</member>
 		<member name="rendering/rendering_device/pipeline_cache/save_chunk_size_mb" type="float" setter="" getter="" default="3.0">
 			Determines at which interval pipeline cache is saved to disk. The lower the value, the more often it is saved.
 		</member>

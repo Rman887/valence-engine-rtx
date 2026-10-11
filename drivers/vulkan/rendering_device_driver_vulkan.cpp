@@ -5743,6 +5743,10 @@ void RenderingDeviceDriverVulkan::command_bind_push_constants(CommandBufferID p_
 
 int RenderingDeviceDriverVulkan::caching_instance_count = 0;
 
+// VAL: the most data a cache file can hold: the header stores its size as a uint32_t and
+// hash_murmur3_buffer() takes an int length, so larger data would wrap both.
+static constexpr uint64_t PIPELINE_CACHE_DATA_SIZE_MAX = INT32_MAX;
+
 bool RenderingDeviceDriverVulkan::pipeline_cache_create(const Vector<uint8_t> &p_data) {
 	if (caching_instance_count) {
 		WARN_PRINT("There's already a RenderingDeviceDriverVulkan instance doing PSO caching. Only one can at the same time. This one won't.");
@@ -5759,6 +5763,8 @@ bool RenderingDeviceDriverVulkan::pipeline_cache_create(const Vector<uint8_t> &p
 			// No pre-existing cache, just create it.
 		} else if (p_data.size() <= (int)sizeof(PipelineCacheHeader)) {
 			print_verbose("Invalid/corrupt Vulkan pipelines cache. Existing shader pipeline cache will be ignored, which may result in stuttering during gameplay.");
+		} else if (uint64_t(p_data.size()) - sizeof(PipelineCacheHeader) > PIPELINE_CACHE_DATA_SIZE_MAX) {
+			print_verbose("Vulkan pipelines cache too large to verify. Existing shader pipeline cache will be ignored, which may result in stuttering during gameplay.");
 		} else {
 			const PipelineCacheHeader *loaded_header = reinterpret_cast<const PipelineCacheHeader *>(p_data.ptr());
 			if (loaded_header->magic != 868 + VK_PIPELINE_CACHE_HEADER_VERSION_ONE) {
@@ -5824,6 +5830,8 @@ size_t RenderingDeviceDriverVulkan::pipeline_cache_query_size() {
 
 Vector<uint8_t> RenderingDeviceDriverVulkan::pipeline_cache_serialize() {
 	DEV_ASSERT(pipelines_cache.vk_cache);
+
+	ERR_FAIL_COND_V_MSG(pipelines_cache.current_size > PIPELINE_CACHE_DATA_SIZE_MAX, Vector<uint8_t>(), vformat("Vulkan pipeline cache too large to save (%d bytes).", uint64_t(pipelines_cache.current_size)));
 
 	pipelines_cache.buffer.resize(pipelines_cache.current_size + sizeof(PipelineCacheHeader));
 

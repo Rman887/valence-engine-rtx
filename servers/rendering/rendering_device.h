@@ -1244,6 +1244,10 @@ private:
 
 	bool pipeline_cache_enabled = false;
 	size_t pipeline_cache_size = 0;
+	// VAL: the largest pipeline cache file kept (rendering/rendering_device/pipeline_cache/max_size_mb, read at start-up), and
+	// whether this session's outgrew it, after which it saves nothing.
+	uint64_t pipeline_cache_max_size = 0;
+	bool pipeline_cache_over_limit = false;
 	String pipeline_cache_file_path;
 	WorkerThreadPool::TaskID pipeline_cache_save_task = WorkerThreadPool::INVALID_TASK_ID;
 

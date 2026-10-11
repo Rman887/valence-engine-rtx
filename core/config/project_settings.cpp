@@ -1829,6 +1829,7 @@ ProjectSettings::ProjectSettings() {
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/rendering_device/staging_buffer/texture_download_region_size_px", PROPERTY_HINT_RANGE, "1,256,1,or_greater"), 64);
 	GLOBAL_DEF_RST(PropertyInfo(Variant::BOOL, "rendering/rendering_device/pipeline_cache/enable"), true);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/rendering_device/pipeline_cache/save_chunk_size_mb", PROPERTY_HINT_RANGE, "0.000001,64.0,0.001,or_greater"), 3.0);
+	GLOBAL_DEF_RST(PropertyInfo(Variant::INT, "rendering/rendering_device/pipeline_cache/max_size_mb", PROPERTY_HINT_RANGE, "1,1024,1"), 1024); // VAL: the pipeline cache's cap (RenderingDevice::_save_pipeline_cache), so it cannot grow past its file format's 2 GiB.
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/rendering_device/vulkan/max_descriptors_per_pool", PROPERTY_HINT_RANGE, "1,256,1,or_greater"), 64);
 	// Read by the Vulkan driver when it requests device extensions, before RenderingServer defines the other pathtracing settings.
 	GLOBAL_DEF_RST(PropertyInfo(Variant::BOOL, "rendering/pathtracing/cluster_blas"), true);

@@ -10113,6 +10113,9 @@ Error RenderingDevice::initialize(RenderingContextDriver *p_context, DisplayServ
 			pipeline_cache_file_path += ".editor";
 		}
 		pipeline_cache_file_path += ".cache";
+		// VAL: the cap on the cache file, held to what the file's format can carry (its data size is a uint32_t and its
+		// hash takes an int length) with room for a save's growth past the cap before it is refused.
+		pipeline_cache_max_size = uint64_t(CLAMP(int(GLOBAL_GET("rendering/rendering_device/pipeline_cache/max_size_mb")), 1, 1024)) * 1024 * 1024;
 
 		Vector<uint8_t> cache_data = _load_pipeline_cache();
 		pipeline_cache_enabled = driver->pipeline_cache_create(cache_data);
@@ -10132,6 +10135,15 @@ Vector<uint8_t> RenderingDevice::_load_pipeline_cache() {
 	DirAccess::make_dir_recursive_absolute(pipeline_cache_file_path.get_base_dir());
 
 	if (FileAccess::exists(pipeline_cache_file_path)) {
+		// VAL: a cache file past the cap is dropped, so the session rebuilds only the pipelines it uses.
+		Ref<FileAccess> f = FileAccess::open(pipeline_cache_file_path, FileAccess::READ);
+		if (f.is_valid() && f->get_length() > pipeline_cache_max_size) {
+			f.unref();
+			print_line(vformat("Pipeline cache over %d MiB, discarded: %s", pipeline_cache_max_size / (1024 * 1024), pipeline_cache_file_path));
+			DirAccess::remove_absolute(pipeline_cache_file_path);
+			return Vector<uint8_t>();
+		}
+		f.unref();
 		Error file_error;
 		Vector<uint8_t> file_data = FileAccess::get_file_as_bytes(pipeline_cache_file_path, &file_error);
 		return file_data;
@@ -10154,6 +10166,10 @@ void RenderingDevice::update_pipeline_cache(bool p_closing) {
 				return;
 			}
 		}
+	}
+
+	if (pipeline_cache_over_limit) {
+		return; // VAL: past the cap (_save_pipeline_cache), nothing more is saved this session.
 	}
 
 	{
@@ -10189,8 +10205,20 @@ void RenderingDevice::_save_pipeline_cache(void *p_data) {
 
 	self->_thread_safe_.lock();
 	Vector<uint8_t> cache_blob = self->driver->pipeline_cache_serialize();
+	// VAL: a cache cannot be trimmed, so a file that would outgrow the cap is not written and the one on disk is removed: the
+	// next session starts empty and keeps only the pipelines it uses, and this one saves nothing more. Without a cap the
+	// cache grew unbounded, and past 2 GiB every save crashed (the size wraps the header's uint32_t and the hash's int).
+	const bool over_limit = uint64_t(cache_blob.size()) > self->pipeline_cache_max_size;
+	if (over_limit) {
+		self->pipeline_cache_over_limit = true;
+	}
 	self->_thread_safe_.unlock();
 
+	if (over_limit) {
+		print_line(vformat("Pipeline cache over %d MiB, not saved and discarded: %s", self->pipeline_cache_max_size / (1024 * 1024), self->pipeline_cache_file_path));
+		DirAccess::remove_absolute(self->pipeline_cache_file_path);
+		return;
+	}
 	if (cache_blob.is_empty()) {
 		return;
 	}

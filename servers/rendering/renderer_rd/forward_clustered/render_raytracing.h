@@ -2325,7 +2325,7 @@ class RenderRaytracing {
 	BuildBudgetTake _build_budget_take(uint64_t p_cost, bool p_carry, bool p_force);
 	bool _build_budget_take_walk(uint64_t p_cost, uint64_t &r_budget_frame, uint64_t &r_wait_since);
 	void _build_budget_note_wait(uint64_t p_since);
-	void _build_budget_consider_surface(RID p_mesh, uint32_t p_surface_index, void *p_mesh_surface, float p_priority, bool p_traced);
+	void _build_budget_consider_surface(RID p_mesh, uint32_t p_surface_index, void *p_mesh_surface, float p_priority);
 	void _build_budget_prepass(const RenderDataRD *p_render_data, uint32_t p_rt_flags);
 	bool _build_budget_admit_surface(RTCacheEntry *p_entry, void *p_mesh_surface);
 	_FORCE_INLINE_ bool _build_budget_merge_waits(RID p_mm_rid, uint32_t p_surface_index) const {

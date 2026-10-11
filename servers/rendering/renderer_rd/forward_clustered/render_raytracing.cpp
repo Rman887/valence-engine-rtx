@@ -1762,11 +1762,9 @@ void RenderRaytracing::_build_budget_note_wait(uint64_t p_since) {
 
 // A surface the walk will populate unless it waits: one whose cache entry misses and holds no BLAS
 // the trace already takes (a rebuild under one is forced, as is any miss of a surface its instance
-// traced the frame before). Its wait carries over only from a decision made the frame before.
-void RenderRaytracing::_build_budget_consider_surface(RID p_mesh, uint32_t p_surface_index, void *p_mesh_surface, float p_priority, bool p_traced) {
-	if (p_traced) {
-		return; // Its instance traced it the frame before: whatever it misses is forced.
-	}
+// traced the frame before, which the caller leaves out). Its wait carries over only from a decision
+// made the frame before.
+void RenderRaytracing::_build_budget_consider_surface(RID p_mesh, uint32_t p_surface_index, void *p_mesh_surface, float p_priority) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	BuildBudget &budget = build_budget;
 	const uint32_t cache_key = (p_mesh.get_local_index() << 8) | (p_surface_index & 0xFF);
@@ -1830,7 +1828,15 @@ void RenderRaytracing::_build_budget_prepass(const RenderDataRD *p_render_data, 
 		if (!inst || !inst->data || inst->rt_procedural) {
 			continue; // A procedural AABB BLAS builds when it is dirty, as before.
 		}
-		const float priority = _build_budget_priority(inst->transformed_aabb, camera);
+		// Taken for an instance with something to admit only: on a settled frame none has, and the
+		// pass is a walk over the surfaces' traced bits.
+		float priority = -1.0f;
+		auto instance_priority = [&]() {
+			if (priority < 0.0f) {
+				priority = _build_budget_priority(inst->transformed_aabb, camera);
+			}
+			return priority;
+		};
 		const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = inst->surface_caches;
 		if (inst->data->base_type == RSE::INSTANCE_MULTIMESH) {
 			const RID mm_rid = inst->data->base;
@@ -1877,7 +1883,7 @@ void RenderRaytracing::_build_budget_prepass(const RenderDataRD *p_render_data, 
 					const uint64_t key = (uint64_t(mm_rid.get_local_index()) << 32) | surf->surface_index;
 					uint32_t *found = budget.candidate_merges.getptr(key);
 					if (found != nullptr) {
-						budget.candidates[*found].priority = MAX(budget.candidates[*found].priority, priority);
+						budget.candidates[*found].priority = MAX(budget.candidates[*found].priority, instance_priority());
 					} else {
 						const BuildBudget::MergeWait *wait = budget.merge_waits.getptr(key);
 						BuildBudget::Candidate candidate;
@@ -1885,7 +1891,7 @@ void RenderRaytracing::_build_budget_prepass(const RenderDataRD *p_render_data, 
 						candidate.merge_id = mm_rid.get_id();
 						candidate.cost = uint64_t(mm_count) * _build_budget_surface_cost(mesh_surface);
 						candidate.wait_since = (wait != nullptr && wait->mm_id == candidate.merge_id && wait->seen + 1 == frames_drawn) ? wait->since : 0;
-						candidate.priority = priority;
+						candidate.priority = instance_priority();
 						candidate.order = budget.candidates.size();
 						candidate.kind = BuildBudget::CANDIDATE_MERGE;
 						budget.candidate_merges.insert(key, budget.candidates.size());
@@ -1893,8 +1899,8 @@ void RenderRaytracing::_build_budget_prepass(const RenderDataRD *p_render_data, 
 					}
 				}
 				// The expanded path populates the surface, and so does a streamed surface's merge (D93d).
-				if ((!merges || mesh_storage->mesh_surface_is_geometry_streamed(mesh_surface)) && mesh.is_valid()) {
-					_build_budget_consider_surface(mesh, surf->surface_index, mesh_surface, priority, _build_budget_traced(inst, surf->surface_index, frames_drawn));
+				if ((!merges || mesh_storage->mesh_surface_is_geometry_streamed(mesh_surface)) && mesh.is_valid() && !_build_budget_traced(inst, surf->surface_index, frames_drawn)) {
+					_build_budget_consider_surface(mesh, surf->surface_index, mesh_surface, instance_priority());
 				}
 			}
 			continue;
@@ -1903,10 +1909,13 @@ void RenderRaytracing::_build_budget_prepass(const RenderDataRD *p_render_data, 
 			if (surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) {
 				continue;
 			}
+			if (_build_budget_traced(inst, surf->surface_index, frames_drawn)) {
+				continue; // Its instance traced it the frame before: whatever it misses is forced.
+			}
 			if (inst->mesh_instance.is_valid() && mesh_storage->mesh_instance_get_vertex_buffer(inst->mesh_instance, surf->surface_index).is_valid()) {
 				continue; // Deformed: forced.
 			}
-			_build_budget_consider_surface(inst->data->base, surf->surface_index, surf->surface, priority, _build_budget_traced(inst, surf->surface_index, frames_drawn));
+			_build_budget_consider_surface(inst->data->base, surf->surface_index, surf->surface, instance_priority());
 		}
 	}
 

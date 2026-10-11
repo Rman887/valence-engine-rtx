@@ -118,6 +118,7 @@ public:
 
 	constexpr static uint32_t RT_SAMPLE_COUNT_SHIFT = 21;
 	constexpr static uint32_t RT_SAMPLE_COUNT_MASK = 0xFF;
+	static_assert(RT_SAMPLE_COUNT_MASK == uint32_t(RSE::PT_SAMPLES_PER_PIXEL_MAX), "The environment's sample count is clamped to what the flags hold.");
 
 	constexpr static uint32_t RT_MAX_BOUNCES_SHIFT = 29;
 	constexpr static uint32_t RT_MAX_BOUNCES_MASK = 0x7;

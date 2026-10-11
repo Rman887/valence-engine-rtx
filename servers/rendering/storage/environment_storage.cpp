@@ -903,7 +903,7 @@ void RendererEnvironmentStorage::environment_set_pathtracing(RID p_env, bool p_e
 	ERR_FAIL_NULL(env);
 	env->pathtracing_enabled = p_enable;
 	env->pathtracing_debug_mode = p_debug_mode;
-	env->pathtracing_samples_per_pixel = p_samples_per_pixel;
+	env->pathtracing_samples_per_pixel = CLAMP(p_samples_per_pixel, 1, RSE::PT_SAMPLES_PER_PIXEL_MAX); // VAL: every reader takes it from here.
 	env->pathtracing_max_bounces = p_max_bounces;
 	env->pathtracing_denoiser = p_denoiser;
 }

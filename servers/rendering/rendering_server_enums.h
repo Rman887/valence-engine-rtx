@@ -794,6 +794,10 @@ enum PathtracingSampler {
 	PT_SAMPLER_SOBOL = 1,
 };
 
+// VAL: the most samples a pixel takes in a frame. The raygen reads the count from 8 bits of its
+// flags (SceneShaderRaytracing::RT_SAMPLE_COUNT_MASK); a larger count would wrap.
+constexpr int PT_SAMPLES_PER_PIXEL_MAX = 255;
+
 enum SubSurfaceScatteringQuality {
 	SUB_SURFACE_SCATTERING_QUALITY_DISABLED,
 	SUB_SURFACE_SCATTERING_QUALITY_LOW,

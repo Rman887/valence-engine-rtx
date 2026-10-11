@@ -10383,6 +10383,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	// Builds bundle if needed; live_ready_mask drives TLAS inclusion below.
 	SceneShaderRaytracing *rt_shader_singleton = SceneShaderRaytracing::get_singleton();
 	rt_shader_singleton->ensure_pipeline_bundle(p_rt_flags);
+	const SceneShaderRaytracing::LiveSlots live_slots = rt_shader_singleton->get_live_slots(p_rt_flags);
 
 	// The subsurface walk (D120): while it is compiled in, an instance whose material can walk takes the walk's mask
 	// bit (a BaseMaterial3D with a strength, a custom shader using SSS_STRENGTH), which the walk's rays select alone.
@@ -10502,7 +10503,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			if (hg_index == 0) {
 				continue;
 			}
-			if (!rt_shader->is_hg_ready_in_bundle(hg_index, p_rt_flags)) {
+			if (!live_slots.is_ready(hg_index)) {
 #ifdef TOOLS_ENABLED
 				if (collect_render_info && rt_shader->is_hg_compiling_in_bundle(hg_index, p_rt_flags)) {
 					rt_instances_compiling++;
@@ -10614,7 +10615,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				RTMaterialData *mat_data = _surface_material(mm_surf);
 
 				if (mat_data->rt_sbt_offset > 0 &&
-						!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
+						!live_slots.is_ready(mat_data->rt_sbt_offset)) {
 #ifdef TOOLS_ENABLED
 					if (collect_render_info && rt_shader_singleton->is_hg_compiling_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
 						rt_instances_compiling += mm_count;
@@ -10754,7 +10755,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			RTMaterialData *mat_data = _surface_material(surf);
 
 			if (mat_data->rt_sbt_offset > 0 &&
-					!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
+					!live_slots.is_ready(mat_data->rt_sbt_offset)) {
 #ifdef TOOLS_ENABLED
 				if (collect_render_info && rt_shader_singleton->is_hg_compiling_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
 					rt_instances_compiling++;

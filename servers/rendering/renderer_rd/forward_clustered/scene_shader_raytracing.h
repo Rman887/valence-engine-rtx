@@ -519,6 +519,16 @@ public:
 	uint32_t get_hit_group_slot_count() const { return hit_group_slots.size(); }
 
 	bool is_hg_ready_in_bundle(uint32_t p_slot_index, uint32_t p_rt_flags) const;
+	// is_hg_ready_in_bundle for a walk, with the variant's bundle looked up once: valid until the
+	// bundles change outside a walk (a rebuild installed, an invalidation, a new variant).
+	struct LiveSlots {
+		const bool *ready = nullptr;
+		uint32_t count = 0;
+		_FORCE_INLINE_ bool is_ready(uint32_t p_slot_index) const {
+			return p_slot_index == 0 || (p_slot_index < count && ready[p_slot_index]);
+		}
+	};
+	LiveSlots get_live_slots(uint32_t p_rt_flags) const;
 	bool is_hg_compiling_in_bundle(uint32_t p_slot_index, uint32_t p_rt_flags) const;
 	bool is_hg_failed_in_bundle(uint32_t p_slot_index, uint32_t p_rt_flags) const;
 	void drain_completed_compiles();

@@ -737,6 +737,17 @@ bool SceneShaderRaytracing::is_hg_ready_in_bundle(uint32_t p_slot_index, uint32_
 	return b.live_ready_mask[p_slot_index];
 }
 
+SceneShaderRaytracing::LiveSlots SceneShaderRaytracing::get_live_slots(uint32_t p_rt_flags) const {
+	LiveSlots live;
+	HashMap<uint32_t, PipelineBundle>::ConstIterator it = pipeline_bundles.find(p_rt_flags);
+	if (it != pipeline_bundles.end()) {
+		const PipelineBundle &b = it->value;
+		live.ready = b.live_ready_mask.ptr();
+		live.count = MIN(MIN(b.live_hg_count, b.live_ready_mask.size()), (uint32_t)hit_group_slots.size());
+	}
+	return live;
+}
+
 // A slot whose hit group failed to compile, for good or in this bundle: its instances stay out of
 // the TLAS until the shader changes, counted apart from the compiling ones (RT_INSTANCES_FAILED).
 bool SceneShaderRaytracing::is_hg_failed_in_bundle(uint32_t p_slot_index, uint32_t p_rt_flags) const {

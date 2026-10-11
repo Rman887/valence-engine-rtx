@@ -692,10 +692,11 @@ uint subsurface_walk(HitData h, vec3 p_albedo, bool p_skin, vec3 N, float hit_t,
 #endif
 
 /// ray_dir and hit_t describe the ray that reached h.hit_pos: the hit stage's
-/// built-ins, or the raygen's own primary ray for a G-buffer surface.
-void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
-	PathState ps = path_unpack(payload);
-	// Every exit below packs the payload, and the raygen reads hit_t for the camera segment's
+/// built-ins, or the raygen's own primary ray for a G-buffer surface. ps is the path
+/// as it arrived; on return it is the path the raygen continues or ends (the caller
+/// packs it into the payload, P3a).
+void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, inout PathState ps) {
+	// Every exit below hands the path back, and the raygen reads hit_t for the camera segment's
 	// length before it checks for termination, so the distance is recorded once, here. The
 	// previous vertex's back offset (D103) is spent: only a transmission below sets it again.
 	ps.hit_t = hit_t;
@@ -760,7 +761,6 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	// Bounce limit check.
 	if (rt_bounce_limit_reached(ps.packed_bounces_flags)) {
 		ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
-		path_pack(payload, ps);
 		return;
 	}
 
@@ -951,7 +951,6 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			if (dot(refracted, refracted) < 0.5) {
 				// No refracted direction (total internal reflection leaves transmit_p at zero, so only a degenerate normal gets here).
 				ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
-				path_pack(payload, ps);
 				return;
 			}
 			// A shading normal tilted far from the geometry can bend the direction back above the surface; mirror it under the plane.
@@ -985,7 +984,6 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			ps.offset_normal = -h.geometry_normal;
 			ps.next_ray_dir = refracted;
 			ps.bsdf_pdf = RT_BSDF_PDF_DELTA;
-			path_pack(payload, ps);
 			return;
 		}
 		ps.throughput /= (1.0 - transmit_p);
@@ -1067,7 +1065,6 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 		if (luminance(brdf_weight) == 0.0 ||
 				!recoverBelowHemisphereSample(next_dir, h.geometry_normal, recovered_dir)) {
 			ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
-			path_pack(payload, ps);
 			return;
 		}
 		next_dir = recovered_dir;
@@ -1116,7 +1113,6 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 #endif
 			if (status != RT_SUBSURFACE_EXITED) {
 				ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
-				path_pack(payload, ps);
 				return;
 			}
 			walked = true;
@@ -1169,7 +1165,6 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 			rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_ROULETTE);
 			if (!(rand(ps.rng_state) < survive)) {
 				ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
-				path_pack(payload, ps);
 				return;
 			}
 			ps.throughput /= survive;
@@ -1248,5 +1243,4 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t) {
 	}
 #endif
 	ps.next_ray_dir = next_dir;
-	path_pack(payload, ps);
 }

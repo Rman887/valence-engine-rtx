@@ -243,7 +243,9 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 		return true;
 	}
 #endif // RT_DEBUG_ENABLED
-	shade_and_bounce(h, m, ray_dir, hit_t);
+	PathState ps = path_unpack(payload);
+	shade_and_bounce(h, m, ray_dir, hit_t, ps);
+	path_pack(payload, ps);
 	return true;
 }
 
@@ -713,6 +715,14 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 #include "raytracing_decals_inc.glsl"
 // clang-format on
 
+/// Shades the evaluated surface and hands the path back to the raygen in the payload. A function of its own, so a custom
+/// hit group's fragment code, spliced into main, cannot shadow its names.
+void shade_hit(HitData h, MaterialResult m) {
+	PathState ps = path_unpack(payload);
+	shade_and_bounce(h, m, gl_WorldRayDirectionEXT, gl_HitTEXT, ps);
+	path_pack(payload, ps);
+}
+
 // ============================================================================
 // CUSTOM SHADER GLOBALS (injected by ShaderCompiler for HG1+)
 // ============================================================================
@@ -841,7 +851,7 @@ void main() {
 		}
 	}
 #endif // RT_DEBUG_ENABLED
-	shade_and_bounce(h, m, gl_WorldRayDirectionEXT, gl_HitTEXT);
+	shade_hit(h, m);
 #else
 	// HG0: StandardMaterial3D evaluation.
 	MaterialData mat = materials[h.geometry_idx];
@@ -1045,7 +1055,7 @@ void main() {
 		}
 	}
 #endif // RT_DEBUG_ENABLED
-	shade_and_bounce(h, m, gl_WorldRayDirectionEXT, gl_HitTEXT);
+	shade_hit(h, m);
 #endif
 }
 

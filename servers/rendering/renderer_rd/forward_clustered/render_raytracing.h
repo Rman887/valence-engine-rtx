@@ -1050,7 +1050,8 @@ struct RTDeformedCacheEntry {
 	uint8_t cluster_frame_kind = CLUSTER_QUEUED_NONE; // Why it is in this frame's batch.
 	LocalVector<uint8_t> cluster_infos; // cluster_count driver build infos, or instantiation infos when templated (D107).
 	// Templated (D107): the CLAS are instantiated in place from the mesh surface's shared templates
-	// (RTDeformedClusterTemplate, keyed by its index buffer and counter) into the entry's own storage after the
+	// (RTDeformedClusterTemplate, keyed by its index buffer and counter, and by the micromap's serial
+	// where the entry carries one, GPU audit P3b) into the entry's own storage after the
 	// BLAS, cluster_clas_stride bytes apart from cluster_clas_address, on the frames the data
 	// changes; an unchanged surface does no work, and no region of the batch is involved.
 	bool cluster_templated = false;
@@ -1058,7 +1059,9 @@ struct RTDeformedCacheEntry {
 	uint64_t cluster_clas_address = 0;
 	uint32_t cluster_clas_stride = 0;
 	// The infos reference an opacity micromap (D96 OMMd): the BLAS storage was sized, and the batch
-	// builds the entry, with the micromap flag, in a build of its own.
+	// builds the entry, with the micromap flag, in a build of its own. Templated (GPU audit P3b), the
+	// templates reference the micromap and the batch instantiates the entry, flagged, with the other
+	// micromapped entries.
 	bool cluster_omm = false;
 	RID cluster_index_buffer; // The mesh's index buffer the infos read, listed as a source at each rebuild.
 	// The cluster LOD hierarchy on the GPU (D87): the entry's region of the shared LOD table
@@ -1092,7 +1095,8 @@ struct RTDeformedCacheEntry {
 };
 
 // The cluster templates of one version of a deformed mesh surface (D107), shared by every deformed
-// entry of it: one template a LOD 0 cluster, built once at explicit addresses into its own storage (the
+// entry of it that carries the same micromap, or none (GPU audit P3b: a micromap's templates are a set of
+// their own): one template a LOD 0 cluster, built once at explicit addresses into its own storage (the
 // first flush after it is made), the build infos kept until then. Freed when no entry holds it.
 struct RTDeformedClusterTemplate {
 	RID storage;
@@ -1110,6 +1114,12 @@ struct RTDeformedClusterTemplate {
 	uint32_t total_triangles = 0;
 	uint32_t total_vertices = 0;
 	uint64_t clas_size = 0; // The worst-case size of one CLAS instantiated from these templates.
+	// The micromap they reference (D96 OMMd, GPU audit P3b): every CLAS instantiated from them carries it, so the set is
+	// keyed by its serial too, built and instantiated with the micromap flag. 0 and null without one; the RIDs are
+	// read by the build and dropped once built.
+	uint64_t omm_serial = 0;
+	RID micromap;
+	RID micromap_index_buffer;
 };
 
 // One region of the deformed cluster batch (D82): the CLAS of one flush, sub-allocated by the
@@ -1566,6 +1576,9 @@ class RenderRaytracing {
 	// path off instead, every entry moving to the triangle path, as D82's failure does.
 	HashMap<uint64_t, RTDeformedClusterTemplate> deformed_cluster_templates;
 	bool deformed_cluster_templates_enabled = false;
+	// Micromapped templates (GPU audit P3b) stop for the run when the driver sizes them at 0, alone:
+	// micromapped surfaces laid out after that build their CLAS per frame (D82), plain ones keep theirs.
+	bool deformed_cluster_templates_omm_enabled = true;
 	// Builds the counters above miss (D97): compactions, opacity micromap bakes, the
 	// selection's per-instance BLAS and cached levels. Reset with them, before prepare_frame.
 	uint32_t frame_extra_builds = 0;
@@ -2475,8 +2488,9 @@ class RenderRaytracing {
 	void _flush_deformed_cluster_batch();
 	void _release_deformed_cluster_storage(RTDeformedCacheEntry &p_entry);
 	// The templates of this version of the mesh surface (D107), made on first use and queued for
-	// the next flush's build; nullptr if they cannot be. r_key is what the entry releases them by, once.
-	RTDeformedClusterTemplate *_deformed_cluster_template_acquire(RID p_index_buffer, uint32_t p_surface_counter, RID p_vertex_buffer, const RTClusterLayout &p_layout, uint32_t p_cluster_count, uint64_t p_index_address, uint32_t p_index_format, uint64_t p_vertex_address, uint32_t p_vertex_stride, uint64_t &r_key);
+	// the next flush's build; nullptr if they cannot be. With p_omm, those of its micromap (GPU audit P3b),
+	// p_omm_address and p_omm_index_address its addresses. r_key is what the entry releases them by, once.
+	RTDeformedClusterTemplate *_deformed_cluster_template_acquire(RID p_index_buffer, uint32_t p_surface_counter, RID p_vertex_buffer, const RTClusterLayout &p_layout, uint32_t p_cluster_count, uint64_t p_index_address, uint32_t p_index_format, uint64_t p_vertex_address, uint32_t p_vertex_stride, const RTOmmEntry *p_omm, uint64_t p_omm_address, uint64_t p_omm_index_address, uint64_t &r_key);
 	void _deformed_cluster_template_release(uint64_t p_key);
 	bool _build_deformed_cluster_templates();
 	// The compaction (D81): RenderingDevice hands the built sizes to the static callback on the

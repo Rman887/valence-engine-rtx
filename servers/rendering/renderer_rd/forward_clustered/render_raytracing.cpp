@@ -3301,17 +3301,27 @@ void RenderRaytracing::_release_deformed_cluster_storage(RTDeformedCacheEntry &p
 // and indices; positions come with each instantiation. Built at explicit addresses, so that every
 // entry's instantiation infos are written once, by the next flush, which reads the first entry's
 // positions as the build's hint. No instantiation bounding box is given: the CLAS are exact for any
-// pose, and a box's tighter traversal is an open item.
-RTDeformedClusterTemplate *RenderRaytracing::_deformed_cluster_template_acquire(RID p_index_buffer, uint32_t p_surface_counter, RID p_vertex_buffer, const RTClusterLayout &p_layout, uint32_t p_cluster_count, uint64_t p_index_address, uint32_t p_index_format, uint64_t p_vertex_address, uint32_t p_vertex_stride, uint64_t &r_key) {
+// pose, and a box's tighter traversal is an open item. With a micromap (OMMd, GPU audit P3b) the
+// templates reference it as a built cluster would, its micromap baked over the same LOD 0 triangles
+// (p_omm_address and p_omm_index_address, its index buffer read from each cluster's first
+// triangle): a set of its own, keyed by the micromap's serial too, released with the entries that
+// hold it, which the micromap's release takes first (_omm_release_entry).
+RTDeformedClusterTemplate *RenderRaytracing::_deformed_cluster_template_acquire(RID p_index_buffer, uint32_t p_surface_counter, RID p_vertex_buffer, const RTClusterLayout &p_layout, uint32_t p_cluster_count, uint64_t p_index_address, uint32_t p_index_format, uint64_t p_vertex_address, uint32_t p_vertex_stride, const RTOmmEntry *p_omm, uint64_t p_omm_address, uint64_t p_omm_index_address, uint64_t &r_key) {
 	// One set a version of the surface: an index-region update keeps the buffer and bumps the
 	// counter, and the old set leaves with its last holder.
-	const uint64_t key = (uint64_t(hash_murmur3_one_64(p_index_buffer.get_id())) << 32) | p_surface_counter;
+	const uint64_t omm_serial = p_omm ? p_omm->serial : 0;
+	const bool omm = omm_serial != 0;
+	uint32_t key_high = hash_murmur3_one_64(p_index_buffer.get_id());
+	if (omm) {
+		key_high = hash_murmur3_one_64(omm_serial, key_high);
+	}
+	const uint64_t key = (uint64_t(key_high) << 32) | p_surface_counter;
 	r_key = key;
 	RTDeformedClusterTemplate *found = deformed_cluster_templates.getptr(key);
 	if (found) {
 		// A request for fewer clusters is the same version's LOD 0, the first of a per-level set (D108),
 		// as after a failed selection flush took the hierarchies off.
-		if (found->index_buffer != p_index_buffer || found->surface_counter != p_surface_counter || found->cluster_count < p_cluster_count) {
+		if (found->index_buffer != p_index_buffer || found->surface_counter != p_surface_counter || found->omm_serial != omm_serial || found->cluster_count < p_cluster_count) {
 			return nullptr; // A colliding key, or another layout of the same version: built per frame, as D82.
 		}
 		found->refs++;
@@ -3329,7 +3339,7 @@ RTDeformedClusterTemplate *RenderRaytracing::_deformed_cluster_template_acquire(
 	input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER_TEMPLATE;
 	input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
 	input.max_acceleration_structure_count = p_cluster_count;
-	input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT); // Built once, traced through every instantiation.
+	input.flags = _cluster_build_flags_omm(RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT, omm); // Built once, traced through every instantiation.
 	input.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
 	input.max_cluster_triangle_count = p_layout.max_triangles;
 	input.max_cluster_vertex_count = p_layout.max_vertices;
@@ -3340,7 +3350,7 @@ RTDeformedClusterTemplate *RenderRaytracing::_deformed_cluster_template_acquire(
 	// The worst case of one CLAS instantiated from them, the stride of an entry's CLAS.
 	RD::ClusterAccelerationStructureInput instantiate_input = input;
 	instantiate_input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_INSTANTIATE_TRIANGLE_CLUSTER;
-	instantiate_input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT);
+	instantiate_input.flags = _cluster_build_flags_omm(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT, omm); // As the flush instantiates.
 	uint64_t clas_size = 0;
 	rd->cluster_acceleration_structure_get_build_sizes(instantiate_input, clas_size, scratch);
 	// The worst case under the templates' own flags too, the larger taken: an instantiation's size
@@ -3353,6 +3363,12 @@ RTDeformedClusterTemplate *RenderRaytracing::_deformed_cluster_template_acquire(
 	}
 	clas_size = MAX(clas_size, clas_size_template_flags);
 	if (template_size == 0 || clas_size == 0) {
+		if (omm) {
+			// Templates without a micromap may still be had: only micromapped surfaces fall back, for the run.
+			WARN_PRINT_ONCE("RT: the driver sized a deformed surface's micromapped cluster templates at 0 bytes; micromapped deformed surfaces build their CLAS each frame (D82).");
+			deformed_cluster_templates_omm_enabled = false;
+			return nullptr;
+		}
 		WARN_PRINT_ONCE("RT: the driver sized a deformed surface's cluster templates at 0 bytes; deformed surfaces build their CLAS each frame (D82).");
 		deformed_cluster_templates_enabled = false;
 		return nullptr;
@@ -3377,7 +3393,13 @@ RTDeformedClusterTemplate *RenderRaytracing::_deformed_cluster_template_acquire(
 	t.total_triangles = total_triangles;
 	t.total_vertices = total_vertices;
 	t.clas_size = clas_size;
-	// The build infos, as the D82 layout's CLAS infos: each cluster's ID its first triangle.
+	t.omm_serial = omm_serial;
+	if (omm) {
+		t.micromap = p_omm->micromap;
+		t.micromap_index_buffer = p_omm->index_buffer;
+	}
+	// The build infos, as the D82 layout's CLAS infos: each cluster's ID its first triangle, and its
+	// micromap indices from there.
 	const uint32_t index_size = p_index_format == RT_INDEX_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t);
 	const uint32_t info_stride = caps.triangle_template_build_info_size;
 	t.build_infos.resize(uint64_t(info_stride) * p_cluster_count);
@@ -3392,6 +3414,12 @@ RTDeformedClusterTemplate *RenderRaytracing::_deformed_cluster_template_acquire(
 		info.index_stride = index_size;
 		info.vertex_address = p_vertex_address;
 		info.vertex_stride = p_vertex_stride;
+		if (omm) {
+			info.opacity_micromap_address = p_omm_address;
+			info.opacity_micromap_index_address = p_omm_index_address + uint64_t(first_triangle) * sizeof(int32_t);
+			info.opacity_micromap_index_type = RD::ClusterTriangleBuildInfo::CLUSTER_INDEX_TYPE_UINT32;
+			info.opacity_micromap_index_stride = sizeof(int32_t);
+		}
 		rd->cluster_triangle_template_build_info_write(t.build_infos.ptr() + uint64_t(c) * info_stride, info);
 		first_triangle += p_layout.triangles[c];
 	}
@@ -3446,7 +3474,7 @@ bool RenderRaytracing::_build_deformed_cluster_templates() {
 		build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_BUILD_TRIANGLE_CLUSTER_TEMPLATE;
 		build.input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
 		build.input.max_acceleration_structure_count = t->cluster_count;
-		build.input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT);
+		build.input.flags = _cluster_build_flags_omm(RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT, t->omm_serial != 0); // As sized.
 		build.input.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
 		build.input.max_cluster_triangle_count = t->max_triangles;
 		build.input.max_cluster_vertex_count = t->max_vertices;
@@ -3460,6 +3488,10 @@ bool RenderRaytracing::_build_deformed_cluster_templates() {
 		build.src_infos_stride = info_stride;
 		build.source_buffers.push_back(t->index_buffer);
 		build.source_buffers.push_back(t->vertex_buffer);
+		if (t->micromap.is_valid()) {
+			build.source_buffers.push_back(t->micromap_index_buffer);
+			build.source_micromaps.push_back(t->micromap);
+		}
 		const Error err = rd->cluster_acceleration_structure_build(build);
 		rd->free_rid(args_buffer); // Deferred past the fence of every frame in flight.
 		if (err != OK) {
@@ -3468,6 +3500,8 @@ bool RenderRaytracing::_build_deformed_cluster_templates() {
 		t->built = true;
 		t->build_infos.clear();
 		t->vertex_buffer = RID();
+		t->micromap = RID();
+		t->micromap_index_buffer = RID();
 		deformed_cluster_templates_built_total++;
 		frame_extra_builds++; // A build in the counters (D97), as the other builds outside the walk.
 		frame_extra_triangles += t->total_triangles;
@@ -3518,17 +3552,17 @@ bool RenderRaytracing::_populate_deformed_cluster_layout(void *p_mesh_surface, u
 	_release_deformed_cluster_lod(r_entry);
 	r_entry.cluster_omm = false; // Set with the layout below.
 
-	// The surface's templates where the entry needs nothing they cannot carry, a micromap being the
-	// entry's own (OMMd): one a LOD 0 cluster for the batch (D107), or with the hierarchy one a cluster
-	// of every level (D108), whose first LOD 0 count serve the batch too. They belong to this version
-	// of the surface (an index-region update keeps the buffer and bumps the counter), and are held
-	// from here, so that every failure below releases them with the layout. A hierarchy whose
-	// templates cannot be had is traced at LOD 0, since the selection instantiates every entry's CLAS
-	// when the device has templates.
+	// The surface's templates: one a LOD 0 cluster for the batch (D107), carrying the entry's micromap
+	// where it has one (OMMd, GPU audit P3b: the micromap's own set, no hierarchy), or with the
+	// hierarchy one a cluster of every level (D108), whose first LOD 0 count serve the batch too. They
+	// belong to this version of the surface (an index-region update keeps the buffer and bumps the
+	// counter), and are held from here, so that every failure below releases them with the layout. A
+	// hierarchy whose templates cannot be had is traced at LOD 0, since the selection instantiates
+	// every entry's CLAS when the device has templates.
 	RTDeformedClusterTemplate *cluster_template = nullptr;
-	if (!omm && index_buffer.is_valid() && (lod ? cluster_lod_deformed_templated : deformed_cluster_templates_enabled)) {
+	if (index_buffer.is_valid() && (!omm || deformed_cluster_templates_omm_enabled) && (lod ? cluster_lod_deformed_templated : deformed_cluster_templates_enabled)) {
 		uint64_t template_key = 0;
-		cluster_template = _deformed_cluster_template_acquire(index_buffer, p_surface_counter, r_entry.owned_vb_full, layout, lod ? layout.triangles.size() : cluster_count, geom.index_buffer_address, geom.index_format, geom.vertex_buffer_address, geom.position_stride, template_key);
+		cluster_template = _deformed_cluster_template_acquire(index_buffer, p_surface_counter, r_entry.owned_vb_full, layout, lod ? layout.triangles.size() : cluster_count, geom.index_buffer_address, geom.index_format, geom.vertex_buffer_address, geom.position_stride, omm ? p_omm : nullptr, omm_address, omm_index_address, template_key);
 		if (cluster_template) {
 			r_entry.cluster_templated = true;
 			r_entry.cluster_template_key = template_key;
@@ -4040,9 +4074,10 @@ bool RenderRaytracing::_record_deformed_cluster_batch() {
 					continue;
 				}
 				if (group.omm) {
-					// The micromap its infos reference, with its index buffer, which the build reads. Always
-					// found: an entry's micromap is released only with its BLAS (_omm_release_entry), which
-					// leaves the batch empty of it; a miss fails the flush, which turns the path off.
+					// The micromap its infos reference (templated, its templates do, P3b), with its index buffer,
+					// which the build reads. Always found: an entry's micromap is released only with its BLAS and
+					// its template refs (_omm_release_entry), which leaves the batch empty of it; a miss fails the
+					// flush, which turns the path off.
 					RTOmmEntry *const *found = omm_by_serial.getptr(entry->omm_serial);
 					ERR_FAIL_NULL_V_MSG(found, false, "RT: a deformed cluster entry's CLAS reference a micromap that is gone.");
 					if (!source_micromaps.has((*found)->micromap)) {
@@ -4230,7 +4265,7 @@ bool RenderRaytracing::_record_deformed_cluster_batch() {
 			build.input.op_type = RD::ClusterAccelerationStructureInput::CLUSTER_OP_INSTANTIATE_TRIANGLE_CLUSTER;
 			build.input.op_mode = RD::ClusterAccelerationStructureInput::CLUSTER_OP_MODE_EXPLICIT_DESTINATIONS;
 			build.input.max_acceleration_structure_count = group.templated_clusters;
-			build.input.flags = _cluster_build_flags(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT);
+			build.input.flags = _cluster_build_flags_omm(RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT, group.omm); // As the templates sized it (P3b).
 			build.input.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
 			build.input.max_cluster_triangle_count = group.templated_max_triangles;
 			build.input.max_cluster_vertex_count = group.templated_max_vertices;
@@ -4245,6 +4280,9 @@ bool RenderRaytracing::_record_deformed_cluster_batch() {
 			build.src_infos_stride = instantiate_info_stride;
 			build.source_buffers = source_buffers;
 			build.source_acceleration_structure_buffers = template_buffers;
+			if (group.omm) {
+				build.source_micromaps = micromap_list; // The micromaps the templates reference, which the CLAS carry.
+			}
 			build.dst_acceleration_structures = _cluster_build_list(CLUSTER_BUILD_LIST_SLICE_HANDLES, blas_handles.ptr() + templated_begin, group_end - templated_begin);
 			if (rd->cluster_acceleration_structure_build(build) != OK) {
 				return false;

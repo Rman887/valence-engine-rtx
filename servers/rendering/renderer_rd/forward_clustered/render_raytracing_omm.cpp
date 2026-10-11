@@ -979,7 +979,10 @@ void RenderRaytracing::_omm_release_entry(RTOmmEntry *p_entry) {
 	}
 	// A deformed triangle BLAS that carries it would be freed with the micromap: it goes now, and its
 	// surface builds it again, plain, at its next processing (OMMc). A deformed cluster BLAS (OMMd) goes
-	// the same way: its CLAS reference the micromap by address, which nothing else keeps alive. Never
+	// the same way: its CLAS reference the micromap by address, which nothing else keeps alive. So does a
+	// templated entry's template set (GPU audit P3b), which references it too: _release_deformed_blas drops
+	// the entry's ref, and the set, keyed by the micromap's serial, leaves with its last holder, its
+	// storage freed past the frames that may still trace it, as the micromap's is. Never
 	// mid-walk on a BLAS the walk queued: the walk's request releases only micromaps of a surface's
 	// earlier contents, which a rebuild this frame no longer attached.
 	for (const RID &handle : p_entry->deformed_handles) {

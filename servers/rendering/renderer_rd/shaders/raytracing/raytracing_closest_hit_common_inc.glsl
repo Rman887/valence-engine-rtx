@@ -152,7 +152,8 @@ vec3 rt_derived_tangent(GeometryData geom, uint i0, uint i1, uint i2, VertexAttr
 /// Fetch vertex attributes and transform to world space.
 /// Requires hitAttributeEXT HitAttribs and GeometryBuffer/MaterialBuffer bindings.
 /// p_footprint: the cone's footprint is wanted whether or not the mesh has UVs or the frame decals.
-/// p_gradients: a fetch reads the elliptical footprint's UV gradients (D116), with the anisotropic switch on.
+/// p_gradients: a fetch reads the elliptical footprint's UV gradients (D116), with the anisotropic switch on, until the
+/// path's first diffuse bounce (GPU audit hot 8).
 /// p_uv2: a fetch reads the second UV set, which the hit fetches with its level (D118).
 HitData compute_hit_data(bool p_footprint, bool p_gradients, bool p_uv2) {
 	HitData h;
@@ -239,17 +240,23 @@ HitData compute_hit_data(bool p_footprint, bool p_gradients, bool p_uv2) {
 			vec3 n = cross(object_to_world * (p1 - p0), object_to_world * (p2 - p0));
 			vec2 cone = unpackHalf2x16(payload.packed_cone);
 			h.texture_footprint = rt_texture_footprint(n, gl_WorldRayDirectionEXT, cone.x + cone.y * gl_HitTEXT);
+			// The anisotropic footprint (D116) only until the path's first diffuse bounce (GPU audit hot 8): the camera's
+			// view and a mirror's or a glossy reflection's of it keep it, since a near-mirror lobe is narrower than the
+			// pixel's cone, which D116 widens by only a fraction of the lobe; past a diffuse bounce the lobe is wider than
+			// any footprint's long axis, and the isotropic level costs one fetch where the elliptical footprint takes up
+			// to the sampler's anisotropy in taps.
+			const bool anisotropic = p_gradients && rt_texture_lod_anisotropic() && get_diffuse_bounces(payload.packed_bounces_flags) == 0u;
 			if (attrs.has_uv) {
 				h.texture_lod = rt_texture_lod_triangle(h.texture_footprint, n, attrs.uv_corners[0], attrs.uv_corners[1], attrs.uv_corners[2]);
 				// The anisotropic footprint where the level is known; a degenerate one leaves the level.
-				if (p_gradients && h.texture_lod > RT_TEXTURE_LOD_BASE && rt_texture_lod_anisotropic()) {
+				if (anisotropic && h.texture_lod > RT_TEXTURE_LOD_BASE) {
 					float radius = (cone.x + cone.y * gl_HitTEXT) * exp2(get_rt_param(RT_PARAM_TEXTURE_LOD_BIAS));
 					h.texture_grad = rt_texture_grad_triangle(object_to_world * (p1 - p0), object_to_world * (p2 - p0), gl_WorldRayDirectionEXT, radius, attrs.uv_corners[0], attrs.uv_corners[1], attrs.uv_corners[2]);
 				}
 			}
 			if (attrs.has_uv2) {
 				h.texture_lod2 = rt_texture_lod_triangle(h.texture_footprint, n, attrs.uv2_corners[0], attrs.uv2_corners[1], attrs.uv2_corners[2]);
-				if (p_gradients && h.texture_lod2 > RT_TEXTURE_LOD_BASE && rt_texture_lod_anisotropic()) {
+				if (anisotropic && h.texture_lod2 > RT_TEXTURE_LOD_BASE) {
 					float radius = (cone.x + cone.y * gl_HitTEXT) * exp2(get_rt_param(RT_PARAM_TEXTURE_LOD_BIAS));
 					h.texture_grad2 = rt_texture_grad_triangle(object_to_world * (p1 - p0), object_to_world * (p2 - p0), gl_WorldRayDirectionEXT, radius, attrs.uv2_corners[0], attrs.uv2_corners[1], attrs.uv2_corners[2]);
 				}

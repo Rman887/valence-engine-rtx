@@ -828,7 +828,8 @@ void main() {
 	// calls read (D116), handed over after the vertex function.
 	float rt_hit_texture_lod = rt_texture_lod_enabled() ? h.texture_lod : RT_TEXTURE_LOD_BASE;
 	float rt_hit_texture_footprint = rt_texture_lod_enabled() ? h.texture_footprint : RT_TEXTURE_LOD_BASE;
-	vec4 rt_hit_texture_grad = h.texture_grad; // Zero unless the anisotropic switch is on.
+	// Zero unless the anisotropic switch is on and the path has not bounced diffusely (GPU audit hot 8).
+	vec4 rt_hit_texture_grad = h.texture_grad;
 	float rt_hit_texture_lod2 = rt_texture_lod_enabled() ? h.texture_lod2 : RT_TEXTURE_LOD_BASE; // At UV2 (D118).
 
 #include "raytracing_custom_fragment_inc.glsl"

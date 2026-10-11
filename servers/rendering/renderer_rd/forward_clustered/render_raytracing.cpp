@@ -13729,7 +13729,8 @@ void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDa
 				u_layers.binding = 3;
 				u_layers.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 				u_layers.append_id(layers);
-				moments_set = UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[moments_mode], 0, u_octmap, u_sampler, u_table, u_layers);
+				// The array alone: the 2D octmap is a slice of it, and the graph cannot take both in one command.
+				moments_set = UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[moments_mode], 0, u_sampler, u_table, u_layers);
 			}
 		} else {
 			moments_set = UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[moments_mode], 0, u_octmap, u_sampler, u_table);
@@ -13788,8 +13789,12 @@ void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDa
 	pc.mix_constant = exposure > 0.0f ? mix[2] / exposure : 0.0f;
 	pc.pad = 0;
 
-	RD::ComputeListID compute_list = rd->compute_list_begin();
+	// The table and the moments in compute lists of their own: a compute list is one command of RenderingDevice's graph,
+	// and in array mode the leaves bind the octmap's sharpest layer as a 2D view, a slice of the array the moments bind,
+	// which one command cannot hold (the graph can link the command to itself, as one uniform set holding both did). The
+	// graph orders the moments after the table through the table buffer's tracker.
 	if (build_table) {
+		RD::ComputeListID compute_list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline[SkyLightShader::MODE_LEAF]);
 		rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[SkyLightShader::MODE_LEAF], 0, u_octmap, u_sampler, u_table), 0);
 		rd->compute_list_set_push_constant(compute_list, &pc, sizeof(SkyLightPC));
@@ -13809,17 +13814,16 @@ void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDa
 		rd->compute_list_bind_uniform_set(compute_list, UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[SkyLightShader::MODE_HEADER], 0, u_table), 0);
 		rd->compute_list_set_push_constant(compute_list, &pc, sizeof(SkyLightPC));
 		rd->compute_list_dispatch(compute_list, 1, 1, 1);
+		rd->compute_list_end();
 	}
 	if (build_moments) {
-		if (build_table) {
-			rd->compute_list_add_barrier(compute_list); // The moments read the pyramid's cells and the header.
-		}
+		RD::ComputeListID compute_list = rd->compute_list_begin();
 		rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline[moments_mode]);
 		rd->compute_list_bind_uniform_set(compute_list, moments_set, 0);
 		rd->compute_list_set_push_constant(compute_list, &pc, sizeof(SkyLightPC));
 		rd->compute_list_dispatch(compute_list, RT_SKY_LIGHT_NORMALS, 1, 1);
+		rd->compute_list_end();
 	}
-	rd->compute_list_end();
 
 	if (build_table) {
 		p_state->sky_light_sky = sky_rid;

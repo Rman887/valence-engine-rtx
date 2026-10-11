@@ -90,13 +90,19 @@ const float SKY_SHARES[SKY_SHARE_COUNT] = float[](0.0, 1.0 / 32.0, 1.0 / 16.0, 0
 const float SKY_CLIP_RATIOS[SKY_CLIP_LEVELS] = float[](2.0, 4.0, 8.0, 16.0, 32.0, 64.0);
 
 #if defined(MODE_LEAF) || defined(MODE_MOMENTS)
-// The radiance octmap's sharpest layer as a 2D texture with its mip chain.
-layout(set = 0, binding = 0) uniform texture2D radiance_octmap;
 layout(set = 0, binding = 1) uniform sampler radiance_sampler;
 #endif
 
+#if defined(MODE_LEAF) || (defined(MODE_MOMENTS) && !defined(USE_RADIANCE_OCTMAP_ARRAY))
+// The radiance octmap's sharpest layer as a 2D texture with its mip chain.
+layout(set = 0, binding = 0) uniform texture2D radiance_octmap;
+#endif
+
 #ifdef USE_RADIANCE_OCTMAP_ARRAY
-// The octmap's roughness layers, for the fog's level, which is one of them.
+// The octmap's roughness layers: the sharpest is layer 0, the fog's level another. The moments read both from here and
+// never bind the sharpest layer's 2D view too: that view is a slice of this texture, and RenderingDevice's graph cannot
+// take a texture and its own slice in one command (the self-dependency it made crashed every variance-share frame in
+// array mode at the graph's sort).
 layout(set = 0, binding = 3) uniform texture2DArray radiance_layers;
 #endif
 
@@ -181,6 +187,15 @@ vec3 sky_grid_tap(uvec2 p_cell, uint p_n, uint p_tap, float p_offset) {
 	return oct_to_vec3(uv * 2.0 - 1.0);
 }
 
+// The sharpest layer at a mip.
+vec3 sky_octmap_sample(vec2 p_tex_uv, float p_lod) {
+#if defined(MODE_MOMENTS) && defined(USE_RADIANCE_OCTMAP_ARRAY)
+	return textureLod(sampler2DArray(radiance_layers, radiance_sampler), vec3(p_tex_uv, 0.0), p_lod).rgb;
+#else
+	return textureLod(sampler2D(radiance_octmap, radiance_sampler), p_tex_uv, p_lod).rgb;
+#endif
+}
+
 // Four taps inside the cell at the chosen mip: the cell's mean radiance, whatever the distortion
 // of the octahedral map inside it. With a zero offset the taps coincide at the centre and one is
 // read: the leaf that is one texel or less.
@@ -189,7 +204,7 @@ float sky_grid_luminance(uvec2 p_cell, uint p_n, float p_lod, float p_offset) {
 	float lum = 0.0;
 	for (uint t = 0u; t < taps; t++) {
 		vec2 tex_uv = vec3_to_oct_with_border(sky_grid_tap(p_cell, p_n, t, p_offset), vec2(params.border_pad, params.border_scale));
-		lum += sky_luminance(textureLod(sampler2D(radiance_octmap, radiance_sampler), tex_uv, p_lod).rgb);
+		lum += sky_luminance(sky_octmap_sample(tex_uv, p_lod));
 	}
 	return max(lum / float(taps), 0.0);
 }

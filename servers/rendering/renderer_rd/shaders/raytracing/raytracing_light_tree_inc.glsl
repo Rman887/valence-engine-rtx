@@ -4,7 +4,8 @@
 // sphere, its power and its orientation cone (Conty Estevez and Kulla 2018), so a torch two
 // metres away is drawn far more often than one across the field, a spot aimed elsewhere is not
 // drawn at all, and a directional sun takes the share its irradiance earns at that surface. The
-// tree is built on the CPU each frame (RenderRaytracing::build_light_tree), which also publishes
+// tree is built on the CPU, or refit in place while its lights stay where they are (P2i,
+// RenderRaytracing::update_light_tree), which also publishes
 // a cut of it: the nodes of its shallowest full levels, as many as Environment.pathtracing_light_tree_cut
 // allows, with the leaves under each cut node contiguous in a leaf list. A hit scores the cut once
 // (D56; the reads are independent, unlike a descent's) and every candidate is a pick over the cut

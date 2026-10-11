@@ -305,6 +305,42 @@ enum : uint32_t {
 static_assert(RT_LIGHT_TREE_CUT_OFFSET % 16 == 0, "the light tree's cut must start on a 16-byte boundary for std430");
 static_assert(RT_LIGHT_TREE_LEAF_ALIAS_OFFSET % 16 == 0, "the light tree's alias table must start on a 16-byte boundary for std430");
 
+// A leaf of the light tree (D55): a positional light or an emissive entry of the frame.
+struct RTLightTreeLeaf {
+	Vector3 center;
+	float radius;
+	Vector3 axis;
+	float cos_theta_o;
+	float power;
+	float max_range;
+	float decay; // The light's attenuation exponent (D63); 2 for an emissive entry.
+	uint32_t encoded; // RT_LIGHT_TREE_LEAF_BIT | flags | index.
+	uint64_t key; // Which light it is from frame to frame (P2i): a light's instance RID, an emitter's instance index.
+};
+
+// The light tree as built for one viewport and uploaded to its buffer (D55), kept so the next frame can
+// refit it (P2i). Its structure (the leaves' order, the nodes' topology, the cuts, each emissive entry's
+// cut slots and leaf position) follows the set of leaves and their centres alone, so a frame with the
+// same lights at the same places keeps it: the leaves whose power, colour, range, cone, radius, decay or
+// index changed are rewritten, their ancestors recomputed, the cut copies and alias tables over them
+// rebuilt, and only what changed is uploaded.
+struct RTLightTree {
+	LocalVector<RT_LightTreeNode> nodes; // Depth first: a node's left child follows it.
+	LocalVector<uint32_t> leaf_list; // The leaf node at each position of the build's order.
+	AHashMap<uint64_t, uint32_t> light_positions; // Each analytic leaf's position by its key.
+	AHashMap<uint64_t, uint32_t> emissive_positions; // Each emissive leaf's position by its key.
+	LocalVector<uint32_t> cut_nodes[2]; // The node at each slot of the primary cut and of the indirect one (D59).
+	LocalVector<RT_LightTreeNode> cuts[2]; // Those nodes, copied for the upload.
+	LocalVector<uint32_t> emissive_cut; // Each emissive entry's cut slots (the primary's low, the indirect's high), RT_LIGHT_TREE_NO_NODE without a leaf.
+	LocalVector<uint32_t> emissive_leaf; // Each emissive entry's position in the leaf list (D60), RT_LIGHT_TREE_NO_NODE without a leaf.
+	LocalVector<RT_LightTreeAlias> leaf_alias; // Each position's alias-table entry inside its cut node (D60, D61): the primary cut's, then the indirect's at RT_LIGHT_TREE_LEAVES_MAX.
+	uint32_t emissive_count = 0;
+	uint32_t cut_size = 0;
+	uint32_t cut_indirect_size = 0;
+	bool power_pick = false;
+	bool uploaded = false; // The viewport's buffer holds it.
+};
+
 enum {
 	RT_OFFSET_NONE = 0xFFFFFFFFu,
 	RT_CACHE_CHUNK_SIZE = 256,
@@ -1366,7 +1402,9 @@ struct RTViewportState {
 
 	RID light_buffer;
 	RID emissive_buffer; // The emissive mesh lights of the frame (D50), RT_EMISSIVE_MAX entries.
-	RID light_tree_buffer; // The light tree (D55): a header, the nodes, each emissive entry's cut slot, the cut's nodes and the leaf list (D56), each emissive entry's leaf position and the leaves' alias tables per cut (D60, D61); rebuilt per frame while the Environment asks for it.
+	RID light_tree_buffer; // The light tree (D55): a header, the nodes, each emissive entry's cut slot, the cut's nodes and the leaf list (D56), each emissive entry's leaf position and the leaves' alias tables per cut (D60, D61); built or refit per frame while the Environment asks for it.
+	RTLightTree light_tree; // What light_tree_buffer holds (P2i).
+	LocalVector<uint8_t> light_tree_image; // Builds with asserts (P2i): light_tree_buffer's bytes as its updates left them, checked against a full build.
 	uint32_t emissive_count_logged = 0; // The last count printed for this viewport.
 	RID decal_buffer; // The decals the hit shaders apply (D104), RT_DECALS_MAX entries; made with the first decal.
 	RID decal_node_buffer; // Their bounding volume hierarchy, RT_DECAL_NODES_MAX nodes.
@@ -2059,8 +2097,12 @@ class RenderRaytracing {
 	LocalVector<RID> merged_mm_active_this_frame;
 
 	RTDeformedCacheEntry *_access_deformed_slot(RID &r_handle);
-	uint32_t _build_light_tree_node(uint32_t p_begin, uint32_t p_end); // The light tree's recursive build (D55).
-	void _build_light_tree_cut(uint32_t p_cut_size, LocalVector<RT_LightTreeNode> &r_cut, uint32_t p_slot_shift, uint32_t p_alias_base, bool p_power_pick); // A cut the shader scores per hit (D56), the primary or the indirect one (D59), with its leaves' alias tables (D60, D61).
+	void _gather_light_tree_leaves(const RT_LightData *p_lights, uint32_t p_light_count, uint32_t p_directional_count, const RT_EmissiveInstance *p_emissive, uint32_t p_emissive_count, float p_exposure); // The frame's leaves into light_tree_leaves (D55).
+	uint32_t _build_light_tree_node(RTLightTree &r_tree, uint32_t p_begin, uint32_t p_end); // The light tree's recursive build (D55).
+	void _build_light_tree_cut(RTLightTree &r_tree, uint32_t p_cut, uint32_t p_cut_size); // A cut the shader scores per hit (D56), the primary (0) or the indirect one (1, D59).
+	void _light_tree_cut_alias(RTLightTree &r_tree, uint32_t p_first, uint32_t p_count, uint32_t p_alias_base); // The alias table over one cut node's leaves (D60, D61).
+	void _light_tree_map_emissive(RTLightTree &r_tree, uint32_t p_emissive_count); // Each emissive entry's cut slots and leaf position.
+	bool _refit_light_tree(RTLightTree &r_tree, uint32_t p_emissive_count, uint32_t p_cut_size, uint32_t p_cut_indirect_size, bool p_power_pick); // P2i: false when the structure changed.
 	void _release_deformed_blas(RTDeformedCacheEntry &p_entry);
 	// The deformed triangle BLAS over owned_vb_full, carrying the micromap the walk wants (D96 OMMc).
 	void _build_deformed_triangle_blas(RID p_handle, RTDeformedCacheEntry &r_entry, void *p_mesh_surface, uint32_t p_cache_key, uint32_t p_surface_counter, LocalVector<RID> &r_dirty_blas_list);
@@ -2111,31 +2153,30 @@ class RenderRaytracing {
 	LocalVector<RT_DecalData> decal_leaf_records;
 	LocalVector<RT_DecalNode> decal_nodes;
 	uint32_t _build_decal_node(uint32_t p_first, uint32_t p_count); // One node of the decals' hierarchy over decal_order[p_first, p_first + p_count), its index.
-	// The light tree's build scratch (D55): a leaf per positional light and per emissive entry,
-	// the nodes in depth-first order, each emissive entry's cut slot, the cut's nodes and the leaf
-	// list (D56), uploaded as one buffer.
-	struct LightTreeLeaf {
-		Vector3 center;
-		float radius;
-		Vector3 axis;
-		float cos_theta_o;
-		float power;
-		float max_range;
-		float decay; // The light's attenuation exponent (D63); 2 for an emissive entry.
-		uint32_t encoded; // RT_LIGHT_TREE_LEAF_BIT | flags | index.
-		uint64_t key; // Which light it is: a light's instance RID, an emitter's instance index (P2i).
-	};
-	LocalVector<LightTreeLeaf> light_tree_leaves;
+	// The light tree's scratch (D55): the frame's leaves, a leaf per positional light and per emissive
+	// entry, and the build's and the refit's working lists; the tree itself is the viewport's (P2i).
+	LocalVector<RTLightTreeLeaf> light_tree_leaves;
 	LocalVector<uint64_t> light_scratch_keys; ///< Each gathered light's instance RID (P2i), parallel to light_scratch.
 	LocalVector<uint32_t> light_tree_order; ///< Leaf indices, partitioned in place by the build.
-	LocalVector<RT_LightTreeNode> light_tree_nodes;
-	LocalVector<uint32_t> light_tree_leaf_list; ///< The leaf node at each position of the order: a node's leaves are contiguous.
-	LocalVector<RT_LightTreeNode> light_tree_cut; ///< The cut's nodes, copied for the upload.
-	LocalVector<RT_LightTreeNode> light_tree_cut_indirect; ///< The indirect bounces' coarser cut (D59), copied for the upload.
 	LocalVector<uint32_t> light_tree_cut_queue; ///< The cut's breadth-first work queue.
-	LocalVector<uint32_t> light_tree_emissive_cut; ///< Each emissive entry's cut slots (the primary's low, the indirect's high, 0xFFFF for none), RT_LIGHT_TREE_NO_NODE without a leaf.
-	LocalVector<uint32_t> light_tree_emissive_leaf; ///< Each emissive entry's position in the leaf list (D60), RT_LIGHT_TREE_NO_NODE without a leaf.
-	LocalVector<RT_LightTreeAlias> light_tree_leaf_alias; ///< Each leaf-list position's alias-table entry inside its cut node (D60, D61): the primary cut's, then the indirect's at RT_LIGHT_TREE_LEAVES_MAX.
+	LocalVector<uint32_t> light_tree_leaf_positions; ///< The refit's match (P2i): each leaf's position in the tree's order.
+	LocalVector<uint8_t> light_tree_node_changed; ///< The refit's marks (P2i): a node rewritten this frame.
+	LocalVector<uint8_t> light_tree_power_changed; ///< The refit's marks (P2i): a position whose leaf's power changed.
+	LocalVector<uint8_t> light_tree_alias_changed; ///< The refit's marks (P2i): an alias entry rebuilt, the primary cut's then the indirect's.
+	bool light_tree_emissive_moved = false; ///< The refit's mark (P2i): an emitter's index moved, so the emissive maps were redone.
+	RTLightTree light_tree_check; ///< A full build the refit is compared with in builds with asserts (P2i).
+	// The light tree's work over the frames since the last verbose report (P2i).
+	struct LightTreeStats {
+		uint32_t builds = 0;
+		uint32_t refits = 0;
+		uint32_t unchanged = 0; // Refits that changed nothing.
+		uint64_t nodes_written = 0; // Nodes and cut copies uploaded.
+		uint64_t bytes = 0;
+		uint32_t updates = 0; // Buffer updates recorded.
+		uint64_t build_usec = 0;
+		uint64_t refit_usec = 0;
+		uint64_t usec_max = 0;
+	} light_tree_stats;
 	LocalVector<double> light_tree_alias_scaled; ///< The alias build's scratch: each leaf's share times its node's count, indexed by leaf-list position.
 	LocalVector<double> emissive_alias_scaled; ///< The emissive alias table's scratch (P1i): each entry's pdf times the count; its lists are the tree's.
 	LocalVector<uint32_t> light_tree_alias_small; ///< The alias build's scratch: positions whose scaled share is below 1.
@@ -2608,7 +2649,10 @@ public:
 	uint32_t gather_emissive(const RenderDataRD *p_render_data, const RTViewportState *p_state, RT_EmissiveInstance *r_emissive_data, uint32_t p_max_emissive, float &r_score_sum);
 	// The decals the hit shaders apply (D104): gathered from the trace's cull, uploaded with their hierarchy; returns the count.
 	uint32_t gather_decals(RTViewportState *p_state, const RenderDataRD *p_render_data);
-	uint32_t build_light_tree(const RT_LightData *p_lights, uint32_t p_light_count, uint32_t p_directional_count, const RT_EmissiveInstance *p_emissive, uint32_t p_emissive_count, float p_exposure, uint32_t p_cut_size, uint32_t p_cut_indirect_size, bool p_power_pick);
+	uint32_t build_light_tree(RTLightTree &r_tree, uint32_t p_emissive_count, uint32_t p_cut_size, uint32_t p_cut_indirect_size, bool p_power_pick); // A full build over light_tree_leaves (D55).
+	// The frame's light tree into the viewport's buffer: refit in place when the leaves are the last
+	// frame's lights at the same places, built and uploaded whole otherwise (P2i).
+	void update_light_tree(RTViewportState *p_state, const RT_LightData *p_lights, uint32_t p_light_count, uint32_t p_directional_count, const RT_EmissiveInstance *p_emissive, uint32_t p_emissive_count, float p_exposure, uint32_t p_cut_size, uint32_t p_cut_indirect_size, bool p_power_pick);
 	RID update_uniform_set(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_primary_from_gbuffer);
 	void update_sky_light(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags);
 

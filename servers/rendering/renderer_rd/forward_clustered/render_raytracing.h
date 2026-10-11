@@ -953,13 +953,14 @@ struct RTCacheEntry {
 ///
 /// The skinned vertex buffer is owned by the engine's MeshInstance system and may
 /// be freed/reallocated outside our control. To decouple BLAS lifetime from that
-/// (and keep last-frame positions alive for motion vectors) we copy the skinned VB
-/// into our own buffers each frame:
+/// we copy the skinned VB into our own buffer on every frame it changed:
 ///   * owned_vb_full mirrors the skinned VB layout (positions + N + T) and is what
 ///     the BLAS and the hit shader read from this frame.
-///   * prev_pos_vb stores the previous-frame positions only (float3 packed) for the
-///     motion-vector path. Updated from owned_vb_full's position section each frame
-///     before owned_vb_full is overwritten with the new skinned data.
+///   * prev_positions is the buffer whose leading positions are the previous frame's,
+///     for the motion-vector path (P2f): owned_vb_full on a frame the data did not
+///     change, the mesh instance's previous skinned buffer on one it did where the
+///     instance double-buffers, else prev_pos_vb, which takes owned_vb_full's
+///     positions before owned_vb_full is overwritten.
 struct RTDeformedCacheEntry {
 	RTSurfaceData *ptr = nullptr;
 	uint32_t last_used_frame = 0;
@@ -972,11 +973,12 @@ struct RTDeformedCacheEntry {
 
 	RID owned_vb_full;
 	uint32_t owned_vb_full_capacity = 0; // Bytes; grow-only.
-	RID prev_pos_vb;
+	RID prev_pos_vb; // Created on the first frame it is needed.
 	uint32_t prev_pos_vb_capacity = 0; // Bytes; grow-only.
+	RID prev_positions; // This frame's previous positions (see above); not owned unless prev_pos_vb.
 	uint32_t cached_vertex_count = 0;
 	uint32_t cached_full_size = 0;
-	bool prev_pos_seeded = false; // False until the first owned->prev copy has run.
+	bool prev_pos_seeded = false; // False until owned_vb_full holds positions of this surface.
 	// The opacity micromap the triangle BLAS carries (D96 OMMc): the surface's, as the instance's
 	// walk wants it for its alpha-tested material. 0 for none; the walk builds the BLAS again when
 	// it wants another, and any other rebuild takes the last one wanted. A micromap the BLAS could

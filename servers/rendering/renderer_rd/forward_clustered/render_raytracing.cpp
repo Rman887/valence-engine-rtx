@@ -2233,16 +2233,6 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 		entry.prev_pos_seeded = false;
 		needs_full_rebuild = true;
 	}
-	if (entry.prev_pos_vb_capacity < pos_size) {
-		if (entry.prev_pos_vb.is_valid()) {
-			rd->free_rid(entry.prev_pos_vb);
-		}
-		entry.prev_pos_vb = rd->storage_buffer_create(pos_size, Vector<uint8_t>(), 0, prev_flags);
-		ERR_FAIL_COND_V(!entry.prev_pos_vb.is_valid(), nullptr);
-		entry.prev_pos_vb_capacity = pos_size;
-		rd->set_resource_name(entry.prev_pos_vb, "RT deformed prev pos VB [" + itos(p_source.cache_key) + "]");
-		entry.prev_pos_seeded = false;
-	}
 
 	// A kept handle on another surface or mesh instance (D110) holds positions that are not this
 	// surface's: the previous positions are seeded again, so motion vectors start at zero.
@@ -2252,16 +2242,30 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 	// Per-frame copies run exactly once per frame, even when the same surface is visible from multiple viewports.
 	const bool first_touch_this_frame = entry.last_used_frame != current_frame;
 	if (first_touch_this_frame) {
-		if (entry.prev_pos_seeded) {
+		// The previous positions (P2f): unchanged, they are the current ones; changed, the mesh
+		// instance's previous skinned buffer, where it double-buffers (motion vectors on, a change
+		// within two frames of the last), which is the previous frame the raster's motion vectors
+		// read too. Skinned in place, or with a new layout, they are copied out first, as before.
+		if (!entry.prev_pos_seeded || !data_changed) {
+			entry.prev_positions = entry.owned_vb_full; // Seeded, the current positions: zero motion.
+		} else if (!layout_changed && p_source.prev_vb.is_valid() && p_source.prev_vb != p_source.current_vb) {
+			entry.prev_positions = p_source.prev_vb;
+		} else {
+			if (entry.prev_pos_vb_capacity < pos_size) {
+				if (entry.prev_pos_vb.is_valid()) {
+					rd->free_rid(entry.prev_pos_vb);
+				}
+				entry.prev_pos_vb = rd->storage_buffer_create(pos_size, Vector<uint8_t>(), 0, prev_flags);
+				ERR_FAIL_COND_V(!entry.prev_pos_vb.is_valid(), nullptr);
+				entry.prev_pos_vb_capacity = pos_size;
+				rd->set_resource_name(entry.prev_pos_vb, "RT deformed prev pos VB [" + itos(p_source.cache_key) + "]");
+			}
 			rd->buffer_copy(entry.owned_vb_full, entry.prev_pos_vb, 0, 0, pos_size);
+			entry.prev_positions = entry.prev_pos_vb;
 		}
 		if (data_changed || !entry.prev_pos_seeded) {
 			rd->buffer_copy(p_source.current_vb, entry.owned_vb_full, 0, 0, full_size);
 			entry.cluster_lod_slots_stale = true; // The persistent selection's slots hold older positions (D109).
-		}
-		if (!entry.prev_pos_seeded) {
-			// Seed prev = current so motion vectors are zero on the first frame.
-			rd->buffer_copy(entry.owned_vb_full, entry.prev_pos_vb, 0, 0, pos_size);
 			entry.prev_pos_seeded = true;
 		}
 	}
@@ -2334,7 +2338,7 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 void RenderRaytracing::_mark_deformed_geometry(RTDeformedCacheEntry &r_entry) {
 	if (r_entry.ptr && r_entry.ptr->blas.is_valid()) {
 		r_entry.ptr->geometry.flags |= RT_GEOM_FLAG_DEFORMED;
-		uint64_t prev_addr = RD::get_singleton()->buffer_get_device_address(r_entry.prev_pos_vb);
+		uint64_t prev_addr = RD::get_singleton()->buffer_get_device_address(r_entry.prev_positions);
 		r_entry.ptr->geometry.prev_vertex_buffer_address_lo = static_cast<uint32_t>(prev_addr & 0xFFFFFFFFULL);
 		r_entry.ptr->geometry.prev_vertex_buffer_address_hi = static_cast<uint32_t>(prev_addr >> 32);
 	}
@@ -13438,8 +13442,8 @@ void RenderRaytracing::register_raytracing_buffer_dependencies(RD::RaytracingLis
 		if (e->owned_vb_full.is_valid()) {
 			rd->raytracing_list_add_buffer_dependency(p_list, e->owned_vb_full, /*p_writable=*/false);
 		}
-		if (e->prev_pos_vb.is_valid()) {
-			rd->raytracing_list_add_buffer_dependency(p_list, e->prev_pos_vb, /*p_writable=*/false);
+		if (e->prev_positions.is_valid() && e->prev_positions != e->owned_vb_full) {
+			rd->raytracing_list_add_buffer_dependency(p_list, e->prev_positions, /*p_writable=*/false);
 		}
 	}
 

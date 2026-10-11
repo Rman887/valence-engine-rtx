@@ -769,7 +769,7 @@ void shade_hit(HitData h, MaterialResult m) {
 	PathState ps = path_unpack(payload);
 	shade_and_bounce(h, m, gl_WorldRayDirectionEXT, gl_HitTEXT, ps);
 	path_pack(payload, ps);
-	shade_resolve_shadows();
+	shade_resolve_shadows(); // After the pack: it replaces the packed radiance with a pending outcome's (P3e).
 }
 
 // ============================================================================

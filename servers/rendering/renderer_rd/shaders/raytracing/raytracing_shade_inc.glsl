@@ -376,9 +376,12 @@ vec3 shade_previous_origin(HitData h, vec3 ray_dir, float hit_t) {
 // it. A hit draws at most two light samples, slot 0 at the hit and slot 1 at a subsurface walk's exit, and nothing
 // writes the radiance between or after them, so the radiance each outcome would have is formed here in the original
 // order, in fp32 (rt_nee_radiance1 with slot 0's light, 2 with slot 1's, 3 with both, ps.radiance with neither), and
-// rounded once by path_pack_radiance, as path_pack rounds the radiance: the same bits. A sum is read only for a set of
-// slots whose bits are pending, so one left unset is never chosen; both slots pass the hit's arriving diffuse count, so
-// one set of opacity micromap flags serves both.
+// rounded once by path_pack_radiance, as path_pack rounds the radiance: the same bits. That makes it a rule: nothing
+// may write ps.radiance after a hit's first shade_direct_light, since a pending outcome's sum replaces the radiance and
+// would drop the write (shade_and_bounce's contract). A sum is read only for a set of slots whose bits are pending, so
+// one left unset is never chosen; they are not initialised, as a value set at the hit's entry would hold registers
+// through the whole shading (4 bytes more spill, tools/shader-stats.ps1). Both slots pass the hit's arriving diffuse
+// count, so one set of opacity micromap flags serves both.
 uint rt_shadow_pending = 0u; // Bit s: slot s's ray waits for the pipeline.
 vec3 rt_nee_radiance1;
 vec3 rt_nee_radiance2;
@@ -396,10 +399,9 @@ uint rt_shadow_omm_flags;
 /// the shadow ray and the BSDF, added to ps.radiance at the path's throughput (in a closest hit, a ray the inline test
 /// cannot decide waits for the end of the hit with the sum it would make, GPU audit P3e). The caller pins the
 /// sampler's dimension first. p_slot is the sample's place at its hit, 0 at the surface and 1 at a subsurface walk's
-/// exit.
-/// p_hit_pos and p_geometry_normal are the vertex and its normal facing the side
-/// the path arrived from, p_hit_t the length of the segment that reached it (for the origin's offset);
-/// diffuse_transmit_max a thin surface's transmission (D103), whose samples below N leave from the back.
+/// exit. p_hit_pos and p_geometry_normal are the vertex and its normal facing the side the path arrived from, p_hit_t
+/// the length of the segment that reached it (for the origin's offset); diffuse_transmit_max a thin surface's
+/// transmission (D103), whose samples below N leave from the back.
 void shade_direct_light(vec3 p_hit_pos, vec3 p_geometry_normal, float p_hit_t, vec3 N, vec3 V, MaterialProperties brdf_mat, float diffuse_transmit_max, uint diffuse_bounces, uint rt_emissive_count, bool in_medium, uint p_slot, inout PathState ps) {
 	uint rt_light_count = uint(get_rt_param(RT_PARAM_LIGHT_COUNT));
 	// The selection's receiver: the geometry normal as the payload carries it to the next vertex,
@@ -770,7 +772,11 @@ bool rt_subsurface_walk_group() {
 /// ray_dir and hit_t describe the ray that reached h.hit_pos: the hit stage's
 /// built-ins, or the raygen's own primary ray for a G-buffer surface. ps is the path
 /// as it arrived; on return it is the path the raygen continues or ends (the caller
-/// packs it into the payload, P3a).
+/// packs it into the payload, P3a). In a closest hit, ps.radiance on return leaves out
+/// the light of any shadow ray still pending (GPU audit P3e): the caller packs ps with
+/// path_pack and then calls shade_resolve_shadows(), which replaces the payload's
+/// radiance with the outcome's sum. So nothing may write ps.radiance after the first
+/// shade_direct_light: the sums were formed from it there and would drop the write.
 void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, inout PathState ps) {
 	// Every exit below hands the path back, and the raygen reads hit_t for the camera segment's
 	// length before it checks for termination, so the distance is recorded once, here. The

@@ -107,7 +107,7 @@ struct PathPayload {
 
 const float RT_BSDF_PDF_DELTA = -1.0;
 
-/// Unpacked fp32 working copy of the payload.
+/// The payload as the shading works on it: fp32 copies of its fields, but for the medium, kept as its packed words.
 struct PathState {
 	vec3 radiance;
 	vec3 throughput;
@@ -165,17 +165,19 @@ PathState path_unpack(PathPayload p) {
 	return s;
 }
 
+/// The largest finite fp16, to which every value the payload packs as halves is clamped.
+const float RT_FP16_MAX = 65504.0;
+
 /// The radiance as the payload carries it: red and green in packed_rt[0], blue in the low half of packed_rt[1]. One
 /// function for path_pack and the closest hit's deferred shadow rays (shade_resolve_shadows), so both round alike.
 uvec2 path_pack_radiance(vec3 p_radiance) {
-	vec3 r = clamp(p_radiance, vec3(0.0), vec3(65504.0));
+	vec3 r = clamp(p_radiance, vec3(0.0), vec3(RT_FP16_MAX));
 	return uvec2(packHalf2x16(r.rg), packHalf2x16(vec2(r.b, 0.0)));
 }
 
 void path_pack(inout PathPayload p, PathState s) {
-	const float FP16_MAX = 65504.0;
 	uvec2 r = path_pack_radiance(s.radiance);
-	vec3 t = clamp(s.throughput, vec3(0.0), vec3(FP16_MAX));
+	vec3 t = clamp(s.throughput, vec3(0.0), vec3(RT_FP16_MAX));
 	p.packed_rt[0] = r.x;
 	p.packed_rt[1] = r.y | (packHalf2x16(vec2(0.0, t.r)) & 0xFFFF0000u);
 	p.packed_rt[2] = packHalf2x16(vec2(t.g, t.b));
@@ -187,7 +189,7 @@ void path_pack(inout PathPayload p, PathState s) {
 	p.packed_medium = s.packed_medium;
 	p.medium_entry_height = s.medium_entry_height;
 	p.bsdf_pdf = s.bsdf_pdf;
-	p.packed_cone = packHalf2x16(clamp(vec2(s.cone_width, s.cone_spread), vec2(0.0), vec2(FP16_MAX)));
+	p.packed_cone = packHalf2x16(clamp(vec2(s.cone_width, s.cone_spread), vec2(0.0), vec2(RT_FP16_MAX)));
 #ifdef RT_SUBSURFACE_COMPILED
 	p.exit_position = s.exit_position;
 #endif
@@ -213,9 +215,8 @@ vec3 path_medium_inscatter(PathState s) {
 
 /// Enters a medium (D49): clamped to fp16's range and packed as the payload carries it.
 void path_set_medium(inout PathState s, vec3 p_absorption, vec3 p_inscatter, float p_entry_height) {
-	const float FP16_MAX = 65504.0;
-	vec3 a = clamp(p_absorption, vec3(0.0), vec3(FP16_MAX));
-	vec3 i = clamp(p_inscatter, vec3(0.0), vec3(FP16_MAX));
+	vec3 a = clamp(p_absorption, vec3(0.0), vec3(RT_FP16_MAX));
+	vec3 i = clamp(p_inscatter, vec3(0.0), vec3(RT_FP16_MAX));
 	s.packed_medium[0] = packHalf2x16(vec2(a.r, a.g));
 	s.packed_medium[1] = packHalf2x16(vec2(a.b, i.r));
 	s.packed_medium[2] = packHalf2x16(vec2(i.g, i.b));

@@ -8768,6 +8768,58 @@ void RenderRaytracing::update_procedural_blas(RTProceduralState *p_state, LocalV
 // Material processing
 // ---------------------------------------------------------------------------
 
+RID RenderRaytracing::_resolve_surface_material(const void *p_surf) {
+	const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = static_cast<const RenderForwardClustered::GeometryInstanceSurfaceDataCache *>(p_surf);
+	if (surf->owner->data->material_override.is_valid()) {
+		return surf->owner->data->material_override;
+	}
+	if (surf->surface_index < surf->owner->data->surface_materials.size() && surf->owner->data->surface_materials[surf->surface_index].is_valid()) {
+		return surf->owner->data->surface_materials[surf->surface_index];
+	}
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	RID mesh = surf->owner->data->base;
+	if (surf->owner->data->base_type == RSE::INSTANCE_MULTIMESH) {
+		mesh = mesh_storage->multimesh_get_mesh(mesh);
+	}
+	if (mesh.is_valid() && mesh_storage->owns_mesh(mesh)) {
+		return mesh_storage->mesh_surface_get_material(mesh, surf->surface_index);
+	}
+	return RID();
+}
+
+// The walk's material, once a frame per instance surface: the resolution (an override, the instance's
+// surface material, the mesh's) and process_material's cache are taken again only when the material's
+// RT counter moved or the material is gone; a change of the override, the instance's surface materials
+// or the mesh's rebuilds the surface caches. A material freed under the surface (its RID still in the
+// chain until the caches rebuild) traces as the default material, as an unset one: its RID never
+// validates again, and its slot may already hold another material's cache entry.
+RTMaterialData *RenderRaytracing::_surface_material(const void *p_surf) {
+	const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = static_cast<const RenderForwardClustered::GeometryInstanceSurfaceDataCache *>(p_surf);
+	RendererRD::MaterialStorage *material_storage = RendererRD::MaterialStorage::get_singleton();
+	uint16_t live_counter = 0;
+	if (surf->rt_material_data != nullptr && (!surf->rt_material.is_valid() || (material_storage->material_get_rt_invalidation_counter_if_live(surf->rt_material, live_counter) && live_counter == surf->rt_material_counter))) {
+#ifdef DEV_ENABLED
+		const RID resolved = _resolve_surface_material(p_surf);
+		uint16_t resolved_counter = 0;
+		DEV_ASSERT(resolved == surf->rt_material || (!surf->rt_material.is_valid() && !material_storage->material_get_rt_invalidation_counter_if_live(resolved, resolved_counter)));
+#endif
+		if (!surf->rt_material_data->is_custom_shader) {
+			return surf->rt_material_data;
+		}
+		return process_material(surf->rt_material, surf->rt_material_counter);
+	}
+	RID material = _resolve_surface_material(p_surf);
+	uint16_t counter = 0;
+	if (material.is_valid() && !material_storage->material_get_rt_invalidation_counter_if_live(material, counter)) {
+		material = RID(); // Freed.
+	}
+	RTMaterialData *mat_data = process_material(material, counter);
+	surf->rt_material = material;
+	surf->rt_material_data = mat_data;
+	surf->rt_material_counter = counter;
+	return mat_data;
+}
+
 RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t p_material_invalidation_counter) {
 	// Static default material for invalid/null materials
 	static RTMaterialData s_default_mat;
@@ -10559,21 +10611,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				void *mesh_surface = mm_surf->surface;
 				uint32_t surface_counter = mesh_storage->mesh_surface_get_rt_invalidation_counter(mesh_surface);
 
-				RID material_rid;
-				if (mm_surf->owner->data->material_override.is_valid()) {
-					material_rid = mm_surf->owner->data->material_override;
-				} else if (mm_surf->surface_index < mm_surf->owner->data->surface_materials.size() &&
-						mm_surf->owner->data->surface_materials[mm_surf->surface_index].is_valid()) {
-					material_rid = mm_surf->owner->data->surface_materials[mm_surf->surface_index];
-				} else {
-					RID mesh_rid = mesh_storage->multimesh_get_mesh(mm_rid);
-					if (mesh_rid.is_valid() && mesh_storage->owns_mesh(mesh_rid)) {
-						material_rid = mesh_storage->mesh_surface_get_material(mesh_rid, mm_surf->surface_index);
-					}
-				}
-
-				uint16_t material_counter = material_storage->material_get_rt_invalidation_counter(material_rid);
-				RTMaterialData *mat_data = process_material(material_rid, material_counter);
+				RTMaterialData *mat_data = _surface_material(mm_surf);
 
 				if (mat_data->rt_sbt_offset > 0 &&
 						!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {
@@ -10713,21 +10751,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			}
 
 			// Resolve material before TLAS so we can skip surfaces whose HG is not live yet (override > surface > mesh).
-			RID material_rid;
-			if (surf->owner->data->material_override.is_valid()) {
-				material_rid = surf->owner->data->material_override;
-			} else if (surf->surface_index < surf->owner->data->surface_materials.size() &&
-					surf->owner->data->surface_materials[surf->surface_index].is_valid()) {
-				material_rid = surf->owner->data->surface_materials[surf->surface_index];
-			} else {
-				RID mesh_rid = surf->owner->data->base;
-				if (mesh_rid.is_valid() && mesh_storage->owns_mesh(mesh_rid)) {
-					material_rid = mesh_storage->mesh_surface_get_material(mesh_rid, surf->surface_index);
-				}
-			}
-
-			uint16_t material_counter = material_storage->material_get_rt_invalidation_counter(material_rid);
-			RTMaterialData *mat_data = process_material(material_rid, material_counter);
+			RTMaterialData *mat_data = _surface_material(surf);
 
 			if (mat_data->rt_sbt_offset > 0 &&
 					!rt_shader_singleton->is_hg_ready_in_bundle(mat_data->rt_sbt_offset, p_rt_flags)) {

@@ -551,6 +551,17 @@ public:
 		}
 	}
 
+	// The RT invalidation counter of a live material: false where p_material is freed, its slot's
+	// reuse included (the RID's validator no longer matches), where the counter alone could read alike.
+	_FORCE_INLINE_ bool material_get_rt_invalidation_counter_if_live(RID p_material, uint16_t &r_counter) const {
+		const Material *material = material_owner.get_or_null(p_material);
+		if (!material) {
+			return false;
+		}
+		r_counter = material->rt_invalidation_counter;
+		return true;
+	}
+
 	_FORCE_INLINE_ uint16_t material_get_rt_invalidation_counter(RID p_material) const {
 		Material *material = material_owner.get_or_null(p_material);
 		if (!material) {

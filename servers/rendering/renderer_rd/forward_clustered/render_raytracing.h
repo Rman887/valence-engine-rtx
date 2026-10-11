@@ -2515,6 +2515,13 @@ class RenderRaytracing {
 	// Frees the surface's BLAS and, on the cluster path, the staging buffers or the arena region it lives in.
 	void _release_surface_data(RTSurfaceData *p_surf_data);
 	RTMaterialData *process_material(RID p_material_rid, uint16_t p_material_invalidation_counter);
+	// The material a surface cache (`p_surf`, a GeometryInstanceSurfaceDataCache) traces with: the
+	// instance's override, else its surface material, else its mesh's (a MultiMesh's mesh's) surface material.
+	static RID _resolve_surface_material(const void *p_surf);
+	// Its RT data, through process_material once and then from the surface cache while the material
+	// lives with the same RT counter; a custom shader's material is processed every frame still, which
+	// keeps its hit group slot current.
+	RTMaterialData *_surface_material(const void *p_surf);
 	bool _build_merged_mm_blas(
 			RID p_mm_rid,
 			RID p_mm_gpu_buffer,

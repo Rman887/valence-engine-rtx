@@ -574,6 +574,12 @@ protected:
 
 		mutable RID rt_deformed_handle;
 		mutable RID rt_lod_handle; // The instance's cluster LOD slot (D86).
+		// The material the path tracer resolved for this surface (override > instance surface > mesh),
+		// its RT data and its RT counter then, kept while the material lives with that counter
+		// (RenderRaytracing::_surface_material). A change of the chain itself rebuilds these caches (_mark_dirty).
+		mutable RID rt_material;
+		mutable RTMaterialData *rt_material_data = nullptr;
+		mutable uint16_t rt_material_counter = 0;
 
 		GeometryInstanceSurfaceDataCache *next = nullptr;
 		GeometryInstanceForwardClustered *owner = nullptr;

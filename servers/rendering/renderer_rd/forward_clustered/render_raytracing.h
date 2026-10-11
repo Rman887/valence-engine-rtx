@@ -2123,8 +2123,10 @@ class RenderRaytracing {
 		float max_range;
 		float decay; // The light's attenuation exponent (D63); 2 for an emissive entry.
 		uint32_t encoded; // RT_LIGHT_TREE_LEAF_BIT | flags | index.
+		uint64_t key; // Which light it is: a light's instance RID, an emitter's instance index (P2i).
 	};
 	LocalVector<LightTreeLeaf> light_tree_leaves;
+	LocalVector<uint64_t> light_scratch_keys; ///< Each gathered light's instance RID (P2i), parallel to light_scratch.
 	LocalVector<uint32_t> light_tree_order; ///< Leaf indices, partitioned in place by the build.
 	LocalVector<RT_LightTreeNode> light_tree_nodes;
 	LocalVector<uint32_t> light_tree_leaf_list; ///< The leaf node at each position of the order: a node's leaves are contiguous.

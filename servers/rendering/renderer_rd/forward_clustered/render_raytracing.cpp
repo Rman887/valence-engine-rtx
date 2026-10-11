@@ -11570,6 +11570,7 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 			break;
 		}
 		RT_LightData &ld = r_light_data[rt_light_count];
+		light_scratch_keys[rt_light_count] = light_instance.get_id();
 		Transform3D xform = ls->light_instance_get_base_transform(light_instance);
 		Vector3 dir = -xform.basis.get_column(2).normalized();
 		ld.position[0] = dir.x;
@@ -11624,6 +11625,7 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		RSE::LightType type = ls->light_get_type(base);
 
 		RT_LightData &ld = r_light_data[rt_light_count];
+		light_scratch_keys[rt_light_count] = light_instance.get_id(); // Which light the tree's leaf is from frame to frame (P2i).
 		Transform3D xform = ls->light_instance_get_base_transform(light_instance);
 		const Vector3 relative_pos = xform.origin - p_origin;
 		ld.position[0] = relative_pos.x;
@@ -11971,7 +11973,8 @@ static void _rt_cone_union(const Vector3 &p_a1, float p_cos1, const Vector3 &p_a
 /// Lists the frame's leaves, one per positional light and per emissive entry (the directional
 /// lights and the sky are the tree's top-level companions in the shader), and builds a binary
 /// tree over them balanced by count, split at the median of the leaf centres along the longest
-/// axis, in depth-first order so a node's left child follows it and a node's leaves are contiguous
+/// axis (a total order, so the tree is the same whatever order the lights were gathered in: the
+/// gather ranks them by a score that moves with the camera and their power), in depth-first order so a node's left child follows it and a node's leaves are contiguous
 /// in the order. Each node carries the union of its children's spheres and cones, their summed
 /// power, their largest range and its leaves' range, and the falloff its analytic lights and its
 /// emitters each take (D63): their shares of the power, the analytic lights' slowest decay and
@@ -12013,6 +12016,9 @@ uint32_t RenderRaytracing::build_light_tree(const RT_LightData *p_lights, uint32
 		}
 		LightTreeLeaf leaf;
 		leaf.center = Vector3(l.position[0], l.position[1], l.position[2]);
+		if (!leaf.center.is_finite()) {
+			continue; // Neither ordered nor bounded: the median sort needs a strict weak order (P2i).
+		}
 		leaf.radius = MAX(l.radius, 0.0f);
 		// Keyed on the cone the shader keys on: a spot opened to a half turn has cos -1 and is an omni here.
 		if (l.type == RT_LIGHT_TYPE_RECT) {
@@ -12034,6 +12040,7 @@ uint32_t RenderRaytracing::build_light_tree(const RT_LightData *p_lights, uint32
 		// The node importance and a leaf slot's target (D59) fall off by it (D63).
 		leaf.decay = l.attenuation;
 		leaf.encoded = RT_LIGHT_TREE_LEAF_BIT | i;
+		leaf.key = light_scratch_keys[i];
 		light_tree_leaves.push_back(leaf);
 	}
 	// The emissive gather's ranking is in the entries' order; its weight is the luminance times
@@ -12047,6 +12054,9 @@ uint32_t RenderRaytracing::build_light_tree(const RT_LightData *p_lights, uint32
 		}
 		LightTreeLeaf leaf;
 		leaf.center = Vector3(e.center[0], e.center[1], e.center[2]);
+		if (!leaf.center.is_finite()) {
+			continue;
+		}
 		leaf.radius = MAX(e.radius, 0.0f);
 		leaf.axis = Vector3(0, 0, 1);
 		leaf.cos_theta_o = -1.0f;
@@ -12054,6 +12064,7 @@ uint32_t RenderRaytracing::build_light_tree(const RT_LightData *p_lights, uint32
 		leaf.max_range = 0.0f;
 		leaf.decay = 2.0f;
 		leaf.encoded = RT_LIGHT_TREE_LEAF_BIT | RT_LIGHT_TREE_EMISSIVE_BIT | n;
+		leaf.key = emissive_candidates[n].index;
 		light_tree_leaves.push_back(leaf);
 	}
 
@@ -12191,11 +12202,26 @@ uint32_t RenderRaytracing::_build_light_tree_node(uint32_t p_begin, uint32_t p_e
 		bounds.expand_to(light_tree_leaves[light_tree_order[i]].center);
 	}
 	int axis = bounds.get_longest_axis_index();
+	// A total order (P2i): leaves level on the axis go by the other two, then lights before emitters,
+	// then by the light, so the split never depends on the order the leaves were gathered in.
 	struct AxisComparator {
 		const LightTreeLeaf *leaves = nullptr;
 		int axis = 0;
 		bool operator()(uint32_t a, uint32_t b) const {
-			return leaves[a].center[axis] < leaves[b].center[axis];
+			const LightTreeLeaf &la = leaves[a];
+			const LightTreeLeaf &lb = leaves[b];
+			for (int k = 0; k < 3; k++) {
+				const int c = (axis + k) % 3;
+				if (la.center[c] != lb.center[c]) {
+					return la.center[c] < lb.center[c];
+				}
+			}
+			const uint32_t kind_a = la.encoded & RT_LIGHT_TREE_EMISSIVE_BIT;
+			const uint32_t kind_b = lb.encoded & RT_LIGHT_TREE_EMISSIVE_BIT;
+			if (kind_a != kind_b) {
+				return kind_a < kind_b;
+			}
+			return la.key < lb.key;
 		}
 	};
 	SortArray<uint32_t, AxisComparator> sorter;
@@ -12717,6 +12743,7 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		const uint32_t light_cap = light_tree ? RT_LIGHTS_MAX : RT_LIGHTS_UNIFORM_MAX;
 		if (light_scratch.size() < RT_LIGHTS_MAX) {
 			light_scratch.resize(RT_LIGHTS_MAX);
+			light_scratch_keys.resize(RT_LIGHTS_MAX);
 		}
 		RT_LightData *rt_light_data = light_scratch.ptr();
 		memset(rt_light_data, 0, light_cap * sizeof(RT_LightData));

@@ -1401,6 +1401,8 @@ struct RTViewportState {
 	uint32_t motion_transform_buffer_capacity = 0;
 
 	RID light_buffer;
+	LocalVector<RT_LightData> light_buffer_held; // What light_buffer holds (P2i): the entries past it are zero.
+	LocalVector<uint8_t> light_buffer_image; // Builds with asserts (P2i): light_buffer's bytes as its updates left them.
 	RID emissive_buffer; // The emissive mesh lights of the frame (D50), RT_EMISSIVE_MAX entries.
 	RID light_tree_buffer; // The light tree (D55): a header, the nodes, each emissive entry's cut slot, the cut's nodes and the leaf list (D56), each emissive entry's leaf position and the leaves' alias tables per cut (D60, D61); built or refit per frame while the Environment asks for it.
 	RTLightTree light_tree; // What light_tree_buffer holds (P2i).
@@ -2157,6 +2159,13 @@ class RenderRaytracing {
 	// entry, and the build's and the refit's working lists; the tree itself is the viewport's (P2i).
 	LocalVector<RTLightTreeLeaf> light_tree_leaves;
 	LocalVector<uint64_t> light_scratch_keys; ///< Each gathered light's instance RID (P2i), parallel to light_scratch.
+	LocalVector<uint8_t> light_upload_marks; ///< The light upload's marks (P2i): an entry that differs from what the buffer holds.
+	// The light buffer's uploads over the frames since the last verbose report (P2i).
+	struct LightBufferStats {
+		uint64_t bytes = 0;
+		uint32_t updates = 0;
+		uint32_t entries = 0; // Entries written.
+	} light_buffer_stats;
 	LocalVector<uint32_t> light_tree_order; ///< Leaf indices, partitioned in place by the build.
 	LocalVector<uint32_t> light_tree_cut_queue; ///< The cut's breadth-first work queue.
 	LocalVector<uint32_t> light_tree_leaf_positions; ///< The refit's match (P2i): each leaf's position in the tree's order.

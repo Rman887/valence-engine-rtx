@@ -11570,6 +11570,7 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 			break;
 		}
 		RT_LightData &ld = r_light_data[rt_light_count];
+		ld = RT_LightData();
 		light_scratch_keys[rt_light_count] = light_instance.get_id();
 		Transform3D xform = ls->light_instance_get_base_transform(light_instance);
 		Vector3 dir = -xform.basis.get_column(2).normalized();
@@ -11625,6 +11626,7 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		RSE::LightType type = ls->light_get_type(base);
 
 		RT_LightData &ld = r_light_data[rt_light_count];
+		ld = RT_LightData(); // Zeroed: the upload compares whole entries, unused fields among them (P2i).
 		light_scratch_keys[rt_light_count] = light_instance.get_id(); // Which light the tree's leaf is from frame to frame (P2i).
 		Transform3D xform = ls->light_instance_get_base_transform(light_instance);
 		const Vector3 relative_pos = xform.origin - p_origin;
@@ -13043,7 +13045,6 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 			light_scratch_keys.resize(RT_LIGHTS_MAX);
 		}
 		RT_LightData *rt_light_data = light_scratch.ptr();
-		memset(rt_light_data, 0, light_cap * sizeof(RT_LightData));
 
 		float light_score_sum = 0.0f;
 		uint32_t rt_directional_count = 0;
@@ -13055,14 +13056,61 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		// The decals the hit shaders apply (D104), with their hierarchy; none skips the walk.
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_DECAL_COUNT] = float(gather_decals(p_state, p_render_data));
 
-		// Upload light buffer: the cap's entries, as the uniform pick always had (zeroed past the count).
+		// Upload the light buffer (P2i): the entries that differ from what it holds, and zeros over the
+		// ones a shorter list no longer uses. Every reader is bounded by the count (the directional loops
+		// by the scene's directional_light_count, which the path-traced frame takes from
+		// _count_directional_lights, the list and filter gather_lights uses); the zeros past it keep what
+		// the cap's whole upload left there, a guard rather than a contract.
 		{
 			uint32_t buf_size = RT_LIGHTS_MAX * sizeof(RT_LightData);
+			LocalVector<RT_LightData> &held = p_state->light_buffer_held;
 			if (!p_state->light_buffer.is_valid()) {
 				p_state->light_buffer = RD::get_singleton()->storage_buffer_create(buf_size);
 				RD::get_singleton()->set_resource_name(p_state->light_buffer, "RT Light Buffer");
+				RD::get_singleton()->buffer_clear(p_state->light_buffer, 0, buf_size);
+				held.clear();
 			}
-			RD::get_singleton()->buffer_update(p_state->light_buffer, 0, light_cap * sizeof(RT_LightData), rt_light_data);
+			uint8_t *image = nullptr;
+#ifdef DEV_ENABLED
+			if (p_state->light_buffer_image.size() != buf_size) {
+				p_state->light_buffer_image.resize(buf_size);
+				memset(p_state->light_buffer_image.ptr(), 0, buf_size);
+			}
+			image = p_state->light_buffer_image.ptr();
+#endif
+			const uint32_t held_count = held.size();
+			light_upload_marks.resize(rt_light_count);
+			for (uint32_t i = 0; i < rt_light_count; i++) {
+				light_upload_marks[i] = i >= held_count || memcmp(&rt_light_data[i], &held[i], sizeof(RT_LightData)) != 0;
+			}
+			light_buffer_stats.entries += _rt_upload_marked_runs(p_state->light_buffer, 0, sizeof(RT_LightData), rt_light_data, light_upload_marks.ptr(), rt_light_count, image, light_buffer_stats.updates, light_buffer_stats.bytes);
+			if (held_count > rt_light_count) {
+				const uint32_t offset = rt_light_count * sizeof(RT_LightData);
+				const uint32_t size = (held_count - rt_light_count) * sizeof(RT_LightData);
+				RD::get_singleton()->buffer_clear(p_state->light_buffer, offset, size);
+				if (image) {
+					memset(image + offset, 0, size);
+				}
+				light_buffer_stats.updates++;
+				light_buffer_stats.bytes += size;
+			}
+			held.resize(rt_light_count);
+			if (rt_light_count > 0) {
+				memcpy(held.ptr(), rt_light_data, rt_light_count * sizeof(RT_LightData));
+			}
+#ifdef DEV_ENABLED
+			// The uploads are complete: the buffer's bytes, as the updates left them, are the frame's
+			// lights and zeros past them.
+			bool uploaded = rt_light_count == 0 || memcmp(image, rt_light_data, rt_light_count * sizeof(RT_LightData)) == 0;
+			for (uint32_t i = rt_light_count * sizeof(RT_LightData); i < buf_size && uploaded; i++) {
+				uploaded = image[i] == 0;
+			}
+			DEV_ASSERT(uploaded);
+#endif
+			if (RD::get_singleton()->get_frames_drawn() % 300 == 0 && OS::get_singleton()->is_stdout_verbose()) {
+				print_verbose(vformat("RT: light buffer (P2i): %d lights; since the last report %d entries written, %d bytes in %d buffer updates.", rt_light_count, light_buffer_stats.entries, light_buffer_stats.bytes, light_buffer_stats.updates));
+				light_buffer_stats = LightBufferStats();
+			}
 		}
 
 		// --- Emissive mesh lights (D50) ---

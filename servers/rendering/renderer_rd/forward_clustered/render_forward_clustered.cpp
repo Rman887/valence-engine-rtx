@@ -1589,8 +1589,14 @@ uint32_t RenderForwardClustered::_count_directional_lights(const RenderDataRD *p
 	uint32_t count = 0;
 	for (uint32_t li = 0; li < (uint32_t)p_render_data->lights->size(); li++) {
 		RID base = ls->light_instance_get_base_light((*p_render_data->lights)[li]);
-		if (ls->light_get_type(base) == RSE::LIGHT_DIRECTIONAL) {
+		// VAL (P2i): the suns LightStorage::update_light_buffers writes, in its order: no sky-only light and no more
+		// than its cap. The count bounds the path-traced frame's raster passes over that buffer and the trace's
+		// loops over its own list (RenderRaytracing::gather_lights), which takes the same suns.
+		if (ls->light_get_type(base) == RSE::LIGHT_DIRECTIONAL && ls->light_directional_get_sky_mode(base) != RSE::LIGHT_DIRECTIONAL_SKY_MODE_SKY_ONLY) {
 			count++;
+			if (count >= ls->get_max_directional_lights()) {
+				break;
+			}
 		}
 	}
 	return count;

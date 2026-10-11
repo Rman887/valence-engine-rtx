@@ -11566,7 +11566,13 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 		if (type != RSE::LIGHT_DIRECTIONAL) {
 			continue;
 		}
-		if (rt_light_count >= p_max_lights) {
+		if (ls->light_directional_get_sky_mode(base) == RSE::LIGHT_DIRECTIONAL_SKY_MODE_SKY_ONLY) {
+			// VAL (P2i): it lights the sky alone; the raster leaves it out of its lights (LightStorage::update_light_buffers).
+			continue;
+		}
+		// VAL (P2i): the raster's directional buffer stops at its cap, and the scene's directional_light_count
+		// (_count_directional_lights) with it; the trace's list stops there too, so all three name the same suns.
+		if (rt_light_count >= p_max_lights || rt_light_count >= ls->get_max_directional_lights()) {
 			break;
 		}
 		RT_LightData &ld = r_light_data[rt_light_count];

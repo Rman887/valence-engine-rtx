@@ -2274,6 +2274,14 @@ RDD::BufferID RenderingDeviceDriverVulkan::buffer_create(uint64_t p_size, BitFie
 				alloc_create_info.preferredFlags |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 				vma_flags_to_remove |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 			}
+			// Every CPU buffer is mapped, and VMA asserts on mapping memory allocated with AUTO usage and
+			// no host access flag: a buffer the GPU reads at its address with neither transfer bit (a
+			// partitioned TLAS's input) is written in sequence, one with both is read and written.
+			if (!is_src && !is_dst) {
+				alloc_create_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+			} else if (is_src && is_dst) {
+				alloc_create_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+			}
 			vma_usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
 			alloc_create_info.requiredFlags = (VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
 		} break;

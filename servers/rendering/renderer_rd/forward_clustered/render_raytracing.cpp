@@ -401,6 +401,10 @@ RenderRaytracing::~RenderRaytracing() {
 		RD::get_singleton()->free_rid(shadow_stats_buffer);
 		shadow_stats_buffer = RID();
 	}
+	if (surface_codec_check_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(surface_codec_check_buffer);
+		surface_codec_check_buffer = RID();
+	}
 
 	if (mat_ubo_pool_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(mat_ubo_pool_buffer);
@@ -1400,6 +1404,11 @@ void RenderRaytracing::prepare_frame() {
 	if (shadow_stats_buffer.is_valid() && RD::get_singleton()->get_frames_drawn() % 300 == 0) {
 		RD::get_singleton()->buffer_get_data_async(shadow_stats_buffer, callable_mp_static(&RenderRaytracing::_on_shadow_stats_read));
 		RD::get_singleton()->buffer_clear(shadow_stats_buffer, 0, sizeof(uint32_t) * RT_SHADOW_STATS_WORDS);
+	}
+	// The surface record's codec check (P3a), asserts builds only.
+	if (surface_codec_check_buffer.is_valid() && RD::get_singleton()->get_frames_drawn() % 300 == 0) {
+		RD::get_singleton()->buffer_get_data_async(surface_codec_check_buffer, callable_mp_static(&RenderRaytracing::_on_surface_codec_check_read));
+		RD::get_singleton()->buffer_clear(surface_codec_check_buffer, 0, sizeof(uint32_t) * RT_SURFACE_CODEC_CHECK_WORDS);
 	}
 	if (async_probe.enabled) {
 		_async_probe_step();
@@ -8637,6 +8646,21 @@ void RenderRaytracing::_on_shadow_stats_read(const PackedByteArray &p_bytes) {
 	print_line(vformat("RT: inline shadow rays (P1k), the last 300 frames, one pixel in 64: %d rays; %.3f %% met a candidate the inline test cannot decide, %.3f %% traced through the pipeline for it.", words[0], 100.0 * words[1] / rays, 100.0 * words[2] / rays));
 }
 
+void RenderRaytracing::_on_surface_codec_check_read(const PackedByteArray &p_bytes) {
+	if (p_bytes.size() < int64_t(sizeof(uint32_t) * RT_SURFACE_CODEC_CHECK_WORDS)) {
+		return;
+	}
+	uint32_t words[RT_SURFACE_CODEC_CHECK_WORDS];
+	memcpy(words, p_bytes.ptr(), sizeof(words));
+	if (words[1] != 0) {
+		ERR_PRINT(vformat("RT: the surface record (P3a) lost a field beyond its encoding's rounding on %d surfaces in the last 300 frames: field mask 0x%x (surface_codec_check_hit's bits, raytracing_surface_inc.glsl).", words[1], words[2]));
+	}
+	if (words[5] != 0) {
+		ERR_PRINT(vformat("RT: %d surfaces in the last 300 frames carried a colour or scalar that is not finite; the surface record (P3a) packs it as 0.", words[5]));
+	}
+	print_verbose(vformat("RT: surface record check (P3a), closest hits and the G-buffer primary, the last 300 frames: %d surfaces compared (one pixel in 64); in every pixel, %d with a field outside its rounding, %d shading normals the record would replace by the geometry normal and %d geometry normals by the normal facing the ray (applied by the G-buffer primary now, by closest hits from S2), %d with a non-finite colour or scalar.", words[0], words[1], words[3], words[4], words[5]));
+}
+
 void RenderRaytracing::_on_position_fetch_check_read(const PackedByteArray &p_bytes) {
 	if (p_bytes.size() < int64_t(sizeof(uint32_t) * RT_POSITION_FETCH_CHECK_WORDS)) {
 		return;
@@ -13547,6 +13571,23 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		}
 		uniforms.push_back(u);
 	}
+
+#ifdef DEV_ENABLED
+	// Binding 55: the surface record's codec check (P3a), declared by every closest hit and the G-buffer raygen of an asserts build.
+	{
+		if (!surface_codec_check_buffer.is_valid()) {
+			Vector<uint8_t> zeros;
+			zeros.resize_initialized(sizeof(uint32_t) * RT_SURFACE_CODEC_CHECK_WORDS);
+			surface_codec_check_buffer = RD::get_singleton()->storage_buffer_create(zeros.size(), zeros);
+			RD::get_singleton()->set_resource_name(surface_codec_check_buffer, "RT surface codec check");
+		}
+		RD::Uniform u;
+		u.binding = 55;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.append_id(surface_codec_check_buffer);
+		uniforms.push_back(u);
+	}
+#endif
 
 	// Binding 46: the position-fetch check (D93a), declared only by a verbose run's shaders.
 	if (position_fetch_check_buffer.is_valid()) {

@@ -91,6 +91,7 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 #include "raytracing_light_tree_inc.glsl"
 #include "raytracing_material_eval_inc.glsl"
 #include "raytracing_shade_inc.glsl"
+#include "raytracing_surface_inc.glsl"
 // clang-format on
 
 layout(set = 0, binding = 33) uniform texture2D gbuffer_albedo_specular;
@@ -201,6 +202,7 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	h.uv2 = vec2(0.0);
 	h.color = vec4(1.0);
 	h.is_front_face = transmission_flags.a > 0.5;
+	h.custom_group = false;
 	h.geometry_idx = 0u;
 	h.primitive_id = 0u;
 	h.texture_lod = RT_TEXTURE_LOD_BASE; // The raster sampled the surface's textures.
@@ -243,8 +245,17 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 		return true;
 	}
 #endif // RT_DEBUG_ENABLED
+	// The surface as the hit shaders will hand it back (P3a): the record of the G-buffer's own precision, so the codec
+	// runs on a supported path and loses only the normals' octahedral rounding.
+#ifdef RT_SURFACE_CODEC_CHECK
+	surface_codec_check_hit(h, m, ray_origin, ray_dir, hit_t);
+#endif
+	const SurfaceRecord record = surface_pack(h, m, hit_t);
+	HitData h_record;
+	MaterialResult m_record;
+	surface_unpack(record, ray_origin, ray_dir, h_record, m_record);
 	PathState ps = path_unpack(payload);
-	shade_and_bounce(h, m, ray_dir, hit_t, ps);
+	shade_and_bounce(h_record, m_record, ray_dir, hit_t, ps);
 	path_pack(payload, ps);
 	return true;
 }
@@ -632,6 +643,11 @@ void main() {
 #ifdef USE_POSITION_FETCH
 #extension GL_EXT_ray_tracing_position_fetch : require
 #endif
+#ifdef RT_SURFACE_CODEC_CHECK
+// The surface record's check counts per subgroup (P3a), an asserts build only.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
 
 #define GLSL 1
 #define RT_STAGE_CLOSEST_HIT 1
@@ -713,11 +729,15 @@ vec3 radiance_octmap_sample(vec2 p_oct_uv, float p_roughness) {
 #include "raytracing_material_eval_inc.glsl"
 #include "raytracing_closest_hit_common_inc.glsl"
 #include "raytracing_decals_inc.glsl"
+#include "raytracing_surface_inc.glsl"
 // clang-format on
 
 /// Shades the evaluated surface and hands the path back to the raygen in the payload. A function of its own, so a custom
 /// hit group's fragment code, spliced into main, cannot shadow its names.
 void shade_hit(HitData h, MaterialResult m) {
+#ifdef RT_SURFACE_CODEC_CHECK
+	surface_codec_check_hit(h, m, gl_WorldRayOriginEXT, gl_WorldRayDirectionEXT, gl_HitTEXT);
+#endif
 	PathState ps = path_unpack(payload);
 	shade_and_bounce(h, m, gl_WorldRayDirectionEXT, gl_HitTEXT, ps);
 	path_pack(payload, ps);
@@ -798,7 +818,7 @@ void main() {
 	m.ior = max(ior, 1.0);
 	m.absorption = max(absorption, vec3(0.0));
 	m.scattering = clamp(scattering, vec3(0.0), vec3(1.0));
-	m.diffuse_transmission = vec3(0.0);
+	m.diffuse_transmission = vec3(0.0); // No BACKLIGHT here: the surface record's thin and refracting words overlay (raytracing_surface_inc.glsl).
 	// VAL: ANISOTROPY and ANISOTROPY_FLOW (D118 MM1) against the fragment's TANGENT and BINORMAL, as the raster turns
 	// them; in a shader that writes neither it is the constant 0, on which the compiler drops the lobe. Capped at 1,
 	// past which the raster's aspect soon has no root; below -1 it stretches further along B, as in the raster.
@@ -964,7 +984,7 @@ void main() {
 	m.emissive = emissive;
 	m.decal_emissive = vec3(0.0);
 	m.normal = final_normal;
-	m.transmission = vec3(0.0);
+	m.transmission = vec3(0.0); // No TRANSMISSION here: the surface record's thin and refracting words overlay (raytracing_surface_inc.glsl).
 	m.ior = 1.5;
 	m.absorption = vec3(0.0);
 	m.scattering = vec3(0.0);

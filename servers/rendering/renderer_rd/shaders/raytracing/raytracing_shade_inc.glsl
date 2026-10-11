@@ -30,6 +30,7 @@ struct HitData {
 	vec2 uv2; // The raw second UV set (D118), zero unless the hit fetched it.
 	vec4 color; // Vertex color (white if not present).
 	bool is_front_face;
+	bool custom_group; // VAL: a custom hit group's surface (P3a): a walk's exit takes the entry's perturbation (D120).
 	uint geometry_idx;
 	uint primitive_id; // The triangle hit; 0 for a G-buffer surface, which never weighs its emission (D50).
 	float texture_lod; // The ray cone's texture-independent level (D116), RT_TEXTURE_LOD_BASE when unknown.
@@ -691,6 +692,20 @@ uint subsurface_walk(HitData h, vec3 p_albedo, bool p_skin, vec3 N, float hit_t,
 }
 #endif
 
+#ifdef RT_SUBSURFACE_COMPILED
+/// Whether this hit group walks (D120 SS2): every custom hit group (each folds the share by its own SSS_STRENGTH), and the
+/// standard hit group only in its walking variant, which the instances whose material can walk select; the plain one
+/// folds the walk away, which would otherwise cost every standard hit the walk's registers. The surface record carries
+/// the share this gives (P3a).
+bool rt_subsurface_walk_group() {
+#ifdef RT_CUSTOM_HIT_GROUP
+	return true;
+#else
+	return (RT_FLAGS & RT_FLAG_SUBSURFACE_WALK_GROUP) != 0u;
+#endif
+}
+#endif
+
 /// ray_dir and hit_t describe the ray that reached h.hit_pos: the hit stage's
 /// built-ins, or the raygen's own primary ray for a G-buffer surface. ps is the path
 /// as it arrived; on return it is the path the raygen continues or ends (the caller
@@ -803,19 +818,12 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	// so its terms, the base's attenuation and the guides agree.
 	brdf_mat.sheenColor = vec3(0.0);
 	brdf_mat.sheenRoughness = clamp(m.roughness, 0.1, 1.0); // Below 0.1 the albedo fit leans on its r = 0 row and under-states the lobe.
-	// VAL: the diffuse lobe's share that walks under the surface (D120); constant 0 while the walk is not compiled in. A
-	// back face (an open mesh seen from inside) never walks, so it keeps the whole diffuse lobe.
-	// The standard hit group walks only in its walking variant (RT_FLAG_SUBSURFACE_WALK_GROUP, D120 SS2), which the
-	// instances whose material can walk select: in the plain one the share folds to 0, and the walk with it, which
-	// would otherwise cost every standard hit the walk's registers. A custom hit group folds it by its own SSS_STRENGTH.
+	// VAL: the diffuse lobe's share that walks under the surface (D120); constant 0 while the walk is not compiled in, and
+	// outside a walking group (rt_subsurface_walk_group). A back face (an open mesh seen from inside) never walks, so it
+	// keeps the whole diffuse lobe.
 	brdf_mat.subsurface = 0.0;
 #ifdef RT_SUBSURFACE_COMPILED
-#ifdef RT_CUSTOM_HIT_GROUP
-	const bool walk_group = true;
-#else
-	const bool walk_group = (RT_FLAGS & RT_FLAG_SUBSURFACE_WALK_GROUP) != 0u;
-#endif
-	brdf_mat.subsurface = (h.is_front_face && walk_group) ? m.subsurface : 0.0;
+	brdf_mat.subsurface = (h.is_front_face && rt_subsurface_walk_group()) ? m.subsurface : 0.0;
 #endif
 	if (m.rim > 0.0 && dot(N, V) > 0.0) {
 		brdf_mat.sheenColor = clamp(m.rim * m.albedo * mix(vec3(1.0), m.albedo, m.rim_tint) * (1.0 - m.metalness), vec3(0.0), vec3(1.0));

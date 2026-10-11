@@ -157,6 +157,11 @@ vec3 rt_derived_tangent(GeometryData geom, uint i0, uint i1, uint i2, VertexAttr
 HitData compute_hit_data(bool p_footprint, bool p_gradients, bool p_uv2) {
 	HitData h;
 	h.geometry_idx = gl_InstanceCustomIndexEXT;
+#ifdef RT_CUSTOM_HIT_GROUP
+	h.custom_group = true;
+#else
+	h.custom_group = false;
+#endif
 	GeometryData geom = geometries[h.geometry_idx];
 #if defined(RT_POSITION_FETCH_CHECK) && defined(USE_CLUSTER_AS)
 	GeometryData surface = geom;

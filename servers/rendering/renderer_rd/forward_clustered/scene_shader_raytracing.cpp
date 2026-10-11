@@ -964,6 +964,11 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 	if ((p_rt_flags & RT_FLAG_RAY_QUERY_SHADOWS_ENABLED) && OS::get_singleton()->is_stdout_verbose()) {
 		inject_define(sources, "#define RT_SHADOW_STATS\n");
 	}
+#ifdef DEV_ENABLED
+	// VAL: an asserts build checks the surface record's codec against every surface a closest hit or the G-buffer primary
+	// shades (P3a).
+	inject_define(sources, "#define RT_SURFACE_CODEC_CHECK\n");
+#endif
 
 	// Procedural templates come from intersection stage; strip from base HG0 path.
 	String intersection_source_template;

@@ -3386,10 +3386,9 @@
 			Number of frames a merged MultiMesh BLAS is kept alive in the path tracer cache after its last visible frame. At 60 fps, the default of 3600 corresponds to approximately one minute. Once this threshold is exceeded the BLAS and all merged vertex, attribute, and index buffers are freed. Decrease this value to reclaim GPU memory when MultiMeshes disappear from the scene.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
-		<member name="rendering/pathtracing/multimesh_cache_cpu_transforms" type="bool" setter="" getter="" default="false">
-			When enabled, setting [member MultiMesh.buffer] keeps a CPU-side mirror of the instance transform data in sync with the GPU buffer. This allows the path tracer to read per-instance transforms without performing a GPU-to-CPU readback on first access, eliminating the one-time stall that occurs otherwise.
-			[b]Warning:[/b] Enabling this setting increases CPU memory usage. Every [MultiMesh] that assigns [member MultiMesh.buffer] will maintain a full duplicate of its transform data in RAM.
-			Enable this only when [MultiMesh] nodes with frequently updated transforms are present in path-traced scenes and the GPU readback stall is measurable.
+		<member name="rendering/pathtracing/multimesh_cache_cpu_transforms" type="bool" setter="" getter="" default="true">
+			When enabled, setting [member MultiMesh.buffer] keeps a CPU-side mirror of the instance data, filled from the data the buffer was given. The path tracer keeps such a mirror of every [MultiMesh] it traces, for the instances it places one by one (a MultiMesh that does not merge, or one whose merge waits for the build budget); when disabled, the first frame that traces a [MultiMesh] reads its buffer back from the GPU to make the mirror, a stall of every frame in flight, which a world streaming MultiMeshes in pays for each one that arrives.
+			Disabling it saves, for a [MultiMesh] the path tracer never traces, the mirror's memory and the copy into it each time [member MultiMesh.buffer] is set.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracing/multimesh_merged_blas_max_triangles" type="int" setter="" getter="" default="65536">

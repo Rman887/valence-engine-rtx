@@ -968,7 +968,8 @@ public:
 
 	// Returns a pointer to the CPU-side transform buffer, syncing from GPU once if needed.
 	// Safe to call every frame; the readback only happens on the first call when data_cache is empty.
-	// Note: for MultiMeshes updated every frame via set_buffer(), data_cache may be stale after init.
+	// set_buffer() and the per-instance setters keep it current from then on; only writes to the GPU
+	// buffer through multimesh_get_buffer_rd_rid() leave it stale.
 	_FORCE_INLINE_ const float *multimesh_get_local_data_ptr(RID p_multimesh) const {
 		MultiMesh *mm = multimesh_owner.get_or_null(p_multimesh);
 		if (!mm) {

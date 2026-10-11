@@ -10629,7 +10629,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			}
 
 			RID mm_gpu_buffer = mesh_storage->multimesh_get_gpu_buffer(mm_rid);
-			// Populate data cache now — first access triggers GPU readback, safe here.
+			// The CPU mirror the expanded path reads, made now, before the merges' compute list opens:
+			// kept from the buffer's data by default, read back with a stall of every frame in flight
+			// with rendering/pathtracing/multimesh_cache_cpu_transforms off (P2g).
 			mesh_storage->multimesh_get_local_data_ptr(mm_rid);
 
 			bool transform_moved = (inst->transform_status ==

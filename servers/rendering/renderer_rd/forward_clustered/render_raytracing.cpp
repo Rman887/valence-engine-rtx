@@ -339,8 +339,9 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 	sky_light_modes.push_back("\n#define MODE_LEAF\n");
 	sky_light_modes.push_back("\n#define MODE_REDUCE\n");
 	sky_light_modes.push_back("\n#define MODE_HEADER\n");
+	sky_light_modes.push_back("\n#define MODE_CELLS\n");
+	sky_light_modes.push_back("\n#define MODE_CELLS\n#define USE_RADIANCE_OCTMAP_ARRAY\n");
 	sky_light_modes.push_back("\n#define MODE_MOMENTS\n");
-	sky_light_modes.push_back("\n#define MODE_MOMENTS\n#define USE_RADIANCE_OCTMAP_ARRAY\n");
 	sky_light_shader.shader.initialize(sky_light_modes);
 	sky_light_shader.version = sky_light_shader.shader.version_create();
 	for (int i = 0; i < SkyLightShader::MODE_MAX; i++) {
@@ -400,6 +401,10 @@ RenderRaytracing::~RenderRaytracing() {
 	if (shadow_stats_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(shadow_stats_buffer);
 		shadow_stats_buffer = RID();
+	}
+	if (sky_light_cells_buffer.is_valid()) {
+		RD::get_singleton()->free_rid(sky_light_cells_buffer);
+		sky_light_cells_buffer = RID();
 	}
 	if (sky_light_placeholder.is_valid()) {
 		RD::get_singleton()->free_rid(sky_light_placeholder);
@@ -13655,8 +13660,9 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 // leaves, one thread per texel, the levels above one dispatch each while they hold more nodes
 // than one workgroup, then the rest and the header in one workgroup; cleared when the sky goes,
 // so the shader's share reads 0 and nothing samples a table that is stale.
-// Under the share by variance (D62) its moments follow (D65): for every receiver normal of the
-// grid, one workgroup per normal, built with the frame's weights of the delivered radiance over
+// Under the share by variance (D62) its moments follow (D65): each cell of the 256-grid read once,
+// then one workgroup per receiver normal of the grid and candidate share (GPU audit 5), built with
+// the frame's weights of the delivered radiance over
 // the exposure normalisation once per table and again when the weights' shape moves (D72), so the
 // trace reads each normal's clipped variance and means ready made.
 void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDataRD *p_render_data, uint32_t p_rt_flags) {
@@ -13775,11 +13781,22 @@ void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDa
 	u_table.append_id(p_state->sky_light_buffer);
 	// Through the cache: a sky that re-renders every frame (a sun that moves) rebuilds every frame.
 	// In array mode the fog's level is a roughness layer, which the sharpest layer's own texture does
-	// not reach, so the array joins the moments' set (D64).
+	// not reach, so the array joins the cells' set (D64). The cells (what every receiver reads of a
+	// cell) and the moments (per receiver and share) are two passes since GPU audit 5.
 	const bool use_octmap_array = owner->is_using_radiance_octmap_array();
-	const int moments_mode = use_octmap_array ? SkyLightShader::MODE_MOMENTS_OCTMAP_ARRAY : SkyLightShader::MODE_MOMENTS_OCTMAP_2D;
+	const int cells_mode = use_octmap_array ? SkyLightShader::MODE_CELLS_OCTMAP_ARRAY : SkyLightShader::MODE_CELLS_OCTMAP_2D;
+	RID cells_set;
 	RID moments_set;
 	if (build_moments) {
+		if (!sky_light_cells_buffer.is_valid()) {
+			sky_light_cells_buffer = rd->storage_buffer_create(RT_SKY_LIGHT_CELLS_SIZE);
+			rd->set_resource_name(sky_light_cells_buffer, "RT Sky Light Cells");
+		}
+		RD::Uniform u_cells;
+		u_cells.binding = 4;
+		u_cells.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u_cells.append_id(sky_light_cells_buffer);
+		moments_set = UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[SkyLightShader::MODE_MOMENTS], 0, u_table, u_cells);
 		if (use_octmap_array) {
 			RID layers = owner->sky.sky_get_radiance_texture_rd(sky_rid);
 			if (layers.is_valid()) {
@@ -13788,12 +13805,12 @@ void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDa
 				u_layers.uniform_type = RD::UNIFORM_TYPE_TEXTURE;
 				u_layers.append_id(layers);
 				// The array alone: the 2D octmap is a slice of it, and the graph cannot take both in one command.
-				moments_set = UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[moments_mode], 0, u_sampler, u_table, u_layers);
+				cells_set = UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[cells_mode], 0, u_sampler, u_table, u_layers, u_cells);
 			}
 		} else {
-			moments_set = UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[moments_mode], 0, u_octmap, u_sampler, u_table);
+			cells_set = UniformSetCacheRD::get_singleton()->get_cache(sky_light_shader.version_shader[cells_mode], 0, u_octmap, u_sampler, u_table, u_cells);
 		}
-		if (!moments_set.is_valid()) {
+		if (!cells_set.is_valid()) {
 			// No layers yet: the table alone, and the moments with a later frame.
 			build_moments = false;
 			if (!build_table) {
@@ -13886,10 +13903,15 @@ void RenderRaytracing::update_sky_light(RTViewportState *p_state, const RenderDa
 			rd->capture_timestamp("RT sky moments");
 		}
 		RD::ComputeListID compute_list = rd->compute_list_begin();
-		rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline[moments_mode]);
+		rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline[cells_mode]);
+		rd->compute_list_bind_uniform_set(compute_list, cells_set, 0);
+		rd->compute_list_set_push_constant(compute_list, &pc, sizeof(SkyLightPC));
+		rd->compute_list_dispatch(compute_list, RT_SKY_LIGHT_CELLS / 256, 1, 1);
+		rd->compute_list_add_barrier(compute_list); // The moments read every cell.
+		rd->compute_list_bind_compute_pipeline(compute_list, sky_light_shader.pipeline[SkyLightShader::MODE_MOMENTS]);
 		rd->compute_list_bind_uniform_set(compute_list, moments_set, 0);
 		rd->compute_list_set_push_constant(compute_list, &pc, sizeof(SkyLightPC));
-		rd->compute_list_dispatch(compute_list, RT_SKY_LIGHT_NORMALS, 1, 1);
+		rd->compute_list_dispatch(compute_list, RT_SKY_LIGHT_NORMALS, RT_SKY_LIGHT_SHARES, 1);
 		rd->compute_list_end();
 		if (sky_timer) {
 			rd->capture_timestamp("RT sky moments end");

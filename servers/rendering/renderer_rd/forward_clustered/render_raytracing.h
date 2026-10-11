@@ -1974,6 +1974,9 @@ class RenderRaytracing {
 	// The surface record's codec check (P3a, RT_SURFACE_CODEC_CHECK_WORDS words, binding 55), made by an asserts build's
 	// first frame, read and cleared on the verbose report's cadence.
 	RID surface_codec_check_buffer;
+	// What the share by variance's moments read of each cell of the 256-grid (GPU audit 5): two floats a cell, written
+	// and read within one rebuild, so one for every viewport; made by the first rebuild of the moments.
+	RID sky_light_cells_buffer;
 	// Binding 43 while a frame has no sky light (GPU audit 4e): the table's fixed part alone, cleared, which the shaders
 	// read as no sky, shared by every viewport in place of a 5.6 MB table each.
 	RID sky_light_placeholder;
@@ -2044,17 +2047,19 @@ class RenderRaytracing {
 	// The sky's sampling table (D54): the compute shader that builds it from the radiance octmap as a
 	// pyramid over the octmap's texels (D69: the leaves, the levels above them one dispatch each while
 	// they are too large for one workgroup, then the rest with the header in one), then the share by
-	// variance's moments per receiver normal (D65), in the form the trace reads the octmap in (the
-	// roughness layers as an array, or one texture whose mips are the roughness levels), since the
-	// fog's level is read as the trace reads it (D64); the moments carry the frame's weights' shape and
-	// are clipped at multiples of the receiver's irradiance (D72), so there is no combine pass.
+	// variance's moments: the cells of the 256-grid read once, in the form the trace reads the octmap in
+	// (the roughness layers as an array, or one texture whose mips are the roughness levels), since the
+	// fog's level is read as the trace reads it (D64), then the moments per receiver normal (D65) and
+	// candidate share (GPU audit 5); they carry the frame's weights' shape and are clipped at multiples
+	// of the receiver's irradiance (D72), so there is no combine pass.
 	struct SkyLightShader {
 		enum Mode {
 			MODE_LEAF = 0,
 			MODE_REDUCE = 1,
 			MODE_HEADER = 2,
-			MODE_MOMENTS_OCTMAP_2D = 3,
-			MODE_MOMENTS_OCTMAP_ARRAY = 4,
+			MODE_CELLS_OCTMAP_2D = 3, // The moments' cells (GPU audit 5), in the form the trace reads the octmap in.
+			MODE_CELLS_OCTMAP_ARRAY = 4,
+			MODE_MOMENTS = 5,
 			MODE_MAX,
 		};
 		SkyLightTableShaderRD shader;
@@ -2089,6 +2094,9 @@ class RenderRaytracing {
 	// its largest.
 	static constexpr uint32_t RT_SKY_LIGHT_MOMENT_FLOATS = RT_SKY_LIGHT_NORMALS * RT_SKY_LIGHT_CLIP_LEVELS * RT_SKY_LIGHT_SHARES * 4;
 	static constexpr uint32_t RT_SKY_LIGHT_BUFFER_SIZE = (RT_SKY_LIGHT_HEADER_WORDS + RT_SKY_LIGHT_SHARES + RT_SKY_LIGHT_MOMENT_FLOATS + RT_SKY_LIGHT_PYRAMID_FLOATS) * sizeof(float);
+	// The moments' cells (GPU audit 5): the 256-grid, two floats each.
+	static constexpr uint32_t RT_SKY_LIGHT_CELLS = (1u << RT_SKY_LIGHT_CELL_LEVEL) * (1u << RT_SKY_LIGHT_CELL_LEVEL);
+	static constexpr uint32_t RT_SKY_LIGHT_CELLS_SIZE = RT_SKY_LIGHT_CELLS * 2 * sizeof(float);
 	// Everything before the pyramid's runtime array: the least a binding of the table's block may hold.
 	static constexpr uint32_t RT_SKY_LIGHT_FIXED_SIZE = (RT_SKY_LIGHT_HEADER_WORDS + RT_SKY_LIGHT_SHARES + RT_SKY_LIGHT_MOMENT_FLOATS) * sizeof(float);
 	static_assert((RT_SKY_LIGHT_HEADER_WORDS + RT_SKY_LIGHT_SHARES) % 4 == 0, "The moments' vec4 array must start 16-byte aligned in std430, or the shaders pad where the size does not.");

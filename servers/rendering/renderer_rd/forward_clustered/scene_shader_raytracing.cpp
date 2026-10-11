@@ -965,6 +965,10 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 	if (p_rt_flags & RT_FLAG_SKY_LIGHT) {
 		inject_define(sources, "#define RT_SKY_LIGHT_COMPILED\n");
 	}
+	// Likewise the light tree's total (GPU audit light 1a), carried only while the tree selects the lights.
+	if (p_rt_flags & RT_FLAG_LIGHT_TREE) {
+		inject_define(sources, "#define RT_LIGHT_TREE_COMPILED\n");
+	}
 	// The inline shadow ray's counters (P1k) in a verbose run: verbosity is fixed for the process, so no flag bit.
 	if ((p_rt_flags & RT_FLAG_RAY_QUERY_SHADOWS_ENABLED) && OS::get_singleton()->is_stdout_verbose()) {
 		inject_define(sources, "#define RT_SHADOW_STATS\n");

@@ -383,8 +383,10 @@ void shade_direct_light(vec3 p_hit_pos, vec3 p_geometry_normal, float p_hit_t, v
 	// The sky's share of the light samples (D54), 0 without a sky light; the surface lights
 	// split the rest, so their densities carry the remainder on both sides of the weight.
 	float p_sky = light_tree_enabled() ? 0.0 : sky_light_probability(N_select);
-	// What the next vertex weighs a sky or an emitter it finds against (GPU audit 4a); the tree sets its own below.
+	// What the next vertex weighs a sky or an emitter it finds against (GPU audit 4a); the tree sets its own below,
+	// and the top's total (light 1a), 0 until the tree scores one.
 	ps.sky_probability = p_sky;
+	ps.tree_total = 0.0;
 	// Under the tree (D55) the sky's share is per hit, so a frame whose only light is the sky still
 	// takes its sample here (the miss weighs against it either way).
 	bool tree_sky = light_tree_enabled() && sky_light_enabled() && sky_total > 0.0;
@@ -422,7 +424,7 @@ void shade_direct_light(vec3 p_hit_pos, vec3 p_geometry_normal, float p_hit_t, v
 			if (is_indirect) {
 				ps.packed_bounces_flags = set_light_tree_indirect(ps.packed_bounces_flags);
 			}
-			have_sample = light_tree_sample_direct(hit_pos_offset, N_select, N, V, brdf_mat, ps.rng_state, is_indirect, tree_candidates, light_sample, strategy_probability, ps.sky_probability);
+			have_sample = light_tree_sample_direct(hit_pos_offset, N_select, N, V, brdf_mat, ps.rng_state, is_indirect, tree_candidates, light_sample, strategy_probability, ps.sky_probability, ps.tree_total);
 		} else if (sample_sky) {
 			have_sample = sky_sample_direct(N, V, brdf_mat, ps.rng_state, strategy_probability, light_sample);
 		} else if (sample_emissive) {
@@ -752,10 +754,11 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	if (total_bounces > 0u && rt_emissive_count > 0u && ps.bsdf_pdf != RT_BSDF_PDF_DELTA && any(greaterThan(m.emissive, vec3(0.0)))) {
 		float pdf_light;
 		if (light_tree_enabled()) {
-			// The light tree's exact probability of this entry at the previous vertex (D55): the ray's
-			// origin and the offset normal the payload carried from there.
+			// The light tree's probability of this entry at the previous vertex (D55): its cut node scored at
+			// the ray's origin and the offset normal the payload carried from there, over the top's total
+			// the payload carried too (GPU audit light 1a).
 			uint entry = emissive_find_entry(h.geometry_idx, rt_emissive_count);
-			float p_instance = (entry < rt_emissive_count) ? light_tree_emissive_probability(entry, shade_previous_origin(h, ray_dir, hit_t), ps.offset_normal, is_light_tree_indirect(ps.packed_bounces_flags)) : 0.0;
+			float p_instance = (entry < rt_emissive_count) ? light_tree_emissive_probability(entry, shade_previous_origin(h, ray_dir, hit_t), ps.offset_normal, is_light_tree_indirect(ps.packed_bounces_flags), ps.tree_total) : 0.0;
 			pdf_light = (entry < rt_emissive_count) ? emissive_hit_pdf_entry(entry, p_instance, h.primitive_id, ray_dir, hit_t, h.is_front_face) : 0.0;
 		} else {
 			// The sky's share of the light samples (D54), 0 without a sky light; the surface lights

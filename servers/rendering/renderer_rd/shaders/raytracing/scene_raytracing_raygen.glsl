@@ -374,6 +374,7 @@ void main() {
 		ps.exit_position = vec3(0.0);
 #endif
 		ps.sky_probability = 0.0;
+		ps.tree_total = 0.0;
 		path_clear_medium(ps);
 		if (camera_in_medium) {
 			// The camera is inside a medium (D49): the path starts in it and leaves it through the

@@ -53,7 +53,8 @@
 const float RT_TEXTURE_LOD_BASE = -128.0;
 
 // ============================================================================
-// PATHTRACING PAYLOAD (56 bytes, fp16/unorm-packed)
+// PATHTRACING PAYLOAD (56 bytes, fp16/unorm-packed; 12 more with the subsurface walk, 4 more with the
+// sky light, 4 more with the light tree, each compiled in by its flag)
 // ============================================================================
 // Radiance (r) and throughput (T) interleaved as fp16 into 3 uints:
 //   [0]=rg, [1]=bR, [2]=GB  (packHalf2x16 pairs).
@@ -94,6 +95,13 @@ struct PathPayload {
 	// the payload's normal and the ray's origin. 4 bytes more while the sky light is on.
 	float sky_probability; //  4 bytes
 #endif
+#ifdef RT_LIGHT_TREE_COMPILED
+	// The light tree's top as the vertex the ray left scored it (D55, GPU audit light 1a): the sky's, the
+	// directional lights' and the cut's importances summed. An emitter found next weighs against its leaf's
+	// probability there, its cut node's importance over this total, so it scores that one node instead of the
+	// whole top again. 4 bytes more while the tree is on.
+	float tree_total; //  4 bytes
+#endif
 };
 
 const float RT_BSDF_PDF_DELTA = -1.0;
@@ -117,6 +125,7 @@ struct PathState {
 	vec3 exit_position;
 #endif
 	float sky_probability; // 0 while the sky light is not compiled in.
+	float tree_total; // 0 while the light tree is not compiled in.
 };
 
 PathState path_unpack(PathPayload p) {
@@ -149,6 +158,11 @@ PathState path_unpack(PathPayload p) {
 #else
 	s.sky_probability = 0.0;
 #endif
+#ifdef RT_LIGHT_TREE_COMPILED
+	s.tree_total = p.tree_total;
+#else
+	s.tree_total = 0.0;
+#endif
 	return s;
 }
 
@@ -177,6 +191,9 @@ void path_pack(inout PathPayload p, PathState s) {
 #endif
 #ifdef RT_SKY_LIGHT_COMPILED
 	p.sky_probability = s.sky_probability;
+#endif
+#ifdef RT_LIGHT_TREE_COMPILED
+	p.tree_total = s.tree_total;
 #endif
 }
 

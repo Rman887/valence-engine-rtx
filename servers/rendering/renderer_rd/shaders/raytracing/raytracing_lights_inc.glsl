@@ -364,6 +364,7 @@ bool lights_trace_shadow_ray_pipeline(vec3 origin, vec3 direction, float max_dis
 	shadow_ps.exit_position = vec3(0.0);
 #endif
 	shadow_ps.sky_probability = 0.0;
+	shadow_ps.tree_total = 0.0;
 	shadow_ps.offset_normal = vec3(0.0, 0.0, 1.0);
 	shadow_ps.next_ray_dir = vec3(0.0, 0.0, 1.0);
 	path_clear_medium(shadow_ps);

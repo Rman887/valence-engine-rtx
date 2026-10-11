@@ -11618,10 +11618,25 @@ uint32_t RenderRaytracing::gather_lights(const RenderDataRD *p_render_data, RT_L
 	};
 	positional_lights.sort_custom<LightScoreComparator>();
 
-	// Fill remaining slots with top positional lights.
-	for (uint32_t i = 0; i < positional_lights.size() && rt_light_count < p_max_lights; i++) {
-		RID light_instance = positional_lights[i].light_instance;
+	// The cap keeps the best scores, whose shares are summed in that order. The kept lights then go
+	// into the buffer by their instance (P2i), so a light keeps its index while the kept set does: a
+	// ranking that moves with the camera and the lights' power no longer moves the buffer's entries
+	// and the light tree's leaves.
+	const uint32_t kept = MIN(positional_lights.size(), p_max_lights - rt_light_count);
+	for (uint32_t i = 0; i < kept; i++) {
 		r_score_sum += positional_lights[i].share;
+	}
+	positional_lights.resize(kept);
+	struct LightKeyComparator {
+		bool operator()(const LightScore &a, const LightScore &b) const {
+			return a.light_instance.get_id() < b.light_instance.get_id();
+		}
+	};
+	positional_lights.sort_custom<LightKeyComparator>();
+
+	// Fill remaining slots with the kept positional lights.
+	for (uint32_t i = 0; i < kept; i++) {
+		RID light_instance = positional_lights[i].light_instance;
 		RID base = ls->light_instance_get_base_light(light_instance);
 		RSE::LightType type = ls->light_get_type(base);
 

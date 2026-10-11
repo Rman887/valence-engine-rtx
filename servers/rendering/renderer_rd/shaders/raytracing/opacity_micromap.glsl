@@ -118,9 +118,13 @@ vec2 unpack_cell(uint p_cell) {
 	return vec2(lo == 0u ? ALPHA_BELOW : float(lo) / 65535.0, hi == 0xFFFFu ? ALPHA_ABOVE : float(hi) / 65535.0);
 }
 
-// The smallest and largest alpha over texels [p_lo, p_hi] (inclusive, inside the texture).
+// The smallest and largest alpha over texels [p_lo, p_hi] (inclusive, inside the texture): a box of up to 3 x 3
+// texels read directly, a larger one from the pyramid level whose cells cover it in at most 3 x 3 (GPU audit geo 8).
+// A level's cells are aligned blocks of 2^k texels, so the cells read span up to about three times the box per axis,
+// where covering it in at most 2 x 2 spanned up to about four; the level is the same or the one below, for at most
+// nine reads instead of four.
 vec2 rect_min_max(ivec2 p_lo, ivec2 p_hi) {
-	if (p_hi.x - p_lo.x <= 1 && p_hi.y - p_lo.y <= 1) {
+	if (p_hi.x - p_lo.x <= 2 && p_hi.y - p_lo.y <= 2) {
 		vec2 r = vec2(ALPHA_ABOVE, ALPHA_BELOW);
 		for (int y = p_lo.y; y <= p_hi.y; y++) {
 			for (int x = p_lo.x; x <= p_hi.x; x++) {
@@ -131,7 +135,7 @@ vec2 rect_min_max(ivec2 p_lo, ivec2 p_hi) {
 		return r;
 	}
 	uint k = 1u;
-	while (k < params.level_count && (((p_hi.x >> k) - (p_lo.x >> k)) > 1 || ((p_hi.y >> k) - (p_lo.y >> k)) > 1)) {
+	while (k < params.level_count && (((p_hi.x >> k) - (p_lo.x >> k)) > 2 || ((p_hi.y >> k) - (p_lo.y >> k)) > 2)) {
 		k++;
 	}
 	uint first = pyramid.words[(k - 1u) * 3u];

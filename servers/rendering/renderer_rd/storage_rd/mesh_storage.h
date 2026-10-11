@@ -332,6 +332,9 @@ private:
 		uint32_t data_cache_dirty_region_count = 0;
 		bool *previous_data_cache_dirty_regions = nullptr;
 		uint32_t previous_data_cache_dirty_region_count = 0;
+		// set_buffer() uploaded the whole current half since the last motion-vector flip: the dirty
+		// pass owes none of it, and the next flip takes every region as the previous frame's change.
+		bool data_cache_whole_written = false;
 
 		RID buffer; //storage buffer
 		RID uniform_set_3d;
@@ -353,6 +356,7 @@ private:
 	static inline uint64_t multimesh_buffer_generation_counter = 0;
 	static _FORCE_INLINE_ void _multimesh_bump_buffer_generation(MultiMesh *multimesh) { multimesh->buffer_generation = ++multimesh_buffer_generation_counter; }
 	void _multimesh_make_local(MultiMesh *multimesh) const;
+	void _multimesh_settle_whole_write(MultiMesh *multimesh);
 	void _multimesh_enable_motion_vectors(MultiMesh *multimesh);
 	void _multimesh_update_motion_vectors_data_cache(MultiMesh *multimesh);
 	bool _multimesh_uses_motion_vectors(MultiMesh *multimesh);

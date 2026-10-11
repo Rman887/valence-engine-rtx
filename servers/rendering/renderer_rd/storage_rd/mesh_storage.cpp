@@ -2258,6 +2258,7 @@ void MeshStorage::_multimesh_allocate_data(RID p_multimesh, int p_instances, RSE
 
 	//print_line("allocate, elements: " + itos(p_instances) + " 2D: " + itos(p_transform_format == RSE::MULTIMESH_TRANSFORM_2D) + " colors " + itos(multimesh->uses_colors) + " data " + itos(multimesh->uses_custom_data) + " stride " + itos(multimesh->stride_cache) + " total size " + itos(multimesh->stride_cache * multimesh->instances));
 	multimesh->data_cache = Vector<float>();
+	multimesh->data_cache_whole_written = false;
 	multimesh->aabb = AABB();
 	multimesh->aabb_dirty = false;
 	multimesh->visible_instances = MIN(multimesh->visible_instances, multimesh->instances);
@@ -2440,6 +2441,20 @@ void MeshStorage::_multimesh_make_local(MultiMesh *multimesh) const {
 	_multimesh_bump_buffer_generation(multimesh);
 }
 
+// At the first motion-vector flip after set_buffer() wrote the whole current half, every region
+// is the previous frame's change: the new current half takes them all from the old one, and the
+// dirty pass uploads them all. Taken here and not in the dirty pass, which can run more than once
+// in a frame (a get_aabb() between the set_buffer() and a setter) and rewrites the previous list.
+void MeshStorage::_multimesh_settle_whole_write(MultiMesh *multimesh) {
+	if (!multimesh->data_cache_whole_written) {
+		return;
+	}
+	multimesh->data_cache_whole_written = false;
+	const uint32_t region_count = Math::division_round_up(multimesh->instances, MULTIMESH_DIRTY_REGION_SIZE);
+	memset(multimesh->previous_data_cache_dirty_regions, 1, region_count * sizeof(bool));
+	multimesh->previous_data_cache_dirty_region_count = region_count;
+}
+
 void MeshStorage::_multimesh_update_motion_vectors_data_cache(MultiMesh *multimesh) {
 	ERR_FAIL_COND(multimesh->data_cache.is_empty());
 
@@ -2453,6 +2468,7 @@ void MeshStorage::_multimesh_update_motion_vectors_data_cache(MultiMesh *multime
 		multimesh->motion_vectors_current_offset = multimesh->instances - multimesh->motion_vectors_current_offset;
 		multimesh->motion_vectors_last_change = frame;
 		_multimesh_bump_buffer_generation(multimesh);
+		_multimesh_settle_whole_write(multimesh);
 
 		if (multimesh->previous_data_cache_dirty_region_count > 0) {
 			uint8_t *data = (uint8_t *)multimesh->data_cache.ptrw();
@@ -2853,7 +2869,15 @@ void MeshStorage::_multimesh_set_buffer(RID p_multimesh, const Vector<float> &p_
 	if (multimesh->data_cache.size()) {
 		float *cache_data = multimesh->data_cache.ptrw();
 		memcpy(cache_data + (multimesh->motion_vectors_current_offset * multimesh->stride_cache), p_buffer.ptr(), p_buffer.size() * sizeof(float));
-		_multimesh_mark_all_dirty(multimesh, true, true); //update AABB
+		// The whole current half is uploaded above: the dirty pass owes none of it, only the AABB and
+		// the regions a setter changes after this in the frame; the next flip carries every region over.
+		const uint32_t region_count = Math::division_round_up(multimesh->instances, MULTIMESH_DIRTY_REGION_SIZE);
+		memset(multimesh->data_cache_dirty_regions, 0, region_count * sizeof(bool));
+		multimesh->data_cache_dirty_region_count = 0;
+		memset(multimesh->previous_data_cache_dirty_regions, 0, region_count * sizeof(bool));
+		multimesh->previous_data_cache_dirty_region_count = 0;
+		multimesh->data_cache_whole_written = true;
+		_multimesh_mark_all_dirty(multimesh, false, true); //update AABB
 	} else if (multimesh->mesh.is_valid()) {
 		//if we have a mesh set, we need to re-generate the AABB from the new data
 		const float *data = p_buffer.ptr();

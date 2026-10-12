@@ -969,6 +969,7 @@ public:
 	FUNC3(instance_set_blend_shape_weight, RID, int, float)
 	FUNC3(instance_set_surface_override_material, RID, int, RID)
 	FUNC2(instance_set_visible, RID, bool)
+	FUNC2RC(RID, instance_surface_get_vertex_buffer_rd_rid, RID, int)
 
 	FUNC1(instance_teleport, RID)
 

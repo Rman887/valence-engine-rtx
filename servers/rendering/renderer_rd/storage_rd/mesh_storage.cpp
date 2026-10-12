@@ -1984,6 +1984,15 @@ void MeshStorage::mesh_instance_check_for_update(RID p_mesh_instance) {
 	}
 }
 
+RID MeshStorage::mesh_instance_get_vertex_buffer_rd_rid(RID p_mesh_instance, int p_surface) const {
+	const MeshInstance *mi = mesh_instance_owner.get_or_null(p_mesh_instance);
+	ERR_FAIL_NULL_V(mi, RID());
+	ERR_FAIL_UNSIGNED_INDEX_V((uint32_t)p_surface, mi->surfaces.size(), RID());
+	// The buffer the last update wrote (undefined before the first); empty for a surface that does not deform.
+	const MeshInstance::Surface &mis = mi->surfaces[p_surface];
+	return mis.vertex_buffer[mis.current_buffer];
+}
+
 void MeshStorage::mesh_instance_set_canvas_item_transform(RID p_mesh_instance, const Transform2D &p_transform) {
 	MeshInstance *mi = mesh_instance_owner.get_or_null(p_mesh_instance);
 	mi->canvas_item_transform_2d = p_transform;

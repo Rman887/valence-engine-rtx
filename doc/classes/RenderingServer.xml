@@ -2235,6 +2235,16 @@
 				Sets whether an instance is drawn or not. Equivalent to [member Node3D.visible].
 			</description>
 		</method>
+		<method name="instance_surface_get_vertex_buffer_rd_rid" qualifiers="const">
+			<return type="RID" />
+			<param index="0" name="instance" type="RID" />
+			<param index="1" name="surface" type="int" />
+			<description>
+				Returns the [RenderingDevice] [RID] handle of the vertex buffer the given surface of a mesh instance draws from after deformation (skinning, blend shapes, subdivision), in the mesh surface's own vertex layout (see [method mesh_surface_get_vertex_buffer_rd_rid]). The buffer holds the deformation computed the last time the instance was drawn (in a view, a shadow or the path tracer's range); before its first update its contents are undefined. Read it with [method RenderingDevice.buffer_get_data] on the main [RenderingDevice] after a frame was drawn, for example in [signal frame_post_draw]; with a separate render thread, call this method and [method RenderingDevice.buffer_get_data] together inside [method call_on_render_thread].
+				Query it again each frame and do not keep it: while motion vectors are in use the instance alternates between two buffers, and they are freed when the instance's mesh or skeleton changes. Treat the buffer as read-only: the next update overwrites it, and the ray-traced geometry does not see writes to it.
+				Returns an invalid [RID] if the instance is not a mesh or its mesh does not deform (no blend shapes, and no skeleton attached to a skinned mesh), if the surface does not deform, or if the rendering backend does not expose [RenderingDevice] [RID]s (such as the OpenGL backend).
+			</description>
+		</method>
 		<method name="instance_teleport">
 			<return type="void" />
 			<param index="0" name="instance" type="RID" />

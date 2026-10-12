@@ -1077,6 +1077,15 @@ void RendererSceneCull::instance_set_surface_override_material(RID p_instance, i
 	_instance_queue_update(instance, false, true);
 }
 
+RID RendererSceneCull::instance_surface_get_vertex_buffer_rd_rid(RID p_instance, int p_surface) const {
+	Instance *instance = instance_owner.get_or_null(p_instance);
+	ERR_FAIL_NULL_V(instance, RID());
+	if (instance->mesh_instance.is_null()) {
+		return RID(); // Not a deforming mesh (no blend shapes, no skeleton on a skinned mesh): it draws its mesh's own buffers.
+	}
+	return RSG::mesh_storage->mesh_instance_get_vertex_buffer_rd_rid(instance->mesh_instance, p_surface);
+}
+
 void RendererSceneCull::instance_set_visible(RID p_instance, bool p_visible) {
 	Instance *instance = instance_owner.get_or_null(p_instance);
 	ERR_FAIL_NULL(instance);

@@ -1156,6 +1156,29 @@ TEST_CASE("[SceneTree][ArrayMesh] The storages refuse a subdivided surface again
 		add_subdivision_quad(mesh, compressed, subdivision_quad_payload(true, 0));
 		CHECK(rendering_surface_count(mesh) == 0);
 	}
+	SUBCASE("A subdivided surface with blend shapes carries no cluster LOD hierarchy") {
+		RenderingServerTypes::SurfaceData with_lod = surface;
+		with_lod.subdivision_data = subdivision_quad_payload(true, 1);
+		with_lod.cluster_data.resize(sizeof(uint32_t));
+		const uint32_t lod_version = RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION;
+		memcpy(with_lod.cluster_data.ptrw(), &lod_version, sizeof(uint32_t));
+		String error;
+		CHECK_FALSE(RenderingServer::mesh_subdivision_surface_is_valid(with_lod, 0, 1, -1, Vector<uint8_t>(), &error));
+		CHECK(error.contains("cluster LOD"));
+		Ref<ArrayMesh> mesh;
+		mesh.instantiate();
+		mesh->add_blend_shape("A");
+		add_subdivision_quad(mesh, with_lod, with_lod.subdivision_data);
+		CHECK(rendering_surface_count(mesh) == 0);
+		// The flat table passes with the same payload and blend count: the version word is the reason.
+		RenderingServerTypes::SurfaceData flat = with_lod;
+		const uint32_t flat_version = RenderingServerTypes::MESH_CLUSTER_DATA_VERSION;
+		memcpy(flat.cluster_data.ptrw(), &flat_version, sizeof(uint32_t));
+		CHECK(RenderingServer::mesh_subdivision_surface_is_valid(flat, 0, 1, -1, Vector<uint8_t>(), &error));
+		// Without blend shapes the hierarchy is allowed, as on D87's skinned surfaces.
+		with_lod.subdivision_data = subdivision_quad_payload(true, 0);
+		CHECK(RenderingServer::mesh_subdivision_surface_is_valid(with_lod, 0, 0, -1, Vector<uint8_t>(), &error));
+	}
 	SUBCASE("The owner's blend shape count is the mesh's") {
 		Ref<ArrayMesh> mesh;
 		mesh.instantiate();

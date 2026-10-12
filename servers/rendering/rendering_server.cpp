@@ -1176,7 +1176,7 @@ void RenderingServer::mesh_surface_make_offsets_from_format(uint64_t p_format, i
 	}
 }
 
-Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes::SurfaceData *r_surface_data, RSE::PrimitiveType p_primitive, const Array &p_arrays, const Array &p_blend_shapes, const Dictionary &p_lods, uint64_t p_compress_format, bool p_build_clusters) {
+Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes::SurfaceData *r_surface_data, RSE::PrimitiveType p_primitive, const Array &p_arrays, const Array &p_blend_shapes, const Dictionary &p_lods, uint64_t p_compress_format, bool p_build_clusters, bool p_build_cluster_lod) {
 	ERR_FAIL_INDEX_V(p_primitive, RSE::PRIMITIVE_MAX, ERR_INVALID_PARAMETER);
 	ERR_FAIL_COND_V(p_arrays.size() != RSE::ARRAY_MAX, ERR_INVALID_PARAMETER);
 
@@ -1333,10 +1333,12 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 	// ocean's waves on a flat grid; a per-group error floor from the blend-shape deltas' reach
 	// is the robust alternative). Skinned surfaces get the hierarchy (D87): both builders
 	// reorder the indices alone, so the bone and weight arrays stay in vertex order, and the
-	// coarse levels index the same vertices the skinning writes.
+	// coarse levels index the same vertices the skinning writes. A caller whose surface deforms
+	// by blend shapes it does not carry as arrays (a subdivided surface, whose cage holds them,
+	// D122) passes p_build_cluster_lod false for the same reason.
 	if (p_build_clusters && p_primitive == RSE::PRIMITIVE_TRIANGLES && index_array_len > 0 && p_arrays[RSE::ARRAY_VERTEX].get_type() == Variant::PACKED_VECTOR3_ARRAY && p_arrays[RSE::ARRAY_INDEX].get_type() == Variant::PACKED_INT32_ARRAY && GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
 		Vector<int> indices = p_arrays[RSE::ARRAY_INDEX];
-		if (p_blend_shapes.is_empty() && index_array_len > int(RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES) * 3 && GLOBAL_GET("rendering/pathtracing/cluster_lod")) {
+		if (p_build_cluster_lod && p_blend_shapes.is_empty() && index_array_len > int(RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES) * 3 && GLOBAL_GET("rendering/pathtracing/cluster_lod")) {
 			Vector<Vector3> normals;
 			if (p_arrays[RSE::ARRAY_NORMAL].get_type() == Variant::PACKED_VECTOR3_ARRAY) {
 				normals = p_arrays[RSE::ARRAY_NORMAL];
@@ -1692,6 +1694,15 @@ bool RenderingServer::mesh_subdivision_surface_is_valid(const RenderingServerTyp
 	}
 	if (p_surface.format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) {
 		return _subdivision_fail(r_error, "a subdivided surface keeps uncompressed vertex attributes, which its runtime passes write");
+	}
+	if (p_blend_shape_count > 0 && p_surface.cluster_data.size() >= int64_t(sizeof(uint32_t))) {
+		uint32_t cluster_version;
+		memcpy(&cluster_version, p_surface.cluster_data.ptr(), sizeof(uint32_t));
+		if (cluster_version == RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION) {
+			// D87's reason for blend-shaped surfaces: the hierarchy's errors are the rest pose's, and the
+			// cage's morphs move the surface away from it.
+			return _subdivision_fail(r_error, "a subdivided surface whose mesh has blend shapes carries no cluster LOD hierarchy");
+		}
 	}
 	uint32_t flags;
 	memcpy(&flags, p_surface.subdivision_data.ptr() + sizeof(uint32_t), sizeof(uint32_t));

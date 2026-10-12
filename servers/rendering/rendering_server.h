@@ -206,7 +206,7 @@ public:
 
 	/// Returns stride
 	virtual void mesh_surface_make_offsets_from_format(uint64_t p_format, int p_vertex_len, int p_index_len, uint32_t *r_offsets, uint32_t &r_vertex_element_size, uint32_t &r_normal_element_size, uint32_t &r_attrib_element_size, uint32_t &r_skin_element_size) const;
-	virtual Error mesh_create_surface_data_from_arrays(RenderingServerTypes::SurfaceData *r_surface_data, RSE::PrimitiveType p_primitive, const Array &p_arrays, const Array &p_blend_shapes = Array(), const Dictionary &p_lods = Dictionary(), uint64_t p_compress_format = 0, bool p_build_clusters = true);
+	virtual Error mesh_create_surface_data_from_arrays(RenderingServerTypes::SurfaceData *r_surface_data, RSE::PrimitiveType p_primitive, const Array &p_arrays, const Array &p_blend_shapes = Array(), const Dictionary &p_lods = Dictionary(), uint64_t p_compress_format = 0, bool p_build_clusters = true, bool p_build_cluster_lod = true);
 
 	// Triangle clusters at surface creation (D80), set by the meshoptimizer module. The
 	// builder's signature is meshopt_buildMeshletsSpatial's, the bound's meshopt_buildMeshletsBound's.
@@ -269,7 +269,8 @@ public:
 	// section's size and every index in it against the surface and the owner sections (its own, or
 	// p_owner_data, the payload of the earlier surface its word 2 names), and the mesh's rules (no
 	// skin or blend data on a subdivided surface; with blend shapes, subdivided and plain surfaces do
-	// not mix; p_first_subdivided is -1 for an empty mesh, else whether surface 0 is subdivided).
+	// not mix and a subdivided surface carries no cluster LOD hierarchy, D87's rule for blend-shaped
+	// surfaces; p_first_subdivided is -1 for an empty mesh, else whether surface 0 is subdivided).
 	// mesh_subdivision_data_owner_surface() is word 2, -1 for a payload too short to hold it, and
 	// mesh_subdivision_data_find_section() a section's byte offset, -1 when absent or out of bounds.
 	static bool mesh_subdivision_data_is_valid(const Vector<uint8_t> &p_data, String *r_error = nullptr);

@@ -1329,7 +1329,10 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 		arrays[Mesh::ARRAY_INDEX] = indices;
 
 		RenderingServerTypes::SurfaceData surface_data;
-		const Error err = RS::get_singleton()->mesh_create_surface_data_from_arrays(&surface_data, RSE::PRIMITIVE_TRIANGLES, arrays, Array(), Dictionary(), format_flags);
+		// Flat clusters only when the owner has blend shapes: its cage's morphs move the surface away
+		// from the rest pose a cluster LOD hierarchy's errors are measured on, D87's reason for keeping
+		// blend-shaped surfaces out. The storages refuse such a hierarchy.
+		const Error err = RS::get_singleton()->mesh_create_surface_data_from_arrays(&surface_data, RSE::PRIMITIVE_TRIANGLES, arrays, Array(), Dictionary(), format_flags, true, names.is_empty());
 		ERR_FAIL_COND_V_MSG(err != OK, err, vformat("Surface %d: the refined arrays were rejected.", s));
 
 		// Tangent adjacency over the surface's final index order (the cluster builder reorders

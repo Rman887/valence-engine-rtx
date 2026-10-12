@@ -32,6 +32,7 @@
 
 #include "../subdivision_builder.h"
 
+#include "core/config/project_settings.h"
 #include "scene/resources/3d/importer_mesh.h"
 #include "scene/resources/material.h"
 #include "scene/resources/surface_tool.h"
@@ -570,6 +571,53 @@ static Ref<ArrayMesh> build_grid(const TestCage &p_grid, const PackedVector2Arra
 	builder->add_surface(0, primitive.arrays, Array(), PackedStringArray(), primitive.cage_vertex, primitive.faces, weld, Ref<Material>());
 	REQUIRE(builder->build(2) == OK);
 	return builder->get_owner_mesh(0);
+}
+
+TEST_CASE("[SceneTree][SubdivisionBuilder] An owner with blend shapes gets flat clusters, not a cluster LOD hierarchy") {
+	if (RenderingServer::build_clusters_func == nullptr || RenderingServer::build_cluster_lod_func == nullptr) {
+		return; // No cluster builders without the meshoptimizer module.
+	}
+	const Variant cluster_blas = GLOBAL_GET("rendering/pathtracing/cluster_blas");
+	const Variant cluster_lod = GLOBAL_GET("rendering/pathtracing/cluster_lod");
+	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", true);
+	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_lod", true);
+	const TestCage grid = make_grid(6, 6, -1, true); // 1,152 refined triangles, past one cluster.
+	const PackedVector2Array uv_values = grid_uvs(grid, Vector2(1, 0), Vector2(0, 1));
+	auto cluster_version = [&](bool p_shapes) -> uint32_t {
+		const TestPrimitive primitive = make_shared_primitive(grid, 0);
+		Array blend_arrays;
+		PackedStringArray names;
+		if (p_shapes) {
+			LocalVector<HashMap<int, Vector3>> shapes;
+			shapes.resize(1);
+			shapes[0].insert(grid.faces[0], Vector3(0, 0.1f, 0));
+			blend_arrays = make_blend_arrays(primitive, shapes);
+			names.push_back("A");
+		}
+		Ref<SubdivisionBuilder> builder;
+		builder.instantiate();
+		builder->set_cage_vertex_count(grid.positions.size());
+		builder->add_face_varying_layer(uv_values, Mesh::ARRAY_TEX_UV);
+		Array weld;
+		weld.push_back(primitive.uv_weld);
+		builder->add_surface(0, primitive.arrays, blend_arrays, names, primitive.cage_vertex, primitive.faces, weld, Ref<Material>());
+		REQUIRE(builder->build(2) == OK);
+		const Ref<ArrayMesh> mesh = builder->get_owner_mesh(0);
+		REQUIRE(mesh.is_valid());
+		const Dictionary surface = Array(mesh->get("_surfaces"))[0];
+		const Vector<uint8_t> clusters = surface.get("cluster_data", Vector<uint8_t>());
+		REQUIRE(clusters.size() >= int(sizeof(uint32_t)));
+		uint32_t version;
+		memcpy(&version, clusters.ptr(), sizeof(uint32_t));
+		return version;
+	};
+	// Without shapes the hierarchy is built: the witness that the switches above reach the builder.
+	const uint32_t without_shapes = cluster_version(false);
+	const uint32_t with_shapes = cluster_version(true);
+	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", cluster_blas);
+	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_lod", cluster_lod);
+	CHECK(without_shapes == RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION);
+	CHECK(with_shapes == RenderingServerTypes::MESH_CLUSTER_DATA_VERSION);
 }
 
 TEST_CASE("[SceneTree][SubdivisionBuilder] Tangents have Godot's handedness, as SurfaceTool's MikkTSpace gives") {

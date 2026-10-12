@@ -530,6 +530,16 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 
 	ERR_FAIL_COND(mesh->surface_count == RSE::MAX_MESH_SURFACES);
 
+	// A subdivided surface (D122) carries its blend shapes and skin on its cage, in the payload.
+	const bool subdivided = !p_surface.subdivision_data.is_empty();
+	{
+		const int64_t owner_surface = RenderingServer::mesh_subdivision_data_owner_surface(p_surface.subdivision_data);
+		const Vector<uint8_t> owner_data = (owner_surface >= 0 && owner_surface < mesh->surface_count) ? mesh->surfaces[owner_surface]->subdivision_data : Vector<uint8_t>();
+		const int first_subdivided = mesh->surface_count == 0 ? -1 : int(!mesh->surfaces[0]->subdivision_data.is_empty());
+		String error;
+		ERR_FAIL_COND_MSG(!RenderingServer::mesh_subdivision_surface_is_valid(p_surface, mesh->surface_count, mesh->blend_shape_count, first_subdivided, owner_data, &error), "Invalid subdivided surface: " + error + ".");
+	}
+
 #ifdef DEBUG_ENABLED
 	//do a validation, to catch errors first
 	{
@@ -600,7 +610,7 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 		int expected_size = stride * p_surface.vertex_count;
 		ERR_FAIL_COND_MSG(expected_size != p_surface.vertex_data.size(), "Size of vertex data provided (" + itos(p_surface.vertex_data.size()) + ") does not match expected (" + itos(expected_size) + ")");
 
-		int bs_expected_size = expected_size * mesh->blend_shape_count;
+		int bs_expected_size = subdivided ? 0 : expected_size * mesh->blend_shape_count;
 
 		ERR_FAIL_COND_MSG(bs_expected_size != p_surface.blend_shape_data.size(), "Size of blend shape data provided (" + itos(p_surface.blend_shape_data.size()) + ") does not match expected (" + itos(bs_expected_size) + ")");
 
@@ -633,7 +643,11 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	}
 #endif
 
-	_cluster_surface_at_load(new_surface);
+	if (!subdivided) {
+		// A subdivided surface's index order is frozen at build (D122): its payload's tangent
+		// adjacency names triangles by index position.
+		_cluster_surface_at_load(new_surface);
+	}
 
 	static uint32_t s_next_rt_invalidation_counter = 1; // Monotonic counter is required so that new surfaces are also invalidated.
 	Mesh::Surface *s = memnew(Mesh::Surface);
@@ -642,7 +656,7 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	s->format = new_surface.format;
 	s->primitive = new_surface.primitive;
 
-	const bool use_as_storage = (new_surface.skin_data.size() || mesh->blend_shape_count > 0);
+	const bool use_as_storage = (new_surface.skin_data.size() || (mesh->blend_shape_count > 0 && !subdivided));
 	const bool requested_storage_buffer = (new_surface.format & RSE::ARRAY_FLAG_USE_STORAGE_BUFFER);
 	BitField<RD::BufferCreationBits> as_storage_flag = (use_as_storage || requested_storage_buffer) ? RD::BUFFER_CREATION_AS_STORAGE_BIT : 0;
 	BitField<RD::BufferCreationBits> requested_storage_flag = requested_storage_buffer ? RD::BUFFER_CREATION_AS_STORAGE_BIT : 0;
@@ -685,7 +699,7 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	uint32_t buffer_index_count = new_surface.index_count;
 	uint32_t buffer_index_total = index_total;
 	bool buffer_index_16 = is_index_16;
-	if (index_total > new_surface.index_count && !(new_surface.format & RSE::ARRAY_FORMAT_BONES) && new_surface.skin_data.is_empty() && mesh->blend_shape_count == 0 && is_cluster_geometry_streaming_wanted()) {
+	if (index_total > new_surface.index_count && !(new_surface.format & RSE::ARRAY_FORMAT_BONES) && new_surface.skin_data.is_empty() && mesh->blend_shape_count == 0 && new_surface.subdivision_data.is_empty() && is_cluster_geometry_streaming_wanted()) {
 		const RD::ClusterAccelerationStructureCapabilities &caps = RD::get_singleton()->get_cluster_acceleration_structure_capabilities();
 		LocalVector<uint16_t> local;
 		LocalVector<uint32_t> distinct;
@@ -778,6 +792,7 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 
 	s->uv_scale = new_surface.uv_scale;
 	s->cluster_data = new_surface.cluster_data;
+	s->subdivision_data = new_surface.subdivision_data;
 	if (mesh_surface_is_geometry_streamed(s)) {
 		cluster_geometry_ram_bytes.add(_mesh_surface_ram_bytes(*s));
 		cluster_geometry_fallback_bytes.add(uint64_t(s->vertex_buffer_size) + s->attribute_buffer_size + s->index_buffer_size);
@@ -788,7 +803,7 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 		}
 	}
 
-	if (mesh->blend_shape_count > 0) {
+	if (mesh->blend_shape_count > 0 && !subdivided) {
 		s->blend_shape_buffer = RD::get_singleton()->storage_buffer_create(new_surface.blend_shape_data.size(), new_surface.blend_shape_data);
 		s->blend_shape_buffer_size = new_surface.blend_shape_data.size();
 	}
@@ -1018,6 +1033,7 @@ void RendererRD::MeshStorage::mesh_surface_update_index_region(RID p_mesh, int p
 	ERR_FAIL_NULL(mesh);
 	ERR_FAIL_UNSIGNED_INDEX((uint32_t)p_surface, mesh->surface_count);
 	ERR_FAIL_COND(mesh->surfaces[p_surface]->index_buffer.is_null());
+	ERR_FAIL_COND_MSG(!mesh->surfaces[p_surface]->subdivision_data.is_empty(), "A subdivided surface's index order is frozen at build (D122): its payload's tangent adjacency addresses it.");
 
 	uint64_t data_size = p_data.size();
 	const uint8_t *r = p_data.ptr();
@@ -1239,6 +1255,7 @@ RenderingServerTypes::SurfaceData MeshStorage::_mesh_surface_get_from_buffers(co
 	sd.aabb = s.aabb;
 	sd.uv_scale = s.uv_scale;
 	sd.cluster_data = s.cluster_data;
+	sd.subdivision_data = s.subdivision_data;
 	for (uint32_t i = 0; i < s.lod_count; i++) {
 		RenderingServerTypes::SurfaceData::LOD lod;
 		lod.edge_length = s.lods[i].edge_length;
@@ -1275,6 +1292,7 @@ RenderingServerTypes::SurfaceData MeshStorage::_mesh_surface_get_from_ram(const 
 	sd.aabb = s.aabb;
 	sd.uv_scale = s.uv_scale;
 	sd.cluster_data = s.cluster_data;
+	sd.subdivision_data = s.subdivision_data;
 	sd.lods = s.ram_lods;
 	sd.bone_aabbs = s.bone_aabbs;
 	sd.mesh_to_skeleton_xform = s.mesh_to_skeleton_xform;
@@ -1533,6 +1551,10 @@ void MeshStorage::mesh_surface_remove(RID p_mesh, int p_surface) {
 	Mesh *mesh = mesh_owner.get_or_null(p_mesh);
 	ERR_FAIL_NULL(mesh);
 	ERR_FAIL_UNSIGNED_INDEX((uint32_t)p_surface, mesh->surface_count);
+	// D122: a payload names its owner surface by index (word 2), so only surfaces after the last subdivided one may go.
+	for (uint32_t i = uint32_t(p_surface) + 1; i < mesh->surface_count; i++) {
+		ERR_FAIL_COND_MSG(!mesh->surfaces[i]->subdivision_data.is_empty(), "Cannot remove a surface before a subdivided surface (D122): its payload names its owner surface by index.");
+	}
 
 	// Clear instance data before mesh data.
 	for (MeshInstance *mi : mesh->instances) {
@@ -1619,7 +1641,19 @@ bool MeshStorage::mesh_needs_instance(RID p_mesh, bool p_has_skeleton) {
 	Mesh *mesh = mesh_owner.get_or_null(p_mesh);
 	ERR_FAIL_NULL_V(mesh, false);
 
-	return mesh->blend_shape_count > 0 || (mesh->has_bone_weights && p_has_skeleton);
+	// A mesh whose every surface is subdivided (D122) draws its rest pose until the runtime
+	// passes exist (S2): its blend shapes ask for no instance.
+	bool blends = mesh->blend_shape_count > 0;
+	if (blends && mesh->surface_count > 0) {
+		blends = false;
+		for (uint32_t i = 0; i < mesh->surface_count; i++) {
+			if (mesh->surfaces[i]->subdivision_data.is_empty()) {
+				blends = true;
+				break;
+			}
+		}
+	}
+	return blends || (mesh->has_bone_weights && p_has_skeleton);
 }
 
 Dependency *MeshStorage::mesh_get_dependency(RID p_mesh) const {
@@ -1702,7 +1736,8 @@ void MeshStorage::_mesh_instance_add_surface(MeshInstance *mi, Mesh *mesh, uint3
 	}
 
 	MeshInstance::Surface s;
-	if ((mesh->blend_shape_count > 0 || (mesh->surfaces[p_surface]->format & RSE::ARRAY_FORMAT_BONES)) && mesh->surfaces[p_surface]->vertex_buffer_size > 0) {
+	const bool subdivided = !mesh->surfaces[p_surface]->subdivision_data.is_empty(); // D122: rest pose until S2.
+	if (((mesh->blend_shape_count > 0 && !subdivided) || (mesh->surfaces[p_surface]->format & RSE::ARRAY_FORMAT_BONES)) && mesh->surfaces[p_surface]->vertex_buffer_size > 0) {
 		_mesh_instance_add_surface_buffer(mi, mesh, &s, p_surface, 0);
 	}
 
@@ -1888,7 +1923,7 @@ void MeshStorage::update_mesh_instances() {
 			push_constant.has_normal = mi->mesh->surfaces[i]->format & RSE::ARRAY_FORMAT_NORMAL;
 			push_constant.has_tangent = mi->mesh->surfaces[i]->format & RSE::ARRAY_FORMAT_TANGENT;
 			push_constant.has_skeleton = sk != nullptr && sk->use_2d == array_is_2d && (mi->mesh->surfaces[i]->format & RSE::ARRAY_FORMAT_BONES);
-			push_constant.has_blend_shape = mi->mesh->blend_shape_count > 0;
+			push_constant.has_blend_shape = mi->mesh->blend_shape_count > 0 && mi->mesh->surfaces[i]->blend_shape_buffer.is_valid();
 
 			push_constant.normal_tangent_stride = (push_constant.has_normal ? 1 : 0) + (push_constant.has_tangent ? 1 : 0);
 

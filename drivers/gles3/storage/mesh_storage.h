@@ -116,6 +116,9 @@ struct Mesh {
 		Transform3D mesh_to_skeleton_xform;
 
 		Vector4 uv_scale;
+		// The subdivision payload (D122). A subdivided surface has no blend shape buffers and draws
+		// its rest pose; kept so mesh_get_surface() returns it.
+		Vector<uint8_t> subdivision_data;
 
 		struct BlendShape {
 			GLuint vertex_buffer = 0;

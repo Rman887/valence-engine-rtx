@@ -1454,6 +1454,321 @@ String RenderingServer::mesh_get_cluster_import_settings() {
 	return settings;
 }
 
+// The subdivision payload's checks (D122). Every count is widened to 64 bits before it multiplies.
+namespace {
+
+struct SubdivisionSectionSpan {
+	const uint8_t *data = nullptr;
+	uint64_t bytes = 0;
+	bool present = false;
+};
+
+bool _subdivision_fail(String *r_error, const String &p_message) {
+	if (r_error) {
+		*r_error = p_message;
+	}
+	return false;
+}
+
+bool _subdivision_known_section(uint32_t p_id, bool &r_owner_section) {
+	r_owner_section = p_id >= RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO;
+	return (p_id >= RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U && p_id <= RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_ENTRIES) ||
+			(p_id >= RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO && p_id <= RenderingServerTypes::MESH_SUBDIVISION_SECTION_U_WELDED);
+}
+
+SubdivisionSectionSpan _subdivision_span(const Vector<uint8_t> &p_data, uint32_t p_id) {
+	SubdivisionSectionSpan span;
+	uint32_t size = 0;
+	const int64_t offset = RenderingServer::mesh_subdivision_data_find_section(p_data, p_id, &size);
+	if (offset >= 0) {
+		span.data = p_data.ptr() + offset;
+		span.bytes = size;
+		span.present = true;
+	}
+	return span;
+}
+
+uint32_t _subdivision_word(const SubdivisionSectionSpan &p_span, uint64_t p_index) {
+	uint32_t value;
+	memcpy(&value, p_span.data + p_index * sizeof(uint32_t), sizeof(uint32_t));
+	return value;
+}
+
+// A CSR offset section: p_rows + 1 words, from 0, never decreasing, ending at p_entries.
+bool _subdivision_check_offsets(const SubdivisionSectionSpan &p_span, uint64_t p_rows, uint64_t p_entries, const char *p_name, String *r_error) {
+	if (p_span.bytes != (p_rows + 1) * sizeof(uint32_t)) {
+		return _subdivision_fail(r_error, vformat("%s has %d bytes for %d rows", p_name, p_span.bytes, p_rows));
+	}
+	uint32_t previous = 0;
+	for (uint64_t i = 0; i <= p_rows; i++) {
+		const uint32_t offset = _subdivision_word(p_span, i);
+		if ((i == 0 && offset != 0) || offset < previous) {
+			return _subdivision_fail(r_error, vformat("%s is not a run of offsets from 0 at row %d", p_name, i));
+		}
+		previous = offset;
+	}
+	if (previous != p_entries) {
+		return _subdivision_fail(r_error, vformat("%s ends at %d for %d entries", p_name, previous, p_entries));
+	}
+	return true;
+}
+
+// A section of p_count uint32 values, each below p_limit.
+bool _subdivision_check_indices(const SubdivisionSectionSpan &p_span, uint64_t p_count, uint64_t p_limit, const char *p_name, String *r_error) {
+	if (p_span.bytes != p_count * sizeof(uint32_t)) {
+		return _subdivision_fail(r_error, vformat("%s has %d bytes for %d entries", p_name, p_span.bytes, p_count));
+	}
+	for (uint64_t i = 0; i < p_count; i++) {
+		if (_subdivision_word(p_span, i) >= p_limit) {
+			return _subdivision_fail(r_error, vformat("%s entry %d is %d, out of range %d", p_name, i, _subdivision_word(p_span, i), p_limit));
+		}
+	}
+	return true;
+}
+
+// An accepted owner's info: its size, its blend shape count against the mesh's, and its own U count.
+bool _subdivision_owner_info(const Vector<uint8_t> &p_data, uint32_t p_blend_shape_count, uint32_t &r_own_u_count, String *r_error) {
+	const SubdivisionSectionSpan info = _subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO);
+	if (info.bytes != RenderingServerTypes::MESH_SUBDIVISION_OWNER_INFO_WORDS * sizeof(uint32_t)) {
+		return _subdivision_fail(r_error, "owner info has the wrong size");
+	}
+	const uint32_t shape_count = _subdivision_word(info, RenderingServerTypes::MESH_SUBDIVISION_INFO_BLEND_SHAPE_COUNT);
+	if (shape_count != p_blend_shape_count) {
+		return _subdivision_fail(r_error, vformat("owner info has %d blend shapes, the mesh %d", shape_count, p_blend_shape_count));
+	}
+	r_own_u_count = _subdivision_word(info, RenderingServerTypes::MESH_SUBDIVISION_INFO_OWN_U_COUNT);
+	return true;
+}
+
+// The owner sections, against their info.
+bool _subdivision_check_owner(const Vector<uint8_t> &p_data, uint32_t p_blend_shape_count, uint32_t &r_own_u_count, String *r_error) {
+	const SubdivisionSectionSpan info = _subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO);
+	if (info.bytes != RenderingServerTypes::MESH_SUBDIVISION_OWNER_INFO_WORDS * sizeof(uint32_t)) {
+		return _subdivision_fail(r_error, "owner info has the wrong size");
+	}
+	const uint64_t cage_count = _subdivision_word(info, RenderingServerTypes::MESH_SUBDIVISION_INFO_CAGE_COUNT);
+	const uint64_t own_cage_count = _subdivision_word(info, RenderingServerTypes::MESH_SUBDIVISION_INFO_OWN_CAGE_COUNT);
+	const uint64_t u_count = _subdivision_word(info, RenderingServerTypes::MESH_SUBDIVISION_INFO_U_COUNT);
+	const uint64_t own_u_count = _subdivision_word(info, RenderingServerTypes::MESH_SUBDIVISION_INFO_OWN_U_COUNT);
+	const uint64_t quad_count = _subdivision_word(info, RenderingServerTypes::MESH_SUBDIVISION_INFO_QUAD_COUNT);
+	const uint64_t own_quad_count = _subdivision_word(info, RenderingServerTypes::MESH_SUBDIVISION_INFO_OWN_QUAD_COUNT);
+	const uint64_t shape_count = _subdivision_word(info, RenderingServerTypes::MESH_SUBDIVISION_INFO_BLEND_SHAPE_COUNT);
+	const uint32_t level = _subdivision_word(info, RenderingServerTypes::MESH_SUBDIVISION_INFO_LEVEL);
+	const uint32_t index_bytes = _subdivision_word(info, RenderingServerTypes::MESH_SUBDIVISION_INFO_STENCIL_INDEX_BYTES);
+	const uint64_t weight_count = _subdivision_word(info, RenderingServerTypes::MESH_SUBDIVISION_INFO_STENCIL_WEIGHT_COUNT);
+	if (own_cage_count == 0 || own_cage_count > cage_count || own_u_count == 0 || own_u_count > u_count || own_quad_count == 0 || own_quad_count > quad_count) {
+		return _subdivision_fail(r_error, "owner info counts are inconsistent");
+	}
+	if (shape_count != p_blend_shape_count) {
+		return _subdivision_fail(r_error, vformat("owner info has %d blend shapes, the mesh %d", shape_count, p_blend_shape_count));
+	}
+	if (level < 1 || level > 4 || (index_bytes != 2 && index_bytes != 4) || (index_bytes == 2 && cage_count > 65536)) {
+		return _subdivision_fail(r_error, "owner info level or stencil index width is invalid");
+	}
+	if (_subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_POSITIONS).bytes != cage_count * 3 * sizeof(float)) {
+		return _subdivision_fail(r_error, "cage positions have the wrong size");
+	}
+	const SubdivisionSectionSpan skin = _subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_SKIN);
+	if (skin.present && skin.bytes != cage_count * 2 * RenderingServerTypes::MESH_SUBDIVISION_CAGE_BONES * sizeof(uint16_t)) {
+		return _subdivision_fail(r_error, "cage skin has the wrong size");
+	}
+	if (_subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_DELTAS).bytes != shape_count * cage_count * 3 * sizeof(float)) {
+		return _subdivision_fail(r_error, "cage blend deltas have the wrong size");
+	}
+	if (!_subdivision_check_offsets(_subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_OFFSETS), u_count, weight_count, "stencil offsets", r_error)) {
+		return false;
+	}
+	const SubdivisionSectionSpan indices = _subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_INDICES);
+	if (indices.bytes != weight_count * index_bytes) {
+		return _subdivision_fail(r_error, "stencil indices have the wrong size");
+	}
+	for (uint64_t i = 0; i < weight_count; i++) {
+		uint32_t index;
+		if (index_bytes == 2) {
+			uint16_t narrow;
+			memcpy(&narrow, indices.data + i * 2, 2);
+			index = narrow;
+		} else {
+			memcpy(&index, indices.data + i * 4, 4);
+		}
+		if (index >= cage_count) {
+			return _subdivision_fail(r_error, vformat("stencil index %d is %d, out of the cage's %d", i, index, cage_count));
+		}
+	}
+	if (_subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_WEIGHTS).bytes != weight_count * sizeof(float)) {
+		return _subdivision_fail(r_error, "stencil weights have the wrong size");
+	}
+	if (!_subdivision_check_indices(_subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_QUADS), quad_count * 4, u_count, "quads", r_error)) {
+		return false;
+	}
+	const SubdivisionSectionSpan normal_entries = _subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_NORMAL_ENTRIES);
+	if (!_subdivision_check_offsets(_subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_NORMAL_OFFSETS), own_u_count, normal_entries.bytes / sizeof(uint32_t), "normal offsets", r_error)) {
+		return false;
+	}
+	if (!_subdivision_check_indices(normal_entries, normal_entries.bytes / sizeof(uint32_t), quad_count * 4, "normal entries", r_error)) {
+		return false;
+	}
+	if (_subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_WELDED).bytes != cage_count * sizeof(uint32_t) || _subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_U_WELDED).bytes != u_count * sizeof(uint32_t)) {
+		return _subdivision_fail(r_error, "the welded index sections have the wrong size");
+	}
+	r_own_u_count = own_u_count;
+	return true;
+}
+
+} // namespace
+
+bool RenderingServer::mesh_subdivision_data_is_valid(const Vector<uint8_t> &p_data, String *r_error) {
+	const int64_t size = p_data.size();
+	if (size < int64_t(RenderingServerTypes::MESH_SUBDIVISION_HEADER_WORDS * sizeof(uint32_t)) || (size % sizeof(uint32_t)) != 0) {
+		return _subdivision_fail(r_error, vformat("payload of %d bytes is shorter than its header or not whole words", size));
+	}
+	uint32_t header[RenderingServerTypes::MESH_SUBDIVISION_HEADER_WORDS];
+	memcpy(header, p_data.ptr(), sizeof(header));
+	if (header[0] != RenderingServerTypes::MESH_SUBDIVISION_DATA_VERSION) {
+		return _subdivision_fail(r_error, vformat("payload version %d, expected %d", header[0], RenderingServerTypes::MESH_SUBDIVISION_DATA_VERSION));
+	}
+	if (header[1] & ~uint32_t(RenderingServerTypes::MESH_SUBDIVISION_FLAG_OWNER)) {
+		return _subdivision_fail(r_error, vformat("payload flags %d hold unknown bits", header[1]));
+	}
+	const bool owner = header[1] & RenderingServerTypes::MESH_SUBDIVISION_FLAG_OWNER;
+	const uint64_t section_count = header[3];
+	const uint64_t table_bytes = (RenderingServerTypes::MESH_SUBDIVISION_HEADER_WORDS + section_count * RenderingServerTypes::MESH_SUBDIVISION_SECTION_WORDS) * sizeof(uint32_t);
+	if (table_bytes > uint64_t(size)) {
+		return _subdivision_fail(r_error, vformat("section table of %d sections runs past the payload", section_count));
+	}
+	uint64_t seen = 0; // One bit per section id; every known id is below 64.
+	for (uint64_t i = 0; i < section_count; i++) {
+		uint32_t section[RenderingServerTypes::MESH_SUBDIVISION_SECTION_WORDS];
+		memcpy(section, p_data.ptr() + (RenderingServerTypes::MESH_SUBDIVISION_HEADER_WORDS + i * RenderingServerTypes::MESH_SUBDIVISION_SECTION_WORDS) * sizeof(uint32_t), sizeof(section));
+		const uint64_t offset = section[1];
+		const uint64_t bytes = section[2];
+		bool owner_section = false;
+		if (!_subdivision_known_section(section[0], owner_section)) {
+			return _subdivision_fail(r_error, vformat("section %d has unknown id %d", i, section[0]));
+		}
+		if (seen & (uint64_t(1) << section[0])) {
+			return _subdivision_fail(r_error, vformat("section id %d appears twice", section[0]));
+		}
+		seen |= uint64_t(1) << section[0];
+		if (owner_section && !owner) {
+			return _subdivision_fail(r_error, vformat("owner section %d in a payload without the owner flag", section[0]));
+		}
+		if (offset < table_bytes || offset % RenderingServerTypes::MESH_SUBDIVISION_SECTION_ALIGN != 0 || offset + bytes > uint64_t(size)) {
+			return _subdivision_fail(r_error, vformat("section %d (id %d) at %d, %d bytes, is out of bounds or misaligned", i, section[0], offset, bytes));
+		}
+	}
+	// Every section the payload's kind requires; the cage skin is optional.
+	for (uint32_t id = RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U; id <= RenderingServerTypes::MESH_SUBDIVISION_SECTION_U_WELDED; id++) {
+		bool owner_section = false;
+		if (!_subdivision_known_section(id, owner_section) || id == RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_SKIN || (owner_section && !owner)) {
+			continue;
+		}
+		if (!(seen & (uint64_t(1) << id))) {
+			return _subdivision_fail(r_error, vformat("payload lacks section %d", id));
+		}
+	}
+	return true;
+}
+
+bool RenderingServer::mesh_subdivision_surface_is_valid(const RenderingServerTypes::SurfaceData &p_surface, uint32_t p_surface_index, uint32_t p_blend_shape_count, int p_first_subdivided, const Vector<uint8_t> &p_owner_data, String *r_error) {
+	const bool subdivided = !p_surface.subdivision_data.is_empty();
+	if (p_blend_shape_count > 0 && p_first_subdivided >= 0 && subdivided != bool(p_first_subdivided)) {
+		return _subdivision_fail(r_error, "a mesh with blend shapes cannot mix subdivided and plain surfaces");
+	}
+	if (!subdivided) {
+		return true;
+	}
+	if (!mesh_subdivision_data_is_valid(p_surface.subdivision_data, r_error)) {
+		return false;
+	}
+	if (!p_surface.blend_shape_data.is_empty()) {
+		return _subdivision_fail(r_error, "a subdivided surface carries no blend shape data; its blend shapes live on its cage");
+	}
+	if ((p_surface.format & RSE::ARRAY_FORMAT_BONES) || !p_surface.skin_data.is_empty()) {
+		return _subdivision_fail(r_error, "a subdivided surface carries no skin; its cage does");
+	}
+	if (p_surface.primitive != RSE::PRIMITIVE_TRIANGLES || p_surface.vertex_count == 0 || p_surface.index_count == 0 || p_surface.index_count % 3 != 0) {
+		return _subdivision_fail(r_error, "a subdivided surface is an indexed triangle list");
+	}
+	if (p_surface.format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) {
+		return _subdivision_fail(r_error, "a subdivided surface keeps uncompressed vertex attributes, which its runtime passes write");
+	}
+	uint32_t flags;
+	memcpy(&flags, p_surface.subdivision_data.ptr() + sizeof(uint32_t), sizeof(uint32_t));
+	const int64_t owner_surface = mesh_subdivision_data_owner_surface(p_surface.subdivision_data);
+	uint32_t own_u_count = 0;
+	if (flags & RenderingServerTypes::MESH_SUBDIVISION_FLAG_OWNER) {
+		if (owner_surface != int64_t(p_surface_index)) {
+			return _subdivision_fail(r_error, vformat("an owner payload names surface %d, but is surface %d", owner_surface, p_surface_index));
+		}
+		if (!_subdivision_check_owner(p_surface.subdivision_data, p_blend_shape_count, own_u_count, r_error)) {
+			return false;
+		}
+	} else {
+		if (owner_surface < 0 || owner_surface >= int64_t(p_surface_index)) {
+			return _subdivision_fail(r_error, vformat("payload names owner surface %d, which is not an earlier surface", owner_surface));
+		}
+		uint32_t owner_flags = 0;
+		if (p_owner_data.size() >= int64_t(2 * sizeof(uint32_t))) {
+			memcpy(&owner_flags, p_owner_data.ptr() + sizeof(uint32_t), sizeof(uint32_t));
+		}
+		if (!(owner_flags & RenderingServerTypes::MESH_SUBDIVISION_FLAG_OWNER)) {
+			return _subdivision_fail(r_error, vformat("surface %d, which the payload names, holds no owner sections", owner_surface));
+		}
+		// The owner's payload passed the full check when its surface was added and the storage never
+		// changes it, so only its section table and info are read again, not its sections' contents.
+		if (!mesh_subdivision_data_is_valid(p_owner_data, r_error) || !_subdivision_owner_info(p_owner_data, p_blend_shape_count, own_u_count, r_error)) {
+			return false;
+		}
+	}
+	const uint64_t vertex_count = p_surface.vertex_count;
+	if (!_subdivision_check_indices(_subdivision_span(p_surface.subdivision_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U), vertex_count, own_u_count, "R to U", r_error)) {
+		return false;
+	}
+	const SubdivisionSectionSpan tangent_entries = _subdivision_span(p_surface.subdivision_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_ENTRIES);
+	if (!_subdivision_check_offsets(_subdivision_span(p_surface.subdivision_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_OFFSETS), vertex_count, tangent_entries.bytes / sizeof(uint32_t), "tangent offsets", r_error)) {
+		return false;
+	}
+	return _subdivision_check_indices(tangent_entries, tangent_entries.bytes / sizeof(uint32_t), uint64_t(p_surface.index_count), "tangent entries", r_error);
+}
+
+int64_t RenderingServer::mesh_subdivision_data_owner_surface(const Vector<uint8_t> &p_data) {
+	if (p_data.size() < int64_t(RenderingServerTypes::MESH_SUBDIVISION_HEADER_WORDS * sizeof(uint32_t))) {
+		return -1;
+	}
+	uint32_t word;
+	memcpy(&word, p_data.ptr() + 2 * sizeof(uint32_t), sizeof(uint32_t));
+	return word;
+}
+
+int64_t RenderingServer::mesh_subdivision_data_find_section(const Vector<uint8_t> &p_data, uint32_t p_id, uint32_t *r_size) {
+	const uint64_t size = p_data.size();
+	if (size < RenderingServerTypes::MESH_SUBDIVISION_HEADER_WORDS * sizeof(uint32_t)) {
+		return -1;
+	}
+	uint32_t section_count;
+	memcpy(&section_count, p_data.ptr() + 3 * sizeof(uint32_t), sizeof(uint32_t));
+	if ((RenderingServerTypes::MESH_SUBDIVISION_HEADER_WORDS + uint64_t(section_count) * RenderingServerTypes::MESH_SUBDIVISION_SECTION_WORDS) * sizeof(uint32_t) > size) {
+		return -1;
+	}
+	for (uint64_t i = 0; i < section_count; i++) {
+		uint32_t section[RenderingServerTypes::MESH_SUBDIVISION_SECTION_WORDS];
+		memcpy(section, p_data.ptr() + (RenderingServerTypes::MESH_SUBDIVISION_HEADER_WORDS + i * RenderingServerTypes::MESH_SUBDIVISION_SECTION_WORDS) * sizeof(uint32_t), sizeof(section));
+		if (section[0] != p_id) {
+			continue;
+		}
+		// The first section of the id, and only when it lies inside the payload.
+		if (uint64_t(section[1]) + section[2] > size || section[1] % RenderingServerTypes::MESH_SUBDIVISION_SECTION_ALIGN != 0) {
+			return -1;
+		}
+		if (r_size) {
+			*r_size = section[2];
+		}
+		return section[1];
+	}
+	return -1;
+}
+
 bool RenderingServer::mesh_has_cluster_import_settings(const String &p_imported) {
 	const String current = mesh_get_cluster_import_settings();
 	if (current.is_empty()) {
@@ -2069,6 +2384,7 @@ Dictionary RenderingServer::mesh_surface_get_lods(RID p_mesh, int p_surface) con
 TypedArray<Array> RenderingServer::mesh_surface_get_blend_shape_arrays(RID p_mesh, int p_surface) const {
 	RenderingServerTypes::SurfaceData sd = mesh_get_surface(p_mesh, p_surface);
 	ERR_FAIL_COND_V(sd.vertex_count == 0, Array());
+	ERR_FAIL_COND_V_MSG(!sd.subdivision_data.is_empty(), Array(), "The surface is subdivided (D122): its blend shapes live on its cage, in the subdivision payload, not as per-vertex arrays.");
 
 	Vector<uint8_t> blend_shape_data = sd.blend_shape_data;
 
@@ -2301,6 +2617,9 @@ static RenderingServerTypes::SurfaceData _dict_to_surf(const Dictionary &p_dicti
 	if (p_dictionary.has("cluster_data")) {
 		sd.cluster_data = p_dictionary["cluster_data"];
 	}
+	if (p_dictionary.has("subdivision_data")) {
+		sd.subdivision_data = p_dictionary["subdivision_data"];
+	}
 
 	if (p_dictionary.has("material")) {
 		sd.material = p_dictionary["material"];
@@ -2363,6 +2682,9 @@ Dictionary RenderingServer::_mesh_get_surface(RID p_mesh, int p_idx) {
 	}
 	if (sd.cluster_data.size()) {
 		d["cluster_data"] = sd.cluster_data;
+	}
+	if (sd.subdivision_data.size()) {
+		d["subdivision_data"] = sd.subdivision_data;
 	}
 
 	if (sd.material.is_valid()) {

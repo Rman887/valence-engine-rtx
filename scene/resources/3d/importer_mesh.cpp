@@ -915,6 +915,13 @@ Ref<ImporterMesh> ImporterMesh::from_mesh(const Ref<Mesh> &p_mesh) {
 		return importer_mesh;
 	}
 	Ref<ArrayMesh> array_mesh = p_mesh;
+	if (array_mesh.is_valid()) {
+		// A subdivided surface (D122) has no per-vertex arrays for its blend shapes nor its cage,
+		// which an ImporterMesh cannot carry.
+		for (int surface_i = 0; surface_i < array_mesh->get_surface_count(); surface_i++) {
+			ERR_FAIL_COND_V_MSG(array_mesh->surface_is_subdivided(surface_i), importer_mesh, vformat("Surface %d of the mesh is subdivided (D122); an ImporterMesh cannot hold its subdivision payload.", surface_i));
+		}
+	}
 	// Convert blend shape mode and names if any.
 	if (p_mesh->get_blend_shape_count() > 0) {
 		ArrayMesh::BlendShapeMode shape_mode = ArrayMesh::BLEND_SHAPE_MODE_NORMALIZED;

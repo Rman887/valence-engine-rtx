@@ -127,7 +127,69 @@ struct SurfaceData {
 	// buffer past index_count; the raster draws index_count, the trace reaches every cluster.
 	Vector<uint8_t> cluster_data;
 
+	// The surface's subdivision payload (D122), present when the surface is the refined level of
+	// a subdivision surface, built at import. Its layout is MeshSubdivisionConstants'. A subdivided
+	// surface carries no blend_shape_data whatever the mesh's blend shape count: its blend shapes
+	// live on its cage, in the payload. Empty otherwise.
+	Vector<uint8_t> subdivision_data;
+
 	RID material;
+};
+
+// The subdivision payload (D122, docs/character-subdivision.md). All words are little-endian
+// uint32 unless a section says otherwise. A header of MESH_SUBDIVISION_HEADER_WORDS words
+// (version, flags, the surface holding the owner sections, section count), then per section
+// MESH_SUBDIVISION_SECTION_WORDS words (id, byte offset from the payload's start, byte size);
+// every section starts on a 16-byte boundary, and an id appears at most once. Every subdivided
+// surface holds the surface sections; one surface of each mesh, MESH_SUBDIVISION_FLAG_OWNER in its
+// flags, also holds the owner sections and names itself in word 2, and the others, added after it,
+// name it in word 2. A subdivided surface carries no skin (its cage does) and, on a mesh with
+// blend shapes, shares the mesh with subdivided surfaces only.
+enum MeshSubdivisionConstants : uint32_t {
+	MESH_SUBDIVISION_DATA_VERSION = 1,
+	MESH_SUBDIVISION_HEADER_WORDS = 4,
+	MESH_SUBDIVISION_SECTION_WORDS = 3,
+	MESH_SUBDIVISION_SECTION_ALIGN = 16,
+	MESH_SUBDIVISION_FLAG_OWNER = 1,
+	// Bones and weights per cage vertex, as Godot's 8-weight skin: 8 uint16 bones, then 8 uint16
+	// unorm weights.
+	MESH_SUBDIVISION_CAGE_BONES = 8,
+
+	// Surface sections, on every subdivided surface. R is the surface's vertex, U the refined vertex
+	// of the mesh's welded refinement (a vertex split at a UV seam is several R of one U).
+	MESH_SUBDIVISION_SECTION_R_TO_U = 1, // uint32 per R.
+	MESH_SUBDIVISION_SECTION_TANGENT_OFFSETS = 2, // uint32 per R plus one, into the entries.
+	// uint32 triangle * 3 + corner, in the surface's index order. That order is frozen at build: no
+	// storage may reorder a subdivided surface's indices (the load-time clustering skips it).
+	MESH_SUBDIVISION_SECTION_TANGENT_ENTRIES = 3,
+
+	// Owner sections. The owner's cage is its own cage vertices, then its ghosts (another mesh's cage
+	// vertices its stencils reach); its U are its own, then the ghost U the seam's normals need.
+	MESH_SUBDIVISION_SECTION_OWNER_INFO = 16, // MESH_SUBDIVISION_OWNER_INFO_WORDS words, below.
+	MESH_SUBDIVISION_SECTION_CAGE_POSITIONS = 17, // float x, y, z per cage vertex.
+	MESH_SUBDIVISION_SECTION_CAGE_SKIN = 18, // 8 uint16 bones, 8 uint16 unorm weights per cage vertex; absent without skin.
+	MESH_SUBDIVISION_SECTION_CAGE_BLEND_DELTAS = 19, // float x, y, z per cage vertex, per blend shape in the mesh's order.
+	MESH_SUBDIVISION_SECTION_STENCIL_OFFSETS = 20, // uint32 per U plus one, into the indices and weights.
+	MESH_SUBDIVISION_SECTION_STENCIL_INDICES = 21, // uint16 or uint32 (info word 8) cage vertex per weight.
+	MESH_SUBDIVISION_SECTION_STENCIL_WEIGHTS = 22, // float per weight.
+	MESH_SUBDIVISION_SECTION_QUADS = 23, // uint32 4 U per refined quad in the source's corner order: own quads, then ghost quads.
+	MESH_SUBDIVISION_SECTION_NORMAL_OFFSETS = 24, // uint32 per own U plus one, into the entries.
+	MESH_SUBDIVISION_SECTION_NORMAL_ENTRIES = 25, // uint32 quad * 4 + corner.
+	MESH_SUBDIVISION_SECTION_CAGE_WELDED = 26, // uint32 per cage vertex: its index in the welded cage.
+	MESH_SUBDIVISION_SECTION_U_WELDED = 27, // uint32 per U: its index in the welded refinement.
+
+	// MESH_SUBDIVISION_SECTION_OWNER_INFO's words.
+	MESH_SUBDIVISION_INFO_CAGE_COUNT = 0,
+	MESH_SUBDIVISION_INFO_OWN_CAGE_COUNT = 1,
+	MESH_SUBDIVISION_INFO_U_COUNT = 2,
+	MESH_SUBDIVISION_INFO_OWN_U_COUNT = 3,
+	MESH_SUBDIVISION_INFO_QUAD_COUNT = 4,
+	MESH_SUBDIVISION_INFO_OWN_QUAD_COUNT = 5,
+	MESH_SUBDIVISION_INFO_BLEND_SHAPE_COUNT = 6,
+	MESH_SUBDIVISION_INFO_LEVEL = 7,
+	MESH_SUBDIVISION_INFO_STENCIL_INDEX_BYTES = 8,
+	MESH_SUBDIVISION_INFO_STENCIL_WEIGHT_COUNT = 9,
+	MESH_SUBDIVISION_OWNER_INFO_WORDS = 10,
 };
 
 enum MeshClusterConstants : uint32_t {

@@ -1549,6 +1549,9 @@ Array ArrayMesh::_get_surfaces() const {
 		if (surface.cluster_data.size()) {
 			data["cluster_data"] = surface.cluster_data;
 		}
+		if (surface.subdivision_data.size()) {
+			data["subdivision_data"] = surface.subdivision_data;
+		}
 
 		Array bone_aabbs;
 		for (int j = 0; j < surface.bone_aabbs.size(); j++) {
@@ -1639,6 +1642,9 @@ void ArrayMesh::_set_surfaces(const Array &p_surfaces) {
 		if (d.has("cluster_data")) {
 			surface.cluster_data = d["cluster_data"];
 		}
+		if (d.has("subdivision_data")) {
+			surface.subdivision_data = d["subdivision_data"];
+		}
 
 		if (d.has("bone_aabbs")) {
 			Array bone_aabbs = d["bone_aabbs"];
@@ -1722,6 +1728,7 @@ void ArrayMesh::_set_surfaces(const Array &p_surfaces) {
 		s.primitive = PrimitiveType(surface_data[i].primitive);
 		s.array_length = surface_data[i].vertex_count;
 		s.index_array_length = surface_data[i].index_count;
+		s.subdivided = !surface_data[i].subdivision_data.is_empty();
 
 		surfaces.push_back(s);
 	}
@@ -1789,7 +1796,7 @@ void ArrayMesh::_recompute_aabb() {
 }
 
 // TODO: Need to add binding to add_surface using future MeshSurfaceData object.
-void ArrayMesh::add_surface(BitField<ArrayFormat> p_format, PrimitiveType p_primitive, const Vector<uint8_t> &p_array, const Vector<uint8_t> &p_attribute_array, const Vector<uint8_t> &p_skin_array, int p_vertex_count, const Vector<uint8_t> &p_index_array, int p_index_count, const AABB &p_aabb, const Vector<uint8_t> &p_blend_shape_data, const Vector<AABB> &p_bone_aabbs, const Vector<RenderingServerTypes::SurfaceData::LOD> &p_lods, const Vector4 p_uv_scale, const Vector<uint8_t> &p_cluster_data) {
+void ArrayMesh::add_surface(BitField<ArrayFormat> p_format, PrimitiveType p_primitive, const Vector<uint8_t> &p_array, const Vector<uint8_t> &p_attribute_array, const Vector<uint8_t> &p_skin_array, int p_vertex_count, const Vector<uint8_t> &p_index_array, int p_index_count, const AABB &p_aabb, const Vector<uint8_t> &p_blend_shape_data, const Vector<AABB> &p_bone_aabbs, const Vector<RenderingServerTypes::SurfaceData::LOD> &p_lods, const Vector4 p_uv_scale, const Vector<uint8_t> &p_cluster_data, const Vector<uint8_t> &p_subdivision_data) {
 	ERR_FAIL_COND(surfaces.size() == RSE::MAX_MESH_SURFACES);
 	_create_if_empty();
 
@@ -1800,6 +1807,7 @@ void ArrayMesh::add_surface(BitField<ArrayFormat> p_format, PrimitiveType p_prim
 	s.array_length = p_vertex_count;
 	s.index_array_length = p_index_count;
 	s.format = p_format;
+	s.subdivided = !p_subdivision_data.is_empty();
 
 	surfaces.push_back(s);
 	_recompute_aabb();
@@ -1819,6 +1827,7 @@ void ArrayMesh::add_surface(BitField<ArrayFormat> p_format, PrimitiveType p_prim
 	sd.lods = p_lods;
 	sd.uv_scale = p_uv_scale;
 	sd.cluster_data = p_cluster_data;
+	sd.subdivision_data = p_subdivision_data;
 
 	RenderingServer::get_singleton()->mesh_add_surface(mesh, sd);
 
@@ -1986,6 +1995,11 @@ String ArrayMesh::surface_get_name(int p_idx) const {
 	return surfaces[p_idx].name;
 }
 
+bool ArrayMesh::surface_is_subdivided(int p_idx) const {
+	ERR_FAIL_INDEX_V(p_idx, surfaces.size(), false);
+	return surfaces[p_idx].subdivided;
+}
+
 void ArrayMesh::surface_update_vertex_region(int p_surface, int p_offset, const Vector<uint8_t> &p_data) {
 	ERR_FAIL_INDEX(p_surface, surfaces.size());
 	RS::get_singleton()->mesh_surface_update_vertex_region(mesh, p_surface, p_offset, p_data);
@@ -2036,6 +2050,10 @@ void ArrayMesh::clear_surfaces() {
 
 void ArrayMesh::surface_remove(int p_surface) {
 	ERR_FAIL_INDEX(p_surface, surfaces.size());
+	// D122: a subdivided surface's payload names its owner surface by index, as the storages check.
+	for (int i = p_surface + 1; i < surfaces.size(); i++) {
+		ERR_FAIL_COND_MSG(surfaces[i].subdivided, "Cannot remove a surface before a subdivided surface (D122): its payload names its owner surface by index.");
+	}
 	RS::get_singleton()->mesh_surface_remove(mesh, p_surface);
 	surfaces.remove_at(p_surface);
 

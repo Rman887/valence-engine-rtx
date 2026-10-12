@@ -262,6 +262,20 @@ public:
 	// meshoptimizer configuration) must bump the table version to reach existing imports.
 	static String mesh_get_cluster_import_settings();
 	static bool mesh_has_cluster_import_settings(const String &p_imported);
+	// The subdivision payload (D122). mesh_subdivision_data_is_valid() checks its structure: the
+	// version and flags, a section table in bounds with known, unique, aligned sections, and the
+	// sections its kind requires. mesh_subdivision_surface_is_valid() is the check a storage runs
+	// before adding any surface to a mesh holding p_surface_index surfaces: the structure, then every
+	// section's size and every index in it against the surface and the owner sections (its own, or
+	// p_owner_data, the payload of the earlier surface its word 2 names), and the mesh's rules (no
+	// skin or blend data on a subdivided surface; with blend shapes, subdivided and plain surfaces do
+	// not mix; p_first_subdivided is -1 for an empty mesh, else whether surface 0 is subdivided).
+	// mesh_subdivision_data_owner_surface() is word 2, -1 for a payload too short to hold it, and
+	// mesh_subdivision_data_find_section() a section's byte offset, -1 when absent or out of bounds.
+	static bool mesh_subdivision_data_is_valid(const Vector<uint8_t> &p_data, String *r_error = nullptr);
+	static bool mesh_subdivision_surface_is_valid(const RenderingServerTypes::SurfaceData &p_surface, uint32_t p_surface_index, uint32_t p_blend_shape_count, int p_first_subdivided, const Vector<uint8_t> &p_owner_data, String *r_error = nullptr);
+	static int64_t mesh_subdivision_data_owner_surface(const Vector<uint8_t> &p_data);
+	static int64_t mesh_subdivision_data_find_section(const Vector<uint8_t> &p_data, uint32_t p_id, uint32_t *r_size = nullptr);
 	Array mesh_create_arrays_from_surface_data(const RenderingServerTypes::SurfaceData &p_data) const;
 	Array mesh_surface_get_arrays(RID p_mesh, int p_surface) const;
 	TypedArray<Array> mesh_surface_get_blend_shape_arrays(RID p_mesh, int p_surface) const;

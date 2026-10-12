@@ -31,6 +31,7 @@
 #pragma once
 
 #include "core/templates/rid_owner.h"
+#include "servers/rendering/rendering_server.h"
 #include "servers/rendering/storage/mesh_storage.h"
 
 namespace RendererDummy {
@@ -79,6 +80,14 @@ public:
 	virtual void mesh_add_surface(RID p_mesh, const RenderingServerTypes::SurfaceData &p_surface) override {
 		DummyMesh *m = mesh_owner.get_or_null(p_mesh);
 		ERR_FAIL_NULL(m);
+		{
+			// D122: a headless import saves the payload, so it is checked as the other storages do.
+			const int64_t owner_surface = RenderingServer::mesh_subdivision_data_owner_surface(p_surface.subdivision_data);
+			const Vector<uint8_t> owner_data = (owner_surface >= 0 && owner_surface < m->surfaces.size()) ? m->surfaces[owner_surface].subdivision_data : Vector<uint8_t>();
+			const int first_subdivided = m->surfaces.is_empty() ? -1 : int(!m->surfaces[0].subdivision_data.is_empty());
+			String error;
+			ERR_FAIL_COND_MSG(!RenderingServer::mesh_subdivision_surface_is_valid(p_surface, m->surfaces.size(), MAX(m->blend_shape_count, 0), first_subdivided, owner_data, &error), "Invalid subdivided surface: " + error + ".");
+		}
 		m->surfaces.push_back(RenderingServerTypes::SurfaceData());
 		RenderingServerTypes::SurfaceData *s = &m->surfaces.write[m->surfaces.size() - 1];
 		s->format = p_surface.format;
@@ -96,6 +105,7 @@ public:
 		s->blend_shape_data = p_surface.blend_shape_data;
 		s->uv_scale = p_surface.uv_scale;
 		s->cluster_data = p_surface.cluster_data; // Kept so a headless save keeps the table (D80, D85).
+		s->subdivision_data = p_surface.subdivision_data; // Kept so a headless save keeps the payload (D122).
 		s->material = p_surface.material;
 		m->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_MESH);
 	}

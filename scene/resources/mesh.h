@@ -320,6 +320,7 @@ private:
 		AABB aabb;
 		Ref<Material> material;
 		bool is_2d = false;
+		bool subdivided = false; // Carries a subdivision payload (D122).
 	};
 	Vector<Surface> surfaces;
 	mutable RID mesh;
@@ -346,7 +347,7 @@ protected:
 public:
 	void add_surface_from_arrays(PrimitiveType p_primitive, const Array &p_arrays, const TypedArray<Array> &p_blend_shapes = TypedArray<Array>(), const Dictionary &p_lods = Dictionary(), BitField<ArrayFormat> p_flags = 0);
 
-	void add_surface(BitField<ArrayFormat> p_format, PrimitiveType p_primitive, const Vector<uint8_t> &p_array, const Vector<uint8_t> &p_attribute_array, const Vector<uint8_t> &p_skin_array, int p_vertex_count, const Vector<uint8_t> &p_index_array, int p_index_count, const AABB &p_aabb, const Vector<uint8_t> &p_blend_shape_data = Vector<uint8_t>(), const Vector<AABB> &p_bone_aabbs = Vector<AABB>(), const Vector<RenderingServerTypes::SurfaceData::LOD> &p_lods = Vector<RenderingServerTypes::SurfaceData::LOD>(), const Vector4 p_uv_scale = Vector4(), const Vector<uint8_t> &p_cluster_data = Vector<uint8_t>());
+	void add_surface(BitField<ArrayFormat> p_format, PrimitiveType p_primitive, const Vector<uint8_t> &p_array, const Vector<uint8_t> &p_attribute_array, const Vector<uint8_t> &p_skin_array, int p_vertex_count, const Vector<uint8_t> &p_index_array, int p_index_count, const AABB &p_aabb, const Vector<uint8_t> &p_blend_shape_data = Vector<uint8_t>(), const Vector<AABB> &p_bone_aabbs = Vector<AABB>(), const Vector<RenderingServerTypes::SurfaceData::LOD> &p_lods = Vector<RenderingServerTypes::SurfaceData::LOD>(), const Vector4 p_uv_scale = Vector4(), const Vector<uint8_t> &p_cluster_data = Vector<uint8_t>(), const Vector<uint8_t> &p_subdivision_data = Vector<uint8_t>());
 
 	Array surface_get_arrays(int p_surface) const override;
 	TypedArray<Array> surface_get_blend_shape_arrays(int p_surface) const override;
@@ -383,6 +384,9 @@ public:
 	int surface_find_by_name(const String &p_name) const;
 	void surface_set_name(int p_idx, const String &p_name);
 	String surface_get_name(int p_idx) const;
+	// Whether the surface is the refined level of a subdivision surface (D122), whose blend shapes
+	// live on its cage rather than as per-vertex arrays.
+	bool surface_is_subdivided(int p_idx) const;
 
 	void set_custom_aabb(const AABB &p_custom);
 	AABB get_custom_aabb() const;

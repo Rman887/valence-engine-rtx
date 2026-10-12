@@ -60,6 +60,11 @@ void MeshStorage::mesh_free(RID p_rid) {
 void MeshStorage::mesh_surface_remove(RID p_mesh, int p_surface) {
 	DummyMesh *m = mesh_owner.get_or_null(p_mesh);
 	ERR_FAIL_NULL(m);
+	ERR_FAIL_INDEX(p_surface, m->surfaces.size());
+	// D122: a payload names its owner surface by index (word 2), so only surfaces after the last subdivided one may go.
+	for (int i = p_surface + 1; i < m->surfaces.size(); i++) {
+		ERR_FAIL_COND_MSG(!m->surfaces[i].subdivision_data.is_empty(), "Cannot remove a surface before a subdivided surface (D122): its payload names its owner surface by index.");
+	}
 	m->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_MESH);
 	m->surfaces.remove_at(p_surface);
 }

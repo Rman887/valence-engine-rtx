@@ -36,6 +36,7 @@ TEST_FORCE_LINK(test_arraymesh)
 
 #include "core/config/project_settings.h"
 #include "core/templates/hash_set.h"
+#include "scene/resources/3d/importer_mesh.h"
 #include "scene/resources/3d/primitive_meshes.h"
 #include "scene/resources/mesh.h"
 #include "servers/rendering/rendering_server.h"
@@ -954,6 +955,346 @@ TEST_CASE("[SceneTree][ArrayMesh] A cluster LOD hierarchy keeps LOD 0 as the ind
 	};
 	check_surfaces(mesh);
 	check_surfaces(copy);
+}
+
+// D122: a hand-built subdivision payload for a quad of four vertices, its cage the same four
+// vertices, its refined level the quad itself; the storages' rules on it, without the builder.
+struct SubdivisionSection {
+	uint32_t id = 0;
+	LocalVector<uint32_t> words;
+};
+
+static Vector<uint8_t> subdivision_payload_from(const LocalVector<SubdivisionSection> &p_sections, uint32_t p_flags, uint32_t p_owner_surface) {
+	const uint32_t align = RenderingServerTypes::MESH_SUBDIVISION_SECTION_ALIGN;
+	uint32_t offset = (RenderingServerTypes::MESH_SUBDIVISION_HEADER_WORDS + p_sections.size() * RenderingServerTypes::MESH_SUBDIVISION_SECTION_WORDS) * sizeof(uint32_t);
+	LocalVector<uint32_t> table = { RenderingServerTypes::MESH_SUBDIVISION_DATA_VERSION, p_flags, p_owner_surface, p_sections.size() };
+	LocalVector<uint32_t> offsets;
+	for (const SubdivisionSection &section : p_sections) {
+		offset = (offset + align - 1) / align * align;
+		offsets.push_back(offset);
+		table.push_back(section.id);
+		table.push_back(offset);
+		table.push_back(section.words.size() * sizeof(uint32_t));
+		offset += section.words.size() * sizeof(uint32_t);
+	}
+	Vector<uint8_t> data;
+	data.resize(offset);
+	memset(data.ptrw(), 0, offset);
+	memcpy(data.ptrw(), table.ptr(), table.size() * sizeof(uint32_t));
+	for (uint32_t i = 0; i < p_sections.size(); i++) {
+		if (p_sections[i].words.size()) {
+			memcpy(data.ptrw() + offsets[i], p_sections[i].words.ptr(), p_sections[i].words.size() * sizeof(uint32_t));
+		}
+	}
+	return data;
+}
+
+static LocalVector<SubdivisionSection> subdivision_quad_sections(bool p_owner, uint32_t p_blend_shapes) {
+	LocalVector<SubdivisionSection> sections;
+	auto add = [&sections](uint32_t p_id, const LocalVector<uint32_t> &p_words) {
+		SubdivisionSection section;
+		section.id = p_id;
+		section.words = p_words;
+		sections.push_back(section);
+	};
+	if (p_owner) {
+		add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, { 4, 4, 4, 4, 1, 1, p_blend_shapes, 2, 4, 4 });
+		LocalVector<uint32_t> positions;
+		const float corners[12] = { 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0 };
+		for (float value : corners) {
+			uint32_t bits;
+			memcpy(&bits, &value, sizeof(bits));
+			positions.push_back(bits);
+		}
+		add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_POSITIONS, positions);
+		LocalVector<uint32_t> deltas;
+		deltas.resize(p_blend_shapes * 4 * 3);
+		for (uint32_t &word : deltas) {
+			word = 0;
+		}
+		add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_DELTAS, deltas);
+		add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_OFFSETS, { 0, 1, 2, 3, 4 });
+		add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_INDICES, { 0, 1, 2, 3 }); // 32-bit indices.
+		const uint32_t one = 0x3f800000;
+		add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_WEIGHTS, { one, one, one, one });
+		add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_QUADS, { 0, 1, 2, 3 });
+		add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_NORMAL_OFFSETS, { 0, 1, 2, 3, 4 });
+		add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_NORMAL_ENTRIES, { 0, 1, 2, 3 });
+		add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_WELDED, { 0, 1, 2, 3 });
+		add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_U_WELDED, { 0, 1, 2, 3 });
+	}
+	add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U, { 0, 1, 2, 3 });
+	// Triangles (0, 1, 2) and (0, 2, 3): vertex 0 in two, 1 in one, 2 in two, 3 in one.
+	add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_OFFSETS, { 0, 2, 3, 5, 6 });
+	add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_ENTRIES, { 0, 3, 1, 2, 4, 5 });
+	return sections;
+}
+
+static Vector<uint8_t> subdivision_quad_payload(bool p_owner, uint32_t p_blend_shapes, uint32_t p_owner_surface = 0) {
+	return subdivision_payload_from(subdivision_quad_sections(p_owner, p_blend_shapes), p_owner ? RenderingServerTypes::MESH_SUBDIVISION_FLAG_OWNER : 0, p_owner_surface);
+}
+
+// The quad as surface data: four vertices, two triangles, no blend arrays.
+static RenderingServerTypes::SurfaceData subdivision_quad_surface(bool p_skin = false) {
+	Array arrays;
+	arrays.resize(Mesh::ARRAY_MAX);
+	arrays[Mesh::ARRAY_VERTEX] = PackedVector3Array{ Vector3(0, 0, 0), Vector3(1, 0, 0), Vector3(1, 1, 0), Vector3(0, 1, 0) };
+	arrays[Mesh::ARRAY_NORMAL] = PackedVector3Array{ Vector3(0, 0, 1), Vector3(0, 0, 1), Vector3(0, 0, 1), Vector3(0, 0, 1) };
+	arrays[Mesh::ARRAY_INDEX] = PackedInt32Array{ 0, 1, 2, 0, 2, 3 };
+	if (p_skin) {
+		arrays[Mesh::ARRAY_BONES] = PackedInt32Array{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		arrays[Mesh::ARRAY_WEIGHTS] = PackedFloat32Array{ 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };
+	}
+	RenderingServerTypes::SurfaceData surface;
+	CHECK(RS::get_singleton()->mesh_create_surface_data_from_arrays(&surface, RSE::PRIMITIVE_TRIANGLES, arrays) == OK);
+	return surface;
+}
+
+static void add_subdivision_quad(const Ref<ArrayMesh> &p_mesh, const RenderingServerTypes::SurfaceData &p_surface, const Vector<uint8_t> &p_payload, const Vector<uint8_t> &p_blend_data = Vector<uint8_t>()) {
+	p_mesh->add_surface(p_surface.format, Mesh::PrimitiveType(p_surface.primitive), p_surface.vertex_data, p_surface.attribute_data, p_surface.skin_data, p_surface.vertex_count, p_surface.index_data, p_surface.index_count, p_surface.aabb, p_blend_data, p_surface.bone_aabbs, p_surface.lods, p_surface.uv_scale, p_surface.cluster_data, p_payload);
+}
+
+static int rendering_surface_count(const Ref<ArrayMesh> &p_mesh) {
+	return RS::get_singleton()->mesh_get_surface_count(p_mesh->get_rid());
+}
+
+TEST_CASE("[SceneTree][ArrayMesh] A subdivided surface keeps its payload, carries no blend arrays, and refuses blend readers (D122).") {
+	Ref<ArrayMesh> mesh;
+	mesh.instantiate();
+	mesh->add_blend_shape("A");
+	mesh->add_blend_shape("B");
+	const RenderingServerTypes::SurfaceData surface = subdivision_quad_surface();
+	const Vector<uint8_t> payload = subdivision_quad_payload(true, 2);
+	String error;
+	CHECK_MESSAGE(RenderingServer::mesh_subdivision_data_is_valid(payload, &error), error);
+	add_subdivision_quad(mesh, surface, payload);
+	REQUIRE(rendering_surface_count(mesh) == 1);
+	CHECK(mesh->surface_is_subdivided(0));
+	CHECK(mesh->get_blend_shape_count() == 2);
+	CHECK(RS::get_singleton()->mesh_get_surface(mesh->get_rid(), 0).subdivision_data == payload);
+
+	// A second surface names the first as its owner.
+	add_subdivision_quad(mesh, surface, subdivision_quad_payload(false, 2, 0));
+	CHECK(rendering_surface_count(mesh) == 2);
+
+	Ref<ArrayMesh> copy = mesh->duplicate();
+	REQUIRE(copy.is_valid());
+	const Ref<ArrayMesh> both[2] = { mesh, copy };
+	for (const Ref<ArrayMesh> &each : both) {
+		const Array surfaces = each->get("_surfaces");
+		REQUIRE(surfaces.size() == 2);
+		const Dictionary d = surfaces[0];
+		CHECK(Vector<uint8_t>(d.get("subdivision_data", Vector<uint8_t>())) == payload);
+		CHECK_FALSE(d.has("blend_shapes"));
+		CHECK(each->surface_is_subdivided(1));
+		CHECK(rendering_surface_count(each) == 2);
+	}
+
+	ERR_PRINT_OFF;
+	CHECK(mesh->surface_get_blend_shape_arrays(0).is_empty());
+	CHECK(ImporterMesh::from_mesh(mesh)->get_surface_count() == 0);
+	ERR_PRINT_ON;
+}
+
+TEST_CASE("[SceneTree][ArrayMesh] The storages refuse a subdivided surface against the mesh's rules (D122).") {
+	const RenderingServerTypes::SurfaceData surface = subdivision_quad_surface();
+	ERR_PRINT_OFF;
+	SUBCASE("Blend data on a subdivided surface") {
+		Ref<ArrayMesh> mesh;
+		mesh.instantiate();
+		mesh->add_blend_shape("A");
+		Vector<uint8_t> blend_data;
+		blend_data.resize(surface.vertex_data.size());
+		add_subdivision_quad(mesh, surface, subdivision_quad_payload(true, 1), blend_data);
+		CHECK(rendering_surface_count(mesh) == 0);
+	}
+	SUBCASE("Skin on a subdivided surface") {
+		Ref<ArrayMesh> mesh;
+		mesh.instantiate();
+		add_subdivision_quad(mesh, subdivision_quad_surface(true), subdivision_quad_payload(true, 0));
+		CHECK(rendering_surface_count(mesh) == 0);
+	}
+	SUBCASE("Subdivided and plain surfaces on a mesh with blend shapes") {
+		Ref<ArrayMesh> mesh;
+		mesh.instantiate();
+		mesh->add_blend_shape("A");
+		add_subdivision_quad(mesh, surface, subdivision_quad_payload(true, 1));
+		REQUIRE(rendering_surface_count(mesh) == 1);
+		Vector<uint8_t> blend_data;
+		blend_data.resize(surface.vertex_data.size());
+		memset(blend_data.ptrw(), 0, blend_data.size());
+		add_subdivision_quad(mesh, surface, Vector<uint8_t>(), blend_data);
+		CHECK(rendering_surface_count(mesh) == 1);
+	}
+	SUBCASE("A plain surface first, then a subdivided one, on a mesh with blend shapes") {
+		Ref<ArrayMesh> mesh;
+		mesh.instantiate();
+		mesh->add_blend_shape("A");
+		Vector<uint8_t> blend_data;
+		blend_data.resize(surface.vertex_data.size());
+		memset(blend_data.ptrw(), 0, blend_data.size());
+		add_subdivision_quad(mesh, surface, Vector<uint8_t>(), blend_data);
+		REQUIRE(rendering_surface_count(mesh) == 1);
+		add_subdivision_quad(mesh, surface, subdivision_quad_payload(true, 1, 1));
+		CHECK(rendering_surface_count(mesh) == 1);
+	}
+	SUBCASE("Without blend shapes, subdivided and plain surfaces mix") {
+		Ref<ArrayMesh> mesh;
+		mesh.instantiate();
+		add_subdivision_quad(mesh, surface, subdivision_quad_payload(true, 0));
+		add_subdivision_quad(mesh, surface, Vector<uint8_t>());
+		CHECK(rendering_surface_count(mesh) == 2);
+	}
+	SUBCASE("A subdivided surface keeps uncompressed attributes") {
+		Ref<ArrayMesh> mesh;
+		mesh.instantiate();
+		RenderingServerTypes::SurfaceData compressed = surface;
+		compressed.format |= RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES;
+		compressed.subdivision_data = subdivision_quad_payload(true, 0);
+		String error;
+		CHECK_FALSE(RenderingServer::mesh_subdivision_surface_is_valid(compressed, 0, 0, -1, Vector<uint8_t>(), &error));
+		add_subdivision_quad(mesh, compressed, subdivision_quad_payload(true, 0));
+		CHECK(rendering_surface_count(mesh) == 0);
+	}
+	SUBCASE("The owner's blend shape count is the mesh's") {
+		Ref<ArrayMesh> mesh;
+		mesh.instantiate();
+		mesh->add_blend_shape("A");
+		add_subdivision_quad(mesh, surface, subdivision_quad_payload(true, 2));
+		CHECK(rendering_surface_count(mesh) == 0);
+	}
+	SUBCASE("A payload without owner sections names an earlier owner surface") {
+		Ref<ArrayMesh> mesh;
+		mesh.instantiate();
+		add_subdivision_quad(mesh, surface, subdivision_quad_payload(false, 0, 0));
+		CHECK(rendering_surface_count(mesh) == 0);
+		add_subdivision_quad(mesh, surface, subdivision_quad_payload(true, 0, 0));
+		REQUIRE(rendering_surface_count(mesh) == 1);
+		add_subdivision_quad(mesh, surface, subdivision_quad_payload(false, 0, 1)); // Itself.
+		CHECK(rendering_surface_count(mesh) == 1);
+		add_subdivision_quad(mesh, surface, subdivision_quad_payload(true, 0, 0)); // An owner naming another surface.
+		CHECK(rendering_surface_count(mesh) == 1);
+	}
+	ERR_PRINT_ON;
+}
+
+TEST_CASE("[SceneTree][ArrayMesh] Only surfaces after the last subdivided one can be removed (D122).") {
+	// A payload names its owner surface by index, so a removal that shifts a subdivided surface is refused,
+	// in the ArrayMesh and in the storage alike.
+	const RenderingServerTypes::SurfaceData surface = subdivision_quad_surface();
+	Ref<ArrayMesh> mesh;
+	mesh.instantiate();
+	add_subdivision_quad(mesh, surface, Vector<uint8_t>()); // 0: plain.
+	add_subdivision_quad(mesh, surface, subdivision_quad_payload(true, 0, 1)); // 1: owner.
+	add_subdivision_quad(mesh, surface, subdivision_quad_payload(false, 0, 1)); // 2: names 1.
+	add_subdivision_quad(mesh, surface, Vector<uint8_t>()); // 3: plain.
+	REQUIRE(rendering_surface_count(mesh) == 4);
+	ERR_PRINT_OFF;
+	mesh->surface_remove(0);
+	CHECK(mesh->get_surface_count() == 4);
+	CHECK(rendering_surface_count(mesh) == 4);
+	mesh->surface_remove(1);
+	CHECK(mesh->get_surface_count() == 4);
+	CHECK(rendering_surface_count(mesh) == 4);
+	RS::get_singleton()->mesh_surface_remove(mesh->get_rid(), 1); // The storage refuses on its own too.
+	CHECK(rendering_surface_count(mesh) == 4);
+	RS::get_singleton()->mesh_surface_remove(mesh->get_rid(), 9); // Out of range.
+	CHECK(rendering_surface_count(mesh) == 4);
+	ERR_PRINT_ON;
+	mesh->surface_remove(3);
+	CHECK(rendering_surface_count(mesh) == 3);
+	mesh->surface_remove(2);
+	CHECK(rendering_surface_count(mesh) == 2);
+	mesh->surface_remove(1);
+	CHECK(rendering_surface_count(mesh) == 1);
+	CHECK_FALSE(mesh->surface_is_subdivided(0));
+}
+
+TEST_CASE("[SceneTree][ArrayMesh] Malformed subdivision payloads are refused, also through _surfaces (D122).") {
+	const RenderingServerTypes::SurfaceData surface = subdivision_quad_surface();
+	auto valid = [&surface](const Vector<uint8_t> &p_payload) {
+		RenderingServerTypes::SurfaceData candidate = surface;
+		candidate.subdivision_data = p_payload;
+		return RenderingServer::mesh_subdivision_surface_is_valid(candidate, 0, 1, -1, Vector<uint8_t>());
+	};
+	auto with_section = [](uint32_t p_id, const LocalVector<uint32_t> &p_words) {
+		LocalVector<SubdivisionSection> sections = subdivision_quad_sections(true, 1);
+		for (SubdivisionSection &section : sections) {
+			if (section.id == p_id) {
+				section.words = p_words;
+			}
+		}
+		return subdivision_payload_from(sections, RenderingServerTypes::MESH_SUBDIVISION_FLAG_OWNER, 0);
+	};
+	auto set_word = [](Vector<uint8_t> p_payload, uint32_t p_word, uint32_t p_value) {
+		memcpy(p_payload.ptrw() + p_word * sizeof(uint32_t), &p_value, sizeof(uint32_t));
+		return p_payload;
+	};
+	const Vector<uint8_t> good = subdivision_quad_payload(true, 1);
+	CHECK(valid(good));
+	CHECK_FALSE(valid(Vector<uint8_t>{ 1, 2, 3 }));
+	CHECK_FALSE(valid(set_word(good, 0, RenderingServerTypes::MESH_SUBDIVISION_DATA_VERSION + 1)));
+	CHECK_FALSE(valid(set_word(good, 1, 3))); // An unknown flag.
+	CHECK_FALSE(valid(set_word(good, 3, 1000))); // A table past the end.
+	CHECK_FALSE(valid(set_word(good, 4, 99))); // An unknown section id.
+	CHECK_FALSE(valid(set_word(good, 5, 4))); // A section inside the table.
+	{
+		uint32_t first_offset;
+		memcpy(&first_offset, good.ptr() + 5 * sizeof(uint32_t), sizeof(uint32_t));
+		CHECK_FALSE(valid(set_word(good, 5, first_offset + 4))); // Misaligned.
+	}
+	{
+		// A duplicate id: the owner info's id given to the next section as well.
+		const Vector<uint8_t> duplicate = set_word(good, 4 + 3, RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO);
+		CHECK_FALSE(valid(duplicate));
+		uint32_t size = 0;
+		CHECK(RenderingServer::mesh_subdivision_data_find_section(duplicate, RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, &size) >= 0);
+	}
+	{
+		// Owner sections without the owner flag, and an owner without them.
+		CHECK_FALSE(valid(subdivision_payload_from(subdivision_quad_sections(true, 1), 0, 0)));
+		CHECK_FALSE(valid(subdivision_payload_from(subdivision_quad_sections(false, 1), RenderingServerTypes::MESH_SUBDIVISION_FLAG_OWNER, 0)));
+	}
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, { 4, 4, 4, 4, 1, 1, 1, 2, 4 }))); // Short info.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, { 4, 5, 4, 4, 1, 1, 1, 2, 4, 4 }))); // Own past all.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, { 4, 4, 4, 4, 1, 1, 1, 2, 3, 4 }))); // Index width.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U, { 0, 1, 2, 4 }))); // Past the own U.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U, { 0, 1, 2 }))); // Short.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_OFFSETS, { 0, 2, 1, 5, 6 }))); // Decreasing.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_OFFSETS, { 1, 2, 3, 5, 6 }))); // Not from 0.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_ENTRIES, { 0, 3, 1, 2, 4, 6 }))); // Past the indices.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_INDICES, { 0, 1, 2, 4 }))); // Past the cage.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_OFFSETS, { 0, 1, 2, 3, 3 }))); // Short of the weights.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_QUADS, { 0, 1, 2, 4 }))); // Past the U.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_NORMAL_ENTRIES, { 0, 1, 2, 4 }))); // Past the corners.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_DELTAS, {}))); // Short.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_U_WELDED, { 0, 1, 2 }))); // Short.
+
+	// The .scn path: a surface Dictionary set back through _surfaces is checked by the storage.
+	Ref<ArrayMesh> source;
+	source.instantiate();
+	source->add_blend_shape("A");
+	add_subdivision_quad(source, surface, good);
+	REQUIRE(rendering_surface_count(source) == 1);
+	const Array surfaces = source->get("_surfaces");
+	auto loads = [&surfaces](const Vector<uint8_t> &p_payload) {
+		Dictionary d = Dictionary(surfaces[0]).duplicate();
+		d["subdivision_data"] = p_payload;
+		Array changed;
+		changed.push_back(d);
+		Ref<ArrayMesh> loaded;
+		loaded.instantiate();
+		loaded->set("_blend_shape_names", PackedStringArray{ "A" });
+		loaded->set("_surfaces", changed);
+		return rendering_surface_count(loaded);
+	};
+	CHECK(loads(good) == 1);
+	ERR_PRINT_OFF;
+	CHECK(loads(set_word(good, 0, RenderingServerTypes::MESH_SUBDIVISION_DATA_VERSION + 1)) == 0);
+	CHECK(loads(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U, { 0, 1, 2, 9 })) == 0);
+	CHECK(loads(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_INDICES, { 0, 1, 2, 70000 })) == 0);
+	CHECK(loads(set_word(good, 4 + 3, RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO)) == 0);
+	ERR_PRINT_ON;
 }
 
 } // namespace TestArrayMesh

@@ -149,6 +149,10 @@ private:
 			// The surface's triangle clusters (D80), as RenderingServerTypes::SurfaceData::cluster_data
 			// describes; the cluster BLAS builds from it. Kept so mesh_get_surface() returns it.
 			Vector<uint8_t> cluster_data;
+			// The subdivision payload (D122), as RenderingServerTypes::SurfaceData::subdivision_data
+			// describes. A subdivided surface has no blend shape buffer and, until the runtime passes
+			// (D122 S2), no deformed buffer: it draws its rest pose. Kept so mesh_get_surface() returns it.
+			Vector<uint8_t> subdivision_data;
 			// Geometry residency (D93): with rendering/pathtracing/cluster_lod_stream_geometry and
 			// cluster_lod_stream on, a surface that streams its geometry (its hierarchy's coarse levels
 			// appended to its index data, and mesh_cluster_lod_streamable() and

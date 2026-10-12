@@ -749,6 +749,10 @@ void RendererSceneRender::environment_set_pathtracing_light_tree_cut_indirect(RI
 	environment_storage.environment_set_pathtracing_light_tree_cut_indirect(p_env, p_nodes);
 }
 
+void RendererSceneRender::environment_set_pathtracing_light_tree_candidates(RID p_env, int p_candidates) {
+	environment_storage.environment_set_pathtracing_light_tree_candidates(p_env, p_candidates);
+}
+
 void RendererSceneRender::environment_set_pathtracing_light_tree_power_pick(RID p_env, bool p_enable) {
 	environment_storage.environment_set_pathtracing_light_tree_power_pick(p_env, p_enable);
 }
@@ -827,6 +831,10 @@ int RendererSceneRender::environment_get_pathtracing_light_tree_cut(RID p_env) c
 
 int RendererSceneRender::environment_get_pathtracing_light_tree_cut_indirect(RID p_env) const {
 	return environment_storage.environment_get_pathtracing_light_tree_cut_indirect(p_env);
+}
+
+int RendererSceneRender::environment_get_pathtracing_light_tree_candidates(RID p_env) const {
+	return environment_storage.environment_get_pathtracing_light_tree_candidates(p_env);
 }
 
 bool RendererSceneRender::environment_get_pathtracing_light_tree_power_pick(RID p_env) const {

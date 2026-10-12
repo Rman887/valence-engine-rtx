@@ -3449,6 +3449,7 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("environment_set_pathtracing_light_tree", "env", "enable"), &RenderingServer::environment_set_pathtracing_light_tree);
 	ClassDB::bind_method(D_METHOD("environment_set_pathtracing_light_tree_cut", "env", "nodes"), &RenderingServer::environment_set_pathtracing_light_tree_cut);
 	ClassDB::bind_method(D_METHOD("environment_set_pathtracing_light_tree_cut_indirect", "env", "nodes"), &RenderingServer::environment_set_pathtracing_light_tree_cut_indirect);
+	ClassDB::bind_method(D_METHOD("environment_set_pathtracing_light_tree_candidates", "env", "candidates"), &RenderingServer::environment_set_pathtracing_light_tree_candidates);
 	ClassDB::bind_method(D_METHOD("environment_set_pathtracing_light_tree_power_pick", "env", "enable"), &RenderingServer::environment_set_pathtracing_light_tree_power_pick);
 	ClassDB::bind_method(D_METHOD("environment_set_pathtracing_sky_light_variance_share", "env", "enable"), &RenderingServer::environment_set_pathtracing_sky_light_variance_share);
 	ClassDB::bind_method(D_METHOD("environment_set_pathtracing_russian_roulette", "env", "enable"), &RenderingServer::environment_set_pathtracing_russian_roulette);

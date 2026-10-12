@@ -904,6 +904,7 @@ public:
 	FUNC2(environment_set_pathtracing_light_tree, RID, bool)
 	FUNC2(environment_set_pathtracing_light_tree_cut, RID, int)
 	FUNC2(environment_set_pathtracing_light_tree_cut_indirect, RID, int)
+	FUNC2(environment_set_pathtracing_light_tree_candidates, RID, int)
 	FUNC2(environment_set_pathtracing_light_tree_power_pick, RID, bool)
 	FUNC2(environment_set_pathtracing_sky_light_variance_share, RID, bool)
 	FUNC2(environment_set_pathtracing_russian_roulette, RID, bool)

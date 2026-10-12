@@ -753,6 +753,15 @@ int Environment::get_pathtracing_light_tree_cut_indirect() const {
 	return pathtracing_light_tree_cut_indirect;
 }
 
+void Environment::set_pathtracing_light_tree_candidates(int p_candidates) {
+	pathtracing_light_tree_candidates = CLAMP(p_candidates, 1, 16);
+	RS::get_singleton()->environment_set_pathtracing_light_tree_candidates(environment, pathtracing_light_tree_candidates);
+}
+
+int Environment::get_pathtracing_light_tree_candidates() const {
+	return pathtracing_light_tree_candidates;
+}
+
 void Environment::set_pathtracing_light_tree_power_pick(bool p_enable) {
 	pathtracing_light_tree_power_pick = p_enable;
 	RS::get_singleton()->environment_set_pathtracing_light_tree_power_pick(environment, pathtracing_light_tree_power_pick);
@@ -1698,6 +1707,8 @@ void Environment::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pathtracing_light_tree_cut"), &Environment::get_pathtracing_light_tree_cut);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_light_tree_cut_indirect", "nodes"), &Environment::set_pathtracing_light_tree_cut_indirect);
 	ClassDB::bind_method(D_METHOD("get_pathtracing_light_tree_cut_indirect"), &Environment::get_pathtracing_light_tree_cut_indirect);
+	ClassDB::bind_method(D_METHOD("set_pathtracing_light_tree_candidates", "candidates"), &Environment::set_pathtracing_light_tree_candidates);
+	ClassDB::bind_method(D_METHOD("get_pathtracing_light_tree_candidates"), &Environment::get_pathtracing_light_tree_candidates);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_light_tree_power_pick", "enable"), &Environment::set_pathtracing_light_tree_power_pick);
 	ClassDB::bind_method(D_METHOD("is_pathtracing_light_tree_power_pick"), &Environment::is_pathtracing_light_tree_power_pick);
 	ClassDB::bind_method(D_METHOD("set_pathtracing_sky_light_variance_share", "enable"), &Environment::set_pathtracing_sky_light_variance_share);
@@ -1725,6 +1736,7 @@ void Environment::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_light_tree"), "set_pathtracing_light_tree", "is_pathtracing_light_tree");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_light_tree_cut", PROPERTY_HINT_RANGE, "1,64,1"), "set_pathtracing_light_tree_cut", "get_pathtracing_light_tree_cut");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_light_tree_cut_indirect", PROPERTY_HINT_RANGE, "1,64,1"), "set_pathtracing_light_tree_cut_indirect", "get_pathtracing_light_tree_cut_indirect");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "pathtracing_light_tree_candidates", PROPERTY_HINT_RANGE, "1,16,1"), "set_pathtracing_light_tree_candidates", "get_pathtracing_light_tree_candidates");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathtracing_light_tree_power_pick"), "set_pathtracing_light_tree_power_pick", "is_pathtracing_light_tree_power_pick");
 
 	// Camera medium

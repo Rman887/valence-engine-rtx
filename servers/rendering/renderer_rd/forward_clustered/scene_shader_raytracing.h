@@ -150,7 +150,7 @@ public:
 	static constexpr int RT_PARAM_HAS_PROCEDURAL_INSTANCES = 9;
 	static constexpr int RT_PARAM_EMISSIVE_COUNT = 10; // Emissive mesh lights in the emissive buffer (D50).
 	static constexpr int RT_PARAM_EMISSIVE_PROBABILITY = 11; // The share of light samples that go to the emissive list (D50).
-	static constexpr int RT_PARAM_EMISSIVE_CANDIDATES = 12; // Candidates resampled per emissive light sample (D51).
+	static constexpr int RT_PARAM_EMISSIVE_CANDIDATES = 12; // Candidates resampled per light sample: the light tree's with it on, the emissive list's (D51) with it off.
 	static constexpr int RT_PARAM_CLAMP_DIRECT = 13; // Luminance clamp on a direct light sample, 0 for none (D53).
 	static constexpr int RT_PARAM_LIGHT_COUNT = 14;
 	static constexpr int RT_PARAM_FRAME_INDEX = 15;

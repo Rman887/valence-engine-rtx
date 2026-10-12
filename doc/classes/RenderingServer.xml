@@ -1461,6 +1461,14 @@
 				Sets whether the path tracer selects its light samples through a light tree for the specified environment RID. See [member Environment.pathtracing_light_tree].
 			</description>
 		</method>
+		<method name="environment_set_pathtracing_light_tree_candidates">
+			<return type="void" />
+			<param index="0" name="env" type="RID" />
+			<param index="1" name="candidates" type="int" />
+			<description>
+				Sets how many candidates every light sample draws through the light tree for the specified environment RID. See [member Environment.pathtracing_light_tree_candidates].
+			</description>
+		</method>
 		<method name="environment_set_pathtracing_light_tree_cut">
 			<return type="void" />
 			<param index="0" name="env" type="RID" />

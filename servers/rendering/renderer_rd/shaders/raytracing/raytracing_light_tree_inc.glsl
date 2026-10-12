@@ -59,7 +59,7 @@
 #define RT_LIGHT_TREE_EMISSIVE_BIT 0x40000000u
 #define RT_LIGHT_TREE_INDEX_MASK 0x3FFFFFFFu
 #define RT_LIGHT_TREE_NO_NODE 0xFFFFFFFFu
-// The most candidates one light sample resamples through the tree (Environment.pathtracing_emissive_candidates).
+// The most candidates one light sample resamples through the tree (Environment.pathtracing_light_tree_candidates).
 #define RT_LIGHT_TREE_MAX_CANDIDATES 16
 // The receiver-side cosine bound's floor: a node wholly under the horizon is drawn at this rate.
 #define RT_LIGHT_TREE_RECEIVER_FLOOR 0.02

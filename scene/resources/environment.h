@@ -208,6 +208,7 @@ private:
 	bool pathtracing_light_tree = false;
 	int pathtracing_light_tree_cut = 32;
 	int pathtracing_light_tree_cut_indirect = 32;
+	int pathtracing_light_tree_candidates = 16;
 	bool pathtracing_light_tree_power_pick = false;
 	bool pathtracing_sky_light_variance_share = false;
 	bool pathtracing_russian_roulette = true;
@@ -441,6 +442,8 @@ public:
 	int get_pathtracing_light_tree_cut() const;
 	void set_pathtracing_light_tree_cut_indirect(int p_nodes);
 	int get_pathtracing_light_tree_cut_indirect() const;
+	void set_pathtracing_light_tree_candidates(int p_candidates);
+	int get_pathtracing_light_tree_candidates() const;
 	void set_pathtracing_light_tree_power_pick(bool p_enable);
 	bool is_pathtracing_light_tree_power_pick() const;
 	void set_pathtracing_sky_light_variance_share(bool p_enable);

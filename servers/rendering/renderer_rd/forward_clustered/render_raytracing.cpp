@@ -13209,11 +13209,13 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		{
 			bool emissive_enabled = true;
 			int emissive_candidate_count = 8;
+			int light_tree_candidate_count = 16;
 			int light_tree_cut_size = 32;
 			int light_tree_cut_indirect_size = 32;
 			if (p_render_data && p_render_data->environment.is_valid()) {
 				emissive_enabled = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_emissive_lights(p_render_data->environment);
 				emissive_candidate_count = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_emissive_candidates(p_render_data->environment);
+				light_tree_candidate_count = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_light_tree_candidates(p_render_data->environment);
 				light_tree_cut_size = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_light_tree_cut(p_render_data->environment);
 				light_tree_cut_indirect_size = RendererEnvironmentStorage::get_singleton()->environment_get_pathtracing_light_tree_cut_indirect(p_render_data->environment);
 			}
@@ -13243,7 +13245,10 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 				emissive_probability = (rt_light_count > 0) ? CLAMP(emissive_score_sum / MAX(emissive_score_sum + light_score_sum, 1.0e-20f), 0.1f, 0.9f) : 1.0f;
 			}
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_EMISSIVE_PROBABILITY] = emissive_probability;
-			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_EMISSIVE_CANDIDATES] = float(CLAMP(emissive_candidate_count, 1, 16));
+			// The candidates each light sample resamples: through the tree, or from the emissive list (D51)
+			// with the tree off. The two have their own counts, as more candidates helped the tree and not the
+			// list (GPU audit, 2026-10-11); one slot carries whichever applies, so the shaders read one value.
+			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_EMISSIVE_CANDIDATES] = float(CLAMP(light_tree ? light_tree_candidate_count : emissive_candidate_count, 1, 16));
 			// The sky's share (D54) is judged in the shader against both lists' summed scores, since
 			// the sky's own total lives in the table the GPU builds.
 			rt_ubo.params[SceneShaderRaytracing::RT_PARAM_SKY_SURFACE_SCORE] = light_score_sum + emissive_score_sum;

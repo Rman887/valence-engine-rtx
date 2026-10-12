@@ -327,6 +327,7 @@ public:
 	virtual void environment_set_pathtracing_light_tree(RID p_env, bool p_enable) = 0;
 	virtual void environment_set_pathtracing_light_tree_cut(RID p_env, int p_nodes) = 0;
 	virtual void environment_set_pathtracing_light_tree_cut_indirect(RID p_env, int p_nodes) = 0;
+	virtual void environment_set_pathtracing_light_tree_candidates(RID p_env, int p_candidates) = 0;
 	virtual void environment_set_pathtracing_light_tree_power_pick(RID p_env, bool p_enable) = 0;
 	virtual void environment_set_pathtracing_sky_light_variance_share(RID p_env, bool p_enable) = 0;
 	virtual void environment_set_pathtracing_russian_roulette(RID p_env, bool p_enable) = 0;
@@ -348,6 +349,7 @@ public:
 	virtual bool environment_get_pathtracing_light_tree(RID p_env) const = 0;
 	virtual int environment_get_pathtracing_light_tree_cut(RID p_env) const = 0;
 	virtual int environment_get_pathtracing_light_tree_cut_indirect(RID p_env) const = 0;
+	virtual int environment_get_pathtracing_light_tree_candidates(RID p_env) const = 0;
 	virtual bool environment_get_pathtracing_light_tree_power_pick(RID p_env) const = 0;
 	virtual bool environment_get_pathtracing_sky_light_variance_share(RID p_env) const = 0;
 	virtual bool environment_get_pathtracing_russian_roulette(RID p_env) const = 0;

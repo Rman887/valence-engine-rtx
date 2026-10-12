@@ -30,7 +30,7 @@
 // Environment turns the sampling off or no eligible instance was submitted.
 #define RT_PARAM_EMISSIVE_COUNT 10 // rt_params[2].z
 #define RT_PARAM_EMISSIVE_PROBABILITY 11 // rt_params[2].w - Share of light samples sent to the emissive list
-#define RT_PARAM_EMISSIVE_CANDIDATES 12 // rt_params[3].x - Candidates resampled per emissive light sample (D51), 1 to 16
+#define RT_PARAM_EMISSIVE_CANDIDATES 12 // rt_params[3].x - Candidates resampled per light sample, 1 to 16: the tree's (Environment.pathtracing_light_tree_candidates) with it on, the emissive list's (D51) with it off
 #define RT_PARAM_CLAMP_DIRECT 13 // rt_params[3].y - Luminance clamp on a direct light sample, 0 for none (D53)
 #define RT_PARAM_LIGHT_COUNT 14 // rt_params[3].z - Number of active lights in light buffer
 #define RT_PARAM_FRAME_INDEX 15 // rt_params[3].w - Frame counter for temporal variation

@@ -963,6 +963,12 @@ void RendererEnvironmentStorage::environment_set_pathtracing_light_tree_cut_indi
 	env->pathtracing_light_tree_cut_indirect = CLAMP(p_nodes, 1, 64);
 }
 
+void RendererEnvironmentStorage::environment_set_pathtracing_light_tree_candidates(RID p_env, int p_candidates) {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL(env);
+	env->pathtracing_light_tree_candidates = CLAMP(p_candidates, 1, 16);
+}
+
 void RendererEnvironmentStorage::environment_set_pathtracing_light_tree_power_pick(RID p_env, bool p_enable) {
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL(env);
@@ -1075,6 +1081,12 @@ int RendererEnvironmentStorage::environment_get_pathtracing_light_tree_cut_indir
 	Environment *env = environment_owner.get_or_null(p_env);
 	ERR_FAIL_NULL_V(env, 32);
 	return env->pathtracing_light_tree_cut_indirect;
+}
+
+int RendererEnvironmentStorage::environment_get_pathtracing_light_tree_candidates(RID p_env) const {
+	Environment *env = environment_owner.get_or_null(p_env);
+	ERR_FAIL_NULL_V(env, 16);
+	return env->pathtracing_light_tree_candidates;
 }
 
 bool RendererEnvironmentStorage::environment_get_pathtracing_light_tree_power_pick(RID p_env) const {

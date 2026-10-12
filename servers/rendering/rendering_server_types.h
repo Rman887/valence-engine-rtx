@@ -146,7 +146,8 @@ struct SurfaceData {
 // name it in word 2. A subdivided surface carries no skin (its cage does) and, on a mesh with
 // blend shapes, shares the mesh with subdivided surfaces only.
 enum MeshSubdivisionConstants : uint32_t {
-	MESH_SUBDIVISION_DATA_VERSION = 1,
+	// Version 2 (D122 S2): the cage's blend shapes as sparse per-vertex deltas (CAGE_BLEND_*), not dense ones.
+	MESH_SUBDIVISION_DATA_VERSION = 2,
 	MESH_SUBDIVISION_HEADER_WORDS = 4,
 	MESH_SUBDIVISION_SECTION_WORDS = 3,
 	MESH_SUBDIVISION_SECTION_ALIGN = 16,
@@ -168,7 +169,7 @@ enum MeshSubdivisionConstants : uint32_t {
 	MESH_SUBDIVISION_SECTION_OWNER_INFO = 16, // MESH_SUBDIVISION_OWNER_INFO_WORDS words, below.
 	MESH_SUBDIVISION_SECTION_CAGE_POSITIONS = 17, // float x, y, z per cage vertex.
 	MESH_SUBDIVISION_SECTION_CAGE_SKIN = 18, // 8 uint16 bones, 8 uint16 unorm weights per cage vertex; absent without skin.
-	MESH_SUBDIVISION_SECTION_CAGE_BLEND_DELTAS = 19, // float x, y, z per cage vertex, per blend shape in the mesh's order.
+	// Id 19 held version 1's dense blend deltas and is unknown since version 2.
 	MESH_SUBDIVISION_SECTION_STENCIL_OFFSETS = 20, // uint32 per U plus one, into the indices and weights.
 	MESH_SUBDIVISION_SECTION_STENCIL_INDICES = 21, // uint16 or uint32 (info word 8) cage vertex per weight.
 	MESH_SUBDIVISION_SECTION_STENCIL_WEIGHTS = 22, // float per weight.
@@ -177,6 +178,13 @@ enum MeshSubdivisionConstants : uint32_t {
 	MESH_SUBDIVISION_SECTION_NORMAL_ENTRIES = 25, // uint32 quad * 4 + corner.
 	MESH_SUBDIVISION_SECTION_CAGE_WELDED = 26, // uint32 per cage vertex: its index in the welded cage.
 	MESH_SUBDIVISION_SECTION_U_WELDED = 27, // uint32 per U: its index in the welded refinement.
+	// The cage's blend shapes, per cage vertex: its non-zero deltas, one 16-byte entry per shape that
+	// moves it (uint32 shape index in the mesh's order, then float x, y, z), shapes strictly ascending
+	// within a vertex. A runtime pass sums them in that order, which gives the same bits as a dense loop
+	// over the weighted shapes: a zero delta adds exactly.
+	MESH_SUBDIVISION_SECTION_CAGE_BLEND_OFFSETS = 28, // uint32 per cage vertex plus one, into the entries.
+	MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES = 29,
+	MESH_SUBDIVISION_CAGE_BLEND_ENTRY_WORDS = 4,
 
 	// MESH_SUBDIVISION_SECTION_OWNER_INFO's words.
 	MESH_SUBDIVISION_INFO_CAGE_COUNT = 0,

@@ -165,6 +165,30 @@ static const T *payload_section(const Vector<uint8_t> &p_payload, uint32_t p_id,
 	return offset < 0 ? nullptr : reinterpret_cast<const T *>(p_payload.ptr() + offset);
 }
 
+// A cage vertex's delta for a shape from the payload's sparse sections (D122 S2), zero where it has none.
+static Vector3 payload_cage_delta(const Vector<uint8_t> &p_payload, uint32_t p_cage, uint32_t p_shape) {
+	uint32_t count = 0;
+	const uint32_t *offsets = payload_section<uint32_t>(p_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_OFFSETS, count);
+	const uint32_t *entries = payload_section<uint32_t>(p_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES, count);
+	if (offsets == nullptr || entries == nullptr) {
+		return Vector3();
+	}
+	for (uint32_t e = offsets[p_cage]; e < offsets[p_cage + 1]; e++) {
+		if (entries[4 * e] == p_shape) {
+			float delta[3];
+			memcpy(delta, &entries[4 * e + 1], sizeof(delta));
+			return Vector3(delta[0], delta[1], delta[2]);
+		}
+	}
+	return Vector3();
+}
+
+static uint32_t payload_blend_entry_count(const Vector<uint8_t> &p_payload) {
+	uint32_t count = 0;
+	payload_section<uint32_t>(p_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES, count);
+	return count / RenderingServerTypes::MESH_SUBDIVISION_CAGE_BLEND_ENTRY_WORDS;
+}
+
 // What a runtime pass would compute from the payload alone: each render vertex's position as its
 // stencil sum over the owner's cage (ghosts included), and its normal from the owner's quads (ghost
 // quads included) through the normal adjacency, against the surface's rest pose.
@@ -355,14 +379,13 @@ TEST_CASE("[SceneTree][SubdivisionBuilder] Two owners: ghosts make the seam iden
 	uint32_t count = 0;
 	const uint32_t *welded = payload_section<uint32_t>(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_WELDED, count);
 	const uint32_t cage_count = count;
-	const float *deltas = payload_section<float>(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_DELTAS, count);
-	REQUIRE((welded && deltas));
-	CHECK(count == 3 * cage_count);
+	REQUIRE(welded);
+	CHECK(payload_blend_entry_count(payload) == 1); // Sparse: the one cage vertex the shape moves.
 	bool found = false;
 	for (uint32_t c = 0; c < cage_count; c++) {
 		if (welded[c] == 6) {
 			found = true;
-			CHECK(deltas[3 * c + 1] == 0.5f);
+			CHECK(payload_cage_delta(payload, c, 0) == Vector3(0, 0.5f, 0));
 		}
 	}
 	CHECK(found);
@@ -483,15 +506,14 @@ TEST_CASE("[SceneTree][SubdivisionBuilder] The payload survives the mesh's surfa
 		CHECK(each->get_blend_shape_count() == 2);
 	}
 
-	// The cage's deltas, dense per shape in the mesh's order.
+	// The cage's deltas, sparse per cage vertex, by shape in the mesh's order.
 	uint32_t count = 0;
 	const uint32_t *welded = payload_section<uint32_t>(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_WELDED, count);
-	const float *deltas = payload_section<float>(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_DELTAS, count);
-	REQUIRE((welded && deltas));
-	CHECK(count == 2 * 8 * 3);
-	for (int c = 0; c < 8; c++) {
-		CHECK(deltas[3 * c + 0] == (welded[c] == 0 ? -0.25f : 0.0f));
-		CHECK(deltas[(8 + c) * 3 + 1] == (welded[c] == 7 ? 0.25f : 0.0f));
+	REQUIRE(welded);
+	CHECK(payload_blend_entry_count(payload) == 2);
+	for (uint32_t c = 0; c < 8; c++) {
+		CHECK(payload_cage_delta(payload, c, 0) == (welded[c] == 0 ? Vector3(-0.25f, 0, 0) : Vector3()));
+		CHECK(payload_cage_delta(payload, c, 1) == (welded[c] == 7 ? Vector3(0, 0.25f, 0) : Vector3()));
 	}
 
 	// Per-vertex blend arrays do not exist for a subdivided surface: readers fail loudly.

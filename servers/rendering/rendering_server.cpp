@@ -1474,8 +1474,9 @@ bool _subdivision_fail(String *r_error, const String &p_message) {
 
 bool _subdivision_known_section(uint32_t p_id, bool &r_owner_section) {
 	r_owner_section = p_id >= RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO;
+	// Id 19 was version 1's dense blend deltas.
 	return (p_id >= RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U && p_id <= RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_ENTRIES) ||
-			(p_id >= RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO && p_id <= RenderingServerTypes::MESH_SUBDIVISION_SECTION_U_WELDED);
+			(p_id >= RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO && p_id <= RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES && p_id != 19);
 }
 
 SubdivisionSectionSpan _subdivision_span(const Vector<uint8_t> &p_data, uint32_t p_id) {
@@ -1574,8 +1575,29 @@ bool _subdivision_check_owner(const Vector<uint8_t> &p_data, uint32_t p_blend_sh
 	if (skin.present && skin.bytes != cage_count * 2 * RenderingServerTypes::MESH_SUBDIVISION_CAGE_BONES * sizeof(uint16_t)) {
 		return _subdivision_fail(r_error, "cage skin has the wrong size");
 	}
-	if (_subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_DELTAS).bytes != shape_count * cage_count * 3 * sizeof(float)) {
-		return _subdivision_fail(r_error, "cage blend deltas have the wrong size");
+	// The sparse deltas: whole entries, a run of offsets over them, every shape in range and strictly
+	// ascending within its vertex.
+	const SubdivisionSectionSpan blend_entries = _subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES);
+	const uint64_t entry_bytes = RenderingServerTypes::MESH_SUBDIVISION_CAGE_BLEND_ENTRY_WORDS * sizeof(uint32_t);
+	if (blend_entries.bytes % entry_bytes != 0) {
+		return _subdivision_fail(r_error, "cage blend entries are not whole entries");
+	}
+	const SubdivisionSectionSpan blend_offsets = _subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_OFFSETS);
+	if (!_subdivision_check_offsets(blend_offsets, cage_count, blend_entries.bytes / entry_bytes, "cage blend offsets", r_error)) {
+		return false;
+	}
+	for (uint64_t c = 0; c < cage_count; c++) {
+		const uint32_t first = _subdivision_word(blend_offsets, c);
+		const uint32_t last = _subdivision_word(blend_offsets, c + 1);
+		for (uint32_t e = first; e < last; e++) {
+			const uint32_t shape = _subdivision_word(blend_entries, uint64_t(e) * RenderingServerTypes::MESH_SUBDIVISION_CAGE_BLEND_ENTRY_WORDS);
+			if (shape >= shape_count) {
+				return _subdivision_fail(r_error, vformat("cage blend entry %d names shape %d, out of the mesh's %d", e, shape, shape_count));
+			}
+			if (e > first && shape <= _subdivision_word(blend_entries, uint64_t(e - 1) * RenderingServerTypes::MESH_SUBDIVISION_CAGE_BLEND_ENTRY_WORDS)) {
+				return _subdivision_fail(r_error, vformat("cage vertex %d's blend entries are not in strictly ascending shape order", c));
+			}
+		}
 	}
 	if (!_subdivision_check_offsets(_subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_OFFSETS), u_count, weight_count, "stencil offsets", r_error)) {
 		return false;
@@ -1660,7 +1682,7 @@ bool RenderingServer::mesh_subdivision_data_is_valid(const Vector<uint8_t> &p_da
 		}
 	}
 	// Every section the payload's kind requires; the cage skin is optional.
-	for (uint32_t id = RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U; id <= RenderingServerTypes::MESH_SUBDIVISION_SECTION_U_WELDED; id++) {
+	for (uint32_t id = RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U; id <= RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES; id++) {
 		bool owner_section = false;
 		if (!_subdivision_known_section(id, owner_section) || id == RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_SKIN || (owner_section && !owner)) {
 			continue;

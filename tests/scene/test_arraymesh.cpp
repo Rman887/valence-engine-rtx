@@ -1007,12 +1007,14 @@ static LocalVector<SubdivisionSection> subdivision_quad_sections(bool p_owner, u
 			positions.push_back(bits);
 		}
 		add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_POSITIONS, positions);
-		LocalVector<uint32_t> deltas;
-		deltas.resize(p_blend_shapes * 4 * 3);
-		for (uint32_t &word : deltas) {
-			word = 0;
+		// With blend shapes, shape 0 moves cage vertex 1 by (0, 0, 0.5).
+		if (p_blend_shapes > 0) {
+			add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_OFFSETS, { 0, 0, 1, 1, 1 });
+			add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES, { 0, 0, 0, 0x3f000000 });
+		} else {
+			add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_OFFSETS, { 0, 0, 0, 0, 0 });
+			add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES, {});
 		}
-		add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_DELTAS, deltas);
 		add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_OFFSETS, { 0, 1, 2, 3, 4 });
 		add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_INDICES, { 0, 1, 2, 3 }); // 32-bit indices.
 		const uint32_t one = 0x3f800000;
@@ -1290,7 +1292,24 @@ TEST_CASE("[SceneTree][ArrayMesh] Malformed subdivision payloads are refused, al
 	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_OFFSETS, { 0, 1, 2, 3, 3 }))); // Short of the weights.
 	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_QUADS, { 0, 1, 2, 4 }))); // Past the U.
 	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_NORMAL_ENTRIES, { 0, 1, 2, 4 }))); // Past the corners.
-	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_DELTAS, {}))); // Short.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_OFFSETS, { 0, 0, 1, 1 }))); // Short.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_OFFSETS, { 0, 0, 1, 1, 2 }))); // Past the entries.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES, { 0, 0, 0 }))); // Not a whole entry.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES, { 1, 0, 0, 0x3f000000 }))); // Past the shapes.
+	{
+		// One vertex's entries not strictly ascending: shape 0 twice.
+		LocalVector<SubdivisionSection> sections = subdivision_quad_sections(true, 1);
+		for (SubdivisionSection &section : sections) {
+			if (section.id == RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_OFFSETS) {
+				section.words = LocalVector<uint32_t>{ 0, 0, 2, 2, 2 };
+			} else if (section.id == RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES) {
+				section.words = LocalVector<uint32_t>{ 0, 0, 0, 0x3f000000, 0, 0, 0, 0x3f000000 };
+			}
+		}
+		CHECK_FALSE(valid(subdivision_payload_from(sections, RenderingServerTypes::MESH_SUBDIVISION_FLAG_OWNER, 0)));
+	}
+	CHECK_FALSE(valid(set_word(good, 0, 1))); // Version 1, whose deltas were dense.
+	CHECK_FALSE(valid(set_word(good, 4, 19))); // Version 1's dense delta section id.
 	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_U_WELDED, { 0, 1, 2 }))); // Short.
 
 	// The .scn path: a surface Dictionary set back through _surfaces is checked by the storage.

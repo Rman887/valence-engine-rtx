@@ -235,6 +235,7 @@ struct SubdivisionBuilder::Work {
 		LocalVector<int32_t> local_cage; // Per compact cage vertex, its local index, or -1.
 		LocalVector<int32_t> cage_compact; // Per local cage vertex: own, then ghost, each in welded order.
 		uint32_t own_cage_count = 0;
+		uint64_t blend_entries = 0;
 		PayloadWriter owner_payload;
 	};
 	LocalVector<Part> parts;
@@ -979,7 +980,7 @@ Error SubdivisionBuilder::_check_owners(Work &r_work) {
 	return OK;
 }
 
-// An owner's sections: its cage (positions, skin in its own bind indices, dense deltas in its shape
+// An owner's sections: its cage (positions, skin in its own bind indices, sparse deltas in its shape
 // order), its stencils over the local cage, its quads, and the normal adjacency of its own refined
 // vertices, each vertex's quads in welded quad order so that every owner sums a seam vertex's quads
 // in the same order.
@@ -989,20 +990,45 @@ Error SubdivisionBuilder::_owner_payload(Work &r_work, uint32_t p_part) {
 	const uint32_t bones_max = RenderingServerTypes::MESH_SUBDIVISION_CAGE_BONES;
 	const Vector<String> &names = r_work.owner_shapes[part.owner];
 
-	ERR_FAIL_COND_V_MSG(uint64_t(names.size()) * cage_count * 3 > UINT32_MAX, ERR_OUT_OF_MEMORY, vformat("Owner %d's dense deltas (%d shapes over %d cage vertices) exceed the payload's 4 GB.", part.owner, names.size(), cage_count));
-	LocalVector<float> deltas;
-	deltas.resize(uint32_t(uint64_t(names.size()) * cage_count * 3));
-	memset(deltas.ptr(), 0, deltas.size() * sizeof(float));
+	// The deltas per local cage vertex, in the owner's shape order: counted, then filled shape by shape,
+	// so each vertex's entries come in ascending shape order.
+	const uint32_t entry_words = RenderingServerTypes::MESH_SUBDIVISION_CAGE_BLEND_ENTRY_WORDS;
+	LocalVector<uint32_t> blend_offsets;
+	blend_offsets.resize(cage_count + 1);
+	memset(blend_offsets.ptr(), 0, blend_offsets.size() * sizeof(uint32_t));
 	for (int n = 0; n < names.size(); n++) {
 		for (const KeyValue<uint32_t, Vector3> &E : r_work.shape_deltas[r_work.shape_index[names[n]]]) {
 			const int32_t c = part.local_cage[E.key];
 			if (c >= 0) {
+				blend_offsets[c + 1]++;
+			}
+		}
+	}
+	for (uint32_t c = 0; c < cage_count; c++) {
+		blend_offsets[c + 1] += blend_offsets[c];
+	}
+	const uint64_t entry_count = blend_offsets[cage_count];
+	ERR_FAIL_COND_V_MSG(entry_count * entry_words * sizeof(uint32_t) > UINT32_MAX, ERR_OUT_OF_MEMORY, vformat("Owner %d's %d blend shape deltas exceed the payload's 4 GB.", part.owner, entry_count));
+	LocalVector<uint32_t> blend_entries;
+	blend_entries.resize(uint32_t(entry_count * entry_words));
+	{
+		LocalVector<uint32_t> fill(blend_offsets);
+		for (int n = 0; n < names.size(); n++) {
+			for (const KeyValue<uint32_t, Vector3> &E : r_work.shape_deltas[r_work.shape_index[names[n]]]) {
+				const int32_t c = part.local_cage[E.key];
+				if (c < 0) {
+					continue;
+				}
+				uint32_t *entry = &blend_entries[fill[c]++ * entry_words];
+				entry[0] = n;
 				for (int a = 0; a < 3; a++) {
-					deltas[(uint64_t(n) * cage_count + c) * 3 + a] = E.value[a];
+					const float value = E.value[a];
+					memcpy(entry + 1 + a, &value, sizeof(float));
 				}
 			}
 		}
 	}
+	part.blend_entries = entry_count;
 
 	// The skin in the owner's bind indices: a ghost's joints are found in its receiving owner by name.
 	LocalVector<uint16_t> cage_skin;
@@ -1137,7 +1163,6 @@ Error SubdivisionBuilder::_owner_payload(Work &r_work, uint32_t p_part) {
 	if (r_work.has_skin) {
 		payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_SKIN, cage_skin);
 	}
-	payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_DELTAS, deltas);
 	payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_OFFSETS, stencil_offsets);
 	if (wide) {
 		payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_INDICES, indices32);
@@ -1150,6 +1175,8 @@ Error SubdivisionBuilder::_owner_payload(Work &r_work, uint32_t p_part) {
 	payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_NORMAL_ENTRIES, normal_entries);
 	payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_WELDED, cage_welded);
 	payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_U_WELDED, u_welded);
+	payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_OFFSETS, blend_offsets);
+	payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES, blend_entries);
 	return OK;
 }
 
@@ -1432,6 +1459,7 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 	owner_report["triangles"] = triangles_total;
 	owner_report["blend_shapes"] = names.size();
 	owner_report["payload_bytes"] = payload_bytes;
+	owner_report["blend_entries"] = part.blend_entries;
 	owner_report["ms"] = ms_since(begin);
 	r_work.owner_reports[part.owner] = owner_report;
 	return OK;

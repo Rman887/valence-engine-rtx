@@ -1385,6 +1385,111 @@ TEST_CASE("[SceneTree][ArrayMesh] Malformed subdivision payloads are refused, al
 	ERR_PRINT_ON;
 }
 
+TEST_CASE("[SceneTree][ArrayMesh] Skin weights are quantized to nearest with their sum kept (D122).") {
+	const auto sum_of = [](const uint16_t *p_q, uint32_t p_count) {
+		int64_t sum = 0;
+		for (uint32_t i = 0; i < p_count; i++) {
+			sum += p_q[i];
+		}
+		return sum;
+	};
+	uint16_t q[8];
+	// Weights that truncation loses about one unit each on: the rounded sum is still 65535.
+	const float spread[8] = { 0.3f, 0.21f, 0.17f, 0.13f, 0.09f, 0.05f, 0.03f, 0.02f };
+	RS::mesh_quantize_skin_weights(spread, 8, q);
+	CHECK(sum_of(q, 8) == 65535);
+	for (uint32_t i = 1; i < 8; i++) {
+		CHECK(q[i] == uint16_t(Math::round(spread[i] * 65535.0f))); // Only the largest moves.
+	}
+	CHECK(Math::abs(int(q[0]) - int(Math::round(spread[0] * 65535.0f))) <= 4);
+	// Seven sevenths round to 65534 together: the remainder goes on the first of the equal largest.
+	const double sevenths[8] = { 1.0 / 7, 1.0 / 7, 1.0 / 7, 1.0 / 7, 1.0 / 7, 1.0 / 7, 1.0 / 7, 0 };
+	RS::mesh_quantize_skin_weights(sevenths, 8, q);
+	CHECK(q[0] == 9363);
+	for (uint32_t i = 1; i < 7; i++) {
+		CHECK(q[i] == 9362);
+	}
+	CHECK(q[7] == 0);
+	// Weights that do not sum to 1 keep their own rounded sum; a NaN or a negative weight is 0.
+	const float doubled[4] = { 1.0f, 1.0f, 0.0f, 0.0f };
+	RS::mesh_quantize_skin_weights(doubled, 4, q);
+	CHECK((q[0] == 65535 && q[1] == 65535 && q[2] == 0 && q[3] == 0));
+	const float invalid[4] = { Math::NaN, -0.5f, 0.0f, 0.0f };
+	RS::mesh_quantize_skin_weights(invalid, 4, q);
+	CHECK(sum_of(q, 4) == 0);
+	const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	RS::mesh_quantize_skin_weights(zero, 4, q);
+	CHECK(sum_of(q, 4) == 0);
+	// A weight above 1 counts as 1, before the sum.
+	const float over[4] = { 1.5f, 0.25f, 0.0f, 0.0f };
+	RS::mesh_quantize_skin_weights(over, 4, q);
+	CHECK((q[0] == 65535 && q[1] == 16384 && q[2] == 0 && q[3] == 0));
+	// The same values as float and as double pack the same.
+	int float_double_differ = 0;
+	for (int v = 0; v < 512; v++) {
+		float as_float[4];
+		double as_double[4];
+		float total = 0.0f;
+		for (int b = 0; b < 4; b++) {
+			as_float[b] = 0.5f + float((v * 31 + b * 17) % 97);
+			total += as_float[b];
+		}
+		for (int b = 0; b < 4; b++) {
+			as_float[b] /= total;
+			as_double[b] = as_float[b];
+		}
+		uint16_t from_double[4];
+		RS::mesh_quantize_skin_weights(as_float, 4, q);
+		RS::mesh_quantize_skin_weights(as_double, 4, from_double);
+		float_double_differ += memcmp(q, from_double, sizeof(from_double)) != 0 ? 1 : 0;
+	}
+	CHECK(float_double_differ == 0);
+
+	// Through surface data: every vertex's weights read back summing to 1 within float rounding.
+	Vector<Vector3> positions;
+	Vector<int> bones;
+	Vector<float> weights;
+	for (int v = 0; v < 64; v++) {
+		positions.push_back(Vector3(v, 0, v % 3));
+		float raw[8];
+		float total = 0;
+		for (int b = 0; b < 8; b++) {
+			raw[b] = 1.0f + float((v * 13 + b * 7) % 11);
+			total += raw[b];
+			bones.push_back(b);
+		}
+		for (int b = 0; b < 8; b++) {
+			weights.push_back(raw[b] / total);
+		}
+	}
+	Array arrays;
+	arrays.resize(RSE::ARRAY_MAX);
+	arrays[RSE::ARRAY_VERTEX] = positions;
+	arrays[RSE::ARRAY_BONES] = bones;
+	arrays[RSE::ARRAY_WEIGHTS] = weights;
+	RenderingServerTypes::SurfaceData surface;
+	REQUIRE(RS::get_singleton()->mesh_create_surface_data_from_arrays(&surface, RSE::PRIMITIVE_POINTS, arrays, Array(), Dictionary(), RSE::ARRAY_FLAG_USE_8_BONE_WEIGHTS) == OK);
+	const Array read = RS::get_singleton()->mesh_create_arrays_from_surface_data(surface);
+	const PackedFloat32Array read_weights = read[RSE::ARRAY_WEIGHTS];
+	REQUIRE(read_weights.size() == weights.size());
+	int not_affine = 0;
+	for (int v = 0; v < 64; v++) {
+		double sum = 0;
+		for (int b = 0; b < 8; b++) {
+			sum += read_weights[v * 8 + b];
+			CHECK(Math::abs(read_weights[v * 8 + b] - weights[v * 8 + b]) <= 4.5f / 65535.0f);
+		}
+		not_affine += Math::abs(sum - 1.0) > 1e-6 ? 1 : 0;
+	}
+	CHECK(not_affine == 0);
+	// Decoded weights packed again give the same bytes: meshes edited through their arrays
+	// (MeshDataTool, SurfaceTool::create_from) keep their skin exactly.
+	Array repacked_arrays = read;
+	RenderingServerTypes::SurfaceData repacked;
+	REQUIRE(RS::get_singleton()->mesh_create_surface_data_from_arrays(&repacked, RSE::PRIMITIVE_POINTS, repacked_arrays, Array(), Dictionary(), RSE::ARRAY_FLAG_USE_8_BONE_WEIGHTS) == OK);
+	CHECK(repacked.skin_data == surface.skin_data);
+}
+
 } // namespace TestArrayMesh
 
 #endif // _3D_DISABLED

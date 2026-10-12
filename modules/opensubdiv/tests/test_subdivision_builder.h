@@ -1213,7 +1213,7 @@ TEST_CASE("[SceneTree][SubdivisionBuilder] The runtime passes reproduce the rest
 	PassResult moved[2];
 	for (int owner = 0; owner < 2; owner++) {
 		// At rest, from the payload alone, the surface the builder made: positions, normals, tangents.
-		// Unskinned: two quantized skin weights do not sum to exactly 1.
+		// Unskinned: the passes' rest output with no bone matrices applied.
 		rest[owner] = run_subdivision_passes(meshes[owner], 0, LocalVector<float>(), no_weights);
 		const Array arrays = meshes[owner]->surface_get_arrays(0);
 		const PackedVector3Array positions = arrays[Mesh::ARRAY_VERTEX];

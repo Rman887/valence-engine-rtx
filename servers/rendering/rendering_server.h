@@ -277,6 +277,11 @@ public:
 	static bool mesh_subdivision_surface_is_valid(const RenderingServerTypes::SurfaceData &p_surface, uint32_t p_surface_index, uint32_t p_blend_shape_count, int p_first_subdivided, const Vector<uint8_t> &p_owner_data, String *r_error = nullptr);
 	static int64_t mesh_subdivision_data_owner_surface(const Vector<uint8_t> &p_data);
 	static int64_t mesh_subdivision_data_find_section(const Vector<uint8_t> &p_data, uint32_t p_id, uint32_t *r_size = nullptr);
+	// One vertex's skin weights as the unorm16 the skin buffer stores: each rounded to nearest, then
+	// the difference between the rounded sum and the sum of the rounded weights put on the largest
+	// (the first of equals), so weights that sum to 1 still sum to 65535 and skinning stays affine.
+	static void mesh_quantize_skin_weights(const float *p_weights, uint32_t p_count, uint16_t *r_quantized);
+	static void mesh_quantize_skin_weights(const double *p_weights, uint32_t p_count, uint16_t *r_quantized);
 	Array mesh_create_arrays_from_surface_data(const RenderingServerTypes::SurfaceData &p_data) const;
 	Array mesh_surface_get_arrays(RID p_mesh, int p_surface) const;
 	TypedArray<Array> mesh_surface_get_blend_shape_arrays(RID p_mesh, int p_surface) const;

@@ -847,9 +847,7 @@ Error RenderingServer::_surface_set_data(Array p_arrays, uint64_t p_format, uint
 					{
 						uint16_t data[8];
 						for (int i = 0; i < p_vertex_array_len; i++) {
-							for (uint32_t j = 0; j < bone_count; j++) {
-								data[j] = CLAMP(src[i * bone_count + j] * 65535, 0, 65535);
-							}
+							mesh_quantize_skin_weights(&src[i * bone_count], bone_count, data);
 
 							memcpy(&sw[p_offsets[ai] + i * p_skin_stride], data, 2 * bone_count);
 						}
@@ -861,9 +859,7 @@ Error RenderingServer::_surface_set_data(Array p_arrays, uint64_t p_format, uint
 					{
 						uint16_t data[8];
 						for (int i = 0; i < p_vertex_array_len; i++) {
-							for (uint32_t j = 0; j < bone_count; j++) {
-								data[j] = CLAMP(src[i * bone_count + j] * 65535, 0, 65535);
-							}
+							mesh_quantize_skin_weights(&src[i * bone_count], bone_count, data);
 
 							memcpy(&sw[p_offsets[ai] + i * p_skin_stride], data, 2 * bone_count);
 						}
@@ -1640,6 +1636,39 @@ bool _subdivision_check_owner(const Vector<uint8_t> &p_data, uint32_t p_blend_sh
 }
 
 } // namespace
+
+template <typename T>
+static void _quantize_skin_weights(const T *p_weights, uint32_t p_count, uint16_t *r_quantized) {
+	// In double whatever the input type: a float times 65535 is exact there, so float and double
+	// input of the same values pack the same, and no platform's float evaluation changes the bits.
+	int64_t sum = 0;
+	double exact_sum = 0.0;
+	double largest_weight = -1.0;
+	uint32_t largest = 0;
+	for (uint32_t i = 0; i < p_count; i++) {
+		const double weight = p_weights[i] > T(0) ? MIN(double(p_weights[i]), 1.0) : 0.0; // A NaN counts as 0.
+		r_quantized[i] = uint16_t(Math::round(weight * 65535.0));
+		sum += r_quantized[i];
+		exact_sum += weight;
+		if (weight > largest_weight) {
+			largest_weight = weight;
+			largest = i;
+		}
+	}
+	if (p_count == 0) {
+		return;
+	}
+	const int64_t target = int64_t(Math::round(exact_sum * 65535.0));
+	r_quantized[largest] = uint16_t(CLAMP(int64_t(r_quantized[largest]) + target - sum, int64_t(0), int64_t(65535)));
+}
+
+void RenderingServer::mesh_quantize_skin_weights(const float *p_weights, uint32_t p_count, uint16_t *r_quantized) {
+	_quantize_skin_weights(p_weights, p_count, r_quantized);
+}
+
+void RenderingServer::mesh_quantize_skin_weights(const double *p_weights, uint32_t p_count, uint16_t *r_quantized) {
+	_quantize_skin_weights(p_weights, p_count, r_quantized);
+}
 
 bool RenderingServer::mesh_subdivision_data_is_valid(const Vector<uint8_t> &p_data, String *r_error) {
 	const int64_t size = p_data.size();

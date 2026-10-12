@@ -595,9 +595,12 @@ Error SubdivisionBuilder::_gather_skin(Work &r_work) {
 				skin[b] = SKIN_NO_BONE;
 				skin[bones_max + b] = 0;
 			}
+			uint16_t quantized[8];
+			if (bones_per_vertex > 0) {
+				RenderingServer::mesh_quantize_skin_weights(weights.ptr() + v * bones_per_vertex, bones_per_vertex, quantized); // As the skin buffer stores them.
+			}
 			for (int b = 0; b < bones_per_vertex; b++) {
-				// As RenderingServer quantizes skin weights.
-				const uint16_t weight = uint16_t(CLAMP(weights[v * bones_per_vertex + b] * 65535, 0, 65535));
+				const uint16_t weight = quantized[b];
 				if (weight == 0) {
 					continue;
 				}

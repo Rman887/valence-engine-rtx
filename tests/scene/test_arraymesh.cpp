@@ -1158,6 +1158,52 @@ TEST_CASE("[SceneTree][ArrayMesh] The storages refuse a subdivided surface again
 		add_subdivision_quad(mesh, compressed, subdivision_quad_payload(true, 0));
 		CHECK(rendering_surface_count(mesh) == 0);
 	}
+	SUBCASE("A subdivided surface is whole refined quads of 3D vertices, its arrays matching its counts (D122 S2)") {
+		// Each refusal by its own reason: the runtime passes read and write these arrays by the counts.
+		auto refusal = [](const RenderingServerTypes::SurfaceData &p_candidate) {
+			RenderingServerTypes::SurfaceData candidate = p_candidate;
+			candidate.subdivision_data = subdivision_quad_payload(true, 0);
+			String error;
+			CHECK_FALSE(RenderingServer::mesh_subdivision_surface_is_valid(candidate, 0, 0, -1, Vector<uint8_t>(), &error));
+			return error;
+		};
+		{
+			RenderingServerTypes::SurfaceData candidate = surface;
+			candidate.index_count = 3;
+			candidate.index_data.resize(3 * sizeof(uint16_t));
+			CHECK(refusal(candidate).contains("two triangles each"));
+		}
+		{
+			RenderingServerTypes::SurfaceData candidate = surface;
+			candidate.format |= RSE::ARRAY_FLAG_USE_2D_VERTICES;
+			CHECK(refusal(candidate).contains("3D vertices"));
+		}
+		{
+			RenderingServerTypes::SurfaceData candidate = surface;
+			const uint16_t past = 4;
+			memcpy(candidate.index_data.ptrw() + 5 * sizeof(uint16_t), &past, sizeof(past));
+			CHECK(refusal(candidate).contains("index 5 is 4"));
+		}
+		{
+			RenderingServerTypes::SurfaceData candidate = surface;
+			candidate.index_data.resize(candidate.index_data.size() - sizeof(uint16_t));
+			CHECK(refusal(candidate).contains("index data does not match"));
+		}
+		{
+			RenderingServerTypes::SurfaceData candidate = surface;
+			candidate.vertex_data.resize(candidate.vertex_data.size() - sizeof(float));
+			CHECK(refusal(candidate).contains("vertex or attribute data"));
+		}
+		{
+			RenderingServerTypes::SurfaceData candidate = surface;
+			candidate.attribute_data.resize(candidate.attribute_data.size() + sizeof(float));
+			CHECK(refusal(candidate).contains("vertex or attribute data"));
+		}
+		// The quad itself passes.
+		RenderingServerTypes::SurfaceData good = surface;
+		good.subdivision_data = subdivision_quad_payload(true, 0);
+		CHECK(RenderingServer::mesh_subdivision_surface_is_valid(good, 0, 0, -1, Vector<uint8_t>()));
+	}
 	SUBCASE("A subdivided surface with blend shapes carries no cluster LOD hierarchy") {
 		RenderingServerTypes::SurfaceData with_lod = surface;
 		with_lod.subdivision_data = subdivision_quad_payload(true, 1);

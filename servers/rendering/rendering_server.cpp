@@ -1711,11 +1711,46 @@ bool RenderingServer::mesh_subdivision_surface_is_valid(const RenderingServerTyp
 	if ((p_surface.format & RSE::ARRAY_FORMAT_BONES) || !p_surface.skin_data.is_empty()) {
 		return _subdivision_fail(r_error, "a subdivided surface carries no skin; its cage does");
 	}
-	if (p_surface.primitive != RSE::PRIMITIVE_TRIANGLES || p_surface.vertex_count == 0 || p_surface.index_count == 0 || p_surface.index_count % 3 != 0) {
-		return _subdivision_fail(r_error, "a subdivided surface is an indexed triangle list");
+	if (p_surface.primitive != RSE::PRIMITIVE_TRIANGLES || p_surface.vertex_count == 0 || p_surface.index_count == 0 || p_surface.index_count % 6 != 0) {
+		// Two triangles per refined quad, which also keeps 16-bit indices whole words for the runtime passes.
+		return _subdivision_fail(r_error, "a subdivided surface is an indexed list of refined quads, two triangles each");
 	}
 	if (p_surface.format & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) {
 		return _subdivision_fail(r_error, "a subdivided surface keeps uncompressed vertex attributes, which its runtime passes write");
+	}
+	if (p_surface.format & RSE::ARRAY_FLAG_USE_2D_VERTICES) {
+		return _subdivision_fail(r_error, "a subdivided surface has 3D vertices");
+	}
+	{
+		// The arrays the runtime passes read and write by the surface's counts and format, which the
+		// storages otherwise check only in debug builds.
+		uint32_t offsets[RSE::ARRAY_MAX];
+		uint32_t vertex_element_size = 0;
+		uint32_t normal_element_size = 0;
+		uint32_t attrib_element_size = 0;
+		uint32_t skin_element_size = 0;
+		get_singleton()->mesh_surface_make_offsets_from_format(p_surface.format, p_surface.vertex_count, p_surface.index_count, offsets, vertex_element_size, normal_element_size, attrib_element_size, skin_element_size);
+		const uint64_t vertex_count = p_surface.vertex_count;
+		if (uint64_t(p_surface.vertex_data.size()) != (uint64_t(vertex_element_size) + normal_element_size) * vertex_count || uint64_t(p_surface.attribute_data.size()) != uint64_t(attrib_element_size) * vertex_count) {
+			return _subdivision_fail(r_error, "a subdivided surface's vertex or attribute data does not match its format and vertex count");
+		}
+		const bool index_16 = vertex_count <= 65536;
+		if (uint64_t(p_surface.index_data.size()) != uint64_t(p_surface.index_count) * (index_16 ? 2 : 4)) {
+			return _subdivision_fail(r_error, "a subdivided surface's index data does not match its index count");
+		}
+		for (uint32_t i = 0; i < p_surface.index_count; i++) {
+			uint32_t index;
+			if (index_16) {
+				uint16_t narrow;
+				memcpy(&narrow, p_surface.index_data.ptr() + uint64_t(i) * 2, 2);
+				index = narrow;
+			} else {
+				memcpy(&index, p_surface.index_data.ptr() + uint64_t(i) * 4, 4);
+			}
+			if (index >= vertex_count) {
+				return _subdivision_fail(r_error, vformat("a subdivided surface's index %d is %d, out of its %d vertices", i, index, vertex_count));
+			}
+		}
 	}
 	if (p_blend_shape_count > 0 && p_surface.cluster_data.size() >= int64_t(sizeof(uint32_t))) {
 		uint32_t cluster_version;

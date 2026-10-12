@@ -228,6 +228,16 @@ MeshStorage::MeshStorage() {
 			skeleton_shader.default_skeleton_uniform_set = RD::get_singleton()->uniform_set_create(uniforms, skeleton_shader.version_shader[0], SkeletonShader::UNIFORM_SET_SKELETON);
 		}
 	}
+
+	{
+		// D122 S2: the subdivision passes.
+		Vector<String> subdivision_modes;
+		subdivision_modes.push_back("");
+		subdivision_shader.shader.initialize(subdivision_modes);
+		subdivision_shader.version = subdivision_shader.shader.version_create();
+		subdivision_shader.version_shader = subdivision_shader.shader.version_get_shader(subdivision_shader.version, 0);
+		subdivision_shader.pipeline = RD::get_singleton()->compute_pipeline_create(subdivision_shader.version_shader);
+	}
 }
 
 MeshStorage::~MeshStorage() {
@@ -237,6 +247,7 @@ MeshStorage::~MeshStorage() {
 	}
 
 	skeleton_shader.shader.version_free(skeleton_shader.version);
+	subdivision_shader.shader.version_free(subdivision_shader.version);
 
 	RD::get_singleton()->free_rid(default_rd_storage_buffer);
 
@@ -523,6 +534,72 @@ static void _cluster_fallback_attributes(const Vector<uint8_t> &p_attribute_data
 	}
 }
 
+// D122 S2: uploads a subdivided surface's payload for the runtime passes and finds its
+// sections. mesh_add_surface() validated the payload, so every section read here is present and in
+// bounds, and the owner surface named by a payload is an earlier one.
+void MeshStorage::_mesh_surface_set_subdivision(Mesh *p_mesh, Mesh::Surface *p_surface, const RenderingServerTypes::SurfaceData &p_data) {
+	const Vector<uint8_t> &payload = p_data.subdivision_data;
+	Mesh::Surface::Subdivision &sd = p_surface->subdivision;
+	sd.buffer = RD::get_singleton()->storage_buffer_create(payload.size(), payload);
+	auto section = [&payload](uint32_t p_id) -> uint32_t {
+		const int64_t offset = RenderingServer::mesh_subdivision_data_find_section(payload, p_id);
+		return offset < 0 ? 0 : uint32_t(offset / sizeof(uint32_t));
+	};
+	auto word = [&payload](uint32_t p_word) -> uint32_t {
+		uint32_t value;
+		memcpy(&value, payload.ptr() + uint64_t(p_word) * sizeof(uint32_t), sizeof(uint32_t));
+		return value;
+	};
+	sd.owner = word(1) & RenderingServerTypes::MESH_SUBDIVISION_FLAG_OWNER;
+	sd.owner_surface = word(2);
+	sd.r_to_u = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U);
+	sd.tangent_offsets = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_OFFSETS);
+	sd.tangent_entries = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_ENTRIES);
+	sd.index_16 = p_data.vertex_count <= 65536 && p_data.vertex_count > 0; // As the index buffer is made.
+	uint32_t offsets[RSE::ARRAY_MAX];
+	uint32_t vertex_element_size;
+	uint32_t normal_element_size;
+	uint32_t attrib_element_size;
+	uint32_t skin_element_size;
+	RS::get_singleton()->mesh_surface_make_offsets_from_format(p_data.format, p_data.vertex_count, p_data.index_count, offsets, vertex_element_size, normal_element_size, attrib_element_size, skin_element_size);
+	sd.attribute_stride = attrib_element_size / sizeof(uint32_t);
+	sd.uv_offset = offsets[RSE::ARRAY_TEX_UV] / sizeof(uint32_t);
+	if (!sd.owner) {
+		return;
+	}
+	const uint32_t info = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO);
+	sd.cage_count = word(info + RenderingServerTypes::MESH_SUBDIVISION_INFO_CAGE_COUNT);
+	sd.u_count = word(info + RenderingServerTypes::MESH_SUBDIVISION_INFO_U_COUNT);
+	sd.own_u_count = word(info + RenderingServerTypes::MESH_SUBDIVISION_INFO_OWN_U_COUNT);
+	sd.cage_positions = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_POSITIONS);
+	const int64_t skin = RenderingServer::mesh_subdivision_data_find_section(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_SKIN);
+	sd.has_skin = skin >= 0;
+	if (sd.has_skin) {
+		// The largest bone any slot names (a slot without weight names bone 0), which the instance's
+		// skeleton must hold: the cage pass reads its transforms unchecked.
+		sd.cage_skin = uint32_t(skin / sizeof(uint32_t));
+		const uint32_t bones_max = RenderingServerTypes::MESH_SUBDIVISION_CAGE_BONES;
+		const uint16_t *skin_data = reinterpret_cast<const uint16_t *>(payload.ptr() + skin);
+		uint32_t largest = 0;
+		for (uint32_t c = 0; c < sd.cage_count; c++) {
+			for (uint32_t b = 0; b < bones_max; b++) {
+				largest = MAX(largest, uint32_t(skin_data[c * 2 * bones_max + b]));
+			}
+		}
+		sd.bone_count = largest + 1;
+		p_mesh->has_subdivision_skin = true;
+	}
+	sd.blend_offsets = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_OFFSETS);
+	sd.blend_entries = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES);
+	sd.stencil_offsets = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_OFFSETS);
+	sd.stencil_indices = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_INDICES);
+	sd.stencil_weights = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_WEIGHTS);
+	sd.stencil_index_16 = word(info + RenderingServerTypes::MESH_SUBDIVISION_INFO_STENCIL_INDEX_BYTES) == 2;
+	sd.quads = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_QUADS);
+	sd.normal_offsets = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_NORMAL_OFFSETS);
+	sd.normal_entries = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_NORMAL_ENTRIES);
+}
+
 /// Returns stride
 void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::SurfaceData &p_surface) {
 	Mesh *mesh = mesh_owner.get_or_null(p_mesh);
@@ -660,6 +737,10 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 	const bool requested_storage_buffer = (new_surface.format & RSE::ARRAY_FLAG_USE_STORAGE_BUFFER);
 	BitField<RD::BufferCreationBits> as_storage_flag = (use_as_storage || requested_storage_buffer) ? RD::BUFFER_CREATION_AS_STORAGE_BIT : 0;
 	BitField<RD::BufferCreationBits> requested_storage_flag = requested_storage_buffer ? RD::BUFFER_CREATION_AS_STORAGE_BIT : 0;
+	if (subdivided) {
+		// D122 S2: the write pass reads the frozen indices and UV0 of a subdivided surface.
+		requested_storage_flag.set_flag(RD::BUFFER_CREATION_AS_STORAGE_BIT);
+	}
 	// Raytracing needs all geometry buffers usable as acceleration-structure build
 	// inputs and addressable via buffer device address for bindless closest-hit access.
 	if (RD::get_singleton()->has_feature(RD::SUPPORTS_RAYTRACING_PIPELINE) || RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY)) {
@@ -808,6 +889,10 @@ void MeshStorage::mesh_add_surface(RID p_mesh, const RenderingServerTypes::Surfa
 		s->blend_shape_buffer_size = new_surface.blend_shape_data.size();
 	}
 
+	if (subdivided) {
+		_mesh_surface_set_subdivision(mesh, s, new_surface);
+	}
+
 	if (use_as_storage) {
 		Vector<RD::Uniform> uniforms;
 		{
@@ -905,6 +990,9 @@ void MeshStorage::_mesh_surface_clear(Mesh *p_mesh, int p_surface) {
 
 	if (s.blend_shape_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(s.blend_shape_buffer);
+	}
+	if (s.subdivision.buffer.is_valid()) {
+		RD::get_singleton()->free_rid(s.subdivision.buffer);
 	}
 
 	memdelete(p_mesh->surfaces[p_surface]);
@@ -1379,7 +1467,11 @@ AABB MeshStorage::mesh_get_aabb(RID p_mesh, RID p_skeleton) {
 	for (uint32_t i = 0; i < mesh->surface_count; i++) {
 		AABB laabb;
 		const Mesh::Surface &surface = *mesh->surfaces[i];
-		if ((surface.format & RSE::ARRAY_FORMAT_BONES) && surface.bone_aabbs.size()) {
+		// D122 S2: a subdivided surface of a skinned cage carries the bone bounds the builder made.
+		// One whose bounds name more bones than the skeleton holds is drawn unskinned (update_mesh_instances()
+		// reports it), so its rest bound holds.
+		const bool skinned = (surface.format & RSE::ARRAY_FORMAT_BONES) || (!surface.subdivision_data.is_empty() && mesh->has_subdivision_skin && surface.bone_aabbs.size() <= skeleton->size);
+		if (skinned && surface.bone_aabbs.size()) {
 			int bs = surface.bone_aabbs.size();
 			const AABB *skbones = surface.bone_aabbs.ptr();
 
@@ -1537,6 +1629,7 @@ void MeshStorage::mesh_clear(RID p_mesh) {
 	mesh->surface_count = 0;
 	mesh->material_cache.clear();
 	mesh->has_bone_weights = false;
+	mesh->has_subdivision_skin = false;
 	mesh->aabb = AABB();
 	mesh->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_MESH);
 
@@ -1588,6 +1681,10 @@ void MeshStorage::mesh_surface_remove(RID p_mesh, int p_surface) {
 				break;
 			}
 		}
+	}
+	mesh->has_subdivision_skin = false;
+	for (uint32_t i = 0; i < mesh->surface_count; i++) {
+		mesh->has_subdivision_skin = mesh->has_subdivision_skin || (mesh->surfaces[i]->subdivision.owner && mesh->surfaces[i]->subdivision.has_skin);
 	}
 
 	if (mesh->surface_count == 0) {
@@ -1641,19 +1738,9 @@ bool MeshStorage::mesh_needs_instance(RID p_mesh, bool p_has_skeleton) {
 	Mesh *mesh = mesh_owner.get_or_null(p_mesh);
 	ERR_FAIL_NULL_V(mesh, false);
 
-	// A mesh whose every surface is subdivided (D122) draws its rest pose until the runtime
-	// passes exist (S2): its blend shapes ask for no instance.
-	bool blends = mesh->blend_shape_count > 0;
-	if (blends && mesh->surface_count > 0) {
-		blends = false;
-		for (uint32_t i = 0; i < mesh->surface_count; i++) {
-			if (mesh->surfaces[i]->subdivision_data.is_empty()) {
-				blends = true;
-				break;
-			}
-		}
-	}
-	return blends || (mesh->has_bone_weights && p_has_skeleton);
+	// D122 S2: a subdivided surface deforms from its cage, by the mesh's blend shapes and, when
+	// the cage is skinned, by a skeleton.
+	return mesh->blend_shape_count > 0 || ((mesh->has_bone_weights || mesh->has_subdivision_skin) && p_has_skeleton);
 }
 
 Dependency *MeshStorage::mesh_get_dependency(RID p_mesh) const {
@@ -1701,6 +1788,7 @@ void MeshStorage::mesh_instance_set_skeleton(RID p_mesh_instance, RID p_skeleton
 	}
 	mi->skeleton = p_skeleton;
 	mi->skeleton_version = 0;
+	mi->subdivision_bone_error = false;
 	mi->dirty = true;
 }
 
@@ -1736,9 +1824,24 @@ void MeshStorage::_mesh_instance_add_surface(MeshInstance *mi, Mesh *mesh, uint3
 	}
 
 	MeshInstance::Surface s;
-	const bool subdivided = !mesh->surfaces[p_surface]->subdivision_data.is_empty(); // D122: rest pose until S2.
-	if (((mesh->blend_shape_count > 0 && !subdivided) || (mesh->surfaces[p_surface]->format & RSE::ARRAY_FORMAT_BONES)) && mesh->surfaces[p_surface]->vertex_buffer_size > 0) {
+	// D122 S2: a subdivided surface is deformed by its runtime passes whenever its mesh is instanced.
+	const bool subdivided = !mesh->surfaces[p_surface]->subdivision_data.is_empty();
+	if (subdivided && mesh->blend_shape_count > 0 && mi->subdivision_weights_buffer.is_null()) {
+		Vector<uint8_t> zeros;
+		zeros.resize_initialized(mesh->blend_shape_count * sizeof(float));
+		mi->subdivision_weights_buffer = RD::get_singleton()->storage_buffer_create(zeros.size(), zeros);
+		mi->weights_dirty = true;
+	}
+	if ((mesh->blend_shape_count > 0 || subdivided || (mesh->surfaces[p_surface]->format & RSE::ARRAY_FORMAT_BONES)) && mesh->surfaces[p_surface]->vertex_buffer_size > 0) {
+		if (subdivided && mesh->surfaces[p_surface]->subdivision.owner) {
+			_mesh_instance_add_subdivision_owner(mi, mesh, &s, p_surface);
+		}
 		_mesh_instance_add_surface_buffer(mi, mesh, &s, p_surface, 0);
+		if (subdivided) {
+			// Both buffers now, each seeded with the rest pose: update_mesh_instances() makes the second
+			// inside its compute list, where no copy can seed it.
+			_mesh_instance_add_surface_buffer(mi, mesh, &s, p_surface, 1);
+		}
 	}
 
 	mi->surfaces.push_back(s);
@@ -1753,6 +1856,24 @@ void MeshStorage::_mesh_instance_add_surface_buffer(MeshInstance *mi, Mesh *mesh
 		buffer_flags.set_flag(RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
 	}
 	s->vertex_buffer[p_buffer_index] = RD::get_singleton()->vertex_buffer_create(mesh->surfaces[p_surface]->vertex_buffer_size, Vector<uint8_t>(), buffer_flags);
+
+	const Mesh::Surface &surface = *mesh->surfaces[p_surface];
+	if (!surface.subdivision_data.is_empty()) {
+		// D122 S2: the rest pose until the passes first write the buffer, the subdivision passes' surface
+		// set (the payload, this buffer, UV0 and the indices).
+		RD::get_singleton()->buffer_copy(surface.vertex_buffer, s->vertex_buffer[p_buffer_index], 0, 0, surface.vertex_buffer_size);
+		Vector<RD::Uniform> uniforms;
+		const RID ids[4] = { surface.subdivision.buffer, s->vertex_buffer[p_buffer_index], surface.attribute_buffer.is_valid() ? surface.attribute_buffer : default_rd_storage_buffer, surface.index_buffer };
+		for (uint32_t i = 0; i < 4; i++) {
+			RD::Uniform u;
+			u.binding = i;
+			u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+			u.append_id(ids[i]);
+			uniforms.push_back(u);
+		}
+		s->uniform_set[p_buffer_index] = RD::get_singleton()->uniform_set_create(uniforms, subdivision_shader.version_shader, SubdivisionShader::UNIFORM_SET_SURFACE);
+		return;
+	}
 
 	Vector<RD::Uniform> uniforms;
 	{
@@ -1776,6 +1897,25 @@ void MeshStorage::_mesh_instance_add_surface_buffer(MeshInstance *mi, Mesh *mesh
 	s->uniform_set[p_buffer_index] = RD::get_singleton()->uniform_set_create(uniforms, skeleton_shader.version_shader[0], SkeletonShader::UNIFORM_SET_INSTANCE);
 }
 
+// D122 S2: an instance's working buffers for a subdivided owner surface, and the set the
+// subdivision passes bind them in with the owner's payload and the instance's weights.
+void MeshStorage::_mesh_instance_add_subdivision_owner(MeshInstance *mi, Mesh *mesh, MeshInstance::Surface *s, uint32_t p_surface) {
+	const Mesh::Surface::Subdivision &sd = mesh->surfaces[p_surface]->subdivision;
+	s->subdivision_cage = RD::get_singleton()->storage_buffer_create(MAX(sd.cage_count, 1u) * 3 * sizeof(float));
+	s->subdivision_positions = RD::get_singleton()->storage_buffer_create(MAX(sd.u_count, 1u) * 3 * sizeof(float));
+	s->subdivision_normals = RD::get_singleton()->storage_buffer_create(MAX(sd.own_u_count, 1u) * 3 * sizeof(float));
+	Vector<RD::Uniform> uniforms;
+	const RID ids[5] = { sd.buffer, s->subdivision_cage, s->subdivision_positions, s->subdivision_normals, mi->subdivision_weights_buffer.is_valid() ? mi->subdivision_weights_buffer : default_rd_storage_buffer };
+	for (uint32_t i = 0; i < 5; i++) {
+		RD::Uniform u;
+		u.binding = i;
+		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
+		u.append_id(ids[i]);
+		uniforms.push_back(u);
+	}
+	s->subdivision_owner_set = RD::get_singleton()->uniform_set_create(uniforms, subdivision_shader.version_shader, SubdivisionShader::UNIFORM_SET_OWNER);
+}
+
 void MeshStorage::_mesh_instance_remove_surface(MeshInstance *mi, int p_surface) {
 	MeshInstance::Surface &surface = mi->surfaces[p_surface];
 
@@ -1790,6 +1930,12 @@ void MeshStorage::_mesh_instance_remove_surface(MeshInstance *mi, int p_surface)
 			RD::get_singleton()->free_rid(surface.vertex_buffer[i]);
 		}
 	}
+	// D122 S2: freeing these frees the owner set made from them.
+	for (const RID &buffer : { surface.subdivision_cage, surface.subdivision_positions, surface.subdivision_normals }) {
+		if (buffer.is_valid()) {
+			RD::get_singleton()->free_rid(buffer);
+		}
+	}
 
 	mi->surfaces.remove_at(p_surface);
 
@@ -1797,6 +1943,10 @@ void MeshStorage::_mesh_instance_remove_surface(MeshInstance *mi, int p_surface)
 		if (mi->blend_weights_buffer.is_valid()) {
 			RD::get_singleton()->free_rid(mi->blend_weights_buffer);
 			mi->blend_weights_buffer = RID();
+		}
+		if (mi->subdivision_weights_buffer.is_valid()) {
+			RD::get_singleton()->free_rid(mi->subdivision_weights_buffer);
+			mi->subdivision_weights_buffer = RID();
 		}
 
 		mi->blend_weights.clear();
@@ -1843,8 +1993,9 @@ void MeshStorage::update_mesh_instances() {
 	while (dirty_mesh_instance_weights.first()) {
 		MeshInstance *mi = dirty_mesh_instance_weights.first()->self();
 
-		if (mi->blend_weights_buffer.is_valid()) {
+		if (mi->blend_weights_buffer.is_valid() && mi->subdivision_weights_buffer.is_null()) {
 			// VAL (P1g): the shapes the skeleton shader adds, by its own test and in its order.
+			// A mesh with blend shapes and subdivided surfaces has only subdivided ones (D122 S2), which read every weight.
 			uint32_t active = 0;
 			for (uint32_t i = 0; i < mi->blend_weights.size(); i++) {
 				const float w = mi->blend_weights[i];
@@ -1861,6 +2012,10 @@ void MeshStorage::update_mesh_instances() {
 				RD::get_singleton()->buffer_update(mi->blend_weights_buffer, 0, active * 2 * sizeof(uint32_t), mi->blend_active.ptr());
 			}
 		}
+		if (mi->subdivision_weights_buffer.is_valid()) {
+			// D122 S2: every weight, which the cage pass looks up by shape and tests as the skeleton shader does.
+			RD::get_singleton()->buffer_update(mi->subdivision_weights_buffer, 0, mi->blend_weights.size() * sizeof(float), mi->blend_weights.ptr());
+		}
 		dirty_mesh_instance_weights.remove(&mi->weight_update_list);
 		mi->weights_dirty = false;
 	}
@@ -1872,6 +2027,7 @@ void MeshStorage::update_mesh_instances() {
 	uint64_t frame = RSG::rasterizer->get_frame_number();
 	bool uses_motion_vectors = (RSG::viewport->get_num_viewports_with_motion_vectors() > 0) || (RendererCompositorStorage::get_singleton()->get_num_compositor_effects_with_motion_vectors() > 0);
 	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
+	subdivision_dispatches.clear();
 
 	while (dirty_mesh_instance_arrays.first()) {
 		MeshInstance *mi = dirty_mesh_instance_arrays.first()->self();
@@ -1879,6 +2035,35 @@ void MeshStorage::update_mesh_instances() {
 		Skeleton *sk = skeleton_owner.get_or_null(mi->skeleton);
 
 		for (uint32_t i = 0; i < mi->surfaces.size(); i++) {
+			if (!mi->mesh->surfaces[i]->subdivision_data.is_empty()) {
+				// D122 S2: the subdivision passes run after this loop, in phases. The buffers advance as below.
+				MeshInstance::Surface &mis = mi->surfaces[i];
+				if (mis.uniform_set[0].is_null() || mis.uniform_set[1].is_null()) {
+					ERR_PRINT_ONCE("A subdivided surface's instance has no subdivision uniform set: it keeps its rest pose.");
+					continue;
+				}
+				mis.previous_buffer = mis.current_buffer;
+				if (uses_motion_vectors && mis.last_change && (frame - mis.last_change) <= 2) {
+					mis.current_buffer ^= 1; // Both buffers exist from the start (_mesh_instance_add_surface()).
+				}
+				mis.last_change = frame;
+				SubdivisionDispatch dispatch;
+				dispatch.mi = mi;
+				dispatch.surface = i;
+				dispatch.skeleton_set = skeleton_shader.default_skeleton_uniform_set;
+				const Mesh::Surface::Subdivision &sd = mi->mesh->surfaces[i]->subdivision;
+				if (sd.owner && sd.has_skin && sk && !sk->use_2d && sk->uniform_set_mi.is_valid()) {
+					if (uint32_t(sk->size) >= sd.bone_count) {
+						dispatch.skeleton_set = sk->uniform_set_mi;
+						dispatch.skin = true;
+					} else if (!mi->subdivision_bone_error) {
+						ERR_PRINT(vformat("A subdivided mesh's cage is weighted to bone %d, but its skeleton has %d bones: drawn unskinned.", sd.bone_count - 1, sk->size));
+						mi->subdivision_bone_error = true;
+					}
+				}
+				subdivision_dispatches.push_back(dispatch);
+				continue;
+			}
 			if (mi->surfaces[i].uniform_set[0].is_null() || mi->mesh->surfaces[i]->uniform_set.is_null()) {
 				// Skip over mesh instances that don't require their own uniform buffers.
 				continue;
@@ -1968,7 +2153,91 @@ void MeshStorage::update_mesh_instances() {
 		dirty_mesh_instance_arrays.remove(&mi->array_update_list);
 	}
 
+	if (!subdivision_dispatches.is_empty()) {
+		_update_subdivision_passes(compute_list);
+	}
+
 	RD::get_singleton()->compute_list_end();
+}
+
+// D122 S2: every subdivided surface's passes, phase by phase over all of them: the cage, a
+// barrier, the stencils, a barrier, the normals, a barrier, the write into the instance's buffer.
+// The first three run once per owner surface, the write once per surface.
+void MeshStorage::_update_subdivision_passes(RD::ComputeListID p_compute_list) {
+	RD *rd = RD::get_singleton();
+	if (subdivision_shader.pipeline.is_null()) {
+		ERR_PRINT_ONCE("The subdivision passes have no pipeline: subdivided surfaces keep their rest pose.");
+		return;
+	}
+	rd->compute_list_bind_compute_pipeline(p_compute_list, subdivision_shader.pipeline);
+	for (uint32_t pass = 0; pass < SubdivisionShader::PASS_MAX; pass++) {
+		if (pass > 0) {
+			rd->compute_list_add_barrier(p_compute_list);
+		}
+		for (const SubdivisionDispatch &dispatch : subdivision_dispatches) {
+			const Mesh::Surface &surface = *dispatch.mi->mesh->surfaces[dispatch.surface];
+			const Mesh::Surface::Subdivision &sd = surface.subdivision;
+			if (pass != SubdivisionShader::PASS_WRITE && !sd.owner) {
+				continue;
+			}
+			const Mesh::Surface::Subdivision &owner = dispatch.mi->mesh->surfaces[sd.owner_surface]->subdivision;
+			const MeshInstance::Surface &owner_mis = dispatch.mi->surfaces[sd.owner_surface];
+			const MeshInstance::Surface &mis = dispatch.mi->surfaces[dispatch.surface];
+			const RID surface_set = mis.uniform_set[mis.current_buffer];
+			if (owner_mis.subdivision_owner_set.is_null() || surface_set.is_null()) {
+				ERR_PRINT_ONCE("A subdivided surface's instance has no subdivision uniform set: it keeps its last pose.");
+				continue;
+			}
+
+			SubdivisionShader::PushConstant push_constant = {};
+			push_constant.pass = pass;
+			push_constant.has_skin = dispatch.skin;
+			push_constant.has_blend = dispatch.mi->subdivision_weights_buffer.is_valid();
+			push_constant.cage_positions = owner.cage_positions;
+			push_constant.cage_skin = owner.cage_skin;
+			push_constant.blend_offsets = owner.blend_offsets;
+			push_constant.blend_entries = owner.blend_entries;
+			push_constant.stencil_offsets = owner.stencil_offsets;
+			push_constant.stencil_indices = owner.stencil_indices;
+			push_constant.stencil_weights = owner.stencil_weights;
+			push_constant.stencil_index_16 = owner.stencil_index_16;
+			push_constant.quads = owner.quads;
+			push_constant.normal_offsets = owner.normal_offsets;
+			push_constant.normal_entries = owner.normal_entries;
+			push_constant.index_16 = sd.index_16;
+			push_constant.r_to_u = sd.r_to_u;
+			push_constant.tangent_offsets = sd.tangent_offsets;
+			push_constant.tangent_entries = sd.tangent_entries;
+			push_constant.attribute_stride = sd.attribute_stride;
+			push_constant.uv_offset = sd.uv_offset;
+			push_constant.has_normal = (surface.format & RSE::ARRAY_FORMAT_NORMAL) ? 1 : 0;
+			push_constant.has_tangent = (surface.format & RSE::ARRAY_FORMAT_TANGENT) ? 1 : 0;
+			push_constant.normal_tangent_stride = push_constant.has_normal + push_constant.has_tangent;
+			push_constant.has_uv = (surface.format & RSE::ARRAY_FORMAT_TEX_UV) ? 1 : 0;
+			switch (pass) {
+				case SubdivisionShader::PASS_CAGE:
+					push_constant.count = owner.cage_count;
+					break;
+				case SubdivisionShader::PASS_STENCIL:
+					push_constant.count = owner.u_count;
+					break;
+				case SubdivisionShader::PASS_NORMAL:
+					push_constant.count = owner.own_u_count;
+					break;
+				default:
+					push_constant.count = surface.vertex_count;
+					break;
+			}
+			if (push_constant.count == 0) {
+				continue;
+			}
+			rd->compute_list_bind_uniform_set(p_compute_list, owner_mis.subdivision_owner_set, SubdivisionShader::UNIFORM_SET_OWNER);
+			rd->compute_list_bind_uniform_set(p_compute_list, surface_set, SubdivisionShader::UNIFORM_SET_SURFACE);
+			rd->compute_list_bind_uniform_set(p_compute_list, dispatch.skeleton_set, SubdivisionShader::UNIFORM_SET_SKELETON);
+			rd->compute_list_set_push_constant(p_compute_list, &push_constant, sizeof(SubdivisionShader::PushConstant));
+			rd->compute_list_dispatch_threads(p_compute_list, push_constant.count, 1, 1);
+		}
+	}
 }
 
 RD::VertexFormatID MeshStorage::_mesh_surface_generate_vertex_format(uint64_t p_surface_format, uint64_t p_input_mask, bool p_instanced_surface, bool p_input_motion_vectors, bool p_point_size_emulated, uint32_t &r_position_stride) {

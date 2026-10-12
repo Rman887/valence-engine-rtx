@@ -235,6 +235,9 @@ struct SubdivisionBuilder::Work {
 		LocalVector<int32_t> local_cage; // Per compact cage vertex, its local index, or -1.
 		LocalVector<int32_t> cage_compact; // Per local cage vertex: own, then ghost, each in welded order.
 		uint32_t own_cage_count = 0;
+		// Per local cage vertex, its bones with a non-zero weight in the owner's bind indices, SKIN_NO_BONE
+		// in the other slots; the surfaces' bone bounds read it.
+		LocalVector<uint16_t> cage_binds;
 		uint64_t blend_entries = 0;
 		PayloadWriter owner_payload;
 	};
@@ -1032,6 +1035,7 @@ Error SubdivisionBuilder::_owner_payload(Work &r_work, uint32_t p_part) {
 
 	// The skin in the owner's bind indices: a ghost's joints are found in its receiving owner by name.
 	LocalVector<uint16_t> cage_skin;
+	part.cage_binds.clear();
 	if (r_work.has_skin) {
 		LocalVector<int32_t> to_bind;
 		if (r_work.named_bones) {
@@ -1057,6 +1061,7 @@ Error SubdivisionBuilder::_owner_payload(Work &r_work, uint32_t p_part) {
 					}
 				}
 				cage_skin.push_back(bind);
+				part.cage_binds.push_back(skin[b] == SKIN_NO_BONE ? SKIN_NO_BONE : bind);
 			}
 			for (uint32_t b = 0; b < bones_max; b++) {
 				cage_skin.push_back(skin[bones_max + b]);
@@ -1273,6 +1278,50 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 			}
 		}
 
+		// Bone bounds, which a posed instance's culling bound is made from as RenderingServer's are for a
+		// skinned surface (D122 S2): per bind index, the rest positions of the cage vertices weighted to it
+		// that the surface's stencils reach. A posed refined vertex is a combination with positive weights
+		// (Catmull-Clark's stencils, the skin's) of bone-transformed cage vertices, so it stays inside the
+		// transformed bounds; bounds of the render vertices would not hold it. Unused bones are (-1, -1, -1).
+		Vector<AABB> bone_aabbs;
+		if (r_work.has_skin) {
+			int max_bind = -1;
+			for (uint16_t bind : part.cage_binds) {
+				if (bind != SKIN_NO_BONE) {
+					max_bind = MAX(max_bind, int(bind));
+				}
+			}
+			bone_aabbs.resize(max_bind + 1);
+			AABB *bounds = bone_aabbs.ptrw();
+			for (int b = 0; b <= max_bind; b++) {
+				bounds[b].size = Vector3(-1, -1, -1);
+			}
+			const uint32_t bones_max = RenderingServerTypes::MESH_SUBDIVISION_CAGE_BONES;
+			for (uint32_t r = 0; r < count; r++) {
+				const int32_t welded = part.welded_u[render_keys[r].u];
+				for (uint32_t i = r_work.stencil_offsets[welded]; i < r_work.stencil_offsets[welded + 1]; i++) {
+					const uint32_t compact = r_work.stencil_indices[i];
+					const int32_t c = part.local_cage[compact];
+					for (uint32_t b = 0; b < bones_max; b++) {
+						const uint16_t bind = part.cage_binds[c * bones_max + b];
+						if (bind == SKIN_NO_BONE) {
+							continue;
+						}
+						if (bounds[bind].size.x < 0) {
+							bounds[bind] = AABB(r_work.positions[compact], Vector3(CMP_EPSILON, CMP_EPSILON, CMP_EPSILON));
+						} else {
+							bounds[bind].expand_to(r_work.positions[compact]);
+						}
+					}
+				}
+			}
+			int used = bone_aabbs.size();
+			while (used > 0 && bounds[used - 1].size.x < 0) {
+				used--;
+			}
+			bone_aabbs.resize(used);
+		}
+
 		// Tangents from the triangles' UV gradients, each triangle's corner weighted by its angle,
 		// orthogonalized against the normal. Only a triangle of zero UV area is skipped: the gradients
 		// are taken without dividing by the area, its sign alone orienting them, so tiny UV triangles
@@ -1361,6 +1410,7 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 		// blend-shaped surfaces out. The storages refuse such a hierarchy.
 		const Error err = RS::get_singleton()->mesh_create_surface_data_from_arrays(&surface_data, RSE::PRIMITIVE_TRIANGLES, arrays, Array(), Dictionary(), format_flags, true, names.is_empty());
 		ERR_FAIL_COND_V_MSG(err != OK, err, vformat("Surface %d: the refined arrays were rejected.", s));
+		surface_data.bone_aabbs = bone_aabbs;
 
 		// Tangent adjacency over the surface's final index order (the cluster builder reorders
 		// triangles), each vertex's entries in the order its tangent was summed above. That order is

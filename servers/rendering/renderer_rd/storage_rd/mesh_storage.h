@@ -36,6 +36,7 @@
 #include "core/templates/self_list.h"
 #include "servers/rendering/renderer_compositor.h"
 #include "servers/rendering/renderer_rd/shaders/skeleton.glsl.gen.h"
+#include "servers/rendering/renderer_rd/shaders/subdivision.glsl.gen.h"
 #include "servers/rendering/rendering_server_globals.h"
 #include "servers/rendering/storage/mesh_storage.h"
 #include "servers/rendering/storage/utilities.h"
@@ -150,9 +151,39 @@ private:
 			// describes; the cluster BLAS builds from it. Kept so mesh_get_surface() returns it.
 			Vector<uint8_t> cluster_data;
 			// The subdivision payload (D122), as RenderingServerTypes::SurfaceData::subdivision_data
-			// describes. A subdivided surface has no blend shape buffer and, until the runtime passes
-			// (D122 S2), no deformed buffer: it draws its rest pose. Kept so mesh_get_surface() returns it.
+			// describes. A subdivided surface has no blend shape buffer: an instance's runtime passes
+			// (D122 S2) deform it from its cage. Kept so mesh_get_surface() returns it.
 			Vector<uint8_t> subdivision_data;
+			// What the runtime passes read of a subdivided surface (D122 S2): its payload as uploaded,
+			// its sections as word offsets into it, and on the owner surface the owner sections'.
+			struct Subdivision {
+				RID buffer;
+				bool owner = false;
+				uint32_t owner_surface = 0;
+				uint32_t r_to_u = 0;
+				uint32_t tangent_offsets = 0;
+				uint32_t tangent_entries = 0;
+				uint32_t attribute_stride = 0; // In words; UV0's offset in a vertex's attributes too.
+				uint32_t uv_offset = 0;
+				bool index_16 = false;
+				// The owner's.
+				uint32_t cage_count = 0;
+				uint32_t u_count = 0;
+				uint32_t own_u_count = 0;
+				uint32_t cage_positions = 0;
+				bool has_skin = false;
+				uint32_t cage_skin = 0;
+				uint32_t bone_count = 0; // The cage skin's largest bone plus one: a skeleton needs as many.
+				uint32_t blend_offsets = 0;
+				uint32_t blend_entries = 0;
+				uint32_t stencil_offsets = 0;
+				uint32_t stencil_indices = 0;
+				uint32_t stencil_weights = 0;
+				bool stencil_index_16 = false;
+				uint32_t quads = 0;
+				uint32_t normal_offsets = 0;
+				uint32_t normal_entries = 0;
+			} subdivision;
 			// Geometry residency (D93): with rendering/pathtracing/cluster_lod_stream_geometry and
 			// cluster_lod_stream on, a surface that streams its geometry (its hierarchy's coarse levels
 			// appended to its index data, and mesh_cluster_lod_streamable() and
@@ -203,6 +234,8 @@ private:
 		uint32_t surface_count = 0;
 
 		bool has_bone_weights = false;
+		// A subdivided surface's cage is skinned (D122 S2): the mesh deforms by a skeleton without bone weights of its own.
+		bool has_subdivision_skin = false;
 
 		AABB aabb;
 		AABB custom_aabb;
@@ -237,6 +270,14 @@ private:
 
 			Mesh::Surface::Version *versions = nullptr; //allocated on demand
 			uint32_t version_count = 0;
+
+			// D122 S2, on a subdivided owner surface: the instance's deformed cage, refined positions and
+			// normals, and the uniform set the passes bind them in. A subdivided surface's uniform_set[]
+			// is the passes' surface set, not the skeleton shader's.
+			RID subdivision_cage;
+			RID subdivision_positions;
+			RID subdivision_normals;
+			RID subdivision_owner_set;
 		};
 		LocalVector<Surface> surfaces;
 		LocalVector<float> blend_weights;
@@ -246,6 +287,9 @@ private:
 		uint32_t blend_active_count = 0;
 
 		RID blend_weights_buffer;
+		// D122 S2: every weight, as floats, for the subdivision cage pass's lookup by shape.
+		RID subdivision_weights_buffer;
+		bool subdivision_bone_error = false; // Printed once per instance and skeleton.
 		List<MeshInstance *>::Element *I = nullptr; //used to erase itself
 		uint64_t skeleton_version = 0;
 		bool dirty = false;
@@ -260,6 +304,7 @@ private:
 	RD::VertexFormatID _mesh_surface_generate_vertex_format(uint64_t p_surface_format, uint64_t p_input_mask, bool p_instanced_surface, bool p_input_motion_vectors, bool p_point_size_emulated, uint32_t &r_position_stride);
 	void _mesh_surface_generate_version_for_input_mask(Mesh::Surface::Version &v, Mesh::Surface *s, uint64_t p_input_mask, bool p_input_motion_vectors, bool p_point_size_emulated, MeshInstance::Surface *mis = nullptr, uint32_t p_current_buffer = 0, uint32_t p_previous_buffer = 0);
 	void _mesh_surface_clear(Mesh *p_mesh, int p_surface);
+	void _mesh_surface_set_subdivision(Mesh *p_mesh, Mesh::Surface *p_surface, const RenderingServerTypes::SurfaceData &p_data);
 	// Drops a surface's RAM copy (D93): its hierarchy is gone or no longer describes it, or the
 	// surface is going. A surface whose buffers still hold its fallback level is being freed.
 	void _mesh_surface_clear_ram(Mesh::Surface &r_surface) {
@@ -414,6 +459,73 @@ private:
 
 		RID default_skeleton_uniform_set;
 	} skeleton_shader;
+
+	// D122 S2: the subdivision passes, one pipeline whose push constant picks the pass. Set 0 is the
+	// owner's instance set, set 1 a surface's instance set, set 2 the skeleton shader's skeleton set.
+	struct SubdivisionShader {
+		enum Pass : uint32_t {
+			PASS_CAGE,
+			PASS_STENCIL,
+			PASS_NORMAL,
+			PASS_WRITE,
+			PASS_MAX,
+		};
+		struct PushConstant {
+			uint32_t pass;
+			uint32_t count;
+			uint32_t has_skin;
+			uint32_t has_blend;
+
+			uint32_t cage_positions;
+			uint32_t cage_skin;
+			uint32_t blend_offsets;
+			uint32_t blend_entries;
+
+			uint32_t stencil_offsets;
+			uint32_t stencil_indices;
+			uint32_t stencil_weights;
+			uint32_t stencil_index_16;
+
+			uint32_t quads;
+			uint32_t normal_offsets;
+			uint32_t normal_entries;
+			uint32_t index_16;
+
+			uint32_t r_to_u;
+			uint32_t tangent_offsets;
+			uint32_t tangent_entries;
+			uint32_t attribute_stride;
+
+			uint32_t uv_offset;
+			uint32_t has_normal;
+			uint32_t has_tangent;
+			uint32_t normal_tangent_stride;
+
+			uint32_t has_uv;
+			uint32_t pad[3];
+		};
+		enum {
+			UNIFORM_SET_OWNER = 0,
+			UNIFORM_SET_SURFACE = 1,
+			UNIFORM_SET_SKELETON = 2,
+		};
+
+		SubdivisionShaderRD shader;
+		RID version;
+		RID version_shader;
+		RID pipeline;
+	} subdivision_shader;
+
+	// The subdivided surfaces update_mesh_instances() deforms this frame, after the skeleton shader's.
+	struct SubdivisionDispatch {
+		MeshInstance *mi = nullptr;
+		uint32_t surface = 0;
+		RID skeleton_set;
+		bool skin = false;
+	};
+	LocalVector<SubdivisionDispatch> subdivision_dispatches;
+	void _mesh_instance_add_subdivision_owner(MeshInstance *mi, Mesh *mesh, MeshInstance::Surface *s, uint32_t p_surface);
+	void _update_subdivision_passes(RD::ComputeListID p_compute_list);
 
 	struct Skeleton {
 		bool use_2d = false;

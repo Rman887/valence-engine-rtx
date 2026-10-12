@@ -76,7 +76,7 @@
 	</methods>
 	<members>
 		<member name="blend_shape_mode" type="int" setter="set_blend_shape_mode" getter="get_blend_shape_mode" enum="Mesh.BlendShapeMode" default="0">
-			The blend shape mode of the built meshes. glTF's is [constant Mesh.BLEND_SHAPE_MODE_NORMALIZED].
+			The blend shape mode of the built meshes. glTF's is [constant Mesh.BLEND_SHAPE_MODE_NORMALIZED]. The blend arrays given to [method add_surface] are absolute target positions, and the payload stores each shape's delta, the target minus the base. The runtime passes add the weighted deltas to the cage's rest positions, which is the same sum in either mode, so the mode does not affect them; the meshes keep it as their API.
 		</member>
 		<member name="cage_vertex_count" type="int" setter="set_cage_vertex_count" getter="get_cage_vertex_count" default="0">
 			The welded cage's vertex count, every owner together.

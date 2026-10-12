@@ -984,6 +984,305 @@ TEST_CASE("[SceneTree][SubdivisionBuilder] A bent seam: both owners' payloads gi
 	CHECK(shared == 9);
 }
 
+// The runtime passes on the CPU (D122 S2), as subdivision.glsl computes them from the payload alone,
+// in real_t and in the shader's order of operations: the cage morphed by every weight over 1e-4 and skinned by the bones (a skeleton
+// buffer's 12 floats a bone), the stencil sums, the own refined vertices' normals, and a surface's
+// render vertices with their tangents. Both owners' passes give a seam vertex the bits computed here.
+struct PassResult {
+	LocalVector<Vector3> positions; // Per render vertex.
+	LocalVector<Vector3> normals;
+	LocalVector<Vector3> tangents;
+	LocalVector<float> signs;
+};
+
+static float pass_corner_angle(const Vector3 &p_prev, const Vector3 &p_corner, const Vector3 &p_next) {
+	const Vector3 to_prev = (p_prev - p_corner).normalized();
+	const Vector3 to_next = (p_next - p_corner).normalized();
+	return Math::acos(CLAMP(to_prev.dot(to_next), -1.0f, 1.0f));
+}
+
+static PassResult run_subdivision_passes(const Ref<ArrayMesh> &p_mesh, int p_surface, const LocalVector<float> &p_bones, const LocalVector<float> &p_weights) {
+	PassResult result;
+	const Vector<uint8_t> payload = surface_payload(p_mesh, p_surface);
+	const Vector<uint8_t> owner_payload = surface_payload(p_mesh, int(RenderingServer::mesh_subdivision_data_owner_surface(payload)));
+	uint32_t count = 0;
+	const uint32_t *info = payload_section<uint32_t>(owner_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, count);
+	const float *rest = payload_section<float>(owner_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_POSITIONS, count);
+	const uint16_t *skin = payload_section<uint16_t>(owner_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_SKIN, count);
+	const uint32_t *blend_offsets = payload_section<uint32_t>(owner_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_OFFSETS, count);
+	const uint32_t *blend_entries = payload_section<uint32_t>(owner_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES, count);
+	const uint32_t *stencil_offsets = payload_section<uint32_t>(owner_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_OFFSETS, count);
+	const uint8_t *stencil_indices = payload_section<uint8_t>(owner_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_INDICES, count);
+	const float *stencil_weights = payload_section<float>(owner_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_WEIGHTS, count);
+	const uint32_t *quads = payload_section<uint32_t>(owner_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_QUADS, count);
+	const uint32_t *normal_offsets = payload_section<uint32_t>(owner_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_NORMAL_OFFSETS, count);
+	const uint32_t *normal_entries = payload_section<uint32_t>(owner_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_NORMAL_ENTRIES, count);
+	const uint32_t *r_to_u = payload_section<uint32_t>(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U, count);
+	const uint32_t *tangent_offsets = payload_section<uint32_t>(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_OFFSETS, count);
+	const uint32_t *tangent_entries = payload_section<uint32_t>(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_ENTRIES, count);
+	REQUIRE((info && rest && blend_offsets && stencil_offsets && stencil_indices && stencil_weights && quads && normal_offsets && normal_entries && r_to_u && tangent_offsets && tangent_entries));
+	const uint32_t cage_count = info[RenderingServerTypes::MESH_SUBDIVISION_INFO_CAGE_COUNT];
+	const uint32_t u_count = info[RenderingServerTypes::MESH_SUBDIVISION_INFO_U_COUNT];
+	const bool index_16 = info[RenderingServerTypes::MESH_SUBDIVISION_INFO_STENCIL_INDEX_BYTES] == 2;
+
+	// The cage pass.
+	LocalVector<Vector3> cage;
+	cage.resize(cage_count);
+	for (uint32_t c = 0; c < cage_count; c++) {
+		Vector3 vertex(rest[3 * c], rest[3 * c + 1], rest[3 * c + 2]);
+		if (!p_weights.is_empty()) {
+			Vector3 blend;
+			for (uint32_t e = blend_offsets[c]; e < blend_offsets[c + 1]; e++) {
+				const float w = p_weights[blend_entries[4 * e]];
+				if (Math::abs(w) > 0.0001f) {
+					float delta[3];
+					memcpy(delta, &blend_entries[4 * e + 1], sizeof(delta));
+					blend += Vector3(delta[0], delta[1], delta[2]) * w;
+				}
+			}
+			vertex += blend;
+		}
+		if (skin && !p_bones.is_empty()) {
+			float m[12] = {};
+			for (int b = 0; b < 8; b++) {
+				const uint32_t bone = skin[16 * c + b];
+				const float w = float(skin[16 * c + 8 + b]) / 65535.0f;
+				REQUIRE(bone * 12 < p_bones.size());
+				for (int k = 0; k < 12; k++) {
+					m[k] += p_bones[bone * 12 + k] * w;
+				}
+			}
+			vertex = Vector3(m[0] * vertex.x + m[1] * vertex.y + m[2] * vertex.z + m[3], m[4] * vertex.x + m[5] * vertex.y + m[6] * vertex.z + m[7], m[8] * vertex.x + m[9] * vertex.y + m[10] * vertex.z + m[11]);
+		}
+		cage[c] = vertex;
+	}
+	// The stencil pass.
+	LocalVector<Vector3> positions;
+	positions.resize(u_count);
+	for (uint32_t u = 0; u < u_count; u++) {
+		Vector3 sum;
+		for (uint32_t i = stencil_offsets[u]; i < stencil_offsets[u + 1]; i++) {
+			uint32_t c;
+			if (index_16) {
+				uint16_t narrow;
+				memcpy(&narrow, stencil_indices + 2 * i, 2);
+				c = narrow;
+			} else {
+				memcpy(&c, stencil_indices + 4 * i, 4);
+			}
+			sum += cage[c] * stencil_weights[i];
+		}
+		positions[u] = sum;
+	}
+	// The normal pass.
+	LocalVector<Vector3> normals;
+	normals.resize(info[RenderingServerTypes::MESH_SUBDIVISION_INFO_OWN_U_COUNT]);
+	for (uint32_t u = 0; u < normals.size(); u++) {
+		Vector3 sum;
+		for (uint32_t e = normal_offsets[u]; e < normal_offsets[u + 1]; e++) {
+			const uint32_t *quad = &quads[4 * (normal_entries[e] / 4)];
+			const uint32_t corner = normal_entries[e] % 4;
+			Vector3 p[4];
+			for (int c = 0; c < 4; c++) {
+				p[c] = positions[quad[c]];
+			}
+			const Vector3 face = (p[0] - p[2]).cross(p[1] - p[3]).normalized();
+			sum += face * pass_corner_angle(p[(corner + 3) % 4], p[corner], p[(corner + 1) % 4]);
+		}
+		normals[u] = sum.is_zero_approx() ? Vector3(0, 1, 0) : sum.normalized();
+	}
+	// The write pass.
+	const RenderingServerTypes::SurfaceData surface = RS::get_singleton()->mesh_get_surface(p_mesh->get_rid(), p_surface);
+	const bool surface_index_16 = surface.vertex_count <= 65536;
+	auto index = [&surface, surface_index_16](uint32_t p_i) -> uint32_t {
+		if (surface_index_16) {
+			uint16_t narrow;
+			memcpy(&narrow, surface.index_data.ptr() + 2 * p_i, 2);
+			return narrow;
+		}
+		uint32_t wide;
+		memcpy(&wide, surface.index_data.ptr() + 4 * p_i, 4);
+		return wide;
+	};
+	const PackedVector2Array uvs = p_mesh->surface_get_arrays(p_surface)[Mesh::ARRAY_TEX_UV];
+	REQUIRE(uint32_t(uvs.size()) == surface.vertex_count);
+	for (uint32_t r = 0; r < surface.vertex_count; r++) {
+		const uint32_t u = r_to_u[r];
+		const Vector3 normal = normals[u];
+		result.positions.push_back(positions[u]);
+		result.normals.push_back(normal);
+		Vector3 tangent_sum;
+		Vector3 bitangent_sum;
+		for (uint32_t e = tangent_offsets[r]; e < tangent_offsets[r + 1]; e++) {
+			const uint32_t triangle = tangent_entries[e] / 3;
+			const uint32_t corner = tangent_entries[e] % 3;
+			const uint32_t v[3] = { index(3 * triangle), index(3 * triangle + 1), index(3 * triangle + 2) };
+			const Vector3 p[3] = { positions[r_to_u[v[0]]], positions[r_to_u[v[1]]], positions[r_to_u[v[2]]] };
+			const Vector3 e1 = p[1] - p[0];
+			const Vector3 e2 = p[2] - p[0];
+			const Vector2 d1 = uvs[v[1]] - uvs[v[0]];
+			const Vector2 d2 = uvs[v[2]] - uvs[v[0]];
+			const float det = d1.x * d2.y - d2.x * d1.y;
+			if (det == 0.0f) {
+				continue;
+			}
+			const float orientation = det < 0.0f ? -1.0f : 1.0f;
+			const Vector3 tangent = ((e1 * d2.y - e2 * d1.y) * orientation).normalized();
+			const Vector3 bitangent = ((e2 * d1.x - e1 * d2.x) * orientation).normalized();
+			const float angle = pass_corner_angle(p[(corner + 2) % 3], p[corner], p[(corner + 1) % 3]);
+			tangent_sum += tangent * angle;
+			bitangent_sum += bitangent * angle;
+		}
+		Vector3 t = tangent_sum - normal * normal.dot(tangent_sum);
+		if (t.is_zero_approx()) {
+			t = normal.get_any_perpendicular();
+		}
+		t.normalize();
+		result.tangents.push_back(t);
+		result.signs.push_back(normal.cross(t).dot(bitangent_sum) < 0.0f ? 1.0f : -1.0f);
+	}
+	return result;
+}
+
+// A skeleton buffer's 12 floats a bone: the basis rows, each followed by its origin component.
+static void push_bone(LocalVector<float> &r_bones, const Transform3D &p_transform) {
+	for (int row = 0; row < 3; row++) {
+		for (int column = 0; column < 3; column++) {
+			r_bones.push_back(p_transform.basis.rows[row][column]);
+		}
+		r_bones.push_back(p_transform.origin[row]);
+	}
+}
+
+TEST_CASE("[SceneTree][SubdivisionBuilder] The runtime passes reproduce the rest pose, keep a posed seam's bits, and stay in the bone bounds") {
+	// The bent grid of two owners, skinned to two bones per cage vertex, with two shapes that move
+	// cage vertices on and beside the seam column x = 2.
+	const TestCage grid = make_grid(4, 2, 2, true);
+	TestPrimitive sides[2] = { make_shared_primitive(grid, 0), make_shared_primitive(grid, 1) };
+	for (TestPrimitive &side : sides) {
+		PackedInt32Array bones;
+		PackedFloat32Array weights;
+		for (int v = 0; v < side.cage_vertex.size(); v++) {
+			const int cage = side.cage_vertex[v];
+			const int slots[4] = { cage % 3, (cage + 1) % 3, 0, 0 };
+			const float slot_weights[4] = { 0.75f, 0.25f, 0.0f, 0.0f };
+			for (int b = 0; b < 4; b++) {
+				bones.push_back(slots[b]);
+				weights.push_back(slot_weights[b]);
+			}
+		}
+		side.arrays[Mesh::ARRAY_BONES] = bones;
+		side.arrays[Mesh::ARRAY_WEIGHTS] = weights;
+	}
+	LocalVector<HashMap<int, Vector3>> shapes;
+	shapes.resize(2);
+	shapes[0].insert(7, Vector3(0, 0.3f, 0)); // (2, 1): on the seam.
+	shapes[1].insert(7, Vector3(0.05f, 0, 0));
+	shapes[1].insert(4, Vector3(0, 0, 0.1f)); // (1, 1): owner 0's, a ghost of owner 1's.
+	PackedStringArray names;
+	names.push_back("A");
+	names.push_back("B");
+	Ref<SubdivisionBuilder> builder;
+	builder.instantiate();
+	builder->set_cage_vertex_count(grid.positions.size());
+	builder->set_owner_bone_names(0, test_bone_names());
+	builder->set_owner_bone_names(1, test_bone_names());
+	builder->add_face_varying_layer(grid_uvs(grid, Vector2(0.25f, 0), Vector2(0, 0.5f)), Mesh::ARRAY_TEX_UV);
+	for (int owner = 0; owner < 2; owner++) {
+		Array weld;
+		weld.push_back(sides[owner].uv_weld);
+		builder->add_surface(owner, sides[owner].arrays, make_blend_arrays(sides[owner], shapes), names, sides[owner].cage_vertex, sides[owner].faces, weld, Ref<Material>());
+	}
+	REQUIRE(builder->build(2) == OK);
+	const Ref<ArrayMesh> meshes[2] = { builder->get_owner_mesh(0), builder->get_owner_mesh(1) };
+	REQUIRE((meshes[0].is_valid() && meshes[1].is_valid()));
+
+	const Transform3D pose[3] = {
+		Transform3D(),
+		Transform3D(Basis(Vector3(1, 0, 0), 0.5f), Vector3(0, 0.2f, 0)),
+		Transform3D(Basis(Vector3(0, 0, 1), -0.4f), Vector3(0.1f, 0, 0)),
+	};
+	LocalVector<float> posed;
+	for (const Transform3D &bone : pose) {
+		push_bone(posed, bone);
+	}
+	const LocalVector<float> no_weights = { 0.0f, 0.0f };
+	const LocalVector<float> weights = { 0.7f, -0.3f };
+
+	PassResult rest[2];
+	PassResult moved[2];
+	for (int owner = 0; owner < 2; owner++) {
+		// At rest, from the payload alone, the surface the builder made: positions, normals, tangents.
+		// Unskinned: two quantized skin weights do not sum to exactly 1.
+		rest[owner] = run_subdivision_passes(meshes[owner], 0, LocalVector<float>(), no_weights);
+		const Array arrays = meshes[owner]->surface_get_arrays(0);
+		const PackedVector3Array positions = arrays[Mesh::ARRAY_VERTEX];
+		const PackedVector3Array normals = arrays[Mesh::ARRAY_NORMAL];
+		const PackedFloat32Array tangents = arrays[Mesh::ARRAY_TANGENT];
+		REQUIRE(rest[owner].positions.size() == uint32_t(positions.size()));
+		REQUIRE(tangents.size() == 4 * positions.size());
+		for (int r = 0; r < positions.size(); r++) {
+			CHECK(rest[owner].positions[r].is_equal_approx(positions[r]));
+			CHECK(rest[owner].normals[r].dot(normals[r]) > 0.9999f); // The surface's are octahedron-encoded.
+			CHECK(rest[owner].tangents[r].dot(Vector3(tangents[4 * r], tangents[4 * r + 1], tangents[4 * r + 2])) > 0.999f);
+			CHECK(rest[owner].signs[r] == tangents[4 * r + 3]);
+		}
+		moved[owner] = run_subdivision_passes(meshes[owner], 0, posed, weights);
+	}
+
+	// Posed and morphed, a seam vertex has the same position and normal bits on both owners.
+	uint32_t count = 0;
+	const Vector<uint8_t> payloads[2] = { surface_payload(meshes[0], 0), surface_payload(meshes[1], 0) };
+	const uint32_t *r_to_u[2];
+	const uint32_t *welded[2];
+	for (int owner = 0; owner < 2; owner++) {
+		r_to_u[owner] = payload_section<uint32_t>(payloads[owner], RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U, count);
+		welded[owner] = payload_section<uint32_t>(payloads[owner], RenderingServerTypes::MESH_SUBDIVISION_SECTION_U_WELDED, count);
+		REQUIRE((r_to_u[owner] && welded[owner]));
+	}
+	HashMap<uint32_t, uint32_t> left_vertex;
+	for (uint32_t r = 0; r < moved[0].positions.size(); r++) {
+		left_vertex.insert(welded[0][r_to_u[0][r]], r);
+	}
+	int seam = 0;
+	float largest_move = 0.0f;
+	for (uint32_t r = 0; r < moved[1].positions.size(); r++) {
+		largest_move = MAX(largest_move, moved[1].positions[r].distance_to(rest[1].positions[r]));
+		const uint32_t *l = left_vertex.getptr(welded[1][r_to_u[1][r]]);
+		if (l == nullptr) {
+			continue;
+		}
+		seam++;
+		CHECK(memcmp(&moved[0].positions[*l], &moved[1].positions[r], sizeof(Vector3)) == 0);
+		CHECK(memcmp(&moved[0].normals[*l], &moved[1].normals[r], sizeof(Vector3)) == 0);
+	}
+	CHECK(seam == 9);
+	CHECK(largest_move > 0.05f);
+
+	// The bone bounds (the cage vertices weighted to each bone), transformed by the pose as
+	// mesh_get_aabb() transforms them, hold every posed render vertex. Morphs are outside them, as on
+	// every skinned Godot mesh, so this pose has no weights.
+	for (int owner = 0; owner < 2; owner++) {
+		const Vector<AABB> bounds = RS::get_singleton()->mesh_get_surface(meshes[owner]->get_rid(), 0).bone_aabbs;
+		REQUIRE(bounds.size() == 3);
+		AABB merged;
+		for (int b = 0; b < bounds.size(); b++) {
+			REQUIRE(bounds[b].size.x >= 0.0f); // Every bone is used.
+			const AABB transformed = pose[b].xform(bounds[b]);
+			merged = b == 0 ? transformed : merged.merge(transformed);
+		}
+		const PassResult skinned = run_subdivision_passes(meshes[owner], 0, posed, no_weights);
+		const AABB grown = merged.grow(1e-4f);
+		for (const Vector3 &position : skinned.positions) {
+			CHECK(grown.has_point(position));
+		}
+	}
+	// An unskinned cage gives no bone bounds.
+	const TestCage plain = make_grid(2, 2, -1, false);
+	const Ref<ArrayMesh> unskinned = build_grid(plain, grid_uvs(plain, Vector2(1, 0), Vector2(0, 1)));
+	CHECK(RS::get_singleton()->mesh_get_surface(unskinned->get_rid(), 0).bone_aabbs.is_empty());
+}
+
 TEST_CASE("[SceneTree][SubdivisionBuilder] The same input builds the same bytes") {
 	const TestCage strip = make_strip();
 	LocalVector<HashMap<int, Vector3>> shapes;

@@ -903,8 +903,9 @@ Files extracted from upstream repository:
 - `opensubdiv/version.h`, `opensubdiv/version.cpp`
 - `LICENSE.txt`, `NOTICE.txt`
 
-Not yet compiled: it is the stencil builder for runtime character subdivision (D122,
-`docs/character-subdivision.md` in the Valence repository), which a later commit wires in.
+Compiled by `modules/opensubdiv` (D122 S1, `docs/character-subdivision.md` in the Valence
+repository): its `SubdivisionBuilder` refines subdivision cages and builds their stencil tables at
+import.
 
 
 ## openxr

@@ -1,0 +1,34 @@
+#!/usr/bin/env python
+from misc.utility.scons_hints import *
+
+Import("env")
+Import("env_modules")
+
+env_opensubdiv = env_modules.Clone()
+
+# Thirdparty source files: OpenSubdiv's CPU core (sdc, vtr, far), D122.
+
+thirdparty_obj = []
+
+thirdparty_dir = "#thirdparty/opensubdiv/"
+
+env_opensubdiv.Prepend(CPPPATH=[thirdparty_dir])
+# OpenSubdiv's Catmull-Clark rules use M_PI, which MSVC's <cmath> defines only on request.
+env_opensubdiv.Append(CPPDEFINES=["_USE_MATH_DEFINES"])
+
+env_thirdparty = env_opensubdiv.Clone()
+env_thirdparty.disable_warnings()
+env_thirdparty.add_source_files(thirdparty_obj, thirdparty_dir + "opensubdiv/version.cpp")
+for subdir in ["sdc", "vtr", "far"]:
+    env_thirdparty.add_source_files(thirdparty_obj, thirdparty_dir + "opensubdiv/" + subdir + "/*.cpp")
+env.modules_sources += thirdparty_obj
+
+# Godot source files
+
+module_obj = []
+
+env_opensubdiv.add_source_files(module_obj, "*.cpp")
+env.modules_sources += module_obj
+
+# Needed to force rebuilding the module files when the thirdparty library is updated.
+env.Depends(module_obj, thirdparty_obj)

@@ -332,17 +332,31 @@ bool ray_query_alpha_test(uint geometry_idx, int cluster_id, uint primitive, vec
 // Shadow Ray (an inline ray query, or the traceRayEXT pipeline)
 // ============================================================================
 
+/// VAL: a shadow ray leaves from RT_SHADOW_TMIN and stops RT_SHADOW_TMIN short of the light (max_dist - RT_SHADOW_TMIN).
+#define RT_SHADOW_TMIN 0.001
+
+/// VAL: whether a shadow ray's interval is empty: a light sample closer than twice RT_SHADOW_TMIN (or a distance that
+/// is not a number). Nothing can occlude an empty interval, so the light is visible, and no trace is made: a ray whose
+/// tmin exceeds its tmax is undefined behaviour in Vulkan (VUID-RuntimeSpirv-OpRayQueryInitializeKHR-06350,
+/// OpTraceRayKHR-06357, OpHitObjectTraceRayEXT-11880), and a negative or NaN tmax breaks -06349/-06351 and their twins.
+bool lights_shadow_interval_empty(float max_dist) {
+	return !(max_dist - RT_SHADOW_TMIN >= RT_SHADOW_TMIN);
+}
+
 /// The shadow ray through the pipeline: every candidate is decided by its hit group's any-hit (an alpha
 /// test) or intersection shader. Returns true if the light is visible.
 /// SkipClosestHitShader: only any_hit (alpha test) and miss are invoked.
 /// TerminateOnFirstHit causes early exit on first confirmed opaque hit.
 bool lights_trace_shadow_ray_pipeline(vec3 origin, vec3 direction, float max_dist, uint omm_flags) {
+	if (lights_shadow_interval_empty(max_dist)) {
+		return true;
+	}
 #if defined(USE_SER)
 	hitObjectEXT hitObject;
 	hitObjectTraceRayEXT(hitObject, tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT | omm_flags,
 			RT_MASK_SHADOW, 0, 0, 0,
-			origin, 0.001, direction, max_dist - 0.001, 0);
+			origin, RT_SHADOW_TMIN, direction, max_dist - RT_SHADOW_TMIN, 0);
 
 	return !(hitObjectIsHitEXT(hitObject));
 #else
@@ -373,7 +387,7 @@ bool lights_trace_shadow_ray_pipeline(vec3 origin, vec3 direction, float max_dis
 	traceRayEXT(tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT | omm_flags,
 			RT_MASK_SHADOW, 0, 0, 0,
-			origin, 0.001, direction, max_dist - 0.001, 0);
+			origin, RT_SHADOW_TMIN, direction, max_dist - RT_SHADOW_TMIN, 0);
 
 	// Unpack to check visibility (miss shader packs radiance = 1.0).
 	shadow_ps = path_unpack(payload);
@@ -412,9 +426,13 @@ bool lights_shadow_candidate_inline(rayQueryEXT p_query) {
 #define RT_SHADOW_VISIBLE 1u
 #define RT_SHADOW_UNRESOLVED 2u // A candidate only the pipeline's shaders can decide, and nothing committed.
 
-/// The shadow ray's inline decision: occluded, visible, or unresolved (always, without USE_RAY_QUERY_SHADOWS).
+/// The shadow ray's inline decision: occluded, visible, or unresolved (always without USE_RAY_QUERY_SHADOWS, but for an
+/// empty interval, which is visible).
 /// omm_flags: RT_OMM_RAY_FLAGS of the vertex's arriving diffuse count (D96 OMMe).
 uint lights_shadow_ray_inline(vec3 origin, vec3 direction, float max_dist, uint omm_flags) {
+	if (lights_shadow_interval_empty(max_dist)) {
+		return RT_SHADOW_VISIBLE;
+	}
 #ifdef USE_RAY_QUERY_SHADOWS
 	// VAL (P1k, docs/gpu-audit-2026-10.md): an inline query, which spills nothing of the hit's shading state around a
 	// nested trace. Opaque instances commit without a candidate, and a standard material's alpha is tested here as its
@@ -425,7 +443,7 @@ uint lights_shadow_ray_inline(vec3 origin, vec3 direction, float max_dist, uint 
 	rayQueryEXT shadow_rq;
 	rayQueryInitializeEXT(shadow_rq, tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | omm_flags,
-			RT_MASK_SHADOW, origin, 0.001, direction, max_dist - 0.001);
+			RT_MASK_SHADOW, origin, RT_SHADOW_TMIN, direction, max_dist - RT_SHADOW_TMIN);
 
 	bool unresolved = false;
 	while (rayQueryProceedEXT(shadow_rq)) {

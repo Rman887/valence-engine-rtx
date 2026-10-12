@@ -220,6 +220,12 @@ layout(set = 1, binding = 0) uniform accelerationStructureEXT rt_tlas;
 #define RT_MASK_SHADOW 0x02u
 
 float rt_shadow(vec3 view_pos, vec3 dir_view, float max_dist) {
+	// VAL: a ray shorter than the query's tmin (a froxel within 0.1 m of a light, the callers stopping 0.05 m short of it)
+	// has an empty interval: nothing occludes it, and a query whose tmin exceeds its tmax is undefined behaviour in
+	// Vulkan (VUID-RuntimeSpirv-OpRayQueryInitializeKHR-06350).
+	if (!(max_dist >= 0.05)) {
+		return 1.0;
+	}
 	mat3 cam_rotation = mat3(params.cam_rotation);
 	vec3 origin = cam_rotation * view_pos + params.rt_cam_offset;
 	rayQueryEXT rq;

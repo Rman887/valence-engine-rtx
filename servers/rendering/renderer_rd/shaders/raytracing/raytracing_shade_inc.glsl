@@ -692,6 +692,11 @@ uint subsurface_walk(HitData h, vec3 p_albedo, bool p_skin, vec3 N, float hit_t,
 		float travelled = 0.0;
 		float step_tmin = event == 0u ? min(entry_tmin, t) : 0.0;
 		for (uint skip = 0u; skip <= RT_SUBSURFACE_MAX_SKIPS && travelled < t; skip++) {
+			// VAL: past a front face the query starts entry_tmin on, and a step with less than that left has an empty
+			// interval: no face ends it, and a query whose tmin exceeds its tmax is undefined (lights_shadow_interval_empty).
+			if (!(t - travelled >= step_tmin)) {
+				break;
+			}
 			rayQueryEXT q;
 			rayQueryInitializeEXT(q, tlas, gl_RayFlagsOpaqueEXT, RT_MASK_SUBSURFACE, h.hit_pos + (local + direction * travelled), step_tmin, direction, t - travelled);
 			while (rayQueryProceedEXT(q)) {

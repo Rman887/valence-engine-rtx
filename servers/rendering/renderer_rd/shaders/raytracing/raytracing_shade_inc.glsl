@@ -790,9 +790,21 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	ps.packed_bounces_flags = set_back_offset(ps.packed_bounces_flags, false);
 #ifdef RT_SUBSURFACE_COMPILED
 	ps.packed_bounces_flags &= ~SUBSURFACE_EXIT_FLAG; // And so is the previous vertex's walk exit (D120).
+	// The raygen reads the exit only under the flag, which only a walk below sets again with its own exit, so the
+	// incoming one is not carried through the shading (GPU audit P3e step 3).
+	ps.exit_position = vec3(0.0);
 #endif
 	// The ray cone moves to the hit (D116), which is the next ray's origin on every exit.
 	ps.cone_width += ps.cone_spread * hit_t;
+	// The densities the previous vertex drew with are read once more, by the emitter weight below. A path that ends here
+	// returns none of them, and every exit that continues writes them again (shade_direct_light, the scatter, the
+	// refraction), so the incoming values are not carried through the shading (GPU audit P3e step 3).
+	float incoming_bsdf_pdf = ps.bsdf_pdf;
+	float incoming_sky_probability = ps.sky_probability;
+	float incoming_tree_total = ps.tree_total;
+	ps.bsdf_pdf = RT_BSDF_PDF_DELTA;
+	ps.sky_probability = 0.0;
+	ps.tree_total = 0.0;
 
 	vec3 V = -ray_dir;
 
@@ -800,8 +812,8 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	vec3 N = clampShadingNormal(m.normal, h.geometry_normal, V, RT_SHADING_NORMAL_CLAMP_THRESHOLD);
 	float NdotV = max(dot(N, V), 0.0001);
 
-	uint total_bounces = get_total_bounces(ps.packed_bounces_flags);
-	uint diffuse_bounces = get_diffuse_bounces(ps.packed_bounces_flags);
+	// The bounce counts are read from the flags where they are used, rather than cached here: the flags are live through
+	// the shading anyway, and nothing below changes the counts before their last use (GPU audit P3e step 3).
 
 	// Media on this segment (D37): the camera segment is composed in the raygen over the whole
 	// path; every later segment is charged here, over its own length. Inside a medium (D49) the
@@ -810,7 +822,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	bool in_medium = is_in_medium(ps.packed_bounces_flags);
 	if (in_medium) {
 		apply_segment_medium(hit_t, ps);
-	} else if (total_bounces > 0u) {
+	} else if (get_total_bounces(ps.packed_bounces_flags) > 0u) {
 		apply_segment_fog(ray_dir, hit_t, ps.radiance, ps.throughput);
 	}
 
@@ -819,22 +831,22 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	// a surface the emissive list does not carry, since light sampling never reaches it.
 	uint rt_emissive_count = uint(get_rt_param(RT_PARAM_EMISSIVE_COUNT));
 	float emissive_weight = 1.0;
-	if (total_bounces > 0u && rt_emissive_count > 0u && ps.bsdf_pdf != RT_BSDF_PDF_DELTA && any(greaterThan(m.emissive, vec3(0.0)))) {
+	if (get_total_bounces(ps.packed_bounces_flags) > 0u && rt_emissive_count > 0u && incoming_bsdf_pdf != RT_BSDF_PDF_DELTA && any(greaterThan(m.emissive, vec3(0.0)))) {
 		float pdf_light;
 		if (light_tree_enabled()) {
 			// The light tree's probability of this entry at the previous vertex (D55): its cut node scored at
 			// the ray's origin and the offset normal the payload carried from there, over the top's total
 			// the payload carried too (GPU audit light 1a).
 			uint entry = emissive_find_entry(h.geometry_idx, rt_emissive_count);
-			float p_instance = (entry < rt_emissive_count) ? light_tree_emissive_probability(entry, shade_previous_origin(h, ray_dir, hit_t), ps.offset_normal, is_light_tree_indirect(ps.packed_bounces_flags), ps.tree_total) : 0.0;
+			float p_instance = (entry < rt_emissive_count) ? light_tree_emissive_probability(entry, shade_previous_origin(h, ray_dir, hit_t), ps.offset_normal, is_light_tree_indirect(ps.packed_bounces_flags), incoming_tree_total) : 0.0;
 			pdf_light = (entry < rt_emissive_count) ? emissive_hit_pdf_entry(entry, p_instance, h.primitive_id, ray_dir, hit_t, h.is_front_face) : 0.0;
 		} else {
 			// The sky's share of the light samples (D54), 0 without a sky light; the surface lights
 			// split the rest, so their densities carry the remainder on both sides of the weight. It is
 			// the previous vertex's share as drawn there, carried in the payload (GPU audit 4a).
-			pdf_light = (1.0 - ps.sky_probability) * get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY) * emissive_hit_pdf(h.geometry_idx, h.primitive_id, ray_dir, hit_t, h.is_front_face, rt_emissive_count);
+			pdf_light = (1.0 - incoming_sky_probability) * get_rt_param(RT_PARAM_EMISSIVE_PROBABILITY) * emissive_hit_pdf(h.geometry_idx, h.primitive_id, ray_dir, hit_t, h.is_front_face, rt_emissive_count);
 		}
-		emissive_weight = emissive_mis_weight(ps.bsdf_pdf, pdf_light);
+		emissive_weight = emissive_mis_weight(incoming_bsdf_pdf, pdf_light);
 	}
 	// A decal's emission (D104) is not in the emissive list, so the BSDF ray is its only estimator.
 	vec3 emitted = ps.throughput * m.emissive * emissive_weight + ps.throughput * m.decal_emissive;
@@ -930,7 +942,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	// DLSS Ray Reconstruction output (primary ray, sample 0 only)
 	// =================================================================
 #ifdef DLSS_RR_ENABLED
-	if (total_bounces == 0u && is_sample_zero(ps.packed_bounces_flags)) {
+	if (get_total_bounces(ps.packed_bounces_flags) == 0u && is_sample_zero(ps.packed_bounces_flags)) {
 		ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
 
 		// The transmitted radiance is demodulated as diffuse: the guide carries the transmitted fraction on top of the diffuse remainder.
@@ -1018,13 +1030,13 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 #if 2 * RT_LIGHT_RESERVOIR_SIZE + 5 > 40 || 2 * RT_LIGHT_TREE_MAX_CANDIDATES + 4 > 40
 #error RT_SOBOL_DIM_SCATTER must exceed the light sampling paths' draw counts
 #endif
-	rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE);
-	shade_direct_light(h.hit_pos, h.geometry_normal, hit_t, N, V, brdf_mat, diffuse_transmit_max, diffuse_bounces, rt_emissive_count, in_medium, 0u, ps);
+	rng_set_dimension(ps.rng_state, get_total_bounces(ps.packed_bounces_flags) * RT_SOBOL_DIMS_PER_BOUNCE);
+	shade_direct_light(h.hit_pos, h.geometry_normal, hit_t, N, V, brdf_mat, diffuse_transmit_max, get_diffuse_bounces(ps.packed_bounces_flags), rt_emissive_count, in_medium, 0u, ps);
 
 	// =================================================================
 	// Transmission: refract through the surface with probability transmit_p
 	// =================================================================
-	rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER);
+	rng_set_dimension(ps.rng_state, get_total_bounces(ps.packed_bounces_flags) * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER);
 	if (transmit_p > 0.0) {
 		if (rand(ps.rng_state) < transmit_p) {
 			vec3 refracted = refract(-V, N, refract_eta);
@@ -1075,9 +1087,9 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	float coat_p = clearcoatProbability(brdf_mat, N, V, specularF0, diffuseReflectance);
 	bool coat_sampled = coat_p >= 1.0;
 	if (coat_p > 0.0 && coat_p < 1.0) {
-		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_CLEARCOAT);
+		rng_set_dimension(ps.rng_state, get_total_bounces(ps.packed_bounces_flags) * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_CLEARCOAT);
 		coat_sampled = rand(ps.rng_state) < coat_p;
-		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER + (transmit_p > 0.0 ? 1u : 0u));
+		rng_set_dimension(ps.rng_state, get_total_bounces(ps.packed_bounces_flags) * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER + (transmit_p > 0.0 ? 1u : 0u));
 		ps.throughput /= coat_sampled ? coat_p : (1.0 - coat_p);
 	}
 	// VAL: a sheen (D118 MM3) is chosen next, under the coat and over the base's lobes, with the probability brdf_pdf
@@ -1085,9 +1097,9 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	float sheen_p = coat_sampled ? 0.0 : sheenProbability(brdf_mat, N, V, specularF0, diffuseReflectance);
 	bool sheen_sampled = sheen_p >= 1.0;
 	if (sheen_p > 0.0 && sheen_p < 1.0) {
-		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SHEEN);
+		rng_set_dimension(ps.rng_state, get_total_bounces(ps.packed_bounces_flags) * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SHEEN);
 		sheen_sampled = rand(ps.rng_state) < sheen_p;
-		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER + (transmit_p > 0.0 ? 1u : 0u));
+		rng_set_dimension(ps.rng_state, get_total_bounces(ps.packed_bounces_flags) * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER + (transmit_p > 0.0 ? 1u : 0u));
 		ps.throughput /= sheen_sampled ? sheen_p : (1.0 - sheen_p);
 	}
 
@@ -1097,9 +1109,9 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	float diffuse_transmit_p = (diffuse_transmit_max > 0.0 && !coat_sampled && !sheen_sampled) ? diffuseTransmissionProbability(specularF0, diffuseReflectance, m.diffuse_transmission) : 0.0;
 	bool diffuse_transmitted = false;
 	if (diffuse_transmit_p > 0.0) {
-		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_DIFFUSE_TRANSMISSION);
+		rng_set_dimension(ps.rng_state, get_total_bounces(ps.packed_bounces_flags) * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_DIFFUSE_TRANSMISSION);
 		diffuse_transmitted = rand(ps.rng_state) < diffuse_transmit_p;
-		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER + (transmit_p > 0.0 ? 1u : 0u));
+		rng_set_dimension(ps.rng_state, get_total_bounces(ps.packed_bounces_flags) * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER + (transmit_p > 0.0 ? 1u : 0u));
 		ps.throughput /= diffuse_transmitted ? diffuse_transmit_p : (1.0 - diffuse_transmit_p);
 	}
 
@@ -1174,11 +1186,11 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	MaterialProperties exit_mat = brdf_mat;
 	// Only from outside: a back face (seen from inside an open mesh) keeps the plain diffuse bounce.
 	if (brdfType == DIFFUSE_TYPE && !coat_sampled && !sheen_sampled && !diffuse_transmitted && brdf_mat.subsurface > 0.0 && h.is_front_face) {
-		rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SUBSURFACE);
+		rng_set_dimension(ps.rng_state, get_total_bounces(ps.packed_bounces_flags) * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SUBSURFACE);
 		if (rand(ps.rng_state) < brdf_mat.subsurface) {
 			float exit_t;
 			uint events, skips;
-			uint seed = pcg_hash(ps.rng_state ^ pcg_hash(rt_pixel_seed() + total_bounces * 0x9e3779b9u));
+			uint seed = pcg_hash(ps.rng_state ^ pcg_hash(rt_pixel_seed() + get_total_bounces(ps.packed_bounces_flags) * 0x9e3779b9u));
 			uint status = subsurface_walk(h, m.albedo, m.subsurface_skin, N, hit_t, seed, ps.throughput, exit_position, exit_normal, exit_shading_normal, exit_t, events, skips);
 #ifdef RT_SUBSURFACE_STATS
 			if (((gl_LaunchIDEXT.x | gl_LaunchIDEXT.y) & 7u) == 0u) {
@@ -1215,10 +1227,10 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 			// block. Past
 			// the walk the path has scattered, so its light is indirect for the clamp (D53).
 			ps.packed_bounces_flags = set_scattered(ps.packed_bounces_flags);
-			rng_set_dimension(ps.rng_state, RT_SOBOL_DIM_SUBSURFACE_EXIT_BASE + total_bounces * RT_SOBOL_DIMS_PER_BOUNCE);
-			shade_direct_light(exit_position, exit_normal, exit_t, exit_shading_normal, exit_shading_normal, exit_mat, 0.0, diffuse_bounces, rt_emissive_count, in_medium, 1u, ps);
+			rng_set_dimension(ps.rng_state, RT_SOBOL_DIM_SUBSURFACE_EXIT_BASE + get_total_bounces(ps.packed_bounces_flags) * RT_SOBOL_DIMS_PER_BOUNCE);
+			shade_direct_light(exit_position, exit_normal, exit_t, exit_shading_normal, exit_shading_normal, exit_mat, 0.0, get_diffuse_bounces(ps.packed_bounces_flags), rt_emissive_count, in_medium, 1u, ps);
 			// And its direction: the cosine cancels its density, leaving a weight of 1.
-			rng_set_dimension(ps.rng_state, RT_SOBOL_DIM_SUBSURFACE_EXIT_BASE + total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER);
+			rng_set_dimension(ps.rng_state, RT_SOBOL_DIM_SUBSURFACE_EXIT_BASE + get_total_bounces(ps.packed_bounces_flags) * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_SCATTER);
 			next_dir = rotatePoint(getRotationFromZAxis(exit_shading_normal), sampleHemisphere(rand2(ps.rng_state)));
 			// A direction the shading normal tilts below the exit's plane is mirrored above it, as the hit's recovery does.
 			float exit_below = dot(next_dir, exit_normal);
@@ -1240,7 +1252,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	if ((RT_FLAGS & RT_FLAG_RUSSIAN_ROULETTE) != 0u && is_scattered(ps.packed_bounces_flags)) {
 		float survive = max(ps.throughput.r, max(ps.throughput.g, ps.throughput.b));
 		if (!(survive >= 1.0)) {
-			rng_set_dimension(ps.rng_state, total_bounces * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_ROULETTE);
+			rng_set_dimension(ps.rng_state, get_total_bounces(ps.packed_bounces_flags) * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_ROULETTE);
 			if (!(rand(ps.rng_state) < survive)) {
 				ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
 				return;

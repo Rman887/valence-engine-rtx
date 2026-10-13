@@ -672,9 +672,27 @@ void RenderForwardClusteredPT::_free_rt_viewport_state(RenderSceneBuffersRD *p_r
 void RenderForwardClusteredPT::geometry_instance_free(RenderGeometryInstance *p_geometry_instance) {
 	// Its PTLAS slots (D94b) are released first: every viewport disables them at its next build.
 	if (raytracing && p_geometry_instance) {
-		raytracing->release_slot_ranges(static_cast<GeometryInstanceForwardClustered *>(p_geometry_instance)->rt_slots);
+		GeometryInstanceForwardClustered *ginstance = static_cast<GeometryInstanceForwardClustered *>(p_geometry_instance);
+		raytracing->release_slot_ranges(ginstance->rt_slots);
+		// Its deformed entries go with it (D122 S5), from its caches and from those a rebuild has not taken back.
+		for (GeometryInstanceSurfaceDataCache *surf = ginstance->surface_caches; surf; surf = surf->next) {
+			if (surf->rt_deformed_handle.is_valid()) {
+				raytracing->release_deformed_handle(surf->rt_deformed_handle);
+			}
+		}
+		for (const GeometryInstanceForwardClustered::RTKeptHandles &kept : ginstance->rt_handles_kept) {
+			if (kept.deformed.is_valid()) {
+				raytracing->release_deformed_handle(kept.deformed);
+			}
+		}
 	}
 	RenderForwardClustered::geometry_instance_free(p_geometry_instance);
+}
+
+void RenderForwardClusteredPT::_release_rt_deformed_handle(RID p_handle) {
+	if (raytracing) {
+		raytracing->release_deformed_handle(p_handle);
+	}
 }
 
 void RenderForwardClusteredPT::_geometry_instance_base_changed(GeometryInstanceForwardClustered *p_geometry_instance) {

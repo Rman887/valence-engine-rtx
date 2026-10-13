@@ -2146,6 +2146,7 @@ class RenderRaytracing {
 	void _light_tree_map_emissive(RTLightTree &r_tree, uint32_t p_emissive_count); // Each emissive entry's cut slots and leaf position.
 	bool _refit_light_tree(RTLightTree &r_tree, uint32_t p_emissive_count, uint32_t p_cut_size, uint32_t p_cut_indirect_size, bool p_power_pick); // P2i: false when the structure changed.
 	void _release_deformed_blas(RTDeformedCacheEntry &p_entry);
+	void _free_deformed_entry(RTDeformedCacheEntry &p_entry);
 	// The deformed triangle BLAS over owned_vb_full, carrying the micromap the walk wants (D96 OMMc).
 	void _build_deformed_triangle_blas(RID p_handle, RTDeformedCacheEntry &r_entry, void *p_mesh_surface, uint32_t p_cache_key, uint32_t p_surface_counter, LocalVector<RID> &r_dirty_blas_list);
 	// The deformed cluster layout, its CLAS carrying the micromap the walk wants (D96 OMMd); as _populate_deformed_cluster_layout.
@@ -2691,6 +2692,9 @@ public:
 	void release_slot_ranges(RTSlotOwner &r_owner);
 	// Releases the ranges of surface indices from p_surface_count on, as a mesh swapped in place drops them (D95).
 	void release_slot_ranges_from(RTSlotOwner &r_owner, uint32_t p_surface_count);
+	// Releases a deformed entry no surface cache holds any more (its mesh swapped out, its instance freed) at once,
+	// as the expiry would deformed_mesh_cache_ttl_frames later (D122 S5).
+	void release_deformed_handle(RID p_handle);
 	// Releases the RT cache entry of a surface its mesh is dropping (MeshStorage's surface-freed callback).
 	void release_mesh_surface(RID p_mesh, uint32_t p_surface);
 

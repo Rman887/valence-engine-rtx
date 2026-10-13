@@ -4465,6 +4465,9 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 			GeometryInstanceForwardClustered::RTKeptHandles &kept = ginstance->rt_handles_kept[i];
 			if (kept.surface == sdcache->surface && kept.chain_index == chain_index) {
 				sdcache->rt_deformed_handle = ginstance->mesh_instance.is_valid() ? kept.deformed : RID();
+				if (!ginstance->mesh_instance.is_valid() && kept.deformed.is_valid()) {
+					_release_rt_deformed_handle(kept.deformed);
+				}
 				sdcache->rt_lod_handle = kept.lod;
 				ginstance->rt_handles_kept.remove_at_unordered(i);
 				break;
@@ -4738,7 +4741,14 @@ void RenderForwardClustered::_geometry_instance_update(RenderGeometryInstance *p
 		ginstance->data->dirty_dependencies = false;
 	}
 
-	// Handles no rebuilt cache took back (a surface or a pass gone) idle out in the path tracer's pools (D110).
+	// Handles no rebuilt cache took back (a surface or a pass gone, a mesh swapped out): the deformed entries are
+	// released at once (D122 S5); the LOD slots idle out in the path tracer's pool (D110), since another
+	// instance may trace a slot's build as its stand-in (D89, D113).
+	for (const GeometryInstanceForwardClustered::RTKeptHandles &kept : ginstance->rt_handles_kept) {
+		if (kept.deformed.is_valid()) {
+			_release_rt_deformed_handle(kept.deformed);
+		}
+	}
 	ginstance->rt_handles_kept.clear();
 
 	ginstance->dirty_list_element.remove_from_list();

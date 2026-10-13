@@ -52,6 +52,7 @@ protected:
 	virtual void _render_buffers_debug_draw(const RenderDataRD *p_render_data) override;
 	virtual void _free_rt_viewport_state(RenderSceneBuffersRD *p_render_buffers) override;
 	virtual void _geometry_instance_base_changed(GeometryInstanceForwardClustered *p_geometry_instance) override;
+	virtual void _release_rt_deformed_handle(RID p_handle) override;
 
 public:
 	virtual void geometry_instance_free(RenderGeometryInstance *p_geometry_instance) override;

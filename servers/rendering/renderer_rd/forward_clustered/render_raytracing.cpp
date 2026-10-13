@@ -1069,6 +1069,34 @@ RTDeformedCacheEntry *RenderRaytracing::_access_deformed_slot(RID &r_handle) {
 	return entry;
 }
 
+// What the expiry and an owner's release free: every GPU resource goes through free_rid or a region
+// retired past the frames in flight, so an entry traced in the frame before is released as safely.
+void RenderRaytracing::_free_deformed_entry(RTDeformedCacheEntry &p_entry) {
+	RD *rd = RD::get_singleton();
+	if (p_entry.ptr) {
+		_release_deformed_blas(p_entry);
+		memdelete(p_entry.ptr);
+		p_entry.ptr = nullptr;
+	}
+	_release_deformed_cluster_storage(p_entry);
+	if (p_entry.owned_vb_full.is_valid()) {
+		rd->free_rid(p_entry.owned_vb_full);
+		p_entry.owned_vb_full = RID();
+	}
+	if (p_entry.prev_pos_vb.is_valid()) {
+		rd->free_rid(p_entry.prev_pos_vb);
+		p_entry.prev_pos_vb = RID();
+	}
+}
+
+void RenderRaytracing::release_deformed_handle(RID p_handle) {
+	RTDeformedCacheEntry *entry = deformed_pool.get_or_null(p_handle);
+	if (entry) {
+		_free_deformed_entry(*entry);
+		deformed_pool.free(p_handle);
+	}
+}
+
 // The deformed BLAS depends on the mesh's index buffer (only the vertex
 // buffer is overridden), so RenderingDevice cascade-frees it with the mesh
 // or its surfaces: free it only while it still exists, and forget the RID
@@ -1504,20 +1532,7 @@ void RenderRaytracing::prepare_frame() {
 			if (e->last_used_frame == 0 || current_frame - e->last_used_frame <= DEFORMED_CACHE_TTL) {
 				continue;
 			}
-			if (e->ptr) {
-				_release_deformed_blas(*e);
-				memdelete(e->ptr);
-				e->ptr = nullptr;
-			}
-			_release_deformed_cluster_storage(*e);
-			if (e->owned_vb_full.is_valid()) {
-				rd->free_rid(e->owned_vb_full);
-				e->owned_vb_full = RID();
-			}
-			if (e->prev_pos_vb.is_valid()) {
-				rd->free_rid(e->prev_pos_vb);
-				e->prev_pos_vb = RID();
-			}
+			_free_deformed_entry(*e);
 			deformed_pool.free(live[i]);
 		}
 	}

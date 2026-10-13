@@ -902,6 +902,8 @@ protected:
 	void _render_3d_upscaling(const RenderDataRD *p_render_data, Scale3DMode p_scale_type, bool p_using_taa, double p_time_step, const DLSSRRGuideBuffers &p_dlss_rr);
 	virtual void _free_rt_viewport_state(RenderSceneBuffersRD *p_render_buffers);
 	virtual void _geometry_instance_base_changed(GeometryInstanceForwardClustered *p_geometry_instance) {}
+	// A path tracer's deformed entry its surface cache dropped for good (D122 S5).
+	virtual void _release_rt_deformed_handle(RID p_handle) {}
 
 	virtual void _render_material(const Transform3D &p_cam_transform, const Projection &p_cam_projection, bool p_cam_orthogonal, const PagedArray<RenderGeometryInstance *> &p_instances, RID p_framebuffer, const Rect2i &p_region, float p_exposure_normalization) override;
 	virtual void _render_uv2(const PagedArray<RenderGeometryInstance *> &p_instances, RID p_framebuffer, const Rect2i &p_region) override;

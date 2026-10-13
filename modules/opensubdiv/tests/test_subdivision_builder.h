@@ -595,17 +595,17 @@ static Ref<ArrayMesh> build_grid(const TestCage &p_grid, const PackedVector2Arra
 	return builder->get_owner_mesh(0);
 }
 
-TEST_CASE("[SceneTree][SubdivisionBuilder] An owner with blend shapes gets flat clusters, not a cluster LOD hierarchy") {
+TEST_CASE("[SceneTree][SubdivisionBuilder] An owner without blend shapes gets a cluster LOD hierarchy, one with them flat clusters, whatever the settings") {
 	if (RenderingServer::build_clusters_func == nullptr || RenderingServer::build_cluster_lod_func == nullptr) {
 		return; // No cluster builders without the meshoptimizer module.
 	}
 	const Variant cluster_blas = GLOBAL_GET("rendering/pathtracing/cluster_blas");
 	const Variant cluster_lod = GLOBAL_GET("rendering/pathtracing/cluster_lod");
-	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", true);
-	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_lod", true);
 	const TestCage grid = make_grid(6, 6, -1, true); // 1,152 refined triangles, past one cluster.
 	const PackedVector2Array uv_values = grid_uvs(grid, Vector2(1, 0), Vector2(0, 1));
-	auto cluster_version = [&](bool p_shapes) -> uint32_t {
+	auto built_clusters = [&](bool p_shapes, bool p_settings_on) -> Vector<uint8_t> {
+		ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", p_settings_on);
+		ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_lod", p_settings_on);
 		const TestPrimitive primitive = make_shared_primitive(grid, 0);
 		Array blend_arrays;
 		PackedStringArray names;
@@ -627,19 +627,26 @@ TEST_CASE("[SceneTree][SubdivisionBuilder] An owner with blend shapes gets flat 
 		const Ref<ArrayMesh> mesh = builder->get_owner_mesh(0);
 		REQUIRE(mesh.is_valid());
 		const Dictionary surface = Array(mesh->get("_surfaces"))[0];
-		const Vector<uint8_t> clusters = surface.get("cluster_data", Vector<uint8_t>());
-		REQUIRE(clusters.size() >= int(sizeof(uint32_t)));
-		uint32_t version;
-		memcpy(&version, clusters.ptr(), sizeof(uint32_t));
-		return version;
+		return surface.get("cluster_data", Vector<uint8_t>());
 	};
-	// Without shapes the hierarchy is built: the witness that the switches above reach the builder.
-	const uint32_t without_shapes = cluster_version(false);
-	const uint32_t with_shapes = cluster_version(true);
+	// The builder clusters a subdivided surface itself (its index order is frozen at build), so the table and the
+	// order do not follow the project's cluster settings: the hierarchy without blend shapes (D85), the flat
+	// clusters with them (D87).
+	Vector<uint8_t> clusters[2][2];
+	for (int shapes = 0; shapes < 2; shapes++) {
+		for (int on = 0; on < 2; on++) {
+			clusters[shapes][on] = built_clusters(shapes, on);
+		}
+	}
 	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", cluster_blas);
 	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_lod", cluster_lod);
-	CHECK(without_shapes == RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION);
-	CHECK(with_shapes == RenderingServerTypes::MESH_CLUSTER_DATA_VERSION);
+	for (int shapes = 0; shapes < 2; shapes++) {
+		REQUIRE(clusters[shapes][0].size() >= int(sizeof(uint32_t)));
+		uint32_t version;
+		memcpy(&version, clusters[shapes][0].ptr(), sizeof(uint32_t));
+		CHECK(version == (shapes ? RenderingServerTypes::MESH_CLUSTER_DATA_VERSION : RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION));
+		CHECK(clusters[shapes][0] == clusters[shapes][1]);
+	}
 }
 
 TEST_CASE("[SceneTree][SubdivisionBuilder] Tangents have Godot's handedness, as SurfaceTool's MikkTSpace gives") {

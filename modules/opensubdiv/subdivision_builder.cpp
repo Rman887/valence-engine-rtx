@@ -1407,12 +1407,41 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 		memcpy(indices.ptrw(), triangles.ptr(), triangles.size() * sizeof(int32_t));
 		arrays[Mesh::ARRAY_INDEX] = indices;
 
+		// The builder clusters the surface itself, as the rendering server would with
+		// rendering/pathtracing/cluster_blas and cluster_lod on (the gate in
+		// RenderingServer::mesh_create_surface_data_from_arrays, mirrored here without the settings; a change
+		// to one is mirrored in the other or deliberately left out), whatever they say: a subdivided surface's index
+		// order is frozen here (the payload's adjacency indexes it, and the storages never reorder it), so the
+		// bytes built must not depend on a project setting. An owner without blend shapes gets a cluster LOD
+		// hierarchy (D85) when it has more than one cluster's triangles, every other surface the flat clusters
+		// (D80): the cage's morphs move a blend-shaped surface away from the rest pose a hierarchy's errors are
+		// measured on (D87), and the storages refuse a hierarchy on one. With the settings off, or on a device
+		// without cluster BLAS, the coarse levels or the whole table go unused over the same indices.
+		Vector<int> cluster_indices;
+		cluster_indices.resize(triangles.size());
+		memcpy(cluster_indices.ptrw(), triangles.ptr(), triangles.size() * sizeof(int32_t));
+		Vector<uint8_t> cluster_table;
+		if (names.is_empty() && cluster_indices.size() > int(RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES) * 3) {
+			Vector<Vector3> normals;
+			if (arrays[Mesh::ARRAY_NORMAL].get_type() == Variant::PACKED_VECTOR3_ARRAY) {
+				normals = arrays[Mesh::ARRAY_NORMAL];
+			}
+			Vector<Vector2> hierarchy_uvs;
+			if (arrays[Mesh::ARRAY_TEX_UV].get_type() == Variant::PACKED_VECTOR2_ARRAY) {
+				hierarchy_uvs = arrays[Mesh::ARRAY_TEX_UV];
+			}
+			cluster_table = RenderingServer::mesh_surface_build_cluster_lod(arrays[Mesh::ARRAY_VERTEX], normals, hierarchy_uvs, cluster_indices);
+		}
+		if (cluster_table.is_empty()) {
+			cluster_table = RenderingServer::mesh_surface_build_clusters(arrays[Mesh::ARRAY_VERTEX], cluster_indices);
+		}
+		if (cluster_table.size()) {
+			arrays[Mesh::ARRAY_INDEX] = PackedInt32Array(cluster_indices);
+		}
 		RenderingServerTypes::SurfaceData surface_data;
-		// Flat clusters only when the owner has blend shapes: its cage's morphs move the surface away
-		// from the rest pose a cluster LOD hierarchy's errors are measured on, D87's reason for keeping
-		// blend-shaped surfaces out. The storages refuse such a hierarchy.
-		const Error err = RS::get_singleton()->mesh_create_surface_data_from_arrays(&surface_data, RSE::PRIMITIVE_TRIANGLES, arrays, Array(), Dictionary(), format_flags, true, names.is_empty());
+		const Error err = RS::get_singleton()->mesh_create_surface_data_from_arrays(&surface_data, RSE::PRIMITIVE_TRIANGLES, arrays, Array(), Dictionary(), format_flags, false, false);
 		ERR_FAIL_COND_V_MSG(err != OK, err, vformat("Surface %d: the refined arrays were rejected.", s));
+		surface_data.cluster_data = cluster_table;
 		surface_data.bone_aabbs = bone_aabbs;
 
 		// Tangent adjacency over the surface's final index order (the cluster builder reorders

@@ -1330,8 +1330,12 @@ Error RenderingServer::mesh_create_surface_data_from_arrays(RenderingServerTypes
 	// is the robust alternative). Skinned surfaces get the hierarchy (D87): both builders
 	// reorder the indices alone, so the bone and weight arrays stay in vertex order, and the
 	// coarse levels index the same vertices the skinning writes. A caller whose surface deforms
-	// by blend shapes it does not carry as arrays (a subdivided surface, whose cage holds them,
-	// D122) passes p_build_cluster_lod false for the same reason.
+	// by blend shapes it does not carry as arrays passes p_build_cluster_lod false for the same
+	// reason. The subdivision builder (modules/opensubdiv, D122) clusters its own surfaces through
+	// mesh_surface_build_cluster_lod and mesh_surface_build_clusters with this gate, its settings
+	// taken as on and its blend shapes the cage's, mirrored in SubdivisionBuilder::_owner_surfaces,
+	// and passes p_build_clusters false: a change to the gate here is mirrored there or
+	// deliberately left out.
 	if (p_build_clusters && p_primitive == RSE::PRIMITIVE_TRIANGLES && index_array_len > 0 && p_arrays[RSE::ARRAY_VERTEX].get_type() == Variant::PACKED_VECTOR3_ARRAY && p_arrays[RSE::ARRAY_INDEX].get_type() == Variant::PACKED_INT32_ARRAY && GLOBAL_GET("rendering/pathtracing/cluster_blas")) {
 		Vector<int> indices = p_arrays[RSE::ARRAY_INDEX];
 		if (p_build_cluster_lod && p_blend_shapes.is_empty() && index_array_len > int(RenderingServerTypes::MESH_CLUSTER_MAX_TRIANGLES) * 3 && GLOBAL_GET("rendering/pathtracing/cluster_lod")) {

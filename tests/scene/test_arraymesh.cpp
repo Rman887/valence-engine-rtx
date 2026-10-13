@@ -1029,6 +1029,7 @@ static LocalVector<SubdivisionSection> subdivision_quad_sections(bool p_owner, u
 	// Triangles (0, 1, 2) and (0, 2, 3): vertex 0 in two, 1 in one, 2 in two, 3 in one.
 	add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_OFFSETS, { 0, 2, 3, 5, 6 });
 	add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_ENTRIES, { 0, 3, 1, 2, 4, 5 });
+	add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_SIGNS, { 0b1011 }); // Vertex 2's sign is -1.
 	return sections;
 }
 
@@ -1334,6 +1335,9 @@ TEST_CASE("[SceneTree][ArrayMesh] Malformed subdivision payloads are refused, al
 	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_OFFSETS, { 0, 2, 1, 5, 6 }))); // Decreasing.
 	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_OFFSETS, { 1, 2, 3, 5, 6 }))); // Not from 0.
 	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_ENTRIES, { 0, 3, 1, 2, 4, 6 }))); // Past the indices.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_SIGNS, { 0b1011, 0 }))); // A word too many.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_SIGNS, {}))); // None.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_SIGNS, { 0b11011 }))); // A bit past the last vertex.
 	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_INDICES, { 0, 1, 2, 4 }))); // Past the cage.
 	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_STENCIL_OFFSETS, { 0, 1, 2, 3, 3 }))); // Short of the weights.
 	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_QUADS, { 0, 1, 2, 4 }))); // Past the U.
@@ -1355,6 +1359,18 @@ TEST_CASE("[SceneTree][ArrayMesh] Malformed subdivision payloads are refused, al
 		CHECK_FALSE(valid(subdivision_payload_from(sections, RenderingServerTypes::MESH_SUBDIVISION_FLAG_OWNER, 0)));
 	}
 	CHECK_FALSE(valid(set_word(good, 0, 1))); // Version 1, whose deltas were dense.
+	CHECK_FALSE(valid(set_word(good, 0, 2))); // Version 2, without tangent signs.
+	{
+		// Version 3 without its tangent signs.
+		LocalVector<SubdivisionSection> sections = subdivision_quad_sections(true, 1);
+		for (uint32_t i = 0; i < sections.size(); i++) {
+			if (sections[i].id == RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_SIGNS) {
+				sections.remove_at(i);
+				break;
+			}
+		}
+		CHECK_FALSE(valid(subdivision_payload_from(sections, RenderingServerTypes::MESH_SUBDIVISION_FLAG_OWNER, 0)));
+	}
 	CHECK_FALSE(valid(set_word(good, 4, 19))); // Version 1's dense delta section id.
 	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_U_WELDED, { 0, 1, 2 }))); // Short.
 

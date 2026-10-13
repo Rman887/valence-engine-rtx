@@ -108,7 +108,7 @@ layout(push_constant, std430) uniform Params {
 	uint normal_tangent_stride;
 
 	bool has_uv;
-	uint pad1;
+	uint tangent_signs;
 	uint pad2;
 	uint pad3;
 }
@@ -309,6 +309,8 @@ void main() {
 	{
 		// The surface's vertex R: its refined vertex's position and normal, and its tangent from the
 		// triangles' UV gradients, each weighted by its corner's angle, orthogonalized against the normal.
+		// Each gradient is oriented by its triangle's own UV area, as MikkTSpace orients it; the R sums only its
+		// own MikkTSpace group's triangles, and its binormal sign is that group's, from the payload.
 		uint u = surface_payload.data[params.r_to_u + index];
 		vec3 vertex = refined_position(u);
 		uvec3 uvertex = floatBitsToUint(vertex);
@@ -327,8 +329,8 @@ void main() {
 			vec3 tangent = godot_normalized(cross(vec3(normal.z, -normal.x, normal.y), godot_normalized(normal)));
 			dst_vertices.data[dst_normal] = encode_tang_to_uint_oct(vec4(tangent, 1.0));
 		} else if (params.has_tangent) {
+			float binormal_sign = ((surface_payload.data[params.tangent_signs + (index >> 5)] >> (index & 31)) & 1) != 0 ? 1.0 : -1.0;
 			vec3 tangent_sum = vec3(0.0);
-			vec3 bitangent_sum = vec3(0.0);
 			uint last = surface_payload.data[params.tangent_offsets + index + 1];
 			for (uint e = surface_payload.data[params.tangent_offsets + index]; e < last; e++) {
 				uint entry = surface_payload.data[params.tangent_entries + e];
@@ -352,14 +354,12 @@ void main() {
 				}
 				float orientation = det < 0.0 ? -1.0 : 1.0;
 				vec3 tangent = godot_normalized((e1 * d2.y - e2 * d1.y) * orientation);
-				vec3 bitangent = godot_normalized((e2 * d1.x - e1 * d2.x) * orientation);
 				// Corner c's previous, own and next corners are (c + 2) % 3, c and (c + 1) % 3.
 				vec3 prev = corner == 0 ? p2 : (corner == 1 ? p0 : p1);
 				vec3 here = corner == 0 ? p0 : (corner == 1 ? p1 : p2);
 				vec3 next = corner == 0 ? p1 : (corner == 1 ? p2 : p0);
 				float angle = corner_angle(prev, here, next);
 				tangent_sum += tangent * angle;
-				bitangent_sum += bitangent * angle;
 			}
 			vec3 t = tangent_sum - normal * dot(normal, tangent_sum);
 			if (godot_is_zero_approx(t)) {
@@ -368,7 +368,6 @@ void main() {
 				t = godot_normalized(cross(normal, right ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0)));
 			}
 			t = godot_normalized(t);
-			float binormal_sign = dot(cross(normal, t), bitangent_sum) < 0.0 ? 1.0 : -1.0;
 			dst_vertices.data[dst_normal] = encode_tang_to_uint_oct(vec4(t, binormal_sign));
 		}
 	}

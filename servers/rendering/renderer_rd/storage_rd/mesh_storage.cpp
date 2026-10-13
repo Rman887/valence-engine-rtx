@@ -560,6 +560,7 @@ void MeshStorage::_mesh_surface_set_subdivision(Mesh *p_mesh, Mesh::Surface *p_s
 	sd.r_to_u = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U);
 	sd.tangent_offsets = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_OFFSETS);
 	sd.tangent_entries = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_ENTRIES);
+	sd.tangent_signs = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_SIGNS);
 	sd.index_16 = p_data.vertex_count <= 65536 && p_data.vertex_count > 0; // As the index buffer is made.
 	uint32_t offsets[RSE::ARRAY_MAX];
 	uint32_t vertex_element_size;
@@ -2254,6 +2255,7 @@ void MeshStorage::_update_subdivision_passes(RD::ComputeListID &r_compute_list) 
 			push_constant.r_to_u = sd.r_to_u;
 			push_constant.tangent_offsets = sd.tangent_offsets;
 			push_constant.tangent_entries = sd.tangent_entries;
+			push_constant.tangent_signs = sd.tangent_signs;
 			push_constant.attribute_stride = sd.attribute_stride;
 			push_constant.uv_offset = sd.uv_offset;
 			push_constant.has_normal = (surface.format & RSE::ARRAY_FORMAT_NORMAL) ? 1 : 0;

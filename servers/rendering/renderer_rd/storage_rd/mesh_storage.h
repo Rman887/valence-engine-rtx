@@ -163,6 +163,7 @@ private:
 				uint32_t r_to_u = 0;
 				uint32_t tangent_offsets = 0;
 				uint32_t tangent_entries = 0;
+				uint32_t tangent_signs = 0;
 				uint32_t attribute_stride = 0; // In words; UV0's offset in a vertex's attributes too.
 				uint32_t uv_offset = 0;
 				bool index_16 = false;
@@ -506,7 +507,8 @@ private:
 			uint32_t normal_tangent_stride;
 
 			uint32_t has_uv;
-			uint32_t pad[3];
+			uint32_t tangent_signs;
+			uint32_t pad[2];
 		};
 		enum {
 			UNIFORM_SET_OWNER = 0,

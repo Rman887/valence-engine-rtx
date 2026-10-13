@@ -1475,7 +1475,7 @@ bool _subdivision_fail(String *r_error, const String &p_message) {
 bool _subdivision_known_section(uint32_t p_id, bool &r_owner_section) {
 	r_owner_section = p_id >= RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO;
 	// Id 19 was version 1's dense blend deltas.
-	return (p_id >= RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U && p_id <= RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_ENTRIES) ||
+	return (p_id >= RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U && p_id <= RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_SIGNS) ||
 			(p_id >= RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO && p_id <= RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES && p_id != 19);
 }
 
@@ -1830,7 +1830,23 @@ bool RenderingServer::mesh_subdivision_surface_is_valid(const RenderingServerTyp
 	if (!_subdivision_check_offsets(_subdivision_span(p_surface.subdivision_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_OFFSETS), vertex_count, tangent_entries.bytes / sizeof(uint32_t), "tangent offsets", r_error)) {
 		return false;
 	}
-	return _subdivision_check_indices(tangent_entries, tangent_entries.bytes / sizeof(uint32_t), uint64_t(p_surface.index_count), "tangent entries", r_error);
+	if (!_subdivision_check_indices(tangent_entries, tangent_entries.bytes / sizeof(uint32_t), uint64_t(p_surface.index_count), "tangent entries", r_error)) {
+		return false;
+	}
+	// One bit per R, none past the last.
+	const SubdivisionSectionSpan tangent_signs = _subdivision_span(p_surface.subdivision_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_SIGNS);
+	const uint64_t sign_words = (vertex_count + 31) / 32;
+	if (tangent_signs.bytes != sign_words * sizeof(uint32_t)) {
+		return _subdivision_fail(r_error, vformat("tangent signs hold %d bytes, expected %d", tangent_signs.bytes, sign_words * sizeof(uint32_t)));
+	}
+	if (vertex_count % 32 != 0) {
+		uint32_t last;
+		memcpy(&last, tangent_signs.data + (sign_words - 1) * sizeof(uint32_t), sizeof(uint32_t));
+		if (last >> (vertex_count % 32)) {
+			return _subdivision_fail(r_error, "tangent signs set a bit past the last vertex");
+		}
+	}
+	return true;
 }
 
 int64_t RenderingServer::mesh_subdivision_data_owner_surface(const Vector<uint8_t> &p_data) {

@@ -147,7 +147,8 @@ struct SurfaceData {
 // blend shapes, shares the mesh with subdivided surfaces only.
 enum MeshSubdivisionConstants : uint32_t {
 	// Version 2 (D122 S2): the cage's blend shapes as sparse per-vertex deltas (CAGE_BLEND_*), not dense ones.
-	MESH_SUBDIVISION_DATA_VERSION = 2,
+	// Version 3 (D122 tangent frames): each R's binormal sign (TANGENT_SIGNS), from MikkTSpace's grouping.
+	MESH_SUBDIVISION_DATA_VERSION = 3,
 	MESH_SUBDIVISION_HEADER_WORDS = 4,
 	MESH_SUBDIVISION_SECTION_WORDS = 3,
 	MESH_SUBDIVISION_SECTION_ALIGN = 16,
@@ -163,6 +164,9 @@ enum MeshSubdivisionConstants : uint32_t {
 	// uint32 triangle * 3 + corner, in the surface's index order. That order is frozen at build: no
 	// storage may reorder a subdivided surface's indices (the load-time clustering skips it).
 	MESH_SUBDIVISION_SECTION_TANGENT_ENTRIES = 3,
+	// One bit per R (bit R % 32 of word R / 32), set where its binormal sign is +1; bits past the last R
+	// are 0. The sign is MikkTSpace's for the R's group, so a vertex MikkTSpace splits is several R.
+	MESH_SUBDIVISION_SECTION_TANGENT_SIGNS = 4,
 
 	// Owner sections. The owner's cage is its own cage vertices, then its ghosts (another mesh's cage
 	// vertices its stencils reach); its U are its own, then the ghost U the seam's normals need.

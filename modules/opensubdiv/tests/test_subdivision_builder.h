@@ -710,6 +710,301 @@ TEST_CASE("[SceneTree][SubdivisionBuilder] Tiny UV triangles still orient the ta
 	CHECK(largest < 1e-5f);
 }
 
+// SurfaceTool's MikkTSpace on triangles given per corner (deindexed), each corner's tangent and sign.
+static LocalVector<Vector4> surface_tool_frames(const LocalVector<Vector3> &p_positions, const LocalVector<Vector3> &p_normals, const LocalVector<Vector2> &p_uvs) {
+	Ref<SurfaceTool> surface_tool;
+	surface_tool.instantiate();
+	surface_tool->begin(Mesh::PRIMITIVE_TRIANGLES);
+	for (uint32_t i = 0; i < p_positions.size(); i++) {
+		surface_tool->set_normal(p_normals[i]);
+		surface_tool->set_uv(p_uvs[i]);
+		surface_tool->add_vertex(p_positions[i]);
+	}
+	surface_tool->generate_tangents();
+	const PackedFloat32Array tangents = surface_tool->commit_to_arrays()[Mesh::ARRAY_TANGENT];
+	LocalVector<Vector4> frames;
+	for (int i = 0; i < tangents.size() / 4; i++) {
+		frames.push_back(Vector4(tangents[4 * i], tangents[4 * i + 1], tangents[4 * i + 2], tangents[4 * i + 3]));
+	}
+	return frames;
+}
+
+// SurfaceTool's view of quads given in the source's order with UVs v up: each quad as the two triangles along
+// its 0-2 diagonal, in Godot's winding (clockwise) with UVs v down, deindexed. r_corner gets each triangle
+// corner's quad corner.
+static LocalVector<Vector4> surface_tool_quad_frames(const LocalVector<Vector3> &p_positions, const LocalVector<Vector3> &p_normals, const LocalVector<Vector2> &p_uvs, LocalVector<uint32_t> &r_corner) {
+	LocalVector<Vector3> positions;
+	LocalVector<Vector3> normals;
+	LocalVector<Vector2> uvs;
+	r_corner.clear();
+	for (uint32_t q = 0; q < p_positions.size() / 4; q++) {
+		const int order[6] = { 0, 2, 1, 0, 3, 2 }; // (0, 1, 2) and (0, 2, 3), reversed.
+		for (int i : order) {
+			positions.push_back(p_positions[4 * q + i]);
+			normals.push_back(p_normals[4 * q + i]);
+			uvs.push_back(Vector2(p_uvs[4 * q + i].x, 1.0f - p_uvs[4 * q + i].y));
+			r_corner.push_back(4 * q + i);
+		}
+	}
+	return surface_tool_frames(positions, normals, uvs);
+}
+
+TEST_CASE("[SceneTree][SubdivisionBuilder] MikkTSpace on quads: SurfaceTool's frames where a quad is two triangles, the larger triangle's orientation on a badly mapped one") {
+	// A 2 x 1 strip of unit quads in the y = 0 plane, normal +y, its u mirrored at x = 1: the column there has
+	// corners of both orientations, which MikkTSpace groups apart. Corners in the source's order, UVs v up.
+	LocalVector<Vector3> positions;
+	LocalVector<Vector3> normals;
+	LocalVector<Vector2> uvs;
+	auto add_quad = [&](const Vector3 *p_corners, const Vector2 *p_uvs) {
+		for (int c = 0; c < 4; c++) {
+			positions.push_back(p_corners[c]);
+			normals.push_back(Vector3(0, 1, 0));
+			uvs.push_back(p_uvs[c]);
+		}
+	};
+	for (int x = 0; x < 2; x++) {
+		const Vector3 corners[4] = { Vector3(x, 0, 0), Vector3(x + 1, 0, 0), Vector3(x + 1, 0, 1), Vector3(x, 0, 1) };
+		const float u0 = x == 0 ? 0.0f : 1.0f;
+		const float u1 = x == 0 ? 1.0f : 0.0f;
+		const Vector2 quad_uvs[4] = { Vector2(u0, 0), Vector2(u1, 0), Vector2(u1, 1), Vector2(u0, 1) };
+		add_quad(corners, quad_uvs);
+	}
+	LocalVector<Vector4> frames;
+	REQUIRE(SubdivisionBuilder::mikktspace_quad_frames(positions, normals, uvs, frames));
+	// The same quads as Godot's triangles along MikkTSpace's diagonal (0-2: both UV diagonals are equal, and so
+	// are the position ones), through SurfaceTool: the same signs, and the same tangents.
+	LocalVector<uint32_t> tri_corner;
+	const LocalVector<Vector4> theirs = surface_tool_quad_frames(positions, normals, uvs, tri_corner);
+	REQUIRE(theirs.size() == tri_corner.size());
+	for (uint32_t i = 0; i < theirs.size(); i++) {
+		const Vector4 &ours = frames[tri_corner[i]];
+		CHECK(ours.w == theirs[i].w);
+		CHECK(Vector3(ours.x, ours.y, ours.z).dot(Vector3(theirs[i].x, theirs[i].y, theirs[i].z)) > 0.999f);
+	}
+	// The mirror column's corners: one frame on each side, the two signs opposite.
+	CHECK(frames[1].w == -frames[4].w);
+	CHECK(frames[2].w == -frames[7].w);
+
+	// A badly mapped quad: its UVs folded, so its triangles along the shorter UV diagonal (0-2) have opposite
+	// orientations, the first the larger. MikkTSpace gives every corner the larger triangle's orientation;
+	// SurfaceTool on the two triangles gives each its own.
+	positions.clear();
+	normals.clear();
+	uvs.clear();
+	const Vector3 corners[4] = { Vector3(0, 0, 0), Vector3(1, 0, 0), Vector3(1, 0, 1), Vector3(0, 0, 1) };
+	const Vector2 folded[4] = { Vector2(0, 0), Vector2(2, 0), Vector2(0.5f, 0.5f), Vector2(0.4f, 0.1f) };
+	add_quad(corners, folded);
+	const float area_012 = (folded[1] - folded[0]).cross(folded[2] - folded[0]);
+	const float area_023 = (folded[2] - folded[0]).cross(folded[3] - folded[0]);
+	REQUIRE(area_012 * area_023 < 0.0f);
+	REQUIRE(Math::abs(area_012) > Math::abs(area_023));
+	REQUIRE((folded[2] - folded[0]).length_squared() < (folded[3] - folded[1]).length_squared());
+	REQUIRE(SubdivisionBuilder::mikktspace_quad_frames(positions, normals, uvs, frames));
+	const LocalVector<Vector4> per_triangle = surface_tool_quad_frames(positions, normals, uvs, tri_corner);
+	REQUIRE(per_triangle.size() == 6);
+	CHECK(per_triangle[0].w == -per_triangle[3].w); // SurfaceTool: each triangle its own orientation.
+	for (int c = 0; c < 4; c++) {
+		CHECK(frames[c].w == per_triangle[0].w); // MikkTSpace on the quad: the larger triangle's.
+	}
+}
+
+// One owner's grid built with one UV layer, its welds as given, and the built quads recorded.
+static Ref<ArrayMesh> build_recorded(const TestCage &p_grid, const TestPrimitive &p_primitive, const PackedVector2Array &p_uv_values, LocalVector<LocalVector<int32_t>> &r_quads, Ref<SubdivisionBuilder> &r_builder) {
+	r_builder.instantiate();
+	r_builder->set_cage_vertex_count(p_grid.positions.size());
+	r_builder->add_face_varying_layer(p_uv_values, Mesh::ARRAY_TEX_UV);
+	Array weld;
+	weld.push_back(p_primitive.uv_weld);
+	r_builder->add_surface(0, p_primitive.arrays, Array(), PackedStringArray(), p_primitive.cage_vertex, p_primitive.faces, weld, Ref<Material>());
+	REQUIRE(r_builder->build_recording_quads(2, r_quads) == OK);
+	return r_builder->get_owner_mesh(0);
+}
+
+// Every built quad corner against MikkTSpace on the built quads (their render vertices' rest positions, normals
+// and UVs, v up). Every render vertex's sign is its corners' group's. Its tangent is compared, within 0.99, where
+// MikkTSpace splits every quad around it along our diagonal (0-2): where its shorter UV diagonal is 1-3 it sums
+// other triangles than ours, the per-frame triangulation the design leaves out of T2. Counts the badly mapped
+// quads (their two triangles along MikkTSpace's diagonal disagree in orientation): all, and those whose corners'
+// corner tangents were compared.
+struct BuiltFrames {
+	int bad = 0;
+	int bad_compared = 0;
+	int vertices_compared = 0;
+	int vertices = 0;
+};
+
+static BuiltFrames check_built_frames(const Ref<ArrayMesh> &p_mesh, const LocalVector<int32_t> &p_quads) {
+	const Array arrays = p_mesh->surface_get_arrays(0);
+	const PackedVector3Array positions = arrays[Mesh::ARRAY_VERTEX];
+	const PackedVector3Array normals = arrays[Mesh::ARRAY_NORMAL];
+	const PackedVector2Array stored_uvs = arrays[Mesh::ARRAY_TEX_UV];
+	const PackedFloat32Array tangents = arrays[Mesh::ARRAY_TANGENT];
+	LocalVector<Vector3> corner_positions;
+	LocalVector<Vector3> corner_normals;
+	LocalVector<Vector2> corner_uvs;
+	for (int32_t r : p_quads) {
+		corner_positions.push_back(positions[r]);
+		corner_normals.push_back(normals[r]);
+		corner_uvs.push_back(Vector2(stored_uvs[r].x, 1.0f - stored_uvs[r].y));
+	}
+	LocalVector<Vector4> frames;
+	REQUIRE(SubdivisionBuilder::mikktspace_quad_frames(corner_positions, corner_normals, corner_uvs, frames));
+	const uint32_t quad_count = p_quads.size() / 4;
+	LocalVector<uint8_t> diagonal_02;
+	LocalVector<uint8_t> bad;
+	diagonal_02.resize(quad_count);
+	bad.resize(quad_count);
+	LocalVector<uint8_t> other_diagonal; // Per render vertex: a quad around it splits along 1-3.
+	other_diagonal.resize(positions.size());
+	memset(other_diagonal.ptr(), 0, other_diagonal.size());
+	BuiltFrames result;
+	result.vertices = positions.size();
+	for (uint32_t q = 0; q < quad_count; q++) {
+		const Vector2 *uv = &corner_uvs[4 * q];
+		// MikkTSpace's choice: the shorter UV diagonal, a tie broken by the shorter position diagonal, then 0-2.
+		const float uv_02 = (uv[2] - uv[0]).length_squared();
+		const float uv_13 = (uv[3] - uv[1]).length_squared();
+		const Vector3 *p = &corner_positions[4 * q];
+		diagonal_02[q] = uv_02 < uv_13 || (uv_02 == uv_13 && !(float((p[3] - p[1]).length_squared()) < float((p[2] - p[0]).length_squared())));
+		const float a = diagonal_02[q] ? (uv[1] - uv[0]).cross(uv[2] - uv[0]) : (uv[1] - uv[0]).cross(uv[3] - uv[0]);
+		const float b = diagonal_02[q] ? (uv[2] - uv[0]).cross(uv[3] - uv[0]) : (uv[2] - uv[1]).cross(uv[3] - uv[1]);
+		bad[q] = a * b < 0.0f;
+		result.bad += bad[q];
+		for (int c = 0; c < 4; c++) {
+			other_diagonal[p_quads[4 * q + c]] |= !diagonal_02[q];
+		}
+	}
+	LocalVector<uint8_t> compared;
+	compared.resize(positions.size());
+	memset(compared.ptr(), 0, compared.size());
+	for (uint32_t q = 0; q < quad_count; q++) {
+		bool any_compared = false;
+		for (int c = 0; c < 4; c++) {
+			const int32_t r = p_quads[4 * q + c];
+			const Vector4 &frame = frames[4 * q + c];
+			CHECK(tangents[4 * r + 3] == frame.w);
+			if (other_diagonal[r]) {
+				continue;
+			}
+			any_compared = true;
+			const float dot = Vector3(tangents[4 * r], tangents[4 * r + 1], tangents[4 * r + 2]).dot(Vector3(frame.x, frame.y, frame.z));
+			CHECK_MESSAGE(dot > 0.99f, vformat("quad %d corner %d: tangent dot %f, bad %d", q, c, dot, int(bad[q])));
+			compared[r] = 1;
+		}
+		result.bad_compared += bad[q] && any_compared ? 1 : 0;
+	}
+	for (uint8_t value : compared) {
+		result.vertices_compared += value;
+	}
+	return result;
+}
+
+TEST_CASE("[SceneTree][SubdivisionBuilder] A UV mirror splits render vertices by MikkTSpace's groups, each with SurfaceTool's sign") {
+	// A 2 x 2 grid whose u mirrors at x = 1, then one whose v mirrors at z = 1, welded at the mirror: the refined
+	// vertices on the mirror line have corners of both orientations under one UV. The v mirror keeps the tangent
+	// (1, 0, 0) on both sides and flips only the sign, so a group key that dropped the sign would merge them.
+	const TestCage grid = make_grid(2, 2, -1, false);
+	for (int mirror = 0; mirror < 2; mirror++) {
+		PackedVector2Array values;
+		for (const Vector3 &position : grid.positions) {
+			values.push_back(mirror == 0 ? Vector2(Math::abs(position.x - 1.0f), position.z) : Vector2(position.x, Math::abs(position.z - 1.0f)));
+		}
+		LocalVector<LocalVector<int32_t>> quads;
+		Ref<SubdivisionBuilder> builder;
+		const Ref<ArrayMesh> mesh = build_recorded(grid, make_shared_primitive(grid, 0), values, quads, builder);
+		REQUIRE(mesh.is_valid());
+		REQUIRE(quads.size() == 1);
+		// Level 2 of a 2 x 2 grid is 9 x 9 refined vertices, 9 of them on the mirror line: each is split once.
+		const Dictionary owner = Dictionary(builder->get_report()["owners"])[0];
+		const Array splits = owner["tangent_splits"];
+		REQUIRE(splits.size() == 1);
+		CHECK(int(splits[0]) == 9);
+		const Array arrays = mesh->surface_get_arrays(0);
+		const PackedVector3Array positions = arrays[Mesh::ARRAY_VERTEX];
+		const PackedVector3Array normals = arrays[Mesh::ARRAY_NORMAL];
+		const PackedVector2Array uvs = arrays[Mesh::ARRAY_TEX_UV];
+		const PackedFloat32Array tangents = arrays[Mesh::ARRAY_TANGENT];
+		const PackedInt32Array indices = arrays[Mesh::ARRAY_INDEX];
+		CHECK(positions.size() == 81 + 9);
+		// SurfaceTool's MikkTSpace on the built triangles, deindexed: every corner's sign is its render vertex's.
+		LocalVector<Vector3> corner_positions;
+		LocalVector<Vector3> corner_normals;
+		LocalVector<Vector2> corner_uvs;
+		for (int i = 0; i < indices.size(); i++) {
+			corner_positions.push_back(positions[indices[i]]);
+			corner_normals.push_back(normals[indices[i]]);
+			corner_uvs.push_back(uvs[indices[i]]);
+		}
+		const LocalVector<Vector4> theirs = surface_tool_frames(corner_positions, corner_normals, corner_uvs);
+		REQUIRE(int(theirs.size()) == indices.size());
+		for (int i = 0; i < indices.size(); i++) {
+			const int r = indices[i];
+			CHECK(tangents[4 * r + 3] == theirs[i].w);
+			CHECK(Vector3(tangents[4 * r], tangents[4 * r + 1], tangents[4 * r + 2]).dot(Vector3(theirs[i].x, theirs[i].y, theirs[i].z)) > 0.99f);
+		}
+		// MikkTSpace on the built quads agrees with the built signs, and with the tangents where it splits the
+		// quads as we do; a smooth mirror maps no quad badly.
+		const BuiltFrames built = check_built_frames(mesh, quads[0]);
+		CHECK(built.bad == 0);
+		CHECK(built.vertices_compared > built.vertices / 2);
+		// The copies keep their refined vertex: same position, normal and UV bits, opposite signs.
+		const Vector<uint8_t> payload = surface_payload(mesh, 0);
+		uint32_t count = 0;
+		const uint32_t *r_to_u = payload_section<uint32_t>(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U, count);
+		REQUIRE(count == uint32_t(positions.size()));
+		// Each copy comes right after the vertex it was split from.
+		int pairs = 0;
+		for (int r = 1; r < positions.size(); r++) {
+			if (r_to_u[r] != r_to_u[r - 1]) {
+				continue;
+			}
+			pairs++;
+			CHECK(positions[r - 1] == positions[r]);
+			CHECK(normals[r - 1] == normals[r]);
+			CHECK(uvs[r - 1] == uvs[r]);
+			CHECK(tangents[4 * (r - 1) + 3] == -tangents[4 * r + 3]);
+		}
+		CHECK(pairs == 9);
+		// The payload's sign bits, read directly: bit r % 32 of word r / 32 set where w is +1, every vertex, copies
+		// included, and none past the last.
+		const uint32_t *signs = payload_section<uint32_t>(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_SIGNS, count);
+		REQUIRE(signs != nullptr);
+		REQUIRE(count == uint32_t(positions.size() + 31) / 32);
+		int negative = 0;
+		for (int r = 0; r < positions.size(); r++) {
+			const bool bit = (signs[r / 32] >> (r % 32)) & 1;
+			CHECK(bit == (tangents[4 * r + 3] > 0.0f));
+			negative += bit ? 0 : 1;
+		}
+		CHECK(negative > 0);
+		CHECK(negative < positions.size());
+		REQUIRE(positions.size() % 32 != 0);
+		CHECK((signs[count - 1] >> (positions.size() % 32)) == 0);
+		check_payload_reproduces_surface(mesh, 0);
+	}
+}
+
+TEST_CASE("[SceneTree][SubdivisionBuilder] Badly mapped refined quads keep MikkTSpace's tangents and signs") {
+	// A 2 x 2 grid, each face its own UV island, the first face's UVs folded across itself (its corners 2 and 3
+	// moved so the edges 1-2 and 3-0 cross, without collapsing any UV): its refined quads include badly mapped
+	// ones, whose triangles disagree in orientation.
+	const TestCage grid = make_grid(2, 2, -1, false);
+	PackedVector2Array values;
+	TestPrimitive primitive = make_primitive(grid, 0, values);
+	values.write[2] = Vector2(0.1f, 0.8f);
+	values.write[3] = Vector2(0.9f, 0.7f);
+	LocalVector<LocalVector<int32_t>> quads;
+	Ref<SubdivisionBuilder> builder;
+	const Ref<ArrayMesh> mesh = build_recorded(grid, primitive, values, quads, builder);
+	REQUIRE(mesh.is_valid());
+	REQUIRE(quads.size() == 1);
+	const Dictionary owner = Dictionary(builder->get_report()["owners"])[0];
+	CHECK(int(Array(owner["tangent_splits"])[0]) > 0);
+	const BuiltFrames built = check_built_frames(mesh, quads[0]);
+	CHECK(built.bad > 0);
+	CHECK_MESSAGE(built.bad_compared > 0, vformat("%d badly mapped quads, no corner of one compared", built.bad));
+}
+
 TEST_CASE("[SceneTree][SubdivisionBuilder] UV values keep their range, stored as 1 - v") {
 	const TestCage cube = make_cube();
 	PackedVector2Array uv_values;
@@ -991,6 +1286,71 @@ TEST_CASE("[SceneTree][SubdivisionBuilder] A bent seam: both owners' payloads gi
 	CHECK(shared == 9);
 }
 
+TEST_CASE("[SceneTree][SubdivisionBuilder] A seam MikkTSpace splits keeps every copy's position and normal bits on both owners") {
+	// The bent strip with its seam at x = 2 and v mirrored at z = 1, a line across both owners: each owner splits
+	// its refined vertices on that line, the seam's one among them.
+	const TestCage grid = make_grid(4, 2, 2, true);
+	PackedVector2Array values;
+	for (const Vector3 &position : grid.positions) {
+		values.push_back(Vector2(position.x * 0.25f, Math::abs(position.z - 1.0f) * 0.5f));
+	}
+	const TestPrimitive left = make_shared_primitive(grid, 0);
+	const TestPrimitive right = make_shared_primitive(grid, 1);
+	Ref<SubdivisionBuilder> builder;
+	builder.instantiate();
+	builder->set_cage_vertex_count(grid.positions.size());
+	builder->add_face_varying_layer(values, Mesh::ARRAY_TEX_UV);
+	Array left_weld;
+	left_weld.push_back(left.uv_weld);
+	Array right_weld;
+	right_weld.push_back(right.uv_weld);
+	builder->add_surface(0, left.arrays, Array(), PackedStringArray(), left.cage_vertex, left.faces, left_weld, Ref<Material>());
+	builder->add_surface(1, right.arrays, Array(), PackedStringArray(), right.cage_vertex, right.faces, right_weld, Ref<Material>());
+	REQUIRE(builder->build(2) == OK);
+	const Ref<ArrayMesh> meshes[2] = { builder->get_owner_mesh(0), builder->get_owner_mesh(1) };
+	REQUIRE((meshes[0].is_valid() && meshes[1].is_valid()));
+	// Each owner's half is 8 x 4 refined quads, 9 refined vertices on the line z = 1.
+	for (int owner = 0; owner < 2; owner++) {
+		const Dictionary report = Dictionary(builder->get_report()["owners"])[owner];
+		CHECK(int(Array(report["tangent_splits"])[0]) == 9);
+	}
+
+	// Every copy of a seam vertex, on either side, carries the same position and normal bits.
+	const Vector<uint8_t> payloads[2] = { surface_payload(meshes[0], 0), surface_payload(meshes[1], 0) };
+	const Array arrays[2] = { meshes[0]->surface_get_arrays(0), meshes[1]->surface_get_arrays(0) };
+	const PackedVector3Array positions[2] = { arrays[0][Mesh::ARRAY_VERTEX], arrays[1][Mesh::ARRAY_VERTEX] };
+	const PackedVector3Array normals[2] = { arrays[0][Mesh::ARRAY_NORMAL], arrays[1][Mesh::ARRAY_NORMAL] };
+	uint32_t count = 0;
+	const uint32_t *r_to_u[2];
+	const uint32_t *welded[2];
+	for (int owner = 0; owner < 2; owner++) {
+		r_to_u[owner] = payload_section<uint32_t>(payloads[owner], RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U, count);
+		welded[owner] = payload_section<uint32_t>(payloads[owner], RenderingServerTypes::MESH_SUBDIVISION_SECTION_U_WELDED, count);
+		REQUIRE((r_to_u[owner] && welded[owner]));
+	}
+	HashMap<uint32_t, LocalVector<int>> left_copies;
+	for (int r = 0; r < positions[0].size(); r++) {
+		left_copies[welded[0][r_to_u[0][r]]].push_back(r);
+	}
+	int right_seam = 0;
+	int pairs = 0;
+	for (int r = 0; r < positions[1].size(); r++) {
+		const LocalVector<int> *copies = left_copies.getptr(welded[1][r_to_u[1][r]]);
+		if (copies == nullptr) {
+			continue;
+		}
+		right_seam++;
+		for (int l : *copies) {
+			pairs++;
+			CHECK(memcmp(&positions[0][l], &positions[1][r], sizeof(Vector3)) == 0);
+			CHECK(memcmp(&normals[0][l], &normals[1][r], sizeof(Vector3)) == 0);
+		}
+	}
+	// The seam's 9 refined vertices, the one on z = 1 split on both sides: 10 render vertices a side, 12 pairs.
+	CHECK(right_seam == 10);
+	CHECK(pairs == 12);
+}
+
 // The runtime passes on the CPU (D122 S2), as subdivision.glsl computes them from the payload alone,
 // in real_t and in the shader's order of operations: the cage morphed by every weight over 1e-4 and skinned by the bones (a skeleton
 // buffer's 12 floats a bone), the stencil sums, the own refined vertices' normals, and a surface's
@@ -1027,7 +1387,8 @@ static PassResult run_subdivision_passes(const Ref<ArrayMesh> &p_mesh, int p_sur
 	const uint32_t *r_to_u = payload_section<uint32_t>(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U, count);
 	const uint32_t *tangent_offsets = payload_section<uint32_t>(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_OFFSETS, count);
 	const uint32_t *tangent_entries = payload_section<uint32_t>(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_ENTRIES, count);
-	REQUIRE((info && rest && blend_offsets && stencil_offsets && stencil_indices && stencil_weights && quads && normal_offsets && normal_entries && r_to_u && tangent_offsets && tangent_entries));
+	const uint32_t *tangent_signs = payload_section<uint32_t>(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_SIGNS, count);
+	REQUIRE((info && rest && blend_offsets && stencil_offsets && stencil_indices && stencil_weights && quads && normal_offsets && normal_entries && r_to_u && tangent_offsets && tangent_entries && tangent_signs));
 	const uint32_t cage_count = info[RenderingServerTypes::MESH_SUBDIVISION_INFO_CAGE_COUNT];
 	const uint32_t u_count = info[RenderingServerTypes::MESH_SUBDIVISION_INFO_U_COUNT];
 	const bool index_16 = info[RenderingServerTypes::MESH_SUBDIVISION_INFO_STENCIL_INDEX_BYTES] == 2;
@@ -1118,8 +1479,8 @@ static PassResult run_subdivision_passes(const Ref<ArrayMesh> &p_mesh, int p_sur
 		const Vector3 normal = normals[u];
 		result.positions.push_back(positions[u]);
 		result.normals.push_back(normal);
+		const float sign = ((tangent_signs[r / 32] >> (r % 32)) & 1) ? 1.0f : -1.0f;
 		Vector3 tangent_sum;
-		Vector3 bitangent_sum;
 		for (uint32_t e = tangent_offsets[r]; e < tangent_offsets[r + 1]; e++) {
 			const uint32_t triangle = tangent_entries[e] / 3;
 			const uint32_t corner = tangent_entries[e] % 3;
@@ -1135,10 +1496,8 @@ static PassResult run_subdivision_passes(const Ref<ArrayMesh> &p_mesh, int p_sur
 			}
 			const float orientation = det < 0.0f ? -1.0f : 1.0f;
 			const Vector3 tangent = ((e1 * d2.y - e2 * d1.y) * orientation).normalized();
-			const Vector3 bitangent = ((e2 * d1.x - e1 * d2.x) * orientation).normalized();
 			const float angle = pass_corner_angle(p[(corner + 2) % 3], p[corner], p[(corner + 1) % 3]);
 			tangent_sum += tangent * angle;
-			bitangent_sum += bitangent * angle;
 		}
 		Vector3 t = tangent_sum - normal * normal.dot(tangent_sum);
 		if (t.is_zero_approx()) {
@@ -1146,7 +1505,7 @@ static PassResult run_subdivision_passes(const Ref<ArrayMesh> &p_mesh, int p_sur
 		}
 		t.normalize();
 		result.tangents.push_back(t);
-		result.signs.push_back(normal.cross(t).dot(bitangent_sum) < 0.0f ? 1.0f : -1.0f);
+		result.signs.push_back(sign);
 	}
 	return result;
 }
@@ -1378,6 +1737,10 @@ TEST_CASE("[SceneTree][SubdivisionBuilder] The fingerprint hashes a probe that r
 	uint32_t version;
 	memcpy(&version, hierarchy.ptr(), sizeof(uint32_t));
 	CHECK(version == RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION);
+	// Its folded face splits render vertices by MikkTSpace's groups.
+	const Array apart_splits = Dictionary(Dictionary(probe->get_report()["owners"])[2])["tangent_splits"];
+	REQUIRE(apart_splits.size() == 1);
+	CHECK(int(apart_splits[0]) > 0);
 	// The triangle face refines into owner 1's surface: Catmull-Clark gives it three quads at level 1, twelve at
 	// level 2, beside the strip's 8 x 16 and owner 2's 16 x 16.
 	CHECK(int(probe->get_report()["refined_quads"]) == 8 * 16 + 3 * 4 + 16 * 16);

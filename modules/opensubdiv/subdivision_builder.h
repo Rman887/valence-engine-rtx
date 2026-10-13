@@ -80,6 +80,8 @@ private:
 	// surface's data are appended to it.
 	LocalVector<uint8_t> *fingerprint_input = nullptr;
 	void _fingerprint_append(const void *p_data, uint64_t p_size);
+	// Set only while build_recording_quads() builds.
+	LocalVector<LocalVector<int32_t>> *quad_render_output = nullptr;
 
 	struct Work;
 	Error _gather(Work &r_work);
@@ -113,7 +115,8 @@ public:
 	// A hash of everything a fixed probe builds to, computed once per process. The probe is two owners across
 	// a seam (ghost rings), one of them with two surfaces, quads and a triangle face, three UV layers in the A1
 	// slots (UV, UV2, CUSTOM0 as RG float), colours, a blend shape and fractional skin weights, and a third owner
-	// apart without blend shapes, whose surface takes a cluster LOD hierarchy. The hash takes each owner mesh's
+	// apart without blend shapes, whose surface takes a cluster LOD hierarchy and has a face with folded UVs, whose
+	// render vertices MikkTSpace's grouping splits. The hash takes each owner mesh's
 	// blend shape names and mode and every field of every surface as built, so it changes with anything that
 	// changes those bytes: this builder, the rendering server's packing, skin quantization, clusterizer and
 	// hierarchy builder, the payload layout and the vendored libraries. It depends on neither the renderer nor
@@ -124,4 +127,18 @@ public:
 	// and the hash of such bytes. Public for the doctest.
 	static Ref<SubdivisionBuilder> build_fingerprint_probe(LocalVector<uint8_t> *r_input = nullptr);
 	static String fingerprint_of(const LocalVector<uint8_t> &p_input);
+
+	// MikkTSpace's frames on quads, as Blender computes a subdivided mesh's tangents: per corner, 4 corners a quad in
+	// the source's (Blender's) order, counter-clockwise from the front, its position, normal and UV with v up, as
+	// Blender feeds MikkTSpace, so a quad's diagonal and a badly mapped quad's orientation tie break as Blender's
+	// do when Blender's faces start on OpenSubdiv's corner 0. The sign is +1 for an orientation-preserving group, the
+	// convention SurfaceTool::generate_tangents uses on Godot's faces (clockwise, v down); reversing the winding and
+	// flipping v together leave a UV triangle's orientation alone, so the two agree wherever a quad's two triangles
+	// agree, not on a badly mapped quad, which MikkTSpace gives its larger triangle's orientation. r_frames gets each
+	// corner's tangent and sign (w); the corners of one MikkTSpace group get the same bits. The builder groups
+	// render vertices by it. Public for the doctest.
+	static bool mikktspace_quad_frames(const LocalVector<Vector3> &p_positions, const LocalVector<Vector3> &p_normals, const LocalVector<Vector2> &p_uvs, LocalVector<Vector4> &r_frames);
+	// build(), appending each surface's quads as built to r_quads: 4 render vertices a quad, in the source's corner
+	// order, after MikkTSpace's split. For the doctest.
+	Error build_recording_quads(int p_level, LocalVector<LocalVector<int32_t>> &r_quads);
 };

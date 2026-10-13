@@ -38,6 +38,8 @@
 #include "core/templates/hash_set.h"
 #include "servers/rendering/rendering_server.h"
 
+#include <thirdparty/misc/mikktspace.h>
+
 #include <opensubdiv/far/primvarRefiner.h>
 #include <opensubdiv/far/stencilTable.h>
 #include <opensubdiv/far/stencilTableFactory.h>
@@ -169,6 +171,70 @@ struct CornerKeyHasher {
 		return hash_fmix32(h);
 	}
 };
+
+// A render vertex and one MikkTSpace frame of its corners (tangent and sign, as the float bits MikkTSpace
+// gives them): one group of it.
+struct GroupKey {
+	int32_t render = 0;
+	float frame[4] = {};
+};
+
+struct GroupKeyHasher {
+	static uint32_t hash(const GroupKey &p_key) {
+		return hash_murmur3_buffer(&p_key, sizeof(GroupKey));
+	}
+};
+
+struct GroupKeyComparator {
+	static bool compare(const GroupKey &p_a, const GroupKey &p_b) {
+		return memcmp(&p_a, &p_b, sizeof(GroupKey)) == 0;
+	}
+};
+
+// MikkTSpace's callbacks over quads given per corner (SubdivisionBuilder::mikktspace_quad_frames).
+struct QuadFrames {
+	const LocalVector<Vector3> *positions = nullptr;
+	const LocalVector<Vector3> *normals = nullptr;
+	const LocalVector<Vector2> *uvs = nullptr;
+	LocalVector<Vector4> *frames = nullptr;
+};
+
+const QuadFrames &quad_frames(const SMikkTSpaceContext *p_context) {
+	return *static_cast<const QuadFrames *>(p_context->m_pUserData);
+}
+
+int quad_frames_faces(const SMikkTSpaceContext *p_context) {
+	return quad_frames(p_context).positions->size() / 4;
+}
+
+int quad_frames_vertices(const SMikkTSpaceContext *p_context, const int p_face) {
+	return 4;
+}
+
+void quad_frames_position(const SMikkTSpaceContext *p_context, float r_out[], const int p_face, const int p_vertex) {
+	const Vector3 &v = (*quad_frames(p_context).positions)[4 * p_face + p_vertex];
+	r_out[0] = v.x;
+	r_out[1] = v.y;
+	r_out[2] = v.z;
+}
+
+void quad_frames_normal(const SMikkTSpaceContext *p_context, float r_out[], const int p_face, const int p_vertex) {
+	const Vector3 &v = (*quad_frames(p_context).normals)[4 * p_face + p_vertex];
+	r_out[0] = v.x;
+	r_out[1] = v.y;
+	r_out[2] = v.z;
+}
+
+void quad_frames_uv(const SMikkTSpaceContext *p_context, float r_out[], const int p_face, const int p_vertex) {
+	const Vector2 &v = (*quad_frames(p_context).uvs)[4 * p_face + p_vertex];
+	r_out[0] = v.x;
+	r_out[1] = v.y;
+}
+
+// The sign as SurfaceTool::mikktSetTSpaceDefault sets it: +1 for an orientation-preserving group.
+void quad_frames_set(const SMikkTSpaceContext *p_context, const float p_tangent[], const float p_sign, const int p_face, const int p_vertex) {
+	(*quad_frames(p_context).frames)[4 * p_face + p_vertex] = Vector4(p_tangent[0], p_tangent[1], p_tangent[2], p_sign < 0.0f ? -1.0f : 1.0f);
+}
 
 double ms_since(uint64_t p_usec) {
 	return double(OS::get_singleton()->get_ticks_usec() - p_usec) / 1000.0;
@@ -1221,17 +1287,47 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 	uint64_t payload_bytes = 0;
 	uint64_t render_vertices = 0;
 	uint64_t triangles_total = 0;
+	Array surface_tangent_splits; // Per surface of the owner: the render vertices MikkTSpace's grouping added.
+
+	// MikkTSpace's frames, as Blender gives the refined mesh its tangents: once over all the owner's own quads,
+	// as Blender's calc_tangents runs over a whole mesh (several surfaces share a UV0 island, so they share
+	// groups), on the rest surface, in the source's corner order with UVs v up, as Blender feeds it. Each quad is
+	// split along its shorter UV diagonal and a badly mapped quad takes its larger triangle's orientation; every
+	// corner of one group gets the same frame. 4 per own quad, in part.own_quads' order.
+	LocalVector<Vector4> owner_frames;
+	if (tex_uv_layer >= 0) {
+		const uint32_t corner_count = part.own_quads.size() * 4;
+		LocalVector<Vector3> corner_positions;
+		LocalVector<Vector3> corner_normals;
+		LocalVector<Vector2> corner_uvs;
+		corner_positions.resize(corner_count);
+		corner_normals.resize(corner_count);
+		corner_uvs.resize(corner_count);
+		for (uint32_t i = 0; i < corner_count; i++) {
+			const int q = part.own_quads[i / 4];
+			const int32_t welded = r_work.quads[4 * q + i % 4]; // An own quad's corners are own refined vertices.
+			const FVarValue &value = r_work.fvar_values[tex_uv_layer][r_work.quad_fvar[tex_uv_layer][4 * q + i % 4]];
+			corner_positions[i] = r_work.u_positions[welded];
+			corner_normals[i] = r_work.u_normals[welded];
+			corner_uvs[i] = Vector2(float(value.x), float(value.y));
+		}
+		ERR_FAIL_COND_V_MSG(!mikktspace_quad_frames(corner_positions, corner_normals, corner_uvs, owner_frames), ERR_OUT_OF_MEMORY, vformat("Owner %d: MikkTSpace failed (it fails only to allocate).", part.owner));
+	}
+
 	for (uint32_t s = 0; s < surfaces.size(); s++) {
 		if (surfaces[s].owner != part.owner) {
 			continue;
 		}
 		HashMap<CornerKey, int32_t, CornerKeyHasher> render_of;
 		LocalVector<CornerKey> render_keys;
-		LocalVector<int32_t> triangles;
-		for (int q : part.own_quads) {
+		LocalVector<int32_t> quad_render; // 4 render vertices per quad of the surface, in the source's corner order.
+		LocalVector<uint32_t> quad_own; // Per quad of the surface: its index in part.own_quads.
+		for (uint32_t own = 0; own < part.own_quads.size(); own++) {
+			const int q = part.own_quads[own];
 			if (r_work.quad_surface[q] != int(s)) {
 				continue;
 			}
+			quad_own.push_back(own);
 			int32_t render[4];
 			for (int c = 0; c < 4; c++) {
 				CornerKey key;
@@ -1249,6 +1345,104 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 					render_keys.push_back(key);
 				}
 			}
+			for (int c = 0; c < 4; c++) {
+				quad_render.push_back(render[c]);
+			}
+		}
+		ERR_CONTINUE_MSG(quad_render.is_empty(), vformat("Surface %d has no refined faces.", s));
+
+		// MikkTSpace's grouping (owner_frames, above): a render vertex whose corners fall in several groups
+		// becomes one render vertex per group, in the order its corners come, and each render vertex keeps its
+		// group's sign. Only the grouping and the sign are fixed here: a runtime pass sums each render vertex's
+		// tangent from its own group's triangles on the posed surface.
+		LocalVector<float> render_sign;
+		uint32_t tangent_splits = 0;
+		if (tex_uv_layer >= 0) {
+			const uint32_t corner_count = quad_render.size();
+			HashMap<GroupKey, int32_t, GroupKeyHasher, GroupKeyComparator> render_of_group;
+			LocalVector<int32_t> copy_source; // Per copy, in the order they come: the render vertex it was split from.
+			LocalVector<uint8_t> grouped;
+			grouped.resize(render_keys.size());
+			memset(grouped.ptr(), 0, grouped.size());
+			render_sign.resize(render_keys.size());
+			for (uint32_t i = 0; i < corner_count; i++) {
+				const Vector4 &frame = owner_frames[4 * quad_own[i / 4] + i % 4];
+				GroupKey key;
+				key.render = quad_render[i];
+				key.frame[0] = float(frame.x);
+				key.frame[1] = float(frame.y);
+				key.frame[2] = float(frame.z);
+				key.frame[3] = float(frame.w);
+				const int32_t *existing = render_of_group.getptr(key);
+				int32_t render;
+				if (existing) {
+					render = *existing;
+				} else if (!grouped[key.render]) {
+					render = key.render;
+					grouped[render] = 1;
+				} else {
+					render = render_keys.size();
+					render_keys.push_back(CornerKey(render_keys[key.render]));
+					render_sign.push_back(0.0f);
+					copy_source.push_back(key.render);
+					tangent_splits++;
+				}
+				if (!existing) {
+					render_of_group.insert(key, render);
+					render_sign[render] = frame.w < 0.0f ? -1.0f : 1.0f;
+				}
+				quad_render[i] = render;
+			}
+			// Each copy right after the vertex it was split from, in the order the copies came, so a copy stays near
+			// its neighbours in the vertex buffer instead of at its end.
+			if (tangent_splits > 0) {
+				const uint32_t originals = render_keys.size() - tangent_splits;
+				LocalVector<int32_t> first_copy;
+				LocalVector<int32_t> next_copy;
+				LocalVector<int32_t> last_copy;
+				first_copy.resize(originals);
+				last_copy.resize(originals);
+				next_copy.resize(tangent_splits);
+				for (uint32_t r = 0; r < originals; r++) {
+					first_copy[r] = -1;
+				}
+				for (uint32_t c = 0; c < tangent_splits; c++) {
+					const int32_t source = copy_source[c];
+					next_copy[c] = -1;
+					if (first_copy[source] < 0) {
+						first_copy[source] = c;
+					} else {
+						next_copy[last_copy[source]] = c;
+					}
+					last_copy[source] = c;
+				}
+				LocalVector<int32_t> moved_to;
+				moved_to.resize(render_keys.size());
+				LocalVector<CornerKey> ordered_keys;
+				LocalVector<float> ordered_signs;
+				for (uint32_t r = 0; r < originals; r++) {
+					moved_to[r] = ordered_keys.size();
+					ordered_keys.push_back(render_keys[r]);
+					ordered_signs.push_back(render_sign[r]);
+					for (int32_t c = first_copy[r]; c >= 0; c = next_copy[c]) {
+						moved_to[originals + c] = ordered_keys.size();
+						ordered_keys.push_back(render_keys[originals + c]);
+						ordered_signs.push_back(render_sign[originals + c]);
+					}
+				}
+				render_keys = ordered_keys;
+				render_sign = ordered_signs;
+				for (int32_t &render : quad_render) {
+					render = moved_to[render];
+				}
+			}
+		}
+		if (quad_render_output) {
+			quad_render_output->push_back(LocalVector<int32_t>(quad_render));
+		}
+		LocalVector<int32_t> triangles;
+		for (uint32_t q = 0; q < quad_render.size() / 4; q++) {
+			const int32_t *render = &quad_render[4 * q];
 			// The quad's corners run counter-clockwise from the front, as the source's (Blender's) do;
 			// Godot's front faces are clockwise, so each triangle is reversed, as the glTF import does.
 			const int32_t tris[6] = { render[0], render[2], render[1], render[0], render[3], render[2] };
@@ -1256,7 +1450,6 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 				triangles.push_back(tris[i]);
 			}
 		}
-		ERR_CONTINUE_MSG(triangles.is_empty(), vformat("Surface %d has no refined faces.", s));
 
 		const uint32_t count = render_keys.size();
 		ERR_FAIL_COND_V_MSG(count >= (1u << 21), ERR_OUT_OF_MEMORY, vformat("Surface %d has %d render vertices, over the payload's 2 million.", s, count));
@@ -1337,19 +1530,16 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 
 		// Tangents from the triangles' UV gradients, each triangle's corner weighted by its angle,
 		// orthogonalized against the normal. Only a triangle of zero UV area is skipped: the gradients
-		// are taken without dividing by the area, its sign alone orienting them, so tiny UV triangles
-		// count fully. The sign is MikkTSpace's as Godot feeds it (clockwise triangles, v down): +1
-		// where the binormal cross(N, T) points against dP/dv, the shaders' cross(N, T) * w then
-		// pointing texture-up.
+		// are taken without dividing by the area, its sign alone orienting them (as MikkTSpace orients each
+		// triangle's gradient by its own UV area, whatever its group), so tiny UV triangles count fully. A
+		// render vertex sums only its own MikkTSpace group's triangles (above). The sign is that group's,
+		// Godot's as SurfaceTool's MikkTSpace gives it (clockwise triangles, v down).
 		PackedFloat32Array tangents;
 		if (tex_uv_layer >= 0) {
 			LocalVector<Vector3> tangent_sum;
-			LocalVector<Vector3> bitangent_sum;
 			tangent_sum.resize(count);
-			bitangent_sum.resize(count);
 			for (uint32_t r = 0; r < count; r++) {
 				tangent_sum[r] = Vector3();
-				bitangent_sum[r] = Vector3();
 			}
 			const Vector2 *uv = uvs[tex_uv_layer].ptr();
 			for (uint32_t t = 0; t < triangles.size() / 3; t++) {
@@ -1364,11 +1554,9 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 				}
 				const float orientation = det < 0.0f ? -1.0f : 1.0f;
 				const Vector3 tangent = ((e1 * d2.y - e2 * d1.y) * orientation).normalized();
-				const Vector3 bitangent = ((e2 * d1.x - e1 * d2.x) * orientation).normalized();
 				for (int c = 0; c < 3; c++) {
 					const float angle = corner_angle(positions[tri[(c + 2) % 3]], positions[tri[c]], positions[tri[(c + 1) % 3]]);
 					tangent_sum[tri[c]] += tangent * angle;
-					bitangent_sum[tri[c]] += bitangent * angle;
 				}
 			}
 			tangents.resize(4 * count);
@@ -1379,11 +1567,10 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 					t = n.get_any_perpendicular();
 				}
 				t.normalize();
-				const float sign = n.cross(t).dot(bitangent_sum[r]) < 0.0f ? 1.0f : -1.0f;
 				tangents.write[4 * r + 0] = t.x;
 				tangents.write[4 * r + 1] = t.y;
 				tangents.write[4 * r + 2] = t.z;
-				tangents.write[4 * r + 3] = sign;
+				tangents.write[4 * r + 3] = render_sign[r];
 			}
 		}
 
@@ -1515,6 +1702,16 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 		payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U, r_to_u);
 		payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_OFFSETS, tangent_offsets);
 		payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_ENTRIES, tangent_entries);
+		// One bit per render vertex, set where its sign is +1; without UVs every sign is +1 (unused).
+		LocalVector<uint32_t> tangent_signs;
+		tangent_signs.resize((count + 31) / 32);
+		memset(tangent_signs.ptr(), 0, tangent_signs.size() * sizeof(uint32_t));
+		for (uint32_t r = 0; r < count; r++) {
+			if (render_sign.is_empty() || render_sign[r] > 0.0f) {
+				tangent_signs[r / 32] |= 1u << (r % 32);
+			}
+		}
+		payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_SIGNS, tangent_signs);
 		surface_data.subdivision_data = payload.finish(first ? RenderingServerTypes::MESH_SUBDIVISION_FLAG_OWNER : 0, 0);
 		ERR_FAIL_COND_V(surface_data.subdivision_data.is_empty(), ERR_OUT_OF_MEMORY);
 		if (first) {
@@ -1527,6 +1724,7 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 		payload_bytes += surface_data.subdivision_data.size();
 		render_vertices += count;
 		triangles_total += triangles.size() / 3;
+		surface_tangent_splits.push_back(tangent_splits);
 
 		if (fingerprint_input) {
 			// Every field the surface carries, each length-prefixed, in build order.
@@ -1565,12 +1763,45 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 	owner_report["ghost_quads"] = part.ghost_quads.size();
 	owner_report["render_vertices"] = render_vertices;
 	owner_report["triangles"] = triangles_total;
+	owner_report["tangent_splits"] = surface_tangent_splits;
 	owner_report["blend_shapes"] = names.size();
 	owner_report["payload_bytes"] = payload_bytes;
 	owner_report["blend_entries"] = part.blend_entries;
 	owner_report["ms"] = ms_since(begin);
 	r_work.owner_reports[part.owner] = owner_report;
 	return OK;
+}
+
+Error SubdivisionBuilder::build_recording_quads(int p_level, LocalVector<LocalVector<int32_t>> &r_quads) {
+	quad_render_output = &r_quads;
+	const Error err = build(p_level);
+	quad_render_output = nullptr;
+	return err;
+}
+
+bool SubdivisionBuilder::mikktspace_quad_frames(const LocalVector<Vector3> &p_positions, const LocalVector<Vector3> &p_normals, const LocalVector<Vector2> &p_uvs, LocalVector<Vector4> &r_frames) {
+	ERR_FAIL_COND_V(p_positions.size() % 4 != 0 || p_normals.size() != p_positions.size() || p_uvs.size() != p_positions.size(), false);
+	r_frames.resize(p_positions.size());
+	for (Vector4 &frame : r_frames) {
+		frame = Vector4();
+	}
+	QuadFrames data;
+	data.positions = &p_positions;
+	data.normals = &p_normals;
+	data.uvs = &p_uvs;
+	data.frames = &r_frames;
+	SMikkTSpaceInterface callbacks;
+	callbacks.m_getNumFaces = quad_frames_faces;
+	callbacks.m_getNumVerticesOfFace = quad_frames_vertices;
+	callbacks.m_getPosition = quad_frames_position;
+	callbacks.m_getNormal = quad_frames_normal;
+	callbacks.m_getTexCoord = quad_frames_uv;
+	callbacks.m_setTSpaceBasic = quad_frames_set;
+	callbacks.m_setTSpace = nullptr;
+	SMikkTSpaceContext context;
+	context.m_pInterface = &callbacks;
+	context.m_pUserData = &data;
+	return genTangSpaceDefault(&context);
 }
 
 Error SubdivisionBuilder::build(int p_level) {
@@ -1637,7 +1868,9 @@ Ref<SubdivisionBuilder> SubdivisionBuilder::build_fingerprint_probe(LocalVector<
 	// owners carry ghosts. Owner 2, apart, has no blend shapes and enough triangles for a cluster LOD hierarchy. The grid is off the plane so normals and tangents vary. Every corner is its own glTF
 	// vertex with its own weld group, in three UV layers in the A1 slots (UV, UV2, CUSTOM0 as RG float), each
 	// with its own values; colours vary by face; skin weights are fractional so the quantizer's rounding shows;
-	// one blend shape moves a seam vertex and one vertex of each owner, so both carry sparse deltas.
+	// one blend shape moves a seam vertex and one vertex of each owner, so both carry sparse deltas. Owner 2's
+	// first face has its UVs folded (two corners' values swapped), so its refined quads take both orientations
+	// and MikkTSpace splits render vertices.
 	const int rows = 2;
 	auto cage_index = [rows](int p_x, int p_z) { return p_x * (rows + 1) + p_z; };
 	const int tip = cage_index(5, 0); // The triangle's own vertex, past the grid's last column.
@@ -1700,6 +1933,8 @@ Ref<SubdivisionBuilder> SubdivisionBuilder::build_fingerprint_probe(LocalVector<
 	}
 	const int surface_owner[4] = { 0, 0, 1, 2 };
 
+	const uint32_t folded_face = 8 + 1; // Owner 2's first: after the strip's eight quads and the triangle.
+	const Vector2 folded[4] = { square[0], square[1], square[3], square[2] };
 	PackedVector2Array uv_values[3];
 	Array arrays[4];
 	Array blend_arrays[4];
@@ -1736,10 +1971,11 @@ Ref<SubdivisionBuilder> SubdivisionBuilder::build_fingerprint_probe(LocalVector<
 					weights.push_back(cage % 2 == 0 ? even[b] : odd[b]);
 				}
 				colors.push_back(Color(0.125f * float(f % 8), 1.0f - 0.0625f * float(f % 16), 0.5f, 1.0f));
+				const Vector2 uv = f == folded_face ? folded[c] : square[c];
 				uv_weld[surface].push_back(uv_values[0].size());
-				uv_values[0].push_back(square[c]);
-				uv_values[1].push_back(square[c] * 0.5f + Vector2(0.25f, 0.125f));
-				uv_values[2].push_back(Vector2(square[c].y * 0.75f, square[c].x * 0.125f + 0.5f));
+				uv_values[0].push_back(uv);
+				uv_values[1].push_back(uv * 0.5f + Vector2(0.25f, 0.125f));
+				uv_values[2].push_back(Vector2(uv.y * 0.75f, uv.x * 0.125f + 0.5f));
 			}
 		}
 		arrays[surface].resize(Mesh::ARRAY_MAX);

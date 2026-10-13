@@ -2186,16 +2186,17 @@ void MeshStorage::update_mesh_instances() {
 // D122 S2: every subdivided surface's passes, phase by phase over all of them: the cage, a
 // barrier, the stencils, a barrier, the normals, a barrier, the write into the instance's buffer.
 // The first three run once per owner surface, the write once per surface.
-void MeshStorage::_update_subdivision_passes(RD::ComputeListID p_compute_list) {
+void MeshStorage::_update_subdivision_passes(RD::ComputeListID &r_compute_list) {
 	RD *rd = RD::get_singleton();
 	if (subdivision_shader.pipeline.is_null()) {
 		ERR_PRINT_ONCE("The subdivision passes have no pipeline: subdivided surfaces keep their rest pose.");
 		return;
 	}
-	rd->compute_list_bind_compute_pipeline(p_compute_list, subdivision_shader.pipeline);
+	rd->compute_list_bind_compute_pipeline(r_compute_list, subdivision_shader.pipeline);
 	for (uint32_t pass = 0; pass < SubdivisionShader::PASS_MAX; pass++) {
-		if (pass > 0) {
-			rd->compute_list_add_barrier(p_compute_list);
+		if (pass > 0 && !deform_timestamps) {
+			// Under the timer the list closed after the previous pass, which orders that pass before this one.
+			rd->compute_list_add_barrier(r_compute_list);
 		}
 		for (const SubdivisionDispatch &dispatch : subdivision_dispatches) {
 			const Mesh::Surface &surface = *dispatch.mi->mesh->surfaces[dispatch.surface];
@@ -2254,11 +2255,20 @@ void MeshStorage::_update_subdivision_passes(RD::ComputeListID p_compute_list) {
 			if (push_constant.count == 0) {
 				continue;
 			}
-			rd->compute_list_bind_uniform_set(p_compute_list, owner_mis.subdivision_owner_set, SubdivisionShader::UNIFORM_SET_OWNER);
-			rd->compute_list_bind_uniform_set(p_compute_list, surface_set, SubdivisionShader::UNIFORM_SET_SURFACE);
-			rd->compute_list_bind_uniform_set(p_compute_list, dispatch.skeleton_set, SubdivisionShader::UNIFORM_SET_SKELETON);
-			rd->compute_list_set_push_constant(p_compute_list, &push_constant, sizeof(SubdivisionShader::PushConstant));
-			rd->compute_list_dispatch_threads(p_compute_list, push_constant.count, 1, 1);
+			rd->compute_list_bind_uniform_set(r_compute_list, owner_mis.subdivision_owner_set, SubdivisionShader::UNIFORM_SET_OWNER);
+			rd->compute_list_bind_uniform_set(r_compute_list, surface_set, SubdivisionShader::UNIFORM_SET_SURFACE);
+			rd->compute_list_bind_uniform_set(r_compute_list, dispatch.skeleton_set, SubdivisionShader::UNIFORM_SET_SKELETON);
+			rd->compute_list_set_push_constant(r_compute_list, &push_constant, sizeof(SubdivisionShader::PushConstant));
+			rd->compute_list_dispatch_threads(r_compute_list, push_constant.count, 1, 1);
+		}
+		if (deform_timestamps && pass != SubdivisionShader::PASS_WRITE) {
+			// The RT build timer's per-pass marks (D122 S3b): the list closes after each pass for its mark,
+			// which costs the pass's overlap with the next only while the timer runs.
+			static const char *pass_marks[] = { "RT deform timer: cage", "RT deform timer: stencil", "RT deform timer: normal" };
+			rd->compute_list_end();
+			rd->capture_timestamp(pass_marks[pass]);
+			r_compute_list = rd->compute_list_begin();
+			rd->compute_list_bind_compute_pipeline(r_compute_list, subdivision_shader.pipeline);
 		}
 	}
 }

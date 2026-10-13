@@ -134,7 +134,9 @@ void main() {
 	vec2 vertex = uintBitsToFloat(uvec2(src_vertices.data[src_offset + 0], src_vertices.data[src_offset + 1]));
 
 	if (params.has_blend_shape) {
-		float blend_total = 0.0;
+		// VAL (D122 S5): a normalized shape adds w * (target - base), equal to (1 - sum(w)) * base + sum(w * target)
+		// but without cancelling a scaled base against the summed targets in float; a relative one adds w * target.
+		vec2 blend_base = params.normalized_blend_shapes ? vertex : vec2(0.0);
 		vec2 blend_vertex = vec2(0.0);
 
 		for (uint entry = 0; entry < params.blend_shape_count; entry++) {
@@ -143,16 +145,10 @@ void main() {
 			if (abs(w) > 0.0001) {
 				uint base_offset = (params.vertex_count * i + index) * params.vertex_stride;
 
-				blend_vertex += uintBitsToFloat(uvec2(src_blend_shapes.data[base_offset + 0], src_blend_shapes.data[base_offset + 1])) * w;
+				blend_vertex += (uintBitsToFloat(uvec2(src_blend_shapes.data[base_offset + 0], src_blend_shapes.data[base_offset + 1])) - blend_base) * w;
 
 				base_offset += 2;
-
-				blend_total += w;
 			}
-		}
-
-		if (params.normalized_blend_shapes) {
-			vertex = (1.0 - blend_total) * vertex;
 		}
 
 		vertex += blend_vertex;
@@ -210,7 +206,12 @@ void main() {
 	}
 
 	if (params.has_blend_shape) {
-		float blend_total = 0.0;
+		// VAL (D122 S5): a normalized shape adds w * (target - base), equal to (1 - sum(w)) * base + sum(w * target)
+		// but without cancelling a scaled base against the summed targets in float (micrometres over many
+		// shapes); a relative one adds w * target. Normals and tangents are normalized after the sum, as before.
+		vec3 blend_base_vertex = params.normalized_blend_shapes ? vertex : vec3(0.0);
+		vec3 blend_base_normal = params.normalized_blend_shapes && params.has_normal ? normal : vec3(0.0);
+		vec3 blend_base_tangent = params.normalized_blend_shapes && params.has_tangent ? tangent.rgb : vec3(0.0);
 		vec3 blend_vertex = vec3(0.0);
 		vec3 blend_normal = vec3(0.0);
 		vec3 blend_tangent = vec3(0.0);
@@ -221,27 +222,19 @@ void main() {
 			if (abs(w) > 0.0001) {
 				uint base_offset = params.vertex_count * i * (params.vertex_stride + params.normal_tangent_stride) + index * params.vertex_stride;
 
-				blend_vertex += uintBitsToFloat(uvec3(src_blend_shapes.data[base_offset + 0], src_blend_shapes.data[base_offset + 1], src_blend_shapes.data[base_offset + 2])) * w;
+				blend_vertex += (uintBitsToFloat(uvec3(src_blend_shapes.data[base_offset + 0], src_blend_shapes.data[base_offset + 1], src_blend_shapes.data[base_offset + 2])) - blend_base_vertex) * w;
 
 				uint base_normal = params.vertex_count * i * (params.vertex_stride + params.normal_tangent_stride) + params.vertex_count * params.vertex_stride + index * params.normal_tangent_stride;
 
 				if (params.has_normal) {
-					blend_normal += decode_uint_oct_to_norm(src_blend_shapes.data[base_normal]) * w;
+					blend_normal += (decode_uint_oct_to_norm(src_blend_shapes.data[base_normal]) - blend_base_normal) * w;
 					base_normal++;
 				}
 
 				if (params.has_tangent) {
-					blend_tangent += decode_uint_oct_to_tang(src_blend_shapes.data[base_normal]).rgb * w;
+					blend_tangent += (decode_uint_oct_to_tang(src_blend_shapes.data[base_normal]).rgb - blend_base_tangent) * w;
 				}
-
-				blend_total += w;
 			}
-		}
-
-		if (params.normalized_blend_shapes) {
-			vertex = (1.0 - blend_total) * vertex;
-			normal = (1.0 - blend_total) * normal;
-			tangent.rgb = (1.0 - blend_total) * tangent.rgb;
 		}
 
 		vertex += blend_vertex;

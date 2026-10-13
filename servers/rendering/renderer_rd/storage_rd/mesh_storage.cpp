@@ -1015,6 +1015,10 @@ void MeshStorage::mesh_set_blend_shape_mode(RID p_mesh, RSE::BlendShapeMode p_mo
 	ERR_FAIL_INDEX((int)p_mode, 2);
 
 	mesh->blend_shape_mode = p_mode;
+	// VAL (D122 S3b): its instances deform anew in the new mode, as an unchanged weight no longer re-deforms them.
+	for (MeshInstance *mi : mesh->instances) {
+		mi->dirty = true;
+	}
 }
 
 RSE::BlendShapeMode MeshStorage::mesh_get_blend_shape_mode(RID p_mesh) const {
@@ -1057,6 +1061,12 @@ void MeshStorage::mesh_surface_update_vertex_region(RID p_mesh, int p_surface, i
 
 	// Invalidate RT cache for this surface.
 	mesh->surfaces[p_surface]->rt_invalidation_counter++;
+
+	// VAL (D122 S3b): instances that deform this surface do so anew from the new vertices, as an unchanged
+	// weight no longer re-deforms them.
+	for (MeshInstance *mi : mesh->instances) {
+		mi->dirty = true;
+	}
 }
 
 void MeshStorage::mesh_surface_update_attribute_region(RID p_mesh, int p_surface, int p_offset, const Vector<uint8_t> &p_data) {
@@ -1801,6 +1811,9 @@ void MeshStorage::mesh_instance_set_blend_shape_weight(RID p_mesh_instance, int 
 	MeshInstance *mi = mesh_instance_owner.get_or_null(p_mesh_instance);
 	ERR_FAIL_NULL(mi);
 	ERR_FAIL_INDEX(p_shape, (int)mi->blend_weights.size());
+	if (mi->blend_weights[p_shape] == p_weight) {
+		return; // VAL (D122 S3b): an unchanged weight deforms nothing anew.
+	}
 	mi->blend_weights[p_shape] = p_weight;
 	mi->weights_dirty = true;
 	//will be eventually updated

@@ -230,13 +230,18 @@ MeshStorage::MeshStorage() {
 	}
 
 	{
-		// D122 S2: the subdivision passes.
+		// D122 S2: the subdivision passes, a variant each (S3b), in SubdivisionShader::Pass order.
 		Vector<String> subdivision_modes;
-		subdivision_modes.push_back("");
+		subdivision_modes.push_back("\n#define MODE_CAGE\n");
+		subdivision_modes.push_back("\n#define MODE_STENCIL\n");
+		subdivision_modes.push_back("\n#define MODE_NORMAL\n");
+		subdivision_modes.push_back("\n#define MODE_WRITE\n");
 		subdivision_shader.shader.initialize(subdivision_modes);
 		subdivision_shader.version = subdivision_shader.shader.version_create();
-		subdivision_shader.version_shader = subdivision_shader.shader.version_get_shader(subdivision_shader.version, 0);
-		subdivision_shader.pipeline = RD::get_singleton()->compute_pipeline_create(subdivision_shader.version_shader);
+		for (uint32_t i = 0; i < SubdivisionShader::PASS_MAX; i++) {
+			subdivision_shader.version_shader[i] = subdivision_shader.shader.version_get_shader(subdivision_shader.version, i);
+			subdivision_shader.pipeline[i] = RD::get_singleton()->compute_pipeline_create(subdivision_shader.version_shader[i]);
+		}
 	}
 }
 
@@ -1871,7 +1876,7 @@ void MeshStorage::_mesh_instance_add_surface_buffer(MeshInstance *mi, Mesh *mesh
 			u.append_id(ids[i]);
 			uniforms.push_back(u);
 		}
-		s->uniform_set[p_buffer_index] = RD::get_singleton()->uniform_set_create(uniforms, subdivision_shader.version_shader, SubdivisionShader::UNIFORM_SET_SURFACE);
+		s->uniform_set[p_buffer_index] = RD::get_singleton()->uniform_set_create(uniforms, subdivision_shader.version_shader[SubdivisionShader::PASS_WRITE], SubdivisionShader::UNIFORM_SET_SURFACE);
 		return;
 	}
 
@@ -1913,7 +1918,7 @@ void MeshStorage::_mesh_instance_add_subdivision_owner(MeshInstance *mi, Mesh *m
 		u.append_id(ids[i]);
 		uniforms.push_back(u);
 	}
-	s->subdivision_owner_set = RD::get_singleton()->uniform_set_create(uniforms, subdivision_shader.version_shader, SubdivisionShader::UNIFORM_SET_OWNER);
+	s->subdivision_owner_set = RD::get_singleton()->uniform_set_create(uniforms, subdivision_shader.version_shader[SubdivisionShader::PASS_CAGE], SubdivisionShader::UNIFORM_SET_OWNER);
 }
 
 void MeshStorage::_mesh_instance_remove_surface(MeshInstance *mi, int p_surface) {
@@ -2188,16 +2193,18 @@ void MeshStorage::update_mesh_instances() {
 // The first three run once per owner surface, the write once per surface.
 void MeshStorage::_update_subdivision_passes(RD::ComputeListID &r_compute_list) {
 	RD *rd = RD::get_singleton();
-	if (subdivision_shader.pipeline.is_null()) {
-		ERR_PRINT_ONCE("The subdivision passes have no pipeline: subdivided surfaces keep their rest pose.");
-		return;
+	for (uint32_t pass = 0; pass < SubdivisionShader::PASS_MAX; pass++) {
+		if (subdivision_shader.pipeline[pass].is_null()) {
+			ERR_PRINT_ONCE("The subdivision passes have no pipeline: subdivided surfaces keep their rest pose.");
+			return;
+		}
 	}
-	rd->compute_list_bind_compute_pipeline(r_compute_list, subdivision_shader.pipeline);
 	for (uint32_t pass = 0; pass < SubdivisionShader::PASS_MAX; pass++) {
 		if (pass > 0 && !deform_timestamps) {
 			// Under the timer the list closed after the previous pass, which orders that pass before this one.
 			rd->compute_list_add_barrier(r_compute_list);
 		}
+		rd->compute_list_bind_compute_pipeline(r_compute_list, subdivision_shader.pipeline[pass]);
 		for (const SubdivisionDispatch &dispatch : subdivision_dispatches) {
 			const Mesh::Surface &surface = *dispatch.mi->mesh->surfaces[dispatch.surface];
 			const Mesh::Surface::Subdivision &sd = surface.subdivision;
@@ -2214,7 +2221,6 @@ void MeshStorage::_update_subdivision_passes(RD::ComputeListID &r_compute_list) 
 			}
 
 			SubdivisionShader::PushConstant push_constant = {};
-			push_constant.pass = pass;
 			push_constant.has_skin = dispatch.skin;
 			push_constant.has_blend = dispatch.mi->subdivision_weights_buffer.is_valid();
 			push_constant.cage_positions = owner.cage_positions;
@@ -2268,7 +2274,6 @@ void MeshStorage::_update_subdivision_passes(RD::ComputeListID &r_compute_list) 
 			rd->compute_list_end();
 			rd->capture_timestamp(pass_marks[pass]);
 			r_compute_list = rd->compute_list_begin();
-			rd->compute_list_bind_compute_pipeline(r_compute_list, subdivision_shader.pipeline);
 		}
 	}
 }

@@ -8,16 +8,12 @@
 // repository). The payload's layout is RenderingServerTypes::MeshSubdivisionConstants'; every offset
 // below is in words from the start of a payload. The passes run in order, with a barrier between them:
 // the cage (morphed, then skinned), the refined vertices as stencil sums of it, their normals, and the
-// surface's vertices written into the instance's vertex buffer in the mesh's own layout.
+// surface's vertices written into the instance's vertex buffer in the mesh's own layout. Each pass is
+// its own variant (MODE_CAGE, MODE_STENCIL, MODE_NORMAL, MODE_WRITE), so each is compiled alone (S3b).
 // The normals and tangents follow SubdivisionBuilder's rest-pose functions operation for operation, so
 // both owners of a seam vertex compute it from the same bits in the same order.
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
-
-#define PASS_CAGE 0
-#define PASS_STENCIL 1
-#define PASS_NORMAL 2
-#define PASS_WRITE 3
 
 layout(set = 0, binding = 0, std430) buffer restrict readonly OwnerPayload {
 	uint data[];
@@ -74,7 +70,7 @@ layout(set = 2, binding = 0, std430) buffer restrict readonly SkeletonData {
 bone_transforms;
 
 layout(push_constant, std430) uniform Params {
-	uint pass;
+	uint pad0;
 	uint count;
 	bool has_skin;
 	bool has_blend;
@@ -207,7 +203,8 @@ void main() {
 		return;
 	}
 
-	if (params.pass == PASS_CAGE) {
+#if defined(MODE_CAGE)
+	{
 		// The rest position plus the weighted deltas in ascending shape order, then skinned as
 		// skeleton.glsl skins a position with 8 bones.
 		vec3 vertex = owner_vec3(params.cage_positions + index * 3);
@@ -245,7 +242,9 @@ void main() {
 		cage.data[index * 3] = vertex.x;
 		cage.data[index * 3 + 1] = vertex.y;
 		cage.data[index * 3 + 2] = vertex.z;
-	} else if (params.pass == PASS_STENCIL) {
+	}
+#elif defined(MODE_STENCIL)
+	{
 		// The refined vertex as its stencil's weighted sum of deformed cage vertices, in stored order.
 		vec3 sum = vec3(0.0);
 		uint last = owner_payload.data[params.stencil_offsets + index + 1];
@@ -261,7 +260,9 @@ void main() {
 		refined_positions.data[index * 3] = sum.x;
 		refined_positions.data[index * 3 + 1] = sum.y;
 		refined_positions.data[index * 3 + 2] = sum.z;
-	} else if (params.pass == PASS_NORMAL) {
+	}
+#elif defined(MODE_NORMAL)
+	{
 		// Blender's vertex normal: each quad's normal_quad_v3 (the cross product of its diagonals)
 		// weighted by its corner's angle, summed in welded quad order. A quad's normal is recomputed per
 		// corner, from the same bits, so it is the same at each.
@@ -285,7 +286,9 @@ void main() {
 		refined_normals.data[index * 3] = normal.x;
 		refined_normals.data[index * 3 + 1] = normal.y;
 		refined_normals.data[index * 3 + 2] = normal.z;
-	} else {
+	}
+#else // MODE_WRITE
+	{
 		// The surface's vertex R: its refined vertex's position and normal, and its tangent from the
 		// triangles' UV gradients, each weighted by its corner's angle, orthogonalized against the normal.
 		uint u = surface_payload.data[params.r_to_u + index];
@@ -347,4 +350,5 @@ void main() {
 			dst_vertices.data[dst_normal] = encode_tang_to_uint_oct(vec4(t, binormal_sign));
 		}
 	}
+#endif
 }

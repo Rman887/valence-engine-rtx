@@ -460,7 +460,7 @@ private:
 		RID default_skeleton_uniform_set;
 	} skeleton_shader;
 
-	// D122 S2: the subdivision passes, one pipeline whose push constant picks the pass. Set 0 is the
+	// D122 S2: the subdivision passes, one shader variant and pipeline a pass (S3b). Set 0 is the
 	// owner's instance set, set 1 a surface's instance set, set 2 the skeleton shader's skeleton set.
 	struct SubdivisionShader {
 		enum Pass : uint32_t {
@@ -471,7 +471,7 @@ private:
 			PASS_MAX,
 		};
 		struct PushConstant {
-			uint32_t pass;
+			uint32_t pad0;
 			uint32_t count;
 			uint32_t has_skin;
 			uint32_t has_blend;
@@ -512,8 +512,8 @@ private:
 
 		SubdivisionShaderRD shader;
 		RID version;
-		RID version_shader;
-		RID pipeline;
+		RID version_shader[PASS_MAX];
+		RID pipeline[PASS_MAX];
 	} subdivision_shader;
 
 	// The subdivided surfaces update_mesh_instances() deforms this frame, after the skeleton shader's.

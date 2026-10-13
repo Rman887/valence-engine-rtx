@@ -2035,6 +2035,10 @@ void MeshStorage::update_mesh_instances() {
 	//process skeletons and blend shapes
 	uint64_t frame = RSG::rasterizer->get_frame_number();
 	bool uses_motion_vectors = (RSG::viewport->get_num_viewports_with_motion_vectors() > 0) || (RendererCompositorStorage::get_singleton()->get_num_compositor_effects_with_motion_vectors() > 0);
+	if (deform_timestamps) {
+		// The RT build timer's marks (D122 S3), parsed by name in RenderRaytracing::_build_timer_read().
+		RD::get_singleton()->capture_timestamp("RT deform timer: begin");
+	}
 	RD::ComputeListID compute_list = RD::get_singleton()->compute_list_begin();
 	subdivision_dispatches.clear();
 
@@ -2162,11 +2166,21 @@ void MeshStorage::update_mesh_instances() {
 		dirty_mesh_instance_arrays.remove(&mi->array_update_list);
 	}
 
+	if (deform_timestamps) {
+		// capture_timestamp() refuses a list with dispatches, so the list closes for the mark: the skeleton
+		// dispatches and the subdivision passes lose their overlap while the timer runs.
+		RD::get_singleton()->compute_list_end();
+		RD::get_singleton()->capture_timestamp("RT deform timer: skinned");
+		compute_list = RD::get_singleton()->compute_list_begin();
+	}
 	if (!subdivision_dispatches.is_empty()) {
 		_update_subdivision_passes(compute_list);
 	}
 
 	RD::get_singleton()->compute_list_end();
+	if (deform_timestamps) {
+		RD::get_singleton()->capture_timestamp("RT deform timer: end");
+	}
 }
 
 // D122 S2: every subdivided surface's passes, phase by phase over all of them: the cage, a

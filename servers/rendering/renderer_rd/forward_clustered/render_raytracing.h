@@ -1773,8 +1773,9 @@ class RenderRaytracing {
 	void _async_probe_free();
 
 	// The build timer (the debug argument --rt-build-timer=<path>, D97's budget sizing and D98d's
-	// overlap): timestamps on the main queue between the phases of build_tlas, the compute submit's span
-	// and the frame's build counters, one CSV row per frame, the timestamps read once per swap
+	// overlap): timestamps on the main queue between the phases of build_tlas, the compute submit's span,
+	// the deformation passes' spans (D122 S3, marks written by MeshStorage::update_mesh_instances()) and
+	// the frame's build counters, one CSV row per frame, the timestamps read once per swap
 	// (frame_ended()). Each mark orders every command recorded before it ahead of every command after
 	// it, behind a wait for all of them, so a run with marks is compared only with another run with
 	// marks; --rt-build-timer-marks=off drops them and keeps the viewport span, the compute span and

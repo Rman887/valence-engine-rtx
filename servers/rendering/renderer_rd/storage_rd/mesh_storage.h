@@ -526,6 +526,8 @@ private:
 	LocalVector<SubdivisionDispatch> subdivision_dispatches;
 	void _mesh_instance_add_subdivision_owner(MeshInstance *mi, Mesh *mesh, MeshInstance::Surface *s, uint32_t p_surface);
 	void _update_subdivision_passes(RD::ComputeListID p_compute_list);
+	// The RT build timer's marks around update_mesh_instances()' dispatches (D122 S3), set by RenderRaytracing.
+	bool deform_timestamps = false;
 
 	struct Skeleton {
 		bool use_2d = false;
@@ -576,6 +578,7 @@ public:
 	RID get_default_rd_storage_buffer() const { return default_rd_storage_buffer; }
 
 	void set_surface_freed_callback(SurfaceFreedCallback p_callback) { surface_freed_callback = p_callback; }
+	void set_deform_timestamps(bool p_enable) { deform_timestamps = p_enable; }
 
 	/* MESH API */
 

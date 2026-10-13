@@ -152,8 +152,10 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 	if (build_timer.file.is_valid()) {
 		const String path = timer_path;
 		build_timer.compute = RD::get_singleton()->async_compute_timestamps_set_enabled(true);
-		build_timer.file->store_line("frame,lag,complete,vp_us,as_us,prepare_us,walk_us,lod_us,blas_us,tlas_us,compute_us,compute_begin_us,compute_end_us,cpu_frame_us,builds,triangles,async_builds,forced,budget_triangles,refits,stream_loads,stream_load_triangles,async_populations_total,async_stream_issues_total,async_compactions_total");
+		build_timer.file->store_line("frame,lag,complete,vp_us,as_us,prepare_us,walk_us,lod_us,blas_us,tlas_us,compute_us,compute_begin_us,compute_end_us,deform_skin_us,deform_subdiv_us,cpu_frame_us,builds,triangles,async_builds,forced,budget_triangles,refits,stream_loads,stream_load_triangles,async_populations_total,async_stream_issues_total,async_compactions_total");
 		print_line(vformat("RT: build timer on (D98d): writing %s, phase marks %s, compute submits %s.", path, build_timer.marks ? "on" : "off", build_timer.compute ? "timed" : "not timed"));
+		// The deformation passes' marks (D122 S3) go with the phase marks.
+		RendererRD::MeshStorage::get_singleton()->set_deform_timestamps(build_timer.marks);
 	}
 
 	// Every triangle and cluster build allows data access where the device has position fetch (P1d): the hit stages
@@ -356,6 +358,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 RenderRaytracing::~RenderRaytracing() {
 	if (RendererRD::MeshStorage::get_singleton()) {
 		RendererRD::MeshStorage::get_singleton()->set_surface_freed_callback(nullptr);
+		RendererRD::MeshStorage::get_singleton()->set_deform_timestamps(false);
 	}
 	for (KeyValue<RenderSceneBuffersRD *, RTViewportState *> &kv : viewport_states) {
 		_free_viewport_state_internal(kv.value);
@@ -1244,11 +1247,11 @@ RenderRaytracing::BuildTimerRow &RenderRaytracing::_build_timer_row() {
 	return row;
 }
 
-// One CSV line: the frame, the timing fields (p_timing, from the lag to the compute span's end, or empty
+// One CSV line: the frame, the timing fields (p_timing, from the lag to the deformation passes' spans, or empty
 // for a frame whose timestamps never came back), the CPU time from the row created before it, and the
 // frame's counters.
 void RenderRaytracing::_build_timer_write_row(BuildTimerRow &r_row, const String &p_timing) {
-	String line = itos(r_row.frame) + (p_timing.is_empty() ? String(",,,,,,,,,,,,") : p_timing);
+	String line = itos(r_row.frame) + (p_timing.is_empty() ? String(",,,,,,,,,,,,,,") : p_timing);
 	line += "," + (r_row.cpu_frame_usec >= 0 ? itos(r_row.cpu_frame_usec) : String());
 	line += "," + itos(r_row.builds) + "," + itos(r_row.triangles) + "," + itos(r_row.async_builds) + "," + itos(r_row.forced) + "," + itos(r_row.budget_triangles);
 	line += "," + itos(r_row.refits) + "," + itos(r_row.stream_loads) + "," + itos(r_row.stream_load_triangles);
@@ -1270,8 +1273,8 @@ void RenderRaytracing::frame_ended() {
 // Once per swap, right after it (RendererCompositorRD::end_frame), before anything can flush and
 // re-begin the frame, which would drop the set the swap brought back: the frame that recorded it, its
 // phases summed over the viewports whose marks all arrived in order (complete counts them), its
-// measured viewports' spans, and the compute submit's span with its ends from the first viewport's
-// start. The rows created before it and never written go out first, their counters alone, each a lost
+// measured viewports' spans, the compute submit's span with its ends from the first viewport's start,
+// and the deformation passes' spans summed over their complete mark triples. The rows created before it and never written go out first, their counters alone, each a lost
 // set. A field with nothing to read is empty.
 void RenderRaytracing::_build_timer_read() {
 	RD *rd = RD::get_singleton();
@@ -1291,6 +1294,13 @@ void RenderRaytracing::_build_timer_read() {
 	uint64_t vp_open_ns = 0;
 	bool vp_open = false;
 	bool vp_found = false;
+	// The deformation passes (D122 S3): begin, skinned, end around each update_mesh_instances() that dispatched.
+	uint64_t deform_skin_ns = 0;
+	uint64_t deform_subdiv_ns = 0;
+	uint64_t deform_skin_open_ns = 0;
+	uint64_t deform_last_ns = 0;
+	int32_t deform_last = -1;
+	bool deform_found = false;
 	for (uint32_t i = 0; i < count; i++) {
 		const String name = rd->get_captured_timestamp_name(i);
 		const uint64_t t = rd->get_captured_timestamp_gpu_time(i);
@@ -1306,6 +1316,22 @@ void RenderRaytracing::_build_timer_read() {
 				vp_ns += t - vp_open_ns;
 			}
 			vp_open = false;
+		} else if (name.begins_with("RT deform timer: ")) {
+			if (name == "RT deform timer: begin") {
+				deform_last = 0;
+			} else if (name == "RT deform timer: skinned" && deform_last == 0) {
+				deform_skin_open_ns = t > deform_last_ns ? t - deform_last_ns : 0;
+				deform_last = 1;
+			} else if (name == "RT deform timer: end" && deform_last == 1) {
+				// A triple counts only once all its marks arrived in order.
+				deform_skin_ns += deform_skin_open_ns;
+				deform_subdiv_ns += t > deform_last_ns ? t - deform_last_ns : 0;
+				deform_found = true;
+				deform_last = -1;
+			} else {
+				deform_last = -1;
+			}
+			deform_last_ns = t;
 		} else if (name.begins_with("RT build timer: ")) {
 			int32_t phase = -1;
 			for (uint32_t j = 0; j < std_size(BUILD_TIMER_PHASES); j++) {
@@ -1357,6 +1383,7 @@ void RenderRaytracing::_build_timer_read() {
 	} else {
 		timing += build_timer.compute ? ",0,," : ",,,";
 	}
+	timing += "," + (deform_found ? us(deform_skin_ns) : String()) + "," + (deform_found ? us(deform_subdiv_ns) : String());
 
 	// Older rows never written (a flush discarded their timestamps) go out first, in frame order.
 	for (uint32_t pass = 0; pass < BUILD_TIMER_ROWS; pass++) {

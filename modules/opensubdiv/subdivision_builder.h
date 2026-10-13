@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include "core/io/image.h"
 #include "core/object/ref_counted.h"
 #include "core/templates/hash_map.h"
 #include "core/templates/local_vector.h"
@@ -74,6 +75,21 @@ private:
 	LocalVector<SourceSurface> surfaces;
 	HashMap<int, Vector<String>> owner_bone_names; // Per owner, its skin's joint names by bind index.
 
+	// An owner's displacement (D122 S6): the surfaces whose faces displace, their faces' source polygon
+	// indices (empty: add order is the source's), the face-varying layer the maps read, the maps, the height
+	// range and the blend shape whose weight scales it.
+	struct OwnerDisplacement {
+		Vector<int> surfaces;
+		Vector<Vector<int32_t>> source_faces;
+		Mesh::ArrayType uv_slot = Mesh::ARRAY_TEX_UV2;
+		Ref<Image> height_map;
+		Ref<Image> mask;
+		float min_height = 0.0f;
+		float max_height = 0.0f;
+		String shape_name;
+	};
+	HashMap<int, OwnerDisplacement> owner_displacements;
+
 	HashMap<int, Ref<ArrayMesh>> owner_meshes;
 	Dictionary report;
 	// Set only while build_fingerprint_probe() builds: every owner mesh's blend shapes and every built
@@ -92,6 +108,7 @@ private:
 	// owner's partition.
 	Error _partition_owner(Work &r_work, uint32_t p_part);
 	Error _check_owners(Work &r_work);
+	Error _owner_displacement(Work &r_work, uint32_t p_part);
 	Error _owner_payload(Work &r_work, uint32_t p_part);
 	Error _owner_surfaces(Work &r_work, uint32_t p_part);
 
@@ -107,6 +124,16 @@ public:
 	int add_surface(int p_owner, const Array &p_arrays, const Array &p_blend_arrays, const PackedStringArray &p_blend_shape_names, const PackedInt32Array &p_cage_vertex, const PackedInt32Array &p_faces, const Array &p_uv_weld, const Ref<Material> &p_material);
 	void set_owner_bone_names(int p_owner, const PackedStringArray &p_bone_names);
 	PackedStringArray get_owner_bone_names(int p_owner) const;
+	// D122 S6: displaces the owner's refined surface along its undisplaced normal, as Cycles' BOTH method moves
+	// vertices: each refined vertex its height at build, scaled at run time by the weight of a blend shape named
+	// p_shape_name, appended to the owner's mesh without deltas. A vertex takes its height from the first face of
+	// p_surfaces in the source's face order that holds it (p_source_faces: one array per surface of its faces'
+	// source polygon indices, or empty for add order), at that face's corner value in the face-varying layer of
+	// p_uv_slot; the height is displacement_height() of the maps there. A vertex another owner also refines must get
+	// 0, or build() fails, as it does for a shape name any owner uses or a source face named twice. The maps are
+	// 8-bit L, RGB or opaque RGBA (Cycles associates a straight alpha, which is not modelled); p_mask may be null (1).
+	Error set_owner_displacement(int p_owner, const PackedInt32Array &p_surfaces, const Array &p_source_faces, Mesh::ArrayType p_uv_slot, const Ref<Image> &p_height_map, const Ref<Image> &p_mask, float p_min_height, float p_max_height, const String &p_shape_name);
+	void clear_owner_displacement(int p_owner);
 	Error build(int p_level = 2);
 	Ref<ArrayMesh> get_owner_mesh(int p_owner) const;
 	Dictionary get_report() const;
@@ -116,7 +143,7 @@ public:
 	// a seam (ghost rings), one of them with two surfaces, quads and a triangle face, three UV layers in the A1
 	// slots (UV, UV2, CUSTOM0 as RG float), colours, a blend shape and fractional skin weights, and a third owner
 	// apart without blend shapes, whose surface takes a cluster LOD hierarchy and has a face with folded UVs, whose
-	// render vertices MikkTSpace's grouping splits. The hash takes each owner mesh's
+	// render vertices MikkTSpace's grouping splits; one surface displaces (S6). The hash takes each owner mesh's
 	// blend shape names and mode and every field of every surface as built, so it changes with anything that
 	// changes those bytes: this builder, the rendering server's packing, skin quantization, clusterizer and
 	// hierarchy builder, the payload layout and the vendored libraries. It depends on neither the renderer nor
@@ -127,6 +154,12 @@ public:
 	// and the hash of such bytes. Public for the doctest.
 	static Ref<SubdivisionBuilder> build_fingerprint_probe(LocalVector<uint8_t> *r_input = nullptr);
 	static String fingerprint_of(const LocalVector<uint8_t> &p_input);
+
+	// A height as Cycles evaluates the source's displacement chain at a UV (v up), in float as its CPU kernel
+	// does: each map's linear lookup with repeat in its stored 8-bit values (rows from the bottom, as Blender
+	// stores an image), decoded from sRGB, reduced to its luminance; then (height luma * (max - min) + min) times
+	// the mask's luma. NaN for a non-finite UV or a map it does not accept. Public for the doctest.
+	static float displacement_height(const Ref<Image> &p_height_map, const Ref<Image> &p_mask, const Vector2 &p_uv, float p_min_height, float p_max_height);
 
 	// MikkTSpace's frames on quads, as Blender computes a subdivided mesh's tangents: per corner, 4 corners a quad in
 	// the source's (Blender's) order, counter-clockwise from the front, its position, normal and UV with v up, as

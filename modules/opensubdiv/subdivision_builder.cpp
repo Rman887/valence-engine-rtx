@@ -240,6 +240,126 @@ double ms_since(uint64_t p_usec) {
 	return double(OS::get_singleton()->get_ticks_usec() - p_usec) / 1000.0;
 }
 
+// D122 S6: an 8-bit image as Cycles' CPU kernel samples it (intern/cycles/kernel/device/cpu/image.h, Blender
+// 5.2.1), in float. Its stored values over 255, a grey image's in every colour channel; rows counted from the
+// bottom, as Blender stores an image, where Godot's first row is the top.
+struct CyclesImage {
+	const uint8_t *data = nullptr;
+	int width = 0;
+	int height = 0;
+	int channels = 0;
+
+	void texel(int p_x, int p_y_from_bottom, float r_rgb[3]) const {
+		const uint8_t *pixel = data + (int64_t(height - 1 - p_y_from_bottom) * width + p_x) * channels;
+		const float f = 1.0f / 255.0f;
+		for (int a = 0; a < 3; a++) {
+			r_rgb[a] = pixel[channels >= 3 ? a : 0] * f;
+		}
+	}
+};
+
+bool cycles_image_of(const Ref<Image> &p_image, CyclesImage &r_image) {
+	if (p_image.is_null() || p_image->is_empty() || p_image->is_compressed()) {
+		return false;
+	}
+	switch (p_image->get_format()) {
+		case Image::FORMAT_L8:
+			r_image.channels = 1;
+			break;
+		case Image::FORMAT_RGB8:
+			r_image.channels = 3;
+			break;
+		case Image::FORMAT_RGBA8:
+			r_image.channels = 4;
+			break;
+		default:
+			return false;
+	}
+	r_image.data = p_image->ptr();
+	r_image.width = p_image->get_width();
+	r_image.height = p_image->get_height();
+	if (r_image.channels == 4) {
+		// Cycles associates a straight alpha with the colour on load (ImageMetaData::conform_pixels), which the
+		// lookup here does not model: an RGBA map must be opaque.
+		const int64_t pixels = int64_t(r_image.width) * r_image.height;
+		for (int64_t i = 0; i < pixels; i++) {
+			if (r_image.data[i * 4 + 3] != 255) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+// Cycles' frac(): the integer part rounds down, from a truncation.
+float cycles_frac(float p_x, int *r_i) {
+	const int i = int(p_x) - ((p_x < 0.0f) ? 1 : 0);
+	*r_i = i;
+	return p_x - float(i);
+}
+
+int cycles_wrap_periodic(int p_x, int p_width) {
+	p_x %= p_width;
+	return p_x < 0 ? p_x + p_width : p_x;
+}
+
+// interp_linear() with EXTENSION_REPEAT: texel centres at +0.5, the four texels weighted in its order.
+void cycles_linear(const CyclesImage &p_image, float p_u, float p_v, float r_rgb[3]) {
+	const float x = p_u * float(p_image.width);
+	const float y = p_v * float(p_image.height);
+	int ix, iy;
+	const float tx = cycles_frac(x - 0.5f, &ix);
+	const float ty = cycles_frac(y - 0.5f, &iy);
+	ix = cycles_wrap_periodic(ix, p_image.width);
+	const int nix = cycles_wrap_periodic(ix + 1, p_image.width);
+	iy = cycles_wrap_periodic(iy, p_image.height);
+	const int niy = cycles_wrap_periodic(iy + 1, p_image.height);
+	float t00[3], t10[3], t01[3], t11[3];
+	p_image.texel(ix, iy, t00);
+	p_image.texel(nix, iy, t10);
+	p_image.texel(ix, niy, t01);
+	p_image.texel(nix, niy, t11);
+	const float w00 = (1.0f - ty) * (1.0f - tx);
+	const float w10 = (1.0f - ty) * tx;
+	const float w01 = ty * (1.0f - tx);
+	const float w11 = ty * tx;
+	for (int a = 0; a < 3; a++) {
+		r_rgb[a] = w00 * t00[a] + w10 * t10[a] + w01 * t01[a] + w11 * t11[a];
+	}
+}
+
+// color_srgb_to_linear() (intern/cycles/util/color.h), the exact curve.
+float cycles_srgb_to_linear(float p_c) {
+	if (p_c < 0.04045f) {
+		return (p_c < 0.0f) ? 0.0f : p_c * (1.0f / 12.92f);
+	}
+	return powf((p_c + 0.055f) * (1.0f / 1.055f), 2.4f);
+}
+
+// An sRGB image's colour at a UV, decoded, reduced to its luminance as RGB to BW and a colour-to-float
+// conversion do (linear_rgb_to_gray(): the Y row of the scene linear space, Linear Rec.709 in Blender's default
+// configuration).
+float cycles_luma(const CyclesImage &p_image, float p_u, float p_v) {
+	float rgb[3];
+	cycles_linear(p_image, p_u, p_v, rgb);
+	return cycles_srgb_to_linear(rgb[0]) * 0.2126390059f + cycles_srgb_to_linear(rgb[1]) * 0.7151686788f + cycles_srgb_to_linear(rgb[2]) * 0.0721923154f;
+}
+
+// The source's displacement chain at a UV on maps cycles_image_of() accepted (SubdivisionBuilder::displacement_height()).
+float cycles_displacement_height(const CyclesImage &p_height_map, const CyclesImage *p_mask, float p_u, float p_v, float p_min_height, float p_max_height) {
+	if (!Math::is_finite(p_u) || !Math::is_finite(p_v)) {
+		return NAN;
+	}
+	// The DAZ Displacement group's chain: Math (max - min), Math.001 (luma times it), Math.002 (plus min); the
+	// Displacement node's midlevel 0 and scale 1 leave it as is.
+	const float range = p_max_height - p_min_height;
+	float height = cycles_luma(p_height_map, p_u, p_v) * range + p_min_height;
+	if (p_mask) {
+		height *= cycles_luma(*p_mask, p_u, p_v);
+	}
+	return height;
+}
+
 } // namespace
 
 // A skin slot without weight: its bone is not compared and is written as bind index 0.
@@ -286,6 +406,7 @@ struct SubdivisionBuilder::Work {
 	LocalVector<float> stencil_weights;
 	int quad_count = 0;
 	LocalVector<int> quads; // 4 U per refined quad, in the cage face's corner order.
+	LocalVector<int> quad_face; // Its coarse face.
 	LocalVector<int> quad_surface;
 	LocalVector<int> quad_fvar[MAX_FACE_VARYING_LAYERS]; // 4 values per refined quad.
 	LocalVector<FVarValue> fvar_values[MAX_FACE_VARYING_LAYERS];
@@ -308,6 +429,12 @@ struct SubdivisionBuilder::Work {
 		LocalVector<uint16_t> cage_binds;
 		uint64_t blend_entries = 0;
 		PayloadWriter owner_payload;
+		// Its displacement (S6): the shape's name, and a height per own refined vertex.
+		bool displaced = false;
+		String displacement_shape;
+		LocalVector<float> heights;
+		float height_bound = 0.0f; // The largest |height|, which its bounds grow by.
+		Dictionary displacement_report;
 	};
 	LocalVector<Part> parts;
 
@@ -391,6 +518,58 @@ PackedStringArray SubdivisionBuilder::get_owner_bone_names(int p_owner) const {
 	return names;
 }
 
+Error SubdivisionBuilder::set_owner_displacement(int p_owner, const PackedInt32Array &p_surfaces, const Array &p_source_faces, Mesh::ArrayType p_uv_slot, const Ref<Image> &p_height_map, const Ref<Image> &p_mask, float p_min_height, float p_max_height, const String &p_shape_name) {
+	ERR_FAIL_INDEX_V_MSG(p_owner, MAX_OWNERS, ERR_INVALID_PARAMETER, vformat("Owners are 0 to %d.", MAX_OWNERS - 1));
+	ERR_FAIL_COND_V_MSG(p_surfaces.is_empty(), ERR_INVALID_PARAMETER, "A displacement needs at least one surface.");
+	ERR_FAIL_COND_V_MSG(!p_source_faces.is_empty() && p_source_faces.size() != p_surfaces.size(), ERR_INVALID_PARAMETER, "The source faces are one array per displacing surface, or none.");
+	ERR_FAIL_COND_V_MSG(p_uv_slot != Mesh::ARRAY_TEX_UV && p_uv_slot != Mesh::ARRAY_TEX_UV2 && p_uv_slot != Mesh::ARRAY_CUSTOM0, ERR_INVALID_PARAMETER, "The maps read a face-varying layer: ARRAY_TEX_UV, ARRAY_TEX_UV2 or ARRAY_CUSTOM0.");
+	CyclesImage image;
+	ERR_FAIL_COND_V_MSG(!cycles_image_of(p_height_map, image), ERR_INVALID_PARAMETER, "The height map must be an uncompressed 8-bit L, RGB or opaque RGBA image.");
+	ERR_FAIL_COND_V_MSG(p_mask.is_valid() && !cycles_image_of(p_mask, image), ERR_INVALID_PARAMETER, "The mask must be an uncompressed 8-bit L, RGB or opaque RGBA image.");
+	ERR_FAIL_COND_V_MSG(!Math::is_finite(p_min_height) || !Math::is_finite(p_max_height), ERR_INVALID_PARAMETER, "The height range must be finite.");
+	ERR_FAIL_COND_V_MSG(p_shape_name.is_empty(), ERR_INVALID_PARAMETER, "The displacement shape needs a name.");
+	OwnerDisplacement displacement;
+	for (int surface : p_surfaces) {
+		ERR_FAIL_COND_V_MSG(displacement.surfaces.has(surface), ERR_INVALID_PARAMETER, vformat("Surface %d is named twice.", surface));
+		displacement.surfaces.push_back(surface);
+	}
+	for (int i = 0; i < p_source_faces.size(); i++) {
+		ERR_FAIL_COND_V_MSG(p_source_faces[i].get_type() != Variant::PACKED_INT32_ARRAY, ERR_INVALID_PARAMETER, "Each surface's source faces are a PackedInt32Array.");
+		const PackedInt32Array faces = p_source_faces[i];
+		Vector<int32_t> source;
+		for (int32_t face : faces) {
+			ERR_FAIL_COND_V_MSG(face < 0, ERR_INVALID_PARAMETER, "A source face index is negative.");
+			source.push_back(face);
+		}
+		displacement.source_faces.push_back(source);
+	}
+	displacement.uv_slot = p_uv_slot;
+	displacement.height_map = p_height_map;
+	displacement.mask = p_mask;
+	displacement.min_height = p_min_height;
+	displacement.max_height = p_max_height;
+	displacement.shape_name = p_shape_name;
+	owner_displacements[p_owner] = displacement;
+	owner_meshes.clear();
+	return OK;
+}
+
+void SubdivisionBuilder::clear_owner_displacement(int p_owner) {
+	owner_displacements.erase(p_owner);
+	owner_meshes.clear();
+}
+
+float SubdivisionBuilder::displacement_height(const Ref<Image> &p_height_map, const Ref<Image> &p_mask, const Vector2 &p_uv, float p_min_height, float p_max_height) {
+	if (!Math::is_finite(p_uv.x) || !Math::is_finite(p_uv.y)) {
+		return NAN;
+	}
+	CyclesImage height_map;
+	ERR_FAIL_COND_V_MSG(!cycles_image_of(p_height_map, height_map), NAN, "The height map must be an uncompressed 8-bit L, RGB or opaque RGBA image.");
+	CyclesImage mask;
+	ERR_FAIL_COND_V_MSG(p_mask.is_valid() && !cycles_image_of(p_mask, mask), NAN, "The mask must be an uncompressed 8-bit L, RGB or opaque RGBA image.");
+	return cycles_displacement_height(height_map, p_mask.is_valid() ? &mask : nullptr, float(p_uv.x), float(p_uv.y), p_min_height, p_max_height);
+}
+
 Ref<ArrayMesh> SubdivisionBuilder::get_owner_mesh(int p_owner) const {
 	const Ref<ArrayMesh> *mesh = owner_meshes.getptr(p_owner);
 	ERR_FAIL_NULL_V_MSG(mesh, Ref<ArrayMesh>(), vformat("No mesh for owner %d: build() first.", p_owner));
@@ -407,6 +586,7 @@ void SubdivisionBuilder::clear() {
 	layers.clear();
 	surfaces.clear();
 	owner_bone_names.clear();
+	owner_displacements.clear();
 	owner_meshes.clear();
 	report = Dictionary();
 }
@@ -744,6 +924,7 @@ Error SubdivisionBuilder::_refine(Work &r_work, int p_level) {
 
 	// The refined quads, their coarse face's surface, and their face-varying values.
 	r_work.quads.resize(4 * r_work.quad_count);
+	r_work.quad_face.resize(r_work.quad_count);
 	r_work.quad_surface.resize(r_work.quad_count);
 	for (uint32_t l = 0; l < layers.size(); l++) {
 		r_work.quad_fvar[l].resize(4 * r_work.quad_count);
@@ -758,6 +939,7 @@ Error SubdivisionBuilder::_refine(Work &r_work, int p_level) {
 		for (int level = p_level; level > 0; level--) {
 			parent = refiner->GetLevel(level).GetFaceParentFace(parent);
 		}
+		r_work.quad_face[q] = parent;
 		r_work.quad_surface[q] = r_work.face_surface[parent];
 		for (int c = 0; c < 4; c++) {
 			r_work.quads[4 * q + c] = vertices[c];
@@ -1054,6 +1236,142 @@ Error SubdivisionBuilder::_check_owners(Work &r_work) {
 	return OK;
 }
 
+// An owner's displacement (S6): each of its refined vertices takes its height where Cycles evaluates it, once
+// per vertex at the first triangle that reaches it (scene/mesh_displace.cpp): the first face of a displacing
+// surface in the source's face order, at that face's corner value. A refined vertex inside one coarse face has
+// one value whichever of its refined faces reaches it, so the source's order is needed only between coarse
+// faces. A vertex another owner also refines must stay at 0: both owners write it, from their own amounts.
+Error SubdivisionBuilder::_owner_displacement(Work &r_work, uint32_t p_part) {
+	Work::Part &part = r_work.parts[p_part];
+	const OwnerDisplacement *displacement = owner_displacements.getptr(part.owner);
+	if (!displacement) {
+		return OK;
+	}
+	const uint64_t begin = OS::get_singleton()->get_ticks_usec();
+	int layer = -1;
+	for (uint32_t l = 0; l < layers.size(); l++) {
+		if (layers[l].slot == displacement->uv_slot) {
+			layer = l;
+		}
+	}
+	ERR_FAIL_COND_V_MSG(layer < 0, ERR_INVALID_PARAMETER, vformat("Owner %d's displacement reads array slot %d, which no face-varying layer fills.", part.owner, displacement->uv_slot));
+	ERR_FAIL_COND_V_MSG(r_work.shape_index.has(displacement->shape_name), ERR_INVALID_PARAMETER, vformat("Owner %d's displacement shape is named %s, which an owner's blend shape already uses.", part.owner, displacement->shape_name));
+	CyclesImage height_map;
+	CyclesImage mask;
+	ERR_FAIL_COND_V_MSG(!cycles_image_of(displacement->height_map, height_map), ERR_INVALID_PARAMETER, vformat("Owner %d's height map is not an uncompressed 8-bit L, RGB or opaque RGBA image.", part.owner));
+	ERR_FAIL_COND_V_MSG(displacement->mask.is_valid() && !cycles_image_of(displacement->mask, mask), ERR_INVALID_PARAMETER, vformat("Owner %d's mask is not an uncompressed 8-bit L, RGB or opaque RGBA image.", part.owner));
+	const CyclesImage *mask_image = displacement->mask.is_valid() ? &mask : nullptr;
+
+	// Each coarse face's place in the source's order, -1 for a face that does not displace.
+	LocalVector<int64_t> face_key;
+	face_key.resize(r_work.face_size.size());
+	for (int64_t &key : face_key) {
+		key = -1;
+	}
+	{
+		HashSet<int32_t> source_keys;
+		LocalVector<uint32_t> first_face; // Per surface, its first coarse face.
+		first_face.resize(surfaces.size() + 1);
+		first_face[0] = 0;
+		for (uint32_t s = 0; s < surfaces.size(); s++) {
+			first_face[s + 1] = first_face[s] + surfaces[s].faces.size() / 4;
+		}
+		for (int i = 0; i < displacement->surfaces.size(); i++) {
+			const int s = displacement->surfaces[i];
+			ERR_FAIL_INDEX_V_MSG(s, int(surfaces.size()), ERR_INVALID_PARAMETER, vformat("Owner %d's displacement names surface %d, which does not exist.", part.owner, s));
+			ERR_FAIL_COND_V_MSG(surfaces[s].owner != part.owner, ERR_INVALID_PARAMETER, vformat("Owner %d's displacement names surface %d, of owner %d.", part.owner, s, surfaces[s].owner));
+			const uint32_t face_count = first_face[s + 1] - first_face[s];
+			if (displacement->source_faces.is_empty()) {
+				for (uint32_t f = 0; f < face_count; f++) {
+					face_key[first_face[s] + f] = first_face[s] + f;
+				}
+				continue;
+			}
+			const Vector<int32_t> &source = displacement->source_faces[i];
+			ERR_FAIL_COND_V_MSG(uint32_t(source.size()) != face_count, ERR_INVALID_PARAMETER, vformat("Owner %d's displacement: surface %d has %d faces and %d source faces.", part.owner, s, face_count, source.size()));
+			for (uint32_t f = 0; f < face_count; f++) {
+				// Two faces at one place in the source's order would leave the first face to add order.
+				ERR_FAIL_COND_V_MSG(source_keys.has(source[f]), ERR_INVALID_PARAMETER, vformat("Owner %d's displacement names source face %d twice (surface %d face %d).", part.owner, source[f], s, f));
+				source_keys.insert(source[f]);
+				face_key[first_face[s] + f] = source[f];
+			}
+		}
+	}
+
+	// Per refined vertex, its first displacing face's key and its corner value there. Faces of one coarse face
+	// share a key and agree on the value; a disagreement would make the order within one matter, and is counted.
+	LocalVector<int64_t> best_key;
+	LocalVector<int32_t> best_value;
+	best_key.resize(r_work.u_count);
+	best_value.resize(r_work.u_count);
+	for (int64_t &key : best_key) {
+		key = INT64_MAX;
+	}
+	uint32_t value_conflicts = 0;
+	for (int q = 0; q < r_work.quad_count; q++) {
+		const int64_t key = face_key[r_work.quad_face[q]];
+		if (key < 0) {
+			continue;
+		}
+		for (int c = 0; c < 4; c++) {
+			const int u = r_work.quads[4 * q + c];
+			const int32_t value = r_work.quad_fvar[layer][4 * q + c];
+			if (key < best_key[u]) {
+				best_key[u] = key;
+				best_value[u] = value;
+			} else if (key == best_key[u] && value != best_value[u]) {
+				value_conflicts++;
+			}
+		}
+	}
+	ERR_FAIL_COND_V_MSG(value_conflicts > 0, ERR_BUG, vformat("Owner %d's displacement: %d refined corners of one coarse face disagree on their value.", part.owner, value_conflicts));
+
+	part.heights.resize(part.own_u_count);
+	// The value each height was sampled at, per own U, NaN where no displacing face reaches it: the reference
+	// check compares it with Blender's first face's corner value, which decides the face chosen.
+	PackedVector2Array uvs;
+	uvs.resize(part.own_u_count);
+	Vector2 *uv_write = uvs.ptrw();
+	uint32_t displaced = 0;
+	uint32_t seam_reached = 0; // Seam vertices a displacing face reaches; each must have height 0.
+	float lowest = 0.0f;
+	float highest = 0.0f;
+	for (uint32_t i = 0; i < part.own_u_count; i++) {
+		const int u = part.welded_u[i];
+		float height = 0.0f;
+		if (best_key[u] != INT64_MAX) {
+			// The value as the refined mesh stores it, in float, v up as Blender's.
+			const FVarValue &value = r_work.fvar_values[layer][best_value[u]];
+			uv_write[i] = Vector2(float(value.x), float(value.y));
+			height = cycles_displacement_height(height_map, mask_image, float(value.x), float(value.y), displacement->min_height, displacement->max_height);
+			ERR_FAIL_COND_V_MSG(!Math::is_finite(height), ERR_INVALID_DATA, vformat("Owner %d's displacement height at refined vertex %d is not finite.", part.owner, u));
+			const uint32_t owners = r_work.u_owner_mask[u];
+			seam_reached += (owners & (owners - 1)) ? 1 : 0;
+			ERR_FAIL_COND_V_MSG((owners & (owners - 1)) && height != 0.0f, ERR_INVALID_DATA, vformat("Owner %d's displacement moves refined vertex %d by %f, which another owner also refines: the seam would open.", part.owner, u, height));
+		}
+		if (best_key[u] == INT64_MAX) {
+			uv_write[i] = Vector2(NAN, NAN);
+		}
+		part.heights[i] = height;
+		if (height != 0.0f) {
+			displaced++;
+		}
+		lowest = MIN(lowest, height);
+		highest = MAX(highest, height);
+	}
+	part.displaced = true;
+	part.displacement_shape = displacement->shape_name;
+	part.height_bound = MAX(-lowest, highest);
+	part.displacement_report["shape"] = displacement->shape_name;
+	part.displacement_report["displaced_vertices"] = displaced;
+	part.displacement_report["min_height"] = lowest;
+	part.displacement_report["max_height"] = highest;
+	part.displacement_report["seam_vertices_reached"] = seam_reached; // Each at height 0: a non-zero one fails the build.
+	part.displacement_report["displacement_uvs"] = uvs;
+	part.displacement_report["ms"] = ms_since(begin);
+	return OK;
+}
+
 // An owner's sections: its cage (positions, skin in its own bind indices, sparse deltas in its shape
 // order), its stencils over the local cage, its quads, and the normal adjacency of its own refined
 // vertices, each vertex's quads in welded quad order so that every owner sums a seam vertex's quads
@@ -1229,12 +1547,16 @@ Error SubdivisionBuilder::_owner_payload(Work &r_work, uint32_t p_part) {
 	info[RenderingServerTypes::MESH_SUBDIVISION_INFO_OWN_U_COUNT] = part.own_u_count;
 	info[RenderingServerTypes::MESH_SUBDIVISION_INFO_QUAD_COUNT] = part.own_quads.size() + part.ghost_quads.size();
 	info[RenderingServerTypes::MESH_SUBDIVISION_INFO_OWN_QUAD_COUNT] = part.own_quads.size();
-	info[RenderingServerTypes::MESH_SUBDIVISION_INFO_BLEND_SHAPE_COUNT] = names.size();
+	// The displacement's shape comes after the owner's own, without deltas.
+	info[RenderingServerTypes::MESH_SUBDIVISION_INFO_BLEND_SHAPE_COUNT] = names.size() + (part.displaced ? 1 : 0);
 	info[RenderingServerTypes::MESH_SUBDIVISION_INFO_LEVEL] = r_work.level;
 	info[RenderingServerTypes::MESH_SUBDIVISION_INFO_STENCIL_INDEX_BYTES] = wide ? 4 : 2;
 	info[RenderingServerTypes::MESH_SUBDIVISION_INFO_STENCIL_WEIGHT_COUNT] = weights.size();
 	info[RenderingServerTypes::MESH_SUBDIVISION_INFO_DISPLACEMENT_SHAPE] = RenderingServerTypes::MESH_SUBDIVISION_NO_DISPLACEMENT;
 	PayloadWriter &payload = part.owner_payload;
+	if (part.displaced) {
+		info[RenderingServerTypes::MESH_SUBDIVISION_INFO_DISPLACEMENT_SHAPE] = uint32_t(names.size()); // After the owner's own shapes.
+	}
 	payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, info);
 	payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_POSITIONS, cage_positions);
 	if (r_work.has_skin) {
@@ -1254,6 +1576,9 @@ Error SubdivisionBuilder::_owner_payload(Work &r_work, uint32_t p_part) {
 	payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_U_WELDED, u_welded);
 	payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_OFFSETS, blend_offsets);
 	payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES, blend_entries);
+	if (part.displaced) {
+		payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_DISPLACEMENT_HEIGHTS, part.heights);
+	}
 	return OK;
 }
 
@@ -1263,7 +1588,10 @@ Error SubdivisionBuilder::_owner_payload(Work &r_work, uint32_t p_part) {
 Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 	const uint64_t begin = OS::get_singleton()->get_ticks_usec();
 	Work::Part &part = r_work.parts[p_part];
-	const Vector<String> &names = r_work.owner_shapes[part.owner];
+	Vector<String> names = r_work.owner_shapes[part.owner];
+	if (part.displaced) {
+		names.push_back(part.displacement_shape); // Its weight scales the displacement (S6).
+	}
 	Ref<ArrayMesh> mesh;
 	mesh.instantiate();
 	for (const String &name : names) {
@@ -1527,6 +1855,12 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 				used--;
 			}
 			bone_aabbs.resize(used);
+			// A displaced vertex leaves its stencil's hull by up to its height (S6), at an amount up to 1.
+			for (int b = 0; b < used && part.height_bound > 0.0f; b++) {
+				if (bounds[b].size.x >= 0) {
+					bounds[b] = bounds[b].grow(part.height_bound);
+				}
+			}
 		}
 
 		// Tangents from the triangles' UV gradients, each triangle's corner weighted by its angle,
@@ -1641,6 +1975,7 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 		ERR_FAIL_COND_V_MSG(err != OK, err, vformat("Surface %d: the refined arrays were rejected.", s));
 		surface_data.cluster_data = cluster_table;
 		surface_data.bone_aabbs = bone_aabbs;
+		surface_data.aabb = surface_data.aabb.grow(part.height_bound);
 
 		// Tangent adjacency over the surface's final index order (the cluster builder reorders
 		// triangles), each vertex's entries in the order its tangent was summed above. That order is
@@ -1768,6 +2103,9 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 	owner_report["blend_shapes"] = names.size();
 	owner_report["payload_bytes"] = payload_bytes;
 	owner_report["blend_entries"] = part.blend_entries;
+	if (part.displaced) {
+		owner_report["displacement"] = part.displacement_report;
+	}
 	owner_report["ms"] = ms_since(begin);
 	r_work.owner_reports[part.owner] = owner_report;
 	return OK;
@@ -1826,6 +2164,14 @@ Error SubdivisionBuilder::build(int p_level) {
 		err = _check_owners(work);
 	}
 	for (uint32_t i = 0; i < work.parts.size() && err == OK; i++) {
+		err = _owner_displacement(work, i);
+	}
+	if (err == OK) {
+		for (const KeyValue<int, OwnerDisplacement> &E : owner_displacements) {
+			ERR_FAIL_COND_V_MSG(!work.owners.has(E.key), ERR_INVALID_PARAMETER, vformat("A displacement is set on owner %d, which has no surface.", E.key));
+		}
+	}
+	for (uint32_t i = 0; i < work.parts.size() && err == OK; i++) {
 		err = _owner_payload(work, i);
 		if (err == OK) {
 			err = _owner_surfaces(work, i);
@@ -1871,7 +2217,9 @@ Ref<SubdivisionBuilder> SubdivisionBuilder::build_fingerprint_probe(LocalVector<
 	// with its own values; colours vary by face; skin weights are fractional so the quantizer's rounding shows;
 	// one blend shape moves a seam vertex and one vertex of each owner, so both carry sparse deltas. Owner 2's
 	// first face has its UVs folded (two corners' values swapped), so its refined quads take both orientations
-	// and MikkTSpace splits render vertices.
+	// and MikkTSpace splits render vertices. Owner 0's second surface displaces (S6) through its UV2 values, its
+	// source order putting its second face first, so the edge the two faces share (a UV seam: every face has its
+	// own values) takes the second face's heights; its mask is zero where its faces meet the seam (UV2 v = 0.625).
 	const int rows = 2;
 	auto cage_index = [rows](int p_x, int p_z) { return p_x * (rows + 1) + p_z; };
 	const int tip = cage_index(5, 0); // The triangle's own vertex, past the grid's last column.
@@ -2009,6 +2357,25 @@ Ref<SubdivisionBuilder> SubdivisionBuilder::build_fingerprint_probe(LocalVector<
 		}
 		ERR_FAIL_COND_V_MSG(builder->add_surface(surface_owner[surface], arrays[surface], blend_arrays[surface], surface_owner[surface] == 2 ? PackedStringArray() : shape_names, cage_vertex[surface], glTF_faces[surface], weld, Ref<Material>()) < 0, Ref<SubdivisionBuilder>(), "The fingerprint probe was refused.");
 	}
+	{
+		// 4 x 4 maps, rows from the top as Godot stores them: the mask's third row from the bottom (row 1 from the
+		// top) is zero, so the seam's vertices, at v = 0.625, read it alone.
+		Vector<uint8_t> height_bytes;
+		Vector<uint8_t> mask_bytes;
+		for (int y = 0; y < 4; y++) {
+			for (int x = 0; x < 4; x++) {
+				height_bytes.push_back(uint8_t(16 + 48 * x + 8 * y));
+				height_bytes.push_back(uint8_t(200 - 40 * x));
+				height_bytes.push_back(uint8_t(32 * y + 7));
+				mask_bytes.push_back(y == 1 ? 0 : uint8_t(255 - 50 * x - 20 * y));
+			}
+		}
+		const Ref<Image> height_map = Image::create_from_data(4, 4, false, Image::FORMAT_RGB8, height_bytes);
+		const Ref<Image> mask = Image::create_from_data(4, 4, false, Image::FORMAT_L8, mask_bytes);
+		Array source_faces;
+		source_faces.push_back(PackedInt32Array{ 5, 3 });
+		ERR_FAIL_COND_V_MSG(builder->set_owner_displacement(0, PackedInt32Array{ 1 }, source_faces, Mesh::ARRAY_TEX_UV2, height_map, mask, 0.0f, 0.0008f, "ProbeDisplacement") != OK, Ref<SubdivisionBuilder>(), "The fingerprint probe's displacement was refused.");
+	}
 	builder->fingerprint_input = r_input;
 	const Error err = builder->build(2);
 	builder->fingerprint_input = nullptr;
@@ -2054,11 +2421,14 @@ void SubdivisionBuilder::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("add_surface", "owner", "arrays", "blend_arrays", "blend_shape_names", "cage_vertex", "faces", "uv_weld", "material"), &SubdivisionBuilder::add_surface);
 	ClassDB::bind_method(D_METHOD("set_owner_bone_names", "owner", "bone_names"), &SubdivisionBuilder::set_owner_bone_names);
 	ClassDB::bind_method(D_METHOD("get_owner_bone_names", "owner"), &SubdivisionBuilder::get_owner_bone_names);
+	ClassDB::bind_method(D_METHOD("set_owner_displacement", "owner", "surfaces", "source_faces", "uv_slot", "height_map", "mask", "min_height", "max_height", "shape_name"), &SubdivisionBuilder::set_owner_displacement);
+	ClassDB::bind_method(D_METHOD("clear_owner_displacement", "owner"), &SubdivisionBuilder::clear_owner_displacement);
 	ClassDB::bind_method(D_METHOD("build", "level"), &SubdivisionBuilder::build, DEFVAL(2));
 	ClassDB::bind_method(D_METHOD("get_owner_mesh", "owner"), &SubdivisionBuilder::get_owner_mesh);
 	ClassDB::bind_method(D_METHOD("get_report"), &SubdivisionBuilder::get_report);
 	ClassDB::bind_method(D_METHOD("clear"), &SubdivisionBuilder::clear);
 	ClassDB::bind_static_method("SubdivisionBuilder", D_METHOD("get_fingerprint"), &SubdivisionBuilder::get_fingerprint);
+	ClassDB::bind_static_method("SubdivisionBuilder", D_METHOD("displacement_height", "height_map", "mask", "uv", "min_height", "max_height"), &SubdivisionBuilder::displacement_height);
 
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "cage_vertex_count"), "set_cage_vertex_count", "get_cage_vertex_count");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "blend_shape_mode", PROPERTY_HINT_ENUM, "Normalized,Relative"), "set_blend_shape_mode", "get_blend_shape_mode");

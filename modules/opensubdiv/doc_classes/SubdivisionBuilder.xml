@@ -45,6 +45,30 @@
 				Removes every layer, surface and result.
 			</description>
 		</method>
+		<method name="clear_owner_displacement">
+			<return type="void" />
+			<param index="0" name="owner" type="int" />
+			<description>
+				Removes [param owner]'s displacement set by [method set_owner_displacement].
+			</description>
+		</method>
+		<method name="displacement_height" qualifiers="static">
+			<return type="float" />
+			<param index="0" name="height_map" type="Image" />
+			<param index="1" name="mask" type="Image" />
+			<param index="2" name="uv" type="Vector2" />
+			<param index="3" name="min_height" type="float" />
+			<param index="4" name="max_height" type="float" />
+			<description>
+				Returns the height [method set_owner_displacement] gives a vertex whose value is [param uv] (v up, as Blender's UVs), as Blender's Cycles evaluates a DAZ displacement chain on its CPU, in single precision: each map sampled with linear interpolation and repeat in its stored 8-bit values, rows counted from the bottom as Blender stores an image, decoded from sRGB and reduced to its luminance (the Linear Rec.709 Y row); then the height map's luminance times [code]max_height - min_height[/code] plus [param min_height], times the mask's luminance. [param mask] may be null. Returns NaN for a non-finite [param uv] or a map this method does not accept.
+			</description>
+		</method>
+		<method name="get_fingerprint" qualifiers="static">
+			<return type="String" />
+			<description>
+				Returns a SHA-256, in hexadecimal, of everything a fixed probe builds to, computed once per process. The probe is two owners across a seam with ghost rings, one owner with two surfaces, quads and a triangle face, three UV layers in [constant Mesh.ARRAY_TEX_UV], [constant Mesh.ARRAY_TEX_UV2] and [constant Mesh.ARRAY_CUSTOM0], colours, a blend shape and fractional skin weights, and a third owner without blend shapes whose surface takes a cluster LOD hierarchy and has a face with folded UVs, whose render vertices MikkTSpace's grouping splits; one surface displaces, through a height map and a mask on its second UV layer. The hash takes each owner mesh's blend shape names and mode and every field of every surface as built. Because it hashes what is built rather than a version number, it changes with anything that changes those bytes: this builder, the rendering server's surface packing, skin weight quantization, clusterizer and cluster LOD hierarchy builder, the subdivision payload's layout, and the vendored libraries. It depends on neither the renderer nor the [code]rendering/pathtracing/cluster_blas[/code] and [code]rendering/pathtracing/cluster_lod[/code] settings, since the builder clusters every surface itself. It covers the paths the probe exercises only: not 32-bit indices (the probe has fewer than 65,536 vertices), levels other than 2, or other attribute slots. A caller that stores built meshes records it beside them to tell a mesh another engine built from one this engine would build. Returns an empty string, after an error, if the probe does not build.
+			</description>
+		</method>
 		<method name="get_owner_bone_names" qualifiers="const">
 			<return type="PackedStringArray" />
 			<param index="0" name="owner" type="int" />
@@ -65,18 +89,29 @@
 				Returns the last build's counts, sizes and timings, with one entry per owner under [code]"owners"[/code].
 			</description>
 		</method>
-		<method name="get_fingerprint" qualifiers="static">
-			<return type="String" />
-			<description>
-				Returns a SHA-256, in hexadecimal, of everything a fixed probe builds to, computed once per process. The probe is two owners across a seam with ghost rings, one owner with two surfaces, quads and a triangle face, three UV layers in [constant Mesh.ARRAY_TEX_UV], [constant Mesh.ARRAY_TEX_UV2] and [constant Mesh.ARRAY_CUSTOM0], colours, a blend shape and fractional skin weights, and a third owner without blend shapes whose surface takes a cluster LOD hierarchy and has a face with folded UVs, whose render vertices MikkTSpace's grouping splits. The hash takes each owner mesh's blend shape names and mode and every field of every surface as built. Because it hashes what is built rather than a version number, it changes with anything that changes those bytes: this builder, the rendering server's surface packing, skin weight quantization, clusterizer and cluster LOD hierarchy builder, the subdivision payload's layout, and the vendored libraries. It depends on neither the renderer nor the [code]rendering/pathtracing/cluster_blas[/code] and [code]rendering/pathtracing/cluster_lod[/code] settings, since the builder clusters every surface itself. It covers the paths the probe exercises only: not 32-bit indices (the probe has fewer than 65,536 vertices), levels other than 2, or other attribute slots. A caller that stores built meshes records it beside them to tell a mesh another engine built from one this engine would build. Returns an empty string, after an error, if the probe does not build.
-			</description>
-		</method>
 		<method name="set_owner_bone_names">
 			<return type="void" />
 			<param index="0" name="owner" type="int" />
 			<param index="1" name="bone_names" type="PackedStringArray" />
 			<description>
 				Sets [param owner]'s skin joint names by bind index (a [Skin]'s bind names, or a glTF skin's joint node names in its joint order). Required for every owner of a skinned cage of several owners, and then used for all of them: the skin is gathered by joint name, and each owner's payload holds its ghosts' bones as its own bind indices. [method build] fails when a ghost is weighted to a joint its receiving owner lacks.
+			</description>
+		</method>
+		<method name="set_owner_displacement">
+			<return type="int" enum="Error" />
+			<param index="0" name="owner" type="int" />
+			<param index="1" name="surfaces" type="PackedInt32Array" />
+			<param index="2" name="source_faces" type="Array" />
+			<param index="3" name="uv_slot" type="int" enum="Mesh.ArrayType" />
+			<param index="4" name="height_map" type="Image" />
+			<param index="5" name="mask" type="Image" />
+			<param index="6" name="min_height" type="float" />
+			<param index="7" name="max_height" type="float" />
+			<param index="8" name="shape_name" type="String" />
+			<description>
+				Displaces [param owner]'s refined surface along its undisplaced normals, as Cycles' [code]BOTH[/code] displacement method moves a mesh's vertices and keeps their normals. Each refined vertex gets a height at build, stored in the payload; at run time the write pass adds the height times the weight of a blend shape named [param shape_name], which [method build] appends to the owner's mesh after its own blend shapes, without deltas. At weight 0 the surface is exactly as without a displacement.
+				[param surfaces] are the displacing surfaces, as [method add_surface] returned them, all of [param owner]. A vertex takes its height once, as Cycles evaluates it: at the first face of these surfaces in the source's face order that holds it, at that face's corner value in the face-varying layer filling [param uv_slot]. [param source_faces] gives that order: one [PackedInt32Array] per surface, its faces' polygon indices in the source mesh; empty means add order. The height is [method displacement_height] of [param height_map] and [param mask] (which may be null) at that value.
+				A vertex another owner also refines must get a height of 0: both owners write it, each from its own weight, so [method build] fails otherwise. The surfaces' bounds and bone bounds grow by the largest height, which covers weights up to 1. [method get_report] gives the owner's [code]displacement[/code] entry: the shape, the displaced vertex count, the height range, the seam vertices a displacing face reaches, and [code]displacement_uvs[/code], a [PackedVector2Array] with the value each refined vertex was sampled at (v up), NaN where no displacing face reaches it. The maps must be uncompressed [constant Image.FORMAT_L8], [constant Image.FORMAT_RGB8] or [constant Image.FORMAT_RGBA8] images, an RGBA one opaque (every alpha 255): Cycles associates a straight alpha with the colour on load, which the sampling here does not model. [param shape_name] must not be a blend shape name any owner uses, and [param source_faces] must not name one source face twice; [method build] fails otherwise.
 			</description>
 		</method>
 	</methods>

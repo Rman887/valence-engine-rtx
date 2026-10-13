@@ -1707,7 +1707,8 @@ TEST_CASE("[SceneTree][SubdivisionBuilder] The fingerprint hashes a probe that r
 		const Ref<ArrayMesh> mesh = probe->get_owner_mesh(owner);
 		REQUIRE(mesh.is_valid());
 		CHECK(mesh->get_surface_count() == (owner == 0 ? 2 : 1));
-		CHECK(mesh->get_blend_shape_count() == 1);
+		// Owner 0's displacement shape comes after its own (S6).
+		CHECK(mesh->get_blend_shape_count() == (owner == 0 ? 2 : 1));
 		const Vector<uint8_t> owner_payload = surface_payload(mesh, 0);
 		uint32_t count = 0;
 		const uint32_t *info = payload_section<uint32_t>(owner_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, count);
@@ -1744,6 +1745,273 @@ TEST_CASE("[SceneTree][SubdivisionBuilder] The fingerprint hashes a probe that r
 	// The triangle face refines into owner 1's surface: Catmull-Clark gives it three quads at level 1, twelve at
 	// level 2, beside the strip's 8 x 16 and owner 2's 16 x 16.
 	CHECK(int(probe->get_report()["refined_quads"]) == 8 * 16 + 3 * 4 + 16 * 16);
+	// Owner 0 displaces (S6): its shape and heights, some of them non-zero; owner 1 does not.
+	{
+		const Ref<ArrayMesh> mesh = probe->get_owner_mesh(0);
+		CHECK(mesh->get_blend_shape_name(1) == StringName("ProbeDisplacement"));
+		const Vector<uint8_t> owner_payload = surface_payload(mesh, 0);
+		uint32_t count = 0;
+		const uint32_t *info = payload_section<uint32_t>(owner_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, count);
+		CHECK(info[RenderingServerTypes::MESH_SUBDIVISION_INFO_DISPLACEMENT_SHAPE] == 1);
+		const float *heights = payload_section<float>(owner_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_DISPLACEMENT_HEIGHTS, count);
+		REQUIRE(heights != nullptr);
+		CHECK(count == info[RenderingServerTypes::MESH_SUBDIVISION_INFO_OWN_U_COUNT]);
+		const Dictionary displacement = Dictionary(Dictionary(probe->get_report()["owners"])[0])["displacement"];
+		CHECK(int(displacement["displaced_vertices"]) > 0);
+		// The first surface does not displace: its own vertices are unreached, NaN.
+		const PackedVector2Array sampled = displacement["displacement_uvs"];
+		int unreached = 0;
+		for (const Vector2 &uv : sampled) {
+			unreached += Math::is_nan(uv.x) ? 1 : 0;
+		}
+		CHECK(unreached > 0);
+		CHECK(unreached < sampled.size());
+		const Vector<uint8_t> other = surface_payload(probe->get_owner_mesh(1), 0);
+		const uint32_t *other_info = payload_section<uint32_t>(other, RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, count);
+		CHECK(other_info[RenderingServerTypes::MESH_SUBDIVISION_INFO_DISPLACEMENT_SHAPE] == RenderingServerTypes::MESH_SUBDIVISION_NO_DISPLACEMENT);
+		CHECK(payload_section<float>(other, RenderingServerTypes::MESH_SUBDIVISION_SECTION_DISPLACEMENT_HEIGHTS, count) == nullptr);
+	}
+}
+
+// D122 S6: an 8-bit RGB image from rows given top first, as Godot stores them.
+static Ref<Image> rgb_image(int p_width, int p_height, const LocalVector<uint8_t> &p_rgb) {
+	Vector<uint8_t> bytes;
+	for (uint8_t value : p_rgb) {
+		bytes.push_back(value);
+	}
+	return Image::create_from_data(p_width, p_height, false, Image::FORMAT_RGB8, bytes);
+}
+
+static float srgb_decoded(float p_encoded) {
+	return p_encoded < 0.04045f ? p_encoded * (1.0f / 12.92f) : powf((p_encoded + 0.055f) * (1.0f / 1.055f), 2.4f);
+}
+
+static float decoded_luma(float p_r, float p_g, float p_b) {
+	return srgb_decoded(p_r) * 0.2126390059f + srgb_decoded(p_g) * 0.7151686788f + srgb_decoded(p_b) * 0.0721923154f;
+}
+
+TEST_CASE("[SceneTree][SubdivisionBuilder] Displacement heights sample the maps as Cycles does") {
+	// 2 x 2, top row first: (10, 20, 30) (200, 0, 0) / (0, 255, 0) (40, 40, 40).
+	const Ref<Image> map = rgb_image(2, 2, { 10, 20, 30, 200, 0, 0, 0, 255, 0, 40, 40, 40 });
+	const float f = 1.0f / 255.0f;
+	// At a texel's centre, that texel alone; rows count from the bottom, as Blender stores an image.
+	CHECK(SubdivisionBuilder::displacement_height(map, Ref<Image>(), Vector2(0.25, 0.75), 0.0f, 1.0f) == decoded_luma(10 * f, 20 * f, 30 * f));
+	CHECK(SubdivisionBuilder::displacement_height(map, Ref<Image>(), Vector2(0.75, 0.25), 0.0f, 1.0f) == decoded_luma(40 * f, 40 * f, 40 * f));
+	CHECK(SubdivisionBuilder::displacement_height(map, Ref<Image>(), Vector2(0.25, 0.25), 0.0f, 1.0f) == decoded_luma(0, 255 * f, 0));
+	// At u = 0 the repeat mixes the first column with the last, half each, in the stored values before the decode.
+	const float mixed = SubdivisionBuilder::displacement_height(map, Ref<Image>(), Vector2(0.0, 0.75), 0.0f, 1.0f);
+	CHECK(mixed == doctest::Approx(decoded_luma(0.5f * 10 * f + 0.5f * 200 * f, 0.5f * 20 * f, 0.5f * 30 * f)).epsilon(1e-6));
+	// The chain: (luma * (max - min) + min) * the mask's luma; a null mask is 1.
+	const Ref<Image> mask = rgb_image(2, 2, { 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128 });
+	const float base = SubdivisionBuilder::displacement_height(map, Ref<Image>(), Vector2(0.25, 0.75), 0.001f, 0.003f);
+	CHECK(base == decoded_luma(10 * f, 20 * f, 30 * f) * (0.003f - 0.001f) + 0.001f);
+	CHECK(SubdivisionBuilder::displacement_height(map, mask, Vector2(0.25, 0.75), 0.001f, 0.003f) == base * decoded_luma(128 * f, 128 * f, 128 * f));
+	// A grey image's value stands for every channel.
+	Vector<uint8_t> grey_bytes = { 77, 77, 77, 77 };
+	const Ref<Image> grey = Image::create_from_data(2, 2, false, Image::FORMAT_L8, grey_bytes);
+	CHECK(SubdivisionBuilder::displacement_height(grey, Ref<Image>(), Vector2(0.3, 0.6), 0.0f, 1.0f) == doctest::Approx(decoded_luma(77 * f, 77 * f, 77 * f)).epsilon(1e-6));
+	// A non-finite UV gives NaN; an opaque RGBA map samples as its RGB, one with any alpha below 255 is refused.
+	CHECK(Math::is_nan(SubdivisionBuilder::displacement_height(map, Ref<Image>(), Vector2(NAN, 0.5), 0.0f, 1.0f)));
+	Vector<uint8_t> rgba_bytes = { 10, 20, 30, 255, 200, 0, 0, 255, 0, 255, 0, 255, 40, 40, 40, 255 };
+	const Ref<Image> opaque = Image::create_from_data(2, 2, false, Image::FORMAT_RGBA8, rgba_bytes);
+	CHECK(SubdivisionBuilder::displacement_height(opaque, Ref<Image>(), Vector2(0.25, 0.75), 0.0f, 1.0f) == decoded_luma(10 * f, 20 * f, 30 * f));
+	rgba_bytes.write[15] = 254;
+	const Ref<Image> translucent = Image::create_from_data(2, 2, false, Image::FORMAT_RGBA8, rgba_bytes);
+	ERR_PRINT_OFF;
+	CHECK(Math::is_nan(SubdivisionBuilder::displacement_height(translucent, Ref<Image>(), Vector2(0.25, 0.75), 0.0f, 1.0f)));
+	ERR_PRINT_ON;
+}
+
+// The strip with owner 0's two faces displacing: each face's own UV values (u along z, v along x), face 0's
+// v from 0 to 0.25 and face 1's from 0.5 to 0.75, so the edge they share at x = 1 is a UV seam and the seam
+// with owner 1 at x = 2 is face 1's v = 0.75. The mask's two top rows (v from 0.5 up) are 0 unless asked not.
+struct DisplacedStrip {
+	Ref<SubdivisionBuilder> builder;
+	Ref<Image> height_map;
+	Ref<Image> mask;
+};
+
+static DisplacedStrip make_displaced_strip(const Array &p_source_faces, bool p_mask_seam) {
+	const TestCage strip = make_strip();
+	PackedVector2Array ignored;
+	const TestPrimitive left = make_primitive(strip, 0, ignored);
+	const TestPrimitive right = make_primitive(strip, 1, ignored);
+	const Vector2 square[4] = { Vector2(0, 0), Vector2(1, 0), Vector2(1, 1), Vector2(0, 1) };
+	PackedVector2Array uv_values;
+	for (int face = 0; face < 4; face++) {
+		for (int c = 0; c < 4; c++) {
+			uv_values.push_back(Vector2(0.1f + 0.8f * float(square[c].x), float(face % 2) * 0.5f + 0.25f * float(square[c].y)));
+		}
+	}
+	DisplacedStrip result;
+	result.height_map = rgb_image(2, 4, { 250, 250, 250, 30, 30, 30, 90, 90, 90, 200, 200, 200, 160, 160, 160, 60, 60, 60, 20, 20, 20, 120, 120, 120 });
+	LocalVector<uint8_t> mask_rgb;
+	for (int y = 0; y < 4; y++) {
+		for (int x = 0; x < 2; x++) {
+			const uint8_t value = (y < 2 && p_mask_seam) ? 0 : uint8_t(255 - 40 * y - 30 * x);
+			for (int a = 0; a < 3; a++) {
+				mask_rgb.push_back(value);
+			}
+		}
+	}
+	result.mask = rgb_image(2, 4, mask_rgb);
+	result.builder.instantiate();
+	result.builder->set_cage_vertex_count(strip.positions.size());
+	result.builder->set_owner_bone_names(0, test_bone_names());
+	result.builder->set_owner_bone_names(1, test_bone_names());
+	result.builder->add_face_varying_layer(uv_values, Mesh::ARRAY_TEX_UV);
+	Array left_weld;
+	left_weld.push_back(left.uv_weld);
+	Array right_weld;
+	right_weld.push_back(right.uv_weld);
+	result.builder->add_surface(0, left.arrays, Array(), PackedStringArray(), left.cage_vertex, left.faces, left_weld, Ref<Material>());
+	result.builder->add_surface(1, right.arrays, Array(), PackedStringArray(), right.cage_vertex, right.faces, right_weld, Ref<Material>());
+	CHECK(result.builder->set_owner_displacement(0, PackedInt32Array{ 0 }, p_source_faces, Mesh::ARRAY_TEX_UV, result.height_map, result.mask, 0.0f, 0.0008f, "Displace") == OK);
+	return result;
+}
+
+TEST_CASE("[SceneTree][SubdivisionBuilder] A displacement takes each vertex's height from its first face in the source's order") {
+	float shared_heights[2] = {};
+	for (int order = 0; order < 2; order++) {
+		// Add order puts face 0 first; the source order [1, 0] face 1.
+		Array source_faces;
+		if (order == 1) {
+			source_faces.push_back(PackedInt32Array{ 1, 0 });
+		}
+		DisplacedStrip strip = make_displaced_strip(source_faces, true);
+		REQUIRE(strip.builder->build(2) == OK);
+		const Ref<ArrayMesh> mesh = strip.builder->get_owner_mesh(0);
+		REQUIRE(mesh->get_blend_shape_count() == 1);
+		CHECK(mesh->get_blend_shape_name(0) == StringName("Displace"));
+		const Vector<uint8_t> payload = surface_payload(mesh, 0);
+		uint32_t count = 0;
+		const uint32_t *info = payload_section<uint32_t>(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, count);
+		CHECK(info[RenderingServerTypes::MESH_SUBDIVISION_INFO_DISPLACEMENT_SHAPE] == 0);
+		CHECK(info[RenderingServerTypes::MESH_SUBDIVISION_INFO_BLEND_SHAPE_COUNT] == 1);
+		const float *heights = payload_section<float>(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_DISPLACEMENT_HEIGHTS, count);
+		REQUIRE(heights != nullptr);
+		const uint32_t *r_to_u = payload_section<uint32_t>(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U, count);
+		const Array arrays = mesh->surface_get_arrays(0);
+		const PackedVector3Array positions = arrays[Mesh::ARRAY_VERTEX];
+		const PackedVector2Array uvs = arrays[Mesh::ARRAY_TEX_UV];
+		int shared = 0;
+		int seam = 0;
+		int interior = 0;
+		int nonzero = 0;
+		for (int r = 0; r < positions.size(); r++) {
+			const float height = heights[r_to_u[r]];
+			const Vector2 blender_uv(uvs[r].x, 1.0f - float(uvs[r].y)); // Stored as 1 - v.
+			const bool face_1 = blender_uv.y >= 0.5f - 1e-6f;
+			const float own = SubdivisionBuilder::displacement_height(strip.height_map, strip.mask, blender_uv, 0.0f, 0.0008f);
+			nonzero += height != 0.0f ? 1 : 0;
+			if (Math::is_equal_approx(positions[r].x, real_t(2.0), real_t(1e-5))) {
+				seam++;
+				CHECK(height == 0.0f); // The mask's top rows: the seam stays where owner 1 puts it.
+			} else if (Math::is_equal_approx(positions[r].x, real_t(1.0), real_t(1e-5))) {
+				// Two render vertices of one refined vertex, one per face: both carry the first face's height.
+				shared++;
+				if (face_1 == (order == 1)) {
+					CHECK(height == own);
+				}
+				shared_heights[order] += height;
+			} else {
+				interior++;
+				CHECK(height == own);
+			}
+		}
+		CHECK(seam == 5);
+		CHECK(shared == 10);
+		CHECK(interior > 0);
+		CHECK(nonzero > 0);
+		const Dictionary report = Dictionary(Dictionary(strip.builder->get_report()["owners"])[0])["displacement"];
+		CHECK(int(report["displaced_vertices"]) > 0);
+		CHECK(int(report["seam_vertices_reached"]) == 5);
+		// The value each refined vertex was sampled at: its own face's inside a face, the first face's on the edge the
+		// order decides, as v up.
+		const PackedVector2Array sampled = report["displacement_uvs"];
+		REQUIRE(uint32_t(sampled.size()) == info[RenderingServerTypes::MESH_SUBDIVISION_INFO_OWN_U_COUNT]);
+		for (int r = 0; r < positions.size(); r++) {
+			const Vector2 blender_uv(uvs[r].x, 1.0f - float(uvs[r].y));
+			const bool face_1 = blender_uv.y >= 0.5f - 1e-6f;
+			if (!Math::is_equal_approx(positions[r].x, real_t(1.0), real_t(1e-5)) || face_1 == (order == 1)) {
+				CHECK(sampled[r_to_u[r]] == blender_uv);
+			} else {
+				CHECK(sampled[r_to_u[r]] != blender_uv); // The other face's value on the edge: not the one sampled.
+			}
+		}
+		CHECK(float(report["max_height"]) <= 0.0008f);
+		// Owner 1 carries none.
+		CHECK(strip.builder->get_owner_mesh(1)->get_blend_shape_count() == 0);
+	}
+	// The shared edge's faces read different values, so the order decides its heights.
+	CHECK(shared_heights[0] != shared_heights[1]);
+}
+
+TEST_CASE("[SceneTree][SubdivisionBuilder] A displacement refuses to move the seam, and grows the bounds by its height") {
+	{
+		ERR_PRINT_OFF;
+		DisplacedStrip strip = make_displaced_strip(Array(), false);
+		CHECK(strip.builder->build(2) != OK);
+		ERR_PRINT_ON;
+	}
+	DisplacedStrip strip = make_displaced_strip(Array(), true);
+	REQUIRE(strip.builder->build(2) == OK);
+	const RenderingServerTypes::SurfaceData displaced = RS::get_singleton()->mesh_get_surface(strip.builder->get_owner_mesh(0)->get_rid(), 0);
+	const float bound = float(Dictionary(Dictionary(Dictionary(strip.builder->get_report()["owners"])[0])["displacement"])["max_height"]);
+	REQUIRE(bound > 0.0f);
+	strip.builder->clear_owner_displacement(0);
+	REQUIRE(strip.builder->build(2) == OK);
+	const RenderingServerTypes::SurfaceData plain = RS::get_singleton()->mesh_get_surface(strip.builder->get_owner_mesh(0)->get_rid(), 0);
+	CHECK(strip.builder->get_owner_mesh(0)->get_blend_shape_count() == 0);
+	CHECK(displaced.aabb.is_equal_approx(plain.aabb.grow(bound)));
+	REQUIRE(displaced.bone_aabbs.size() == plain.bone_aabbs.size());
+	for (int b = 0; b < plain.bone_aabbs.size(); b++) {
+		CHECK(displaced.bone_aabbs[b].is_equal_approx(plain.bone_aabbs[b].grow(bound)));
+	}
+	// A surface of another owner and a source face named twice are refused at build, a missing map at once.
+	ERR_PRINT_OFF;
+	DisplacedStrip other = make_displaced_strip(Array(), true);
+	other.builder->set_owner_displacement(0, PackedInt32Array{ 1 }, Array(), Mesh::ARRAY_TEX_UV, other.height_map, other.mask, 0.0f, 0.0008f, "Displace");
+	CHECK(other.builder->build(2) != OK);
+	Array repeated;
+	repeated.push_back(PackedInt32Array{ 7, 7 });
+	DisplacedStrip twice = make_displaced_strip(repeated, true);
+	CHECK(twice.builder->build(2) != OK);
+	CHECK(other.builder->set_owner_displacement(0, PackedInt32Array{ 0 }, Array(), Mesh::ARRAY_TEX_UV2, Ref<Image>(), Ref<Image>(), 0.0f, 1.0f, "D") != OK);
+	ERR_PRINT_ON;
+}
+
+TEST_CASE("[SceneTree][SubdivisionBuilder] A displacement shape may not take a name another owner's blend shape uses") {
+	// The strip with a shape named Displace on owner 1 only (without deltas, so owner 0 need not hold it); owner 0's
+	// displacement shape takes the same name.
+	const TestCage strip = make_strip();
+	PackedVector2Array uv_values;
+	const TestPrimitive left = make_primitive(strip, 0, uv_values);
+	const TestPrimitive right = make_primitive(strip, 1, uv_values);
+	LocalVector<HashMap<int, Vector3>> shapes;
+	shapes.resize(1);
+	PackedStringArray names;
+	names.push_back("Displace");
+	Ref<SubdivisionBuilder> builder;
+	builder.instantiate();
+	builder->set_cage_vertex_count(strip.positions.size());
+	builder->set_owner_bone_names(0, test_bone_names());
+	builder->set_owner_bone_names(1, test_bone_names());
+	builder->add_face_varying_layer(uv_values, Mesh::ARRAY_TEX_UV);
+	Array left_weld;
+	left_weld.push_back(left.uv_weld);
+	Array right_weld;
+	right_weld.push_back(right.uv_weld);
+	builder->add_surface(0, left.arrays, Array(), PackedStringArray(), left.cage_vertex, left.faces, left_weld, Ref<Material>());
+	builder->add_surface(1, right.arrays, make_blend_arrays(right, shapes), names, right.cage_vertex, right.faces, right_weld, Ref<Material>());
+	Vector<uint8_t> white = { 255, 255, 255, 255 };
+	const Ref<Image> map = Image::create_from_data(2, 2, false, Image::FORMAT_L8, white);
+	REQUIRE(builder->set_owner_displacement(0, PackedInt32Array{ 0 }, Array(), Mesh::ARRAY_TEX_UV, map, Ref<Image>(), 0.0f, 0.0f, "Displace") == OK);
+	ERR_PRINT_OFF;
+	CHECK(builder->build(2) != OK);
+	ERR_PRINT_ON;
+	REQUIRE(builder->set_owner_displacement(0, PackedInt32Array{ 0 }, Array(), Mesh::ARRAY_TEX_UV, map, Ref<Image>(), 0.0f, 0.0f, "Displace0") == OK);
+	CHECK(builder->build(2) == OK);
 }
 
 TEST_CASE("[SceneTree][SubdivisionBuilder] Shapes that move a shared cage vertex keep one order in both owners") {

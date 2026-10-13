@@ -319,10 +319,13 @@ void main() {
 				uint r0 = surface_index(triangle * 3);
 				uint r1 = surface_index(triangle * 3 + 1);
 				uint r2 = surface_index(triangle * 3 + 2);
+				// The triangle's corners load once; the corner angle below selects from them.
 				vec3 p0 = surface_position(r0);
+				vec3 p1 = surface_position(r1);
+				vec3 p2 = surface_position(r2);
 				vec2 uv0 = surface_uv(r0);
-				vec3 e1 = surface_position(r1) - p0;
-				vec3 e2 = surface_position(r2) - p0;
+				vec3 e1 = p1 - p0;
+				vec3 e2 = p2 - p0;
 				vec2 d1 = surface_uv(r1) - uv0;
 				vec2 d2 = surface_uv(r2) - uv0;
 				float det = d1.x * d2.y - d2.x * d1.y;
@@ -332,9 +335,10 @@ void main() {
 				float orientation = det < 0.0 ? -1.0 : 1.0;
 				vec3 tangent = godot_normalized((e1 * d2.y - e2 * d1.y) * orientation);
 				vec3 bitangent = godot_normalized((e2 * d1.x - e1 * d2.x) * orientation);
-				vec3 prev = surface_position(surface_index(triangle * 3 + (corner + 2) % 3));
-				vec3 here = surface_position(surface_index(triangle * 3 + corner));
-				vec3 next = surface_position(surface_index(triangle * 3 + (corner + 1) % 3));
+				// Corner c's previous, own and next corners are (c + 2) % 3, c and (c + 1) % 3.
+				vec3 prev = corner == 0 ? p2 : (corner == 1 ? p0 : p1);
+				vec3 here = corner == 0 ? p0 : (corner == 1 ? p1 : p2);
+				vec3 next = corner == 0 ? p1 : (corner == 1 ? p2 : p0);
 				float angle = corner_angle(prev, here, next);
 				tangent_sum += tangent * angle;
 				bitangent_sum += bitangent * angle;

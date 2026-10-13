@@ -44,6 +44,13 @@ layout(set = 0, binding = 4, std430) buffer restrict readonly BlendShapeWeights 
 }
 blend_weights;
 
+// float x, y, z per local cage vertex, own then ghosts: the rest position plus the weighted deltas, as
+// the cage pass last morphed it (S3b). Rewritten only when params.morph says the weights changed.
+layout(set = 0, binding = 5, std430) buffer restrict MorphedCage {
+	float data[];
+}
+morphed;
+
 layout(set = 1, binding = 0, std430) buffer restrict readonly SurfacePayload {
 	uint data[];
 }
@@ -70,7 +77,7 @@ layout(set = 2, binding = 0, std430) buffer restrict readonly SkeletonData {
 bone_transforms;
 
 layout(push_constant, std430) uniform Params {
-	uint pad0;
+	bool morph;
 	uint count;
 	bool has_skin;
 	bool has_blend;
@@ -206,19 +213,28 @@ void main() {
 #if defined(MODE_CAGE)
 	{
 		// The rest position plus the weighted deltas in ascending shape order, then skinned as
-		// skeleton.glsl skins a position with 8 bones.
-		vec3 vertex = owner_vec3(params.cage_positions + index * 3);
-		if (params.has_blend) {
-			vec3 blend_vertex = vec3(0.0);
-			uint last = owner_payload.data[params.blend_offsets + index + 1];
-			for (uint e = owner_payload.data[params.blend_offsets + index]; e < last; e++) {
-				uint entry = params.blend_entries + e * 4;
-				float w = blend_weights.data[owner_payload.data[entry]];
-				if (abs(w) > 0.0001) {
-					blend_vertex += owner_vec3(entry + 1) * w;
+		// skeleton.glsl skins a position with 8 bones. The morph runs only on a frame whose weights
+		// changed (S3b); every other frame skins the stored result, the same bits.
+		vec3 vertex;
+		if (params.has_blend && !params.morph) {
+			vertex = vec3(morphed.data[index * 3], morphed.data[index * 3 + 1], morphed.data[index * 3 + 2]);
+		} else {
+			vertex = owner_vec3(params.cage_positions + index * 3);
+			if (params.has_blend) {
+				vec3 blend_vertex = vec3(0.0);
+				uint last = owner_payload.data[params.blend_offsets + index + 1];
+				for (uint e = owner_payload.data[params.blend_offsets + index]; e < last; e++) {
+					uint entry = params.blend_entries + e * 4;
+					float w = blend_weights.data[owner_payload.data[entry]];
+					if (abs(w) > 0.0001) {
+						blend_vertex += owner_vec3(entry + 1) * w;
+					}
 				}
+				vertex += blend_vertex;
+				morphed.data[index * 3] = vertex.x;
+				morphed.data[index * 3 + 1] = vertex.y;
+				morphed.data[index * 3 + 2] = vertex.z;
 			}
-			vertex += blend_vertex;
 		}
 		if (params.has_skin) {
 			uint skin = params.cage_skin + index * 8;

@@ -1920,11 +1920,13 @@ void MeshStorage::_mesh_instance_add_surface_buffer(MeshInstance *mi, Mesh *mesh
 void MeshStorage::_mesh_instance_add_subdivision_owner(MeshInstance *mi, Mesh *mesh, MeshInstance::Surface *s, uint32_t p_surface) {
 	const Mesh::Surface::Subdivision &sd = mesh->surfaces[p_surface]->subdivision;
 	s->subdivision_cage = RD::get_singleton()->storage_buffer_create(MAX(sd.cage_count, 1u) * 3 * sizeof(float));
+	s->subdivision_morphed = RD::get_singleton()->storage_buffer_create(MAX(sd.cage_count, 1u) * 3 * sizeof(float));
+	mi->subdivision_morph_dirty = true;
 	s->subdivision_positions = RD::get_singleton()->storage_buffer_create(MAX(sd.u_count, 1u) * 3 * sizeof(float));
 	s->subdivision_normals = RD::get_singleton()->storage_buffer_create(MAX(sd.own_u_count, 1u) * 3 * sizeof(float));
 	Vector<RD::Uniform> uniforms;
-	const RID ids[5] = { sd.buffer, s->subdivision_cage, s->subdivision_positions, s->subdivision_normals, mi->subdivision_weights_buffer.is_valid() ? mi->subdivision_weights_buffer : default_rd_storage_buffer };
-	for (uint32_t i = 0; i < 5; i++) {
+	const RID ids[6] = { sd.buffer, s->subdivision_cage, s->subdivision_positions, s->subdivision_normals, mi->subdivision_weights_buffer.is_valid() ? mi->subdivision_weights_buffer : default_rd_storage_buffer, s->subdivision_morphed };
+	for (uint32_t i = 0; i < 6; i++) {
 		RD::Uniform u;
 		u.binding = i;
 		u.uniform_type = RD::UNIFORM_TYPE_STORAGE_BUFFER;
@@ -1949,7 +1951,7 @@ void MeshStorage::_mesh_instance_remove_surface(MeshInstance *mi, int p_surface)
 		}
 	}
 	// D122 S2: freeing these frees the owner set made from them.
-	for (const RID &buffer : { surface.subdivision_cage, surface.subdivision_positions, surface.subdivision_normals }) {
+	for (const RID &buffer : { surface.subdivision_cage, surface.subdivision_morphed, surface.subdivision_positions, surface.subdivision_normals }) {
 		if (buffer.is_valid()) {
 			RD::get_singleton()->free_rid(buffer);
 		}
@@ -2042,6 +2044,7 @@ void MeshStorage::update_mesh_instances() {
 		if (mi->subdivision_weights_buffer.is_valid()) {
 			// D122 S2: every weight, which the cage pass looks up by shape and tests as the skeleton shader does.
 			RD::get_singleton()->buffer_update(mi->subdivision_weights_buffer, 0, mi->blend_weights.size() * sizeof(float), mi->blend_weights.ptr());
+			mi->subdivision_morph_dirty = true; // S3b: the cage pass morphs again.
 		}
 		dirty_mesh_instance_weights.remove(&mi->weight_update_list);
 		mi->weights_dirty = false;
@@ -2257,6 +2260,7 @@ void MeshStorage::_update_subdivision_passes(RD::ComputeListID &r_compute_list) 
 			push_constant.has_tangent = (surface.format & RSE::ARRAY_FORMAT_TANGENT) ? 1 : 0;
 			push_constant.normal_tangent_stride = push_constant.has_normal + push_constant.has_tangent;
 			push_constant.has_uv = (surface.format & RSE::ARRAY_FORMAT_TEX_UV) ? 1 : 0;
+			push_constant.morph = dispatch.mi->subdivision_morph_dirty;
 			switch (pass) {
 				case SubdivisionShader::PASS_CAGE:
 					push_constant.count = owner.cage_count;
@@ -2288,6 +2292,10 @@ void MeshStorage::_update_subdivision_passes(RD::ComputeListID &r_compute_list) 
 			rd->capture_timestamp(pass_marks[pass]);
 			r_compute_list = rd->compute_list_begin();
 		}
+	}
+	// S3b: every instance's cage pass has morphed with its current weights; until they change it skins the result.
+	for (const SubdivisionDispatch &dispatch : subdivision_dispatches) {
+		dispatch.mi->subdivision_morph_dirty = false;
 	}
 }
 

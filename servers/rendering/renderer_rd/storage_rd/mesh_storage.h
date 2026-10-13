@@ -275,6 +275,7 @@ private:
 			// normals, and the uniform set the passes bind them in. A subdivided surface's uniform_set[]
 			// is the passes' surface set, not the skeleton shader's.
 			RID subdivision_cage;
+			RID subdivision_morphed; // The rest cage plus the weighted deltas (S3b); written only for a mesh with blend shapes.
 			RID subdivision_positions;
 			RID subdivision_normals;
 			RID subdivision_owner_set;
@@ -289,6 +290,9 @@ private:
 		RID blend_weights_buffer;
 		// D122 S2: every weight, as floats, for the subdivision cage pass's lookup by shape.
 		RID subdivision_weights_buffer;
+		// D122 S3b: the cage pass morphs on its next run: set when an owner surface's morphed cage is created and
+		// by every weight upload, cleared once the passes have run.
+		bool subdivision_morph_dirty = true;
 		bool subdivision_bone_error = false; // Printed once per instance and skeleton.
 		List<MeshInstance *>::Element *I = nullptr; //used to erase itself
 		uint64_t skeleton_version = 0;
@@ -471,7 +475,7 @@ private:
 			PASS_MAX,
 		};
 		struct PushConstant {
-			uint32_t pad0;
+			uint32_t morph;
 			uint32_t count;
 			uint32_t has_skin;
 			uint32_t has_blend;

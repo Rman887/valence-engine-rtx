@@ -75,11 +75,16 @@ layout(push_constant, std430) uniform PC {
 }
 push;
 
+vec2 signNotZero(vec2 v) {
+	return mix(vec2(-1.0), vec2(1.0), greaterThanEqual(v.xy, vec2(0.0)));
+}
+
 vec2 vec3_to_oct(vec3 v) {
 	float abs_sum = abs(v.x) + abs(v.y) + abs(v.z);
 	v.xy /= abs_sum;
 	if (v.z < 0.0) {
-		v.xy = (1.0 - abs(v.yx)) * sign(v.xy);
+		// signNotZero, not sign: on the lower hemisphere a zero component still folds to its edge.
+		v.xy = (1.0 - abs(v.yx)) * signNotZero(v.xy);
 	}
 	return v.xy;
 }
@@ -153,7 +158,9 @@ void main() {
 				vec2 t_oct = vec2(t_raw.x, abs(t_raw.y) * 2.0 - 1.0);
 				vec3 rt = normalize(normal_rot * oct_to_vec3(t_oct));
 				vec2 rt_oct = vec3_to_oct(rt);
-				float t_raw_y = (abs(rt_oct.y) * 0.5 + 0.5) * bitan_sign;
+				// The decode above recovers y as abs(t_raw.y) * 2 - 1, so y itself, not its magnitude, goes back in, kept
+				// off zero so the sign survives quantization, as Vector3::octahedron_tangent_encode does.
+				float t_raw_y = max(rt_oct.y * 0.5 + 0.5, 1.0 / 32767.0) * bitan_sign;
 				uint rt_packed = uint(rt_oct.x * 32767.5 + 32767.5) | (uint(t_raw_y * 32767.5 + 32767.5) << 16u);
 				dst_vtx.v[tbn_dst + 1u] = rt_packed;
 			}

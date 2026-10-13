@@ -109,6 +109,8 @@ uint encode_norm_to_uint_oct(vec3 base) {
 
 uint encode_tang_to_uint_oct(vec4 base) {
 	vec2 oct = vec3_to_oct(base.xyz);
+	// Keep y off zero so both signs stay distinct after quantization, as Vector3::octahedron_tangent_encode does.
+	oct.y = max(oct.y, 1.0f / 32767.0f);
 	// Encode binormal sign in y component
 	oct.y = oct.y * 0.5f + 0.5f;
 	oct.y = base.w >= 0.0f ? oct.y : 1 - oct.y;

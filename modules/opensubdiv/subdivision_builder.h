@@ -76,6 +76,10 @@ private:
 
 	HashMap<int, Ref<ArrayMesh>> owner_meshes;
 	Dictionary report;
+	// Set only while build_fingerprint_probe() builds: every owner mesh's blend shapes and every built
+	// surface's data are appended to it.
+	LocalVector<uint8_t> *fingerprint_input = nullptr;
+	void _fingerprint_append(const void *p_data, uint64_t p_size);
 
 	struct Work;
 	Error _gather(Work &r_work);
@@ -105,4 +109,19 @@ public:
 	Ref<ArrayMesh> get_owner_mesh(int p_owner) const;
 	Dictionary get_report() const;
 	void clear();
+
+	// A hash of everything a fixed probe builds to, computed once per process. The probe is two owners across
+	// a seam (ghost rings), one of them with two surfaces, quads and a triangle face, three UV layers in the A1
+	// slots (UV, UV2, CUSTOM0 as RG float), colours, a blend shape and fractional skin weights, and a third owner
+	// apart without blend shapes, whose surface takes a cluster LOD hierarchy. The hash takes each owner mesh's
+	// blend shape names and mode and every field of every surface as built, so it changes with anything that
+	// changes those bytes: this builder, the rendering server's packing, skin quantization, clusterizer and
+	// hierarchy builder, the payload layout and the vendored libraries. It depends on neither the renderer nor
+	// the cluster settings (the builder clusters every surface itself). Not covered: 32-bit indices (the probe
+	// has fewer than 65,536 vertices), levels other than 2, and other slots or layer counts.
+	static String get_fingerprint();
+	// The probe get_fingerprint() hashes, built (null after an error), its bytes appended to r_input when given;
+	// and the hash of such bytes. Public for the doctest.
+	static Ref<SubdivisionBuilder> build_fingerprint_probe(LocalVector<uint8_t> *r_input = nullptr);
+	static String fingerprint_of(const LocalVector<uint8_t> &p_input);
 };

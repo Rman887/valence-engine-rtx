@@ -65,6 +65,12 @@
 				Returns the last build's counts, sizes and timings, with one entry per owner under [code]"owners"[/code].
 			</description>
 		</method>
+		<method name="get_fingerprint" qualifiers="static">
+			<return type="String" />
+			<description>
+				Returns a SHA-256, in hexadecimal, of everything a fixed probe builds to, computed once per process. The probe is two owners across a seam with ghost rings, one owner with two surfaces, quads and a triangle face, three UV layers in [constant Mesh.ARRAY_TEX_UV], [constant Mesh.ARRAY_TEX_UV2] and [constant Mesh.ARRAY_CUSTOM0], colours, a blend shape and fractional skin weights, and a third owner without blend shapes whose surface takes a cluster LOD hierarchy. The hash takes each owner mesh's blend shape names and mode and every field of every surface as built. Because it hashes what is built rather than a version number, it changes with anything that changes those bytes: this builder, the rendering server's surface packing, skin weight quantization, clusterizer and cluster LOD hierarchy builder, the subdivision payload's layout, and the vendored libraries. It depends on neither the renderer nor the [code]rendering/pathtracing/cluster_blas[/code] and [code]rendering/pathtracing/cluster_lod[/code] settings, since the builder clusters every surface itself. It covers the paths the probe exercises only: not 32-bit indices (the probe has fewer than 65,536 vertices), levels other than 2, or other attribute slots. A caller that stores built meshes records it beside them to tell a mesh another engine built from one this engine would build. Returns an empty string, after an error, if the probe does not build.
+			</description>
+		</method>
 		<method name="set_owner_bone_names">
 			<return type="void" />
 			<param index="0" name="owner" type="int" />

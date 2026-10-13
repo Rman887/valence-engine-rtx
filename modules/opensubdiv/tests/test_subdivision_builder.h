@@ -1334,6 +1334,55 @@ TEST_CASE("[SceneTree][SubdivisionBuilder] The same input builds the same bytes"
 	}
 }
 
+TEST_CASE("[SceneTree][SubdivisionBuilder] The fingerprint hashes a probe that reaches the A1 paths, the same on every call") {
+	LocalVector<uint8_t> input;
+	const Ref<SubdivisionBuilder> probe = SubdivisionBuilder::build_fingerprint_probe(&input);
+	REQUIRE(probe.is_valid());
+	REQUIRE(!input.is_empty());
+	const String fingerprint = SubdivisionBuilder::get_fingerprint();
+	CHECK(fingerprint.length() == 64);
+	CHECK(fingerprint == SubdivisionBuilder::fingerprint_of(input));
+	CHECK(SubdivisionBuilder::get_fingerprint() == fingerprint);
+
+	for (int owner = 0; owner < 2; owner++) {
+		const Ref<ArrayMesh> mesh = probe->get_owner_mesh(owner);
+		REQUIRE(mesh.is_valid());
+		CHECK(mesh->get_surface_count() == (owner == 0 ? 2 : 1));
+		CHECK(mesh->get_blend_shape_count() == 1);
+		const Vector<uint8_t> owner_payload = surface_payload(mesh, 0);
+		uint32_t count = 0;
+		const uint32_t *info = payload_section<uint32_t>(owner_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, count);
+		REQUIRE(info != nullptr);
+		// Ghosts: cage vertices of the other owner its stencils reach.
+		CHECK(info[RenderingServerTypes::MESH_SUBDIVISION_INFO_CAGE_COUNT] > info[RenderingServerTypes::MESH_SUBDIVISION_INFO_OWN_CAGE_COUNT]);
+		payload_section<uint16_t>(owner_payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_SKIN, count);
+		CHECK(count > 0);
+		CHECK(payload_blend_entry_count(owner_payload) > 0);
+		for (int s = 0; s < mesh->get_surface_count(); s++) {
+			const RenderingServerTypes::SurfaceData data = RS::get_singleton()->mesh_get_surface(mesh->get_rid(), s);
+			CHECK(!data.cluster_data.is_empty());
+			// The three UV layers reach their A1 slots' packing: UV, UV2 and CUSTOM0 as two floats, and the colours.
+			CHECK((data.format & RSE::ARRAY_FORMAT_TEX_UV) != 0);
+			CHECK((data.format & RSE::ARRAY_FORMAT_TEX_UV2) != 0);
+			CHECK((data.format & RSE::ARRAY_FORMAT_CUSTOM0) != 0);
+			CHECK(((data.format >> RSE::ARRAY_FORMAT_CUSTOM0_SHIFT) & RSE::ARRAY_FORMAT_CUSTOM_MASK) == RSE::ARRAY_CUSTOM_RG_FLOAT);
+			CHECK((data.format & RSE::ARRAY_FORMAT_COLOR) != 0);
+		}
+	}
+	// Owner 2, apart and without blend shapes, takes the cluster LOD hierarchy.
+	const Ref<ArrayMesh> apart = probe->get_owner_mesh(2);
+	REQUIRE(apart.is_valid());
+	CHECK(apart->get_blend_shape_count() == 0);
+	const Vector<uint8_t> hierarchy = RS::get_singleton()->mesh_get_surface(apart->get_rid(), 0).cluster_data;
+	REQUIRE(hierarchy.size() >= int(sizeof(uint32_t)));
+	uint32_t version;
+	memcpy(&version, hierarchy.ptr(), sizeof(uint32_t));
+	CHECK(version == RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION);
+	// The triangle face refines into owner 1's surface: Catmull-Clark gives it three quads at level 1, twelve at
+	// level 2, beside the strip's 8 x 16 and owner 2's 16 x 16.
+	CHECK(int(probe->get_report()["refined_quads"]) == 8 * 16 + 3 * 4 + 16 * 16);
+}
+
 TEST_CASE("[SceneTree][SubdivisionBuilder] Shapes that move a shared cage vertex keep one order in both owners") {
 	const TestCage strip = make_strip();
 	LocalVector<HashMap<int, Vector3>> shapes;

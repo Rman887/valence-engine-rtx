@@ -30,7 +30,9 @@
 
 #include "subdivision_builder.h"
 
+#include "core/crypto/crypto_core.h"
 #include "core/object/class_db.h"
+#include "core/os/mutex.h"
 #include "core/os/os.h"
 #include "core/templates/hash_map.h"
 #include "core/templates/hash_set.h"
@@ -1201,6 +1203,14 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 		mesh->add_blend_shape(name);
 	}
 	mesh->set_blend_shape_mode(blend_shape_mode);
+	if (fingerprint_input) {
+		const uint64_t header[3] = { uint64_t(part.owner), uint64_t(names.size()), uint64_t(blend_shape_mode) };
+		_fingerprint_append(header, sizeof(header));
+		for (const String &name : names) {
+			const CharString utf8 = name.utf8();
+			_fingerprint_append(utf8.get_data(), utf8.length());
+		}
+	}
 	int tex_uv_layer = -1;
 	for (uint32_t l = 0; l < layers.size(); l++) {
 		if (layers[l].slot == Mesh::ARRAY_TEX_UV) {
@@ -1518,6 +1528,22 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 		render_vertices += count;
 		triangles_total += triangles.size() / 3;
 
+		if (fingerprint_input) {
+			// Every field the surface carries, each length-prefixed, in build order.
+			const uint64_t header[6] = { uint64_t(part.owner), uint64_t(s), surface_data.format, uint64_t(surface_data.primitive), surface_data.vertex_count, surface_data.index_count };
+			_fingerprint_append(header, sizeof(header));
+			for (const Vector<uint8_t> *bytes : { &surface_data.vertex_data, &surface_data.attribute_data, &surface_data.skin_data, &surface_data.index_data, &surface_data.blend_shape_data, &surface_data.cluster_data, &surface_data.subdivision_data }) {
+				_fingerprint_append(bytes->ptr(), bytes->size());
+			}
+			_fingerprint_append(&surface_data.aabb, sizeof(AABB));
+			_fingerprint_append(surface_data.bone_aabbs.ptr(), surface_data.bone_aabbs.size() * sizeof(AABB));
+			for (const RenderingServerTypes::SurfaceData::LOD &lod : surface_data.lods) {
+				_fingerprint_append(&lod.edge_length, sizeof(lod.edge_length));
+				_fingerprint_append(lod.index_data.ptr(), lod.index_data.size());
+			}
+			_fingerprint_append(&surface_data.uv_scale, sizeof(Vector4));
+		}
+
 		mesh->add_surface(surface_data.format, Mesh::PrimitiveType(surface_data.primitive), surface_data.vertex_data, surface_data.attribute_data, surface_data.skin_data, surface_data.vertex_count, surface_data.index_data, surface_data.index_count, surface_data.aabb, Vector<uint8_t>(), surface_data.bone_aabbs, surface_data.lods, surface_data.uv_scale, surface_data.cluster_data, surface_data.subdivision_data);
 		// ArrayMesh counts its own surface before the server accepts it, so the server's count is the one asked.
 		ERR_FAIL_COND_V_MSG(RS::get_singleton()->mesh_get_surface_count(mesh->get_rid()) != surface_index + 1, ERR_BUG, vformat("Surface %d was not accepted by the rendering server.", s));
@@ -1594,6 +1620,194 @@ Error SubdivisionBuilder::build(int p_level) {
 	return OK;
 }
 
+void SubdivisionBuilder::_fingerprint_append(const void *p_data, uint64_t p_size) {
+	const uint8_t *size = reinterpret_cast<const uint8_t *>(&p_size);
+	for (uint32_t i = 0; i < sizeof(p_size); i++) {
+		fingerprint_input->push_back(size[i]);
+	}
+	const uint8_t *data = reinterpret_cast<const uint8_t *>(p_data);
+	for (uint64_t i = 0; i < p_size; i++) {
+		fingerprint_input->push_back(data[i]);
+	}
+}
+
+Ref<SubdivisionBuilder> SubdivisionBuilder::build_fingerprint_probe(LocalVector<uint8_t> *r_input) {
+	// A 4 x 2 grid of quads and one triangle off its end. Owner 0 holds the first two columns as two surfaces
+	// (its owner sections ride on the first), owner 1 the last two and the triangle; the seam is x = 2, so both
+	// owners carry ghosts. Owner 2, apart, has no blend shapes and enough triangles for a cluster LOD hierarchy. The grid is off the plane so normals and tangents vary. Every corner is its own glTF
+	// vertex with its own weld group, in three UV layers in the A1 slots (UV, UV2, CUSTOM0 as RG float), each
+	// with its own values; colours vary by face; skin weights are fractional so the quantizer's rounding shows;
+	// one blend shape moves a seam vertex and one vertex of each owner, so both carry sparse deltas.
+	const int rows = 2;
+	auto cage_index = [rows](int p_x, int p_z) { return p_x * (rows + 1) + p_z; };
+	const int tip = cage_index(5, 0); // The triangle's own vertex, past the grid's last column.
+	// Owner 2: a 4 x 4 grid of its own, apart from the strip, without blend shapes, so its 512 refined triangles
+	// take the cluster LOD hierarchy.
+	const int apart = tip + 1;
+	const int apart_side = 5;
+	auto apart_index = [apart, apart_side](int p_x, int p_z) { return apart + p_x * apart_side + p_z; };
+	auto position_of = [rows, tip, apart, apart_side](int p_cage) {
+		if (p_cage == tip) {
+			return Vector3(5, 0.0625f, 0.5f);
+		}
+		if (p_cage >= apart) {
+			const int x = (p_cage - apart) / apart_side;
+			const int z = (p_cage - apart) % apart_side;
+			return Vector3(10 + x, 0.25f * float((x * z) % 3), z);
+		}
+		const int x = p_cage / (rows + 1);
+		const int z = p_cage % (rows + 1);
+		return Vector3(x, 0.125f * float((x * 3 + z * 5) % 4), z);
+	};
+	PackedStringArray bone_names;
+	bone_names.push_back("B0");
+	bone_names.push_back("B1");
+	bone_names.push_back("B2");
+	PackedStringArray shape_names;
+	shape_names.push_back("Probe");
+	HashMap<int, Vector3> deltas;
+	deltas.insert(cage_index(2, 1), Vector3(0, 0.25f, 0));
+	deltas.insert(cage_index(1, 1), Vector3(0.125f, 0, 0));
+	deltas.insert(cage_index(3, 1), Vector3(0, 0, 0.0625f));
+	const Vector2 square[4] = { Vector2(0, 0), Vector2(1, 0), Vector2(1, 1), Vector2(0, 1) };
+
+	// Faces, 4 cage vertices each (-1 the fourth of a triangle), and the source surface each goes to.
+	LocalVector<int> faces;
+	LocalVector<int> face_surface;
+	for (int x = 0; x < 4; x++) {
+		for (int z = 0; z < rows; z++) {
+			const int quad[4] = { cage_index(x, z), cage_index(x, z + 1), cage_index(x + 1, z + 1), cage_index(x + 1, z) };
+			for (int c = 0; c < 4; c++) {
+				faces.push_back(quad[c]);
+			}
+			face_surface.push_back(x < 2 ? x : 2);
+		}
+	}
+	// Its first edge runs opposite to the last quad's, so the cage stays a consistently oriented manifold.
+	const int triangle[4] = { cage_index(4, 0), cage_index(4, 1), tip, -1 };
+	for (int c = 0; c < 4; c++) {
+		faces.push_back(triangle[c]);
+	}
+	face_surface.push_back(2);
+	for (int x = 0; x < apart_side - 1; x++) {
+		for (int z = 0; z < apart_side - 1; z++) {
+			const int quad[4] = { apart_index(x, z), apart_index(x, z + 1), apart_index(x + 1, z + 1), apart_index(x + 1, z) };
+			for (int c = 0; c < 4; c++) {
+				faces.push_back(quad[c]);
+			}
+			face_surface.push_back(3);
+		}
+	}
+	const int surface_owner[4] = { 0, 0, 1, 2 };
+
+	PackedVector2Array uv_values[3];
+	Array arrays[4];
+	Array blend_arrays[4];
+	PackedInt32Array cage_vertex[4];
+	PackedInt32Array glTF_faces[4];
+	PackedInt32Array uv_weld[4];
+	for (int surface = 0; surface < 4; surface++) {
+		PackedVector3Array vertices;
+		PackedVector3Array targets;
+		PackedInt32Array bones;
+		PackedFloat32Array weights;
+		PackedColorArray colors;
+		for (uint32_t f = 0; f < face_surface.size(); f++) {
+			if (face_surface[f] != surface) {
+				continue;
+			}
+			for (int c = 0; c < 4; c++) {
+				const int cage = faces[4 * f + c];
+				if (cage < 0) {
+					glTF_faces[surface].push_back(-1);
+					uv_weld[surface].push_back(-1);
+					continue;
+				}
+				const Vector3 position = position_of(cage);
+				glTF_faces[surface].push_back(vertices.size());
+				cage_vertex[surface].push_back(cage);
+				vertices.push_back(position);
+				const Vector3 *delta = deltas.getptr(cage);
+				targets.push_back(delta ? position + *delta : position);
+				const float even[4] = { 0.3f, 0.7f, 0.0f, 0.0f };
+				const float odd[4] = { 0.15f, 0.35f, 0.5f, 0.0f };
+				for (int b = 0; b < 4; b++) {
+					bones.push_back(b < 3 ? b : 0);
+					weights.push_back(cage % 2 == 0 ? even[b] : odd[b]);
+				}
+				colors.push_back(Color(0.125f * float(f % 8), 1.0f - 0.0625f * float(f % 16), 0.5f, 1.0f));
+				uv_weld[surface].push_back(uv_values[0].size());
+				uv_values[0].push_back(square[c]);
+				uv_values[1].push_back(square[c] * 0.5f + Vector2(0.25f, 0.125f));
+				uv_values[2].push_back(Vector2(square[c].y * 0.75f, square[c].x * 0.125f + 0.5f));
+			}
+		}
+		arrays[surface].resize(Mesh::ARRAY_MAX);
+		arrays[surface][Mesh::ARRAY_VERTEX] = vertices;
+		arrays[surface][Mesh::ARRAY_BONES] = bones;
+		arrays[surface][Mesh::ARRAY_WEIGHTS] = weights;
+		arrays[surface][Mesh::ARRAY_COLOR] = colors;
+		if (surface_owner[surface] != 2) {
+			Array blend;
+			blend.resize(Mesh::ARRAY_MAX);
+			blend[Mesh::ARRAY_VERTEX] = targets;
+			blend_arrays[surface].push_back(blend);
+		}
+	}
+
+	Ref<SubdivisionBuilder> builder;
+	builder.instantiate();
+	builder->set_cage_vertex_count(apart_index(apart_side - 1, apart_side - 1) + 1);
+	const Mesh::ArrayType slots[3] = { Mesh::ARRAY_TEX_UV, Mesh::ARRAY_TEX_UV2, Mesh::ARRAY_CUSTOM0 };
+	for (int l = 0; l < 3; l++) {
+		ERR_FAIL_COND_V_MSG(builder->add_face_varying_layer(uv_values[l], slots[l]) != l, Ref<SubdivisionBuilder>(), "The fingerprint probe's UV layers were refused.");
+	}
+	for (int owner = 0; owner < 3; owner++) {
+		builder->set_owner_bone_names(owner, bone_names);
+	}
+	for (int surface = 0; surface < 4; surface++) {
+		Array weld;
+		for (int l = 0; l < 3; l++) {
+			weld.push_back(uv_weld[surface]);
+		}
+		ERR_FAIL_COND_V_MSG(builder->add_surface(surface_owner[surface], arrays[surface], blend_arrays[surface], surface_owner[surface] == 2 ? PackedStringArray() : shape_names, cage_vertex[surface], glTF_faces[surface], weld, Ref<Material>()) < 0, Ref<SubdivisionBuilder>(), "The fingerprint probe was refused.");
+	}
+	builder->fingerprint_input = r_input;
+	const Error err = builder->build(2);
+	builder->fingerprint_input = nullptr;
+	ERR_FAIL_COND_V_MSG(err != OK, Ref<SubdivisionBuilder>(), "The fingerprint probe did not build.");
+	return builder;
+}
+
+String SubdivisionBuilder::fingerprint_of(const LocalVector<uint8_t> &p_input) {
+	ERR_FAIL_COND_V(p_input.is_empty(), String());
+	unsigned char hash[32];
+	ERR_FAIL_COND_V(CryptoCore::sha256(p_input.ptr(), p_input.size(), hash) != OK, String());
+	return String::hex_encode_buffer(hash, 32);
+}
+
+String SubdivisionBuilder::get_fingerprint() {
+	static Mutex mutex;
+	static String fingerprint;
+	{
+		MutexLock lock(mutex);
+		if (!fingerprint.is_empty()) {
+			return fingerprint;
+		}
+	}
+	// Computed outside the lock: threads that both miss build the same bytes, and the first to store wins.
+	// Nothing it hashes depends on a setting, so the value holds for the process.
+	const uint64_t begin = OS::get_singleton()->get_ticks_usec();
+	LocalVector<uint8_t> input;
+	const String computed = build_fingerprint_probe(&input).is_valid() ? fingerprint_of(input) : String();
+	print_verbose(vformat("SubdivisionBuilder: fingerprint %s from its probe in %.2f ms.", computed, double(OS::get_singleton()->get_ticks_usec() - begin) / 1000.0));
+	MutexLock lock(mutex);
+	if (fingerprint.is_empty()) {
+		fingerprint = computed;
+	}
+	return fingerprint;
+}
+
 void SubdivisionBuilder::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_cage_vertex_count", "count"), &SubdivisionBuilder::set_cage_vertex_count);
 	ClassDB::bind_method(D_METHOD("get_cage_vertex_count"), &SubdivisionBuilder::get_cage_vertex_count);
@@ -1607,6 +1821,7 @@ void SubdivisionBuilder::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_owner_mesh", "owner"), &SubdivisionBuilder::get_owner_mesh);
 	ClassDB::bind_method(D_METHOD("get_report"), &SubdivisionBuilder::get_report);
 	ClassDB::bind_method(D_METHOD("clear"), &SubdivisionBuilder::clear);
+	ClassDB::bind_static_method("SubdivisionBuilder", D_METHOD("get_fingerprint"), &SubdivisionBuilder::get_fingerprint);
 
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "cage_vertex_count"), "set_cage_vertex_count", "get_cage_vertex_count");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "blend_shape_mode", PROPERTY_HINT_ENUM, "Normalized,Relative"), "set_blend_shape_mode", "get_blend_shape_mode");

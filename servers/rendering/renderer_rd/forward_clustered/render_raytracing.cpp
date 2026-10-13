@@ -2317,6 +2317,12 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 			entry.prev_positions = entry.owned_vb_full; // Seeded, the current positions: zero motion.
 		} else if (!layout_changed && p_source.prev_vb.is_valid() && p_source.prev_vb != p_source.current_vb) {
 			entry.prev_positions = p_source.prev_vb;
+		} else if (entry.last_used_frame + 1 != current_frame) {
+			// The trace skipped the entry last frame (hidden, outside the cull cube), so its positions are
+			// those of the last frame it was traced, not the previous one: the current ones are copied in
+			// below, and its motion starts at zero, as the raster's does for a mesh instance that has not
+			// changed in two frames (D122 S5).
+			entry.prev_positions = entry.owned_vb_full;
 		} else {
 			if (entry.prev_pos_vb_capacity < pos_size) {
 				if (entry.prev_pos_vb.is_valid()) {

@@ -604,6 +604,10 @@ void MeshStorage::_mesh_surface_set_subdivision(Mesh *p_mesh, Mesh::Surface *p_s
 	sd.quads = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_QUADS);
 	sd.normal_offsets = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_NORMAL_OFFSETS);
 	sd.normal_entries = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_NORMAL_ENTRIES);
+	sd.displacement_shape = word(info + RenderingServerTypes::MESH_SUBDIVISION_INFO_DISPLACEMENT_SHAPE);
+	if (sd.displacement_shape != RenderingServerTypes::MESH_SUBDIVISION_NO_DISPLACEMENT) {
+		sd.displacement_heights = section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_DISPLACEMENT_HEIGHTS);
+	}
 }
 
 /// Returns stride
@@ -2263,6 +2267,14 @@ void MeshStorage::_update_subdivision_passes(RD::ComputeListID &r_compute_list) 
 			push_constant.normal_tangent_stride = push_constant.has_normal + push_constant.has_tangent;
 			push_constant.has_uv = (surface.format & RSE::ARRAY_FORMAT_TEX_UV) ? 1 : 0;
 			push_constant.morph = dispatch.mi->subdivision_morph_dirty;
+			if (owner.displacement_heights != 0 && owner.displacement_shape < dispatch.mi->blend_weights.size()) {
+				// S6: the write displaces only at a non-zero finite weight, so at zero it writes the same bits as without.
+				const float amount = dispatch.mi->blend_weights[owner.displacement_shape];
+				if (amount != 0.0f && Math::is_finite(amount)) {
+					push_constant.displacement_heights = owner.displacement_heights;
+					push_constant.displacement_amount = amount;
+				}
+			}
 			switch (pass) {
 				case SubdivisionShader::PASS_CAGE:
 					push_constant.count = owner.cage_count;

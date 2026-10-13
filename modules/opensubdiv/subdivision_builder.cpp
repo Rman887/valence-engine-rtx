@@ -1233,6 +1233,7 @@ Error SubdivisionBuilder::_owner_payload(Work &r_work, uint32_t p_part) {
 	info[RenderingServerTypes::MESH_SUBDIVISION_INFO_LEVEL] = r_work.level;
 	info[RenderingServerTypes::MESH_SUBDIVISION_INFO_STENCIL_INDEX_BYTES] = wide ? 4 : 2;
 	info[RenderingServerTypes::MESH_SUBDIVISION_INFO_STENCIL_WEIGHT_COUNT] = weights.size();
+	info[RenderingServerTypes::MESH_SUBDIVISION_INFO_DISPLACEMENT_SHAPE] = RenderingServerTypes::MESH_SUBDIVISION_NO_DISPLACEMENT;
 	PayloadWriter &payload = part.owner_payload;
 	payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, info);
 	payload.add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_POSITIONS, cage_positions);

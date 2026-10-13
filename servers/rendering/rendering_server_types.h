@@ -148,7 +148,8 @@ struct SurfaceData {
 enum MeshSubdivisionConstants : uint32_t {
 	// Version 2 (D122 S2): the cage's blend shapes as sparse per-vertex deltas (CAGE_BLEND_*), not dense ones.
 	// Version 3 (D122 tangent frames): each R's binormal sign (TANGENT_SIGNS), from MikkTSpace's grouping.
-	MESH_SUBDIVISION_DATA_VERSION = 3,
+	// Version 4 (D122 S6): the displacement shape (owner info word 10) and its heights (DISPLACEMENT_HEIGHTS).
+	MESH_SUBDIVISION_DATA_VERSION = 4,
 	MESH_SUBDIVISION_HEADER_WORDS = 4,
 	MESH_SUBDIVISION_SECTION_WORDS = 3,
 	MESH_SUBDIVISION_SECTION_ALIGN = 16,
@@ -189,6 +190,9 @@ enum MeshSubdivisionConstants : uint32_t {
 	MESH_SUBDIVISION_SECTION_CAGE_BLEND_OFFSETS = 28, // uint32 per cage vertex plus one, into the entries.
 	MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES = 29,
 	MESH_SUBDIVISION_CAGE_BLEND_ENTRY_WORDS = 4,
+	// float per own U: its displacement height along its undisplaced normal, scaled at run time by the
+	// weight of the blend shape owner info word 10 names. Present exactly when that word names one.
+	MESH_SUBDIVISION_SECTION_DISPLACEMENT_HEIGHTS = 30,
 
 	// MESH_SUBDIVISION_SECTION_OWNER_INFO's words.
 	MESH_SUBDIVISION_INFO_CAGE_COUNT = 0,
@@ -201,7 +205,9 @@ enum MeshSubdivisionConstants : uint32_t {
 	MESH_SUBDIVISION_INFO_LEVEL = 7,
 	MESH_SUBDIVISION_INFO_STENCIL_INDEX_BYTES = 8,
 	MESH_SUBDIVISION_INFO_STENCIL_WEIGHT_COUNT = 9,
-	MESH_SUBDIVISION_OWNER_INFO_WORDS = 10,
+	MESH_SUBDIVISION_INFO_DISPLACEMENT_SHAPE = 10, // The blend shape whose weight scales the displacement, or MESH_SUBDIVISION_NO_DISPLACEMENT.
+	MESH_SUBDIVISION_OWNER_INFO_WORDS = 11,
+	MESH_SUBDIVISION_NO_DISPLACEMENT = 0xFFFFFFFF,
 };
 
 enum MeshClusterConstants : uint32_t {

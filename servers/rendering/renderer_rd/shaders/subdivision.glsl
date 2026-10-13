@@ -109,8 +109,8 @@ layout(push_constant, std430) uniform Params {
 
 	bool has_uv;
 	uint tangent_signs;
-	uint pad2;
-	uint pad3;
+	uint displacement_heights; // S6: the owner's heights, 0 when this write does not displace.
+	float displacement_amount;
 }
 params;
 
@@ -311,15 +311,20 @@ void main() {
 		// triangles' UV gradients, each weighted by its corner's angle, orthogonalized against the normal.
 		// Each gradient is oriented by its triangle's own UV area, as MikkTSpace orients it; the R sums only its
 		// own MikkTSpace group's triangles, and its binormal sign is that group's, from the payload.
+		// The position alone is displaced (S6), along the undisplaced normal by the U's height times the
+		// amount, as Cycles' BOTH method moves vertices and keeps their normals and tangents.
 		uint u = surface_payload.data[params.r_to_u + index];
+		vec3 normal = refined_normal(u);
 		vec3 vertex = refined_position(u);
+		if (params.displacement_heights != 0) {
+			vertex += normal * (params.displacement_amount * uintBitsToFloat(owner_payload.data[params.displacement_heights + u]));
+		}
 		uvec3 uvertex = floatBitsToUint(vertex);
 		dst_vertices.data[index * 3] = uvertex.x;
 		dst_vertices.data[index * 3 + 1] = uvertex.y;
 		dst_vertices.data[index * 3 + 2] = uvertex.z;
 
 		uint dst_normal = params.count * 3 + index * params.normal_tangent_stride;
-		vec3 normal = refined_normal(u);
 		if (params.has_normal) {
 			dst_vertices.data[dst_normal] = encode_norm_to_uint_oct(normal);
 			dst_normal++;

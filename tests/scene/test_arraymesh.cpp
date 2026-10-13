@@ -998,7 +998,7 @@ static LocalVector<SubdivisionSection> subdivision_quad_sections(bool p_owner, u
 		sections.push_back(section);
 	};
 	if (p_owner) {
-		add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, { 4, 4, 4, 4, 1, 1, p_blend_shapes, 2, 4, 4 });
+		add(RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, { 4, 4, 4, 4, 1, 1, p_blend_shapes, 2, 4, 4, RenderingServerTypes::MESH_SUBDIVISION_NO_DISPLACEMENT });
 		LocalVector<uint32_t> positions;
 		const float corners[12] = { 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0 };
 		for (float value : corners) {
@@ -1327,9 +1327,10 @@ TEST_CASE("[SceneTree][ArrayMesh] Malformed subdivision payloads are refused, al
 		CHECK_FALSE(valid(subdivision_payload_from(subdivision_quad_sections(true, 1), 0, 0)));
 		CHECK_FALSE(valid(subdivision_payload_from(subdivision_quad_sections(false, 1), RenderingServerTypes::MESH_SUBDIVISION_FLAG_OWNER, 0)));
 	}
-	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, { 4, 4, 4, 4, 1, 1, 1, 2, 4 }))); // Short info.
-	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, { 4, 5, 4, 4, 1, 1, 1, 2, 4, 4 }))); // Own past all.
-	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, { 4, 4, 4, 4, 1, 1, 1, 2, 3, 4 }))); // Index width.
+	const uint32_t none = RenderingServerTypes::MESH_SUBDIVISION_NO_DISPLACEMENT;
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, { 4, 4, 4, 4, 1, 1, 1, 2, 4, 4 }))); // Short info: version 3's.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, { 4, 5, 4, 4, 1, 1, 1, 2, 4, 4, none }))); // Own past all.
+	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, { 4, 4, 4, 4, 1, 1, 1, 2, 3, 4, none }))); // Index width.
 	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U, { 0, 1, 2, 4 }))); // Past the own U.
 	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U, { 0, 1, 2 }))); // Short.
 	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_OFFSETS, { 0, 2, 1, 5, 6 }))); // Decreasing.
@@ -1372,6 +1373,41 @@ TEST_CASE("[SceneTree][ArrayMesh] Malformed subdivision payloads are refused, al
 		CHECK_FALSE(valid(subdivision_payload_from(sections, RenderingServerTypes::MESH_SUBDIVISION_FLAG_OWNER, 0)));
 	}
 	CHECK_FALSE(valid(set_word(good, 4, 19))); // Version 1's dense delta section id.
+	CHECK_FALSE(valid(set_word(good, 0, 3))); // Version 3, without the displacement word.
+	{
+		// The displacement (S6): a shape in range without cage deltas, with a finite height per own U, or neither. The
+		// mesh has two shapes; shape 0 moves cage vertex 1, shape 1 nothing.
+		auto valid_two = [&surface](const Vector<uint8_t> &p_payload) {
+			RenderingServerTypes::SurfaceData candidate = surface;
+			candidate.subdivision_data = p_payload;
+			return RenderingServer::mesh_subdivision_surface_is_valid(candidate, 0, 2, -1, Vector<uint8_t>());
+		};
+		auto displaced = [](uint32_t p_shape, const LocalVector<uint32_t> &p_heights, bool p_with_heights) {
+			LocalVector<SubdivisionSection> sections = subdivision_quad_sections(true, 2);
+			for (SubdivisionSection &section : sections) {
+				if (section.id == RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO) {
+					section.words[RenderingServerTypes::MESH_SUBDIVISION_INFO_DISPLACEMENT_SHAPE] = p_shape;
+				}
+			}
+			if (p_with_heights) {
+				SubdivisionSection heights;
+				heights.id = RenderingServerTypes::MESH_SUBDIVISION_SECTION_DISPLACEMENT_HEIGHTS;
+				heights.words = p_heights;
+				sections.push_back(heights);
+			}
+			return subdivision_payload_from(sections, RenderingServerTypes::MESH_SUBDIVISION_FLAG_OWNER, 0);
+		};
+		const uint32_t half = 0x3f000000;
+		const LocalVector<uint32_t> four = { 0, half, 0, half };
+		CHECK(valid_two(displaced(1, four, true)));
+		CHECK_FALSE(valid_two(displaced(0, four, true))); // A shape the cage's deltas move.
+		CHECK_FALSE(valid_two(displaced(none, four, true))); // Heights without a shape.
+		CHECK_FALSE(valid_two(displaced(1, four, false))); // A shape without heights.
+		CHECK_FALSE(valid_two(displaced(2, four, true))); // A shape past the mesh's.
+		CHECK_FALSE(valid_two(displaced(1, { 0, half, 0 }, true))); // Short.
+		CHECK_FALSE(valid_two(displaced(1, { 0, half, 0x7fc00000, half }, true))); // A NaN.
+		CHECK_FALSE(valid_two(displaced(1, { 0, 0x7f800000, 0, half }, true))); // An infinity.
+	}
 	CHECK_FALSE(valid(with_section(RenderingServerTypes::MESH_SUBDIVISION_SECTION_U_WELDED, { 0, 1, 2 }))); // Short.
 
 	// The .scn path: a surface Dictionary set back through _surfaces is checked by the storage.

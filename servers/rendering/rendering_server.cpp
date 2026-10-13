@@ -1476,7 +1476,7 @@ bool _subdivision_known_section(uint32_t p_id, bool &r_owner_section) {
 	r_owner_section = p_id >= RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO;
 	// Id 19 was version 1's dense blend deltas.
 	return (p_id >= RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U && p_id <= RenderingServerTypes::MESH_SUBDIVISION_SECTION_TANGENT_SIGNS) ||
-			(p_id >= RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO && p_id <= RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES && p_id != 19);
+			(p_id >= RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO && p_id <= RenderingServerTypes::MESH_SUBDIVISION_SECTION_DISPLACEMENT_HEIGHTS && p_id != 19);
 }
 
 SubdivisionSectionSpan _subdivision_span(const Vector<uint8_t> &p_data, uint32_t p_id) {
@@ -1568,6 +1568,7 @@ bool _subdivision_check_owner(const Vector<uint8_t> &p_data, uint32_t p_blend_sh
 	if (level < 1 || level > 4 || (index_bytes != 2 && index_bytes != 4) || (index_bytes == 2 && cage_count > 65536)) {
 		return _subdivision_fail(r_error, "owner info level or stencil index width is invalid");
 	}
+	const uint32_t displacement_shape = _subdivision_word(info, RenderingServerTypes::MESH_SUBDIVISION_INFO_DISPLACEMENT_SHAPE);
 	if (_subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_POSITIONS).bytes != cage_count * 3 * sizeof(float)) {
 		return _subdivision_fail(r_error, "cage positions have the wrong size");
 	}
@@ -1593,6 +1594,9 @@ bool _subdivision_check_owner(const Vector<uint8_t> &p_data, uint32_t p_blend_sh
 			const uint32_t shape = _subdivision_word(blend_entries, uint64_t(e) * RenderingServerTypes::MESH_SUBDIVISION_CAGE_BLEND_ENTRY_WORDS);
 			if (shape >= shape_count) {
 				return _subdivision_fail(r_error, vformat("cage blend entry %d names shape %d, out of the mesh's %d", e, shape, shape_count));
+			}
+			if (shape == displacement_shape) {
+				return _subdivision_fail(r_error, vformat("cage blend entry %d moves the displacement shape %d, which has no deltas", e, shape));
 			}
 			if (e > first && shape <= _subdivision_word(blend_entries, uint64_t(e - 1) * RenderingServerTypes::MESH_SUBDIVISION_CAGE_BLEND_ENTRY_WORDS)) {
 				return _subdivision_fail(r_error, vformat("cage vertex %d's blend entries are not in strictly ascending shape order", c));
@@ -1634,6 +1638,27 @@ bool _subdivision_check_owner(const Vector<uint8_t> &p_data, uint32_t p_blend_sh
 	}
 	if (_subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_WELDED).bytes != cage_count * sizeof(uint32_t) || _subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_U_WELDED).bytes != u_count * sizeof(uint32_t)) {
 		return _subdivision_fail(r_error, "the welded index sections have the wrong size");
+	}
+	// The displacement (S6): a shape in range with a finite height per own U, or neither.
+	const SubdivisionSectionSpan heights = _subdivision_span(p_data, RenderingServerTypes::MESH_SUBDIVISION_SECTION_DISPLACEMENT_HEIGHTS);
+	if (displacement_shape == RenderingServerTypes::MESH_SUBDIVISION_NO_DISPLACEMENT) {
+		if (heights.present) {
+			return _subdivision_fail(r_error, "displacement heights without a displacement shape");
+		}
+	} else {
+		if (displacement_shape >= shape_count) {
+			return _subdivision_fail(r_error, vformat("the displacement shape %d is out of the mesh's %d", displacement_shape, shape_count));
+		}
+		if (heights.bytes != own_u_count * sizeof(float)) {
+			return _subdivision_fail(r_error, vformat("displacement heights hold %d bytes for %d own U", heights.bytes, own_u_count));
+		}
+		for (uint64_t u = 0; u < own_u_count; u++) {
+			float height;
+			memcpy(&height, heights.data + u * sizeof(float), sizeof(float));
+			if (!Math::is_finite(height)) {
+				return _subdivision_fail(r_error, vformat("displacement height %d is not finite", u));
+			}
+		}
 	}
 	r_own_u_count = own_u_count;
 	return true;
@@ -1714,7 +1739,8 @@ bool RenderingServer::mesh_subdivision_data_is_valid(const Vector<uint8_t> &p_da
 			return _subdivision_fail(r_error, vformat("section %d (id %d) at %d, %d bytes, is out of bounds or misaligned", i, section[0], offset, bytes));
 		}
 	}
-	// Every section the payload's kind requires; the cage skin is optional.
+	// Every section the payload's kind requires; the cage skin is optional, and the displacement
+	// heights follow the owner info.
 	for (uint32_t id = RenderingServerTypes::MESH_SUBDIVISION_SECTION_R_TO_U; id <= RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_BLEND_ENTRIES; id++) {
 		bool owner_section = false;
 		if (!_subdivision_known_section(id, owner_section) || id == RenderingServerTypes::MESH_SUBDIVISION_SECTION_CAGE_SKIN || (owner_section && !owner)) {

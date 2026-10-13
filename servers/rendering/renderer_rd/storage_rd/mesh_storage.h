@@ -184,6 +184,9 @@ private:
 				uint32_t quads = 0;
 				uint32_t normal_offsets = 0;
 				uint32_t normal_entries = 0;
+				// S6: the blend shape whose weight scales the displacement, and the heights' section.
+				uint32_t displacement_shape = RenderingServerTypes::MESH_SUBDIVISION_NO_DISPLACEMENT;
+				uint32_t displacement_heights = 0;
 			} subdivision;
 			// Geometry residency (D93): with rendering/pathtracing/cluster_lod_stream_geometry and
 			// cluster_lod_stream on, a surface that streams its geometry (its hierarchy's coarse levels
@@ -508,7 +511,8 @@ private:
 
 			uint32_t has_uv;
 			uint32_t tangent_signs;
-			uint32_t pad[2];
+			uint32_t displacement_heights; // S6: the owner's heights section, 0 when the write does not displace.
+			float displacement_amount;
 		};
 		enum {
 			UNIFORM_SET_OWNER = 0,

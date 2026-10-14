@@ -627,8 +627,10 @@ struct RTSurfaceData {
 	RTClusterAsyncPopulation *cluster_async = nullptr;
 };
 
-// A surface's geometry metadata from its format, and the buffers a BLAS of it reads.
-void _fill_surface_geometry_data(void *p_mesh_surface, bool p_force_uncompressed, RTSurfaceData *r_surf_data, RID *r_vertex_buffer = nullptr, RID *r_attribute_buffer = nullptr, RID *r_index_buffer = nullptr);
+// A surface's geometry metadata from its format, and the buffers a BLAS of it reads. With an index
+// buffer given, its triangles are that list of index_count indices over the surface's vertices (an
+// index variant, D127).
+void _fill_surface_geometry_data(void *p_mesh_surface, bool p_force_uncompressed, RTSurfaceData *r_surf_data, RID *r_vertex_buffer = nullptr, RID *r_attribute_buffer = nullptr, RID *r_index_buffer = nullptr, RID p_index_buffer_override = RID(), uint32_t p_index_count_override = 0);
 // The triangle geometry of a surface's own BLAS over its buffers, as _populate_surface_blas builds it.
 void _fill_surface_triangle_geometry(RID p_vertex_buffer, RID p_index_buffer, const RT_GeometryData &p_geometry, bool p_2d, bool p_compressed, RD::AccelerationStructureGeometry &r_geometry);
 
@@ -1020,6 +1022,7 @@ struct RTDeformedCacheEntry {
 	uint32_t cached_surface_counter = 0;
 	uint64_t cached_buffer_id = 0; // RID id of the deformed vertex buffer at the time of build.
 	void *cached_mesh_surface = nullptr; // The surface it was built for (D110: its handle can outlive the instance's surface cache).
+	int32_t cached_index_variant = -1; // The index variant it was built over (D127).
 	bool blas_built_once = false; // True once the BLAS has been fully built; subsequent ticks can refit.
 
 	RID owned_vb_full;
@@ -1761,6 +1764,20 @@ class RenderRaytracing {
 	// records in a scope of its own.
 	RTClusterAsyncPopulation *cluster_capture = nullptr;
 	LocalVector<RTClusterAsyncPopulation *> cluster_async_populations; // In the walk's order.
+
+	// Index variants (D127). The walk sets the variant of the surface it processes, read where that
+	// surface's BLAS is populated: a variant's BLAS is a triangle BLAS over its own list, never
+	// clustered. A static surface drawn through a variant keeps its BLAS in a cache of its own, keyed
+	// by mesh, surface and variant, as the surface's whole list keeps its in the chunks.
+	struct WalkIndexVariant {
+		const void *mesh_surface = nullptr;
+		int32_t id = -1;
+		RID index_buffer;
+		uint32_t index_count = 0;
+	} walk_index_variant;
+	HashMap<uint64_t, RTCacheEntry *> variant_surface_cache;
+	void _set_walk_index_variant(const void *p_surf);
+	RTCacheEntry *_variant_surface_cache_entry(RID p_mesh, uint32_t p_surface_index, int32_t p_variant);
 	bool walk_in_compute_list = false; // Phase 2's merges: no build records here, a pull-back included.
 	uint64_t async_triangle_builds_total = 0;
 	uint64_t async_compactions_total = 0;
@@ -2445,9 +2462,9 @@ class RenderRaytracing {
 	BuildBudgetTake _build_budget_take(uint64_t p_cost, bool p_carry, bool p_force);
 	bool _build_budget_take_walk(uint64_t p_cost, uint64_t &r_budget_frame, uint64_t &r_wait_since);
 	void _build_budget_note_wait(uint64_t p_since);
-	void _build_budget_consider_surface(RID p_mesh, uint32_t p_surface_index, void *p_mesh_surface, float p_priority);
+	void _build_budget_consider_surface(RID p_mesh, uint32_t p_surface_index, void *p_mesh_surface, float p_priority, int32_t p_index_variant = -1);
 	void _build_budget_prepass(const RenderDataRD *p_render_data, uint32_t p_rt_flags);
-	bool _build_budget_admit_surface(RTCacheEntry *p_entry, void *p_mesh_surface);
+	bool _build_budget_admit_surface(RTCacheEntry *p_entry, void *p_mesh_surface, int32_t p_index_variant = -1);
 	_FORCE_INLINE_ bool _build_budget_merge_waits(RID p_mm_rid, uint32_t p_surface_index) const {
 		if (!build_budget.enabled) {
 			return false;

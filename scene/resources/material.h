@@ -220,6 +220,7 @@ public:
 		FEATURE_REFRACTION,
 		FEATURE_DETAIL,
 		FEATURE_BENT_NORMAL_MAPPING,
+		FEATURE_HAIR,
 		FEATURE_MAX
 	};
 
@@ -294,6 +295,12 @@ public:
 		SPECULAR_TOON,
 		SPECULAR_DISABLED,
 		SPECULAR_MAX
+	};
+
+	enum HairAbsorption {
+		HAIR_ABSORPTION_MELANIN,
+		HAIR_ABSORPTION_COLOR,
+		HAIR_ABSORPTION_MAX
 	};
 
 	enum BillboardMode {
@@ -506,6 +513,11 @@ private:
 		StringName distance_fade_min;
 		StringName distance_fade_max;
 		StringName ao_light_affect;
+		StringName hair_absorption;
+		StringName hair_melanin;
+		StringName hair_melanin_redness;
+		StringName hair_ior;
+		StringName hair_cuticle_tilt;
 
 		StringName metallic_texture_channel;
 		StringName ao_texture_channel;
@@ -567,6 +579,11 @@ private:
 	float alpha_antialiasing_edge = 0.0f;
 	bool grow_enabled = false;
 	float ao_light_affect = 0.0f;
+	HairAbsorption hair_absorption = HAIR_ABSORPTION_MELANIN;
+	float hair_melanin = 0.0f;
+	float hair_melanin_redness = 0.0f;
+	float hair_ior = 0.0f;
+	float hair_cuticle_tilt = 0.0f;
 	float grow = 0.0f;
 	int particles_anim_h_frames = 0;
 	int particles_anim_v_frames = 0;
@@ -670,6 +687,21 @@ public:
 
 	void set_normal_scale(float p_normal_scale);
 	float get_normal_scale() const;
+
+	void set_hair_absorption(HairAbsorption p_absorption);
+	HairAbsorption get_hair_absorption() const;
+
+	void set_hair_melanin(float p_melanin);
+	float get_hair_melanin() const;
+
+	void set_hair_melanin_redness(float p_redness);
+	float get_hair_melanin_redness() const;
+
+	void set_hair_ior(float p_ior);
+	float get_hair_ior() const;
+
+	void set_hair_cuticle_tilt(float p_degrees);
+	float get_hair_cuticle_tilt() const;
 
 	void set_rim(float p_rim);
 	float get_rim() const;
@@ -910,6 +942,7 @@ VARIANT_ENUM_CAST(BaseMaterial3D::BillboardMode)
 VARIANT_ENUM_CAST(BaseMaterial3D::TextureChannel)
 VARIANT_ENUM_CAST(BaseMaterial3D::EmissionOperator)
 VARIANT_ENUM_CAST(BaseMaterial3D::DistanceFadeMode)
+VARIANT_ENUM_CAST(BaseMaterial3D::HairAbsorption)
 VARIANT_ENUM_CAST(BaseMaterial3D::StencilMode)
 VARIANT_ENUM_CAST(BaseMaterial3D::StencilFlags)
 VARIANT_ENUM_CAST(BaseMaterial3D::StencilCompare)

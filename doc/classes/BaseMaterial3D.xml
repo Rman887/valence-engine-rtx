@@ -244,6 +244,24 @@
 		<member name="grow_amount" type="float" setter="set_grow" getter="get_grow" default="0.0">
 			Grows object vertices in the direction of their normals. Only effective if [member grow] is [code]true[/code].
 		</member>
+		<member name="hair_absorption" type="int" setter="set_hair_absorption" getter="get_hair_absorption" enum="BaseMaterial3D.HairAbsorption" default="0">
+			How the path tracer's hair model derives a strand's absorption: from [member hair_melanin] and [member hair_melanin_redness], with [member albedo_color] as a dye tint, or from [member albedo_color] alone.
+		</member>
+		<member name="hair_cuticle_tilt" type="float" setter="set_hair_cuticle_tilt" getter="get_hair_cuticle_tilt" default="2.0">
+			The tilt of the hair's cuticle scales, in degrees, which shifts the highlights along the strand.
+		</member>
+		<member name="hair_enabled" type="bool" setter="set_feature" getter="get_feature" default="false">
+			If [code]true[/code], the path tracer shades strands drawn with this material (line surfaces traced as linear swept spheres) with a hair scattering model, from NVIDIA's RTX Character Rendering. [member roughness] is the strand's longitudinal roughness. A hair material draws none of rim, clearcoat, anisotropy, subsurface scattering and its transmittance, or back lighting; their properties are kept, hidden in the editor, and apply again with this off. Triangle surfaces and the raster keep the standard shading.
+		</member>
+		<member name="hair_ior" type="float" setter="set_hair_ior" getter="get_hair_ior" default="1.55">
+			The index of refraction of the hair fiber, from 1.0 to 2.5.
+		</member>
+		<member name="hair_melanin" type="float" setter="set_hair_melanin" getter="get_hair_melanin" default="0.3">
+			The melanin concentration of the hair fiber, from blond (low) to black (high). Used when [member hair_absorption] is [constant HAIR_ABSORPTION_MELANIN].
+		</member>
+		<member name="hair_melanin_redness" type="float" setter="set_hair_melanin_redness" getter="get_hair_melanin_redness" default="0.0">
+			The share of the melanin that is pheomelanin, the red pigment. Used when [member hair_absorption] is [constant HAIR_ABSORPTION_MELANIN].
+		</member>
 		<member name="heightmap_deep_parallax" type="bool" setter="set_heightmap_deep_parallax" getter="is_heightmap_deep_parallax_enabled" default="false">
 			If [code]true[/code], uses parallax occlusion mapping to represent depth in the material instead of simple offset mapping (see [member heightmap_enabled]). This results in a more convincing depth effect, but is much more expensive on the GPU. Only enable this on materials where it makes a significant visual difference.
 		</member>
@@ -647,7 +665,10 @@
 		<constant name="FEATURE_BENT_NORMAL_MAPPING" value="12" enum="Feature">
 			Constant for setting [member bent_normal_enabled].
 		</constant>
-		<constant name="FEATURE_MAX" value="13" enum="Feature">
+		<constant name="FEATURE_HAIR" value="13" enum="Feature">
+			Constant for setting [member hair_enabled].
+		</constant>
+		<constant name="FEATURE_MAX" value="14" enum="Feature">
 			Represents the size of the [enum Feature] enum.
 		</constant>
 		<constant name="BLEND_MODE_MIX" value="0" enum="BlendMode">
@@ -800,6 +821,15 @@
 		</constant>
 		<constant name="SPECULAR_DISABLED" value="2" enum="SpecularMode">
 			No specular blob. This is slightly faster to render than other specular modes.
+		</constant>
+		<constant name="HAIR_ABSORPTION_MELANIN" value="0" enum="HairAbsorption">
+			The strand's absorption comes from its melanin, tinted by [member albedo_color].
+		</constant>
+		<constant name="HAIR_ABSORPTION_COLOR" value="1" enum="HairAbsorption">
+			The strand's absorption comes from [member albedo_color].
+		</constant>
+		<constant name="HAIR_ABSORPTION_MAX" value="2" enum="HairAbsorption">
+			Represents the size of the [enum HairAbsorption] enum.
 		</constant>
 		<constant name="BILLBOARD_DISABLED" value="0" enum="BillboardMode">
 			Billboard mode is disabled.

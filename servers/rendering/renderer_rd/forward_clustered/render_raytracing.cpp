@@ -164,6 +164,7 @@ void RenderRaytracing::initialize(RenderForwardClustered *p_owner) {
 	if (build_data_access) {
 		print_line("RT: position fetch on: triangle and cluster builds allow data access, hits read the triangle's corners from the structure (P1d).");
 	}
+	lss_enabled = RD::get_singleton()->has_feature(RD::SUPPORTS_LINEAR_SWEPT_SPHERES);
 	cluster_blas_enabled = RD::get_singleton()->has_feature(RD::SUPPORTS_CLUSTER_ACCELERATION_STRUCTURE);
 	if (cluster_blas_enabled) {
 		cluster_compaction_enabled = GLOBAL_GET("rendering/pathtracing/cluster_blas_compaction");
@@ -392,7 +393,7 @@ RenderRaytracing::~RenderRaytracing() {
 		print_verbose(vformat("RT: async builds (D98b, D98c), run totals: %d builds on the compute queue (triangle populations %d, cluster populations %d, compactions %d); on the main queue for a source written in their frame, triangle populations %d, cluster populations %d; stream-load issues %d on the compute queue, %d on the main queue; new surfaces released to the walk the next frame %d, later %d; pulled back to the main queue for a traced instance %d, a traced instance dropped for a frame %d.", async_builds_total, async_triangle_builds_total, async_cluster_populations_total, async_compactions_total, triangle_fallbacks, async_cluster_fallbacks, async_stream_issues_total, async_stream_fallbacks, async_ready_next_frame, async_ready_later, async_pulled_back, async_forced_drops));
 	}
 	if (non_triangle_surfaces_skipped > 0) {
-		print_verbose(vformat("RT: run total: %d surface visits left a mesh surface out of the trace for not being a triangle list.", non_triangle_surfaces_skipped));
+		print_verbose(vformat("RT: run total: %d surface visits left a mesh surface out of the trace (not a triangle list or a linear swept sphere line list).", non_triangle_surfaces_skipped));
 	}
 	singleton = nullptr;
 
@@ -1686,13 +1687,42 @@ void RenderRaytracing::prepare_frame() {
 // The acceleration-structure build budget (D97)
 // ---------------------------------------------------------------------------
 
+// A line surface the trace takes as linear swept spheres (D126): uncompressed 3D positions, which the build reads as
+// R32G32B32_SFLOAT, and a float radius per vertex in CUSTOM0, which it reads in place from the attribute buffer.
+static bool _rt_lss_surface_format(uint64_t p_format) {
+	if (p_format & (RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES | RSE::ARRAY_FLAG_USE_2D_VERTICES)) {
+		return false;
+	}
+	if (!(p_format & (1ULL << RSE::ARRAY_CUSTOM0))) {
+		return false;
+	}
+	return ((p_format >> RSE::ARRAY_FORMAT_CUSTOM0_SHIFT) & RSE::ARRAY_FORMAT_CUSTOM_MASK) == RSE::ARRAY_CUSTOM_R_FLOAT;
+}
+
+// CUSTOM0's byte offset inside an uncompressed surface's attribute stride, as _fill_surface_geometry_data lays it out.
+static uint32_t _rt_custom0_byte_offset(uint64_t p_format) {
+	uint32_t offset = 0;
+	if (p_format & RSE::ARRAY_FORMAT_COLOR) {
+		offset += sizeof(uint32_t);
+	}
+	if (p_format & RSE::ARRAY_FORMAT_TEX_UV) {
+		offset += sizeof(float) * 2;
+	}
+	if (p_format & RSE::ARRAY_FORMAT_TEX_UV2) {
+		offset += sizeof(float) * 2;
+	}
+	return offset;
+}
+
 // A new surface's cost before it is populated: its triangles at full detail (a hierarchy's coarser
 // levels and a streamed surface's fallback cut are not counted apart).
 static uint64_t _build_budget_surface_cost(void *p_mesh_surface) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	const uint32_t index_count = mesh_storage->mesh_surface_get_rt_index_count(p_mesh_surface);
 	const uint32_t vertex_count = mesh_storage->mesh_surface_get_rt_vertex_count(p_mesh_surface);
-	return MAX(uint64_t(index_count > 0 ? index_count / 3 : vertex_count / 3), uint64_t(1));
+	// A line surface's primitives are its segments (D126).
+	const uint32_t corners = mesh_storage->mesh_surface_get_primitive(p_mesh_surface) == RSE::PRIMITIVE_LINES ? 2 : 3;
+	return MAX(uint64_t(index_count > 0 ? index_count / corners : vertex_count / corners), uint64_t(1));
 }
 
 // The surfaces a walk traced (D97): one bit a surface index, the frame's and the frame before's
@@ -1941,8 +1971,8 @@ void RenderRaytracing::_build_budget_prepass(const RenderDataRD *p_render_data, 
 			const RID mm_gpu_buffer = mesh_storage->multimesh_get_gpu_buffer(mm_rid);
 			const RID mesh = mesh_storage->multimesh_get_mesh(mm_rid);
 			for (; surf; surf = surf->next) {
-				// As the walk, which leaves out what is not a triangle list (_skip_non_triangle_surface).
-				if ((surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) || surf->primitive != RSE::PRIMITIVE_TRIANGLES) {
+				// As the walk, which leaves out what it does not trace (_skip_untraced_surface).
+				if ((surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) || !_surface_traced(surf->primitive, surf->surface)) {
 					continue;
 				}
 				// The walk skips a surface whose hit group still compiles before anything is built;
@@ -1998,7 +2028,7 @@ void RenderRaytracing::_build_budget_prepass(const RenderDataRD *p_render_data, 
 			continue;
 		}
 		for (; surf; surf = surf->next) {
-			if ((surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) || surf->primitive != RSE::PRIMITIVE_TRIANGLES) {
+			if ((surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) || !_surface_traced(surf->primitive, surf->surface)) {
 				continue;
 			}
 			if (_build_budget_traced(inst, surf->surface_index, frames_drawn)) {
@@ -2372,7 +2402,7 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 		}
 		_release_deformed_blas(entry);
 		bool clustered = false;
-		if (cluster_blas_enabled && cluster_deformed_enabled) {
+		if (cluster_blas_enabled && cluster_deformed_enabled && mesh_storage->mesh_surface_get_primitive(p_mesh_surface) == RSE::PRIMITIVE_TRIANGLES) {
 			clustered = _build_deformed_cluster_layout(surf->rt_deformed_handle, entry, p_mesh_surface, static_cast<uint32_t>(p_source.cache_key), p_source.surface_counter);
 		}
 		if (clustered && p_lod_select && entry.cluster_lod_table_offset != UINT32_MAX) {
@@ -2609,14 +2639,20 @@ void RendererSceneRenderImplementation::_fill_surface_geometry_data(
 	geom.uv_scale_packed = (uint32_t(Math::make_half_float(uv_scale.y)) << 16) | Math::make_half_float(uv_scale.x);
 	geom.uv2_scale_packed = (uint32_t(Math::make_half_float(uv_scale.w)) << 16) | Math::make_half_float(uv_scale.z);
 
-	// Index format (no device address — caller fills those in)
+	// Index format (no device address — caller fills those in). A line list's primitives are its segments, traced as
+	// linear swept spheres (D126): the walk takes no other line surface.
+	const bool lines = mesh_storage->mesh_surface_get_primitive(p_mesh_surface) == RSE::PRIMITIVE_LINES;
+	const uint32_t corners = lines ? 2 : 3;
+	if (lines) {
+		geom.flags |= RT_GEOM_FLAG_LSS;
+	}
 	if (index_buffer.is_valid() && index_count > 0) {
 		bool is_16bit = vertex_count <= 65536 && vertex_count > 0;
 		geom.index_format = is_16bit ? RT_INDEX_FORMAT_UINT16 : RT_INDEX_FORMAT_UINT32;
-		geom.primitive_count = index_count / 3;
+		geom.primitive_count = index_count / corners;
 	} else {
 		geom.index_format = RT_INDEX_FORMAT_NONE;
-		geom.primitive_count = vertex_count / 3;
+		geom.primitive_count = vertex_count / corners;
 	}
 }
 
@@ -2671,7 +2707,8 @@ void RenderRaytracing::_populate_surface_blas(
 	// never reads. Its blobs carry its hits, with no buffer
 	// addressed; where they cannot (no stream, a failed population, an allocation), the surface's
 	// arrays are uploaded from the RAM copy for the population's life and it builds from those.
-	r_surf_data->geometry_streamed = p_vertex_buffer_override.is_null() && RendererRD::MeshStorage::get_singleton()->mesh_surface_is_geometry_streamed(p_mesh_surface);
+	// A line surface (D126) never streams: the mesh storage clusters triangle lists only.
+	r_surf_data->geometry_streamed = !(geom.flags & RT_GEOM_FLAG_LSS) && p_vertex_buffer_override.is_null() && RendererRD::MeshStorage::get_singleton()->mesh_surface_is_geometry_streamed(p_mesh_surface);
 	if (r_surf_data->geometry_streamed) {
 		vertex_buffer = RID();
 		attribute_buffer = RID();
@@ -2704,6 +2741,42 @@ void RenderRaytracing::_populate_surface_blas(
 	if (index_buffer.is_valid() && geom.index_format != RT_INDEX_FORMAT_NONE) {
 		geom.index_buffer_address = rd->buffer_get_device_address(index_buffer);
 		rd->buffer_add_device_address_read_stages(index_buffer, RDD::PIPELINE_STAGE_RAY_TRACING_SHADER_BIT);
+	}
+
+	// A line list (D126): segments between two vertices, swept by the radius each vertex carries in CUSTOM0, read in place
+	// from the attribute buffer; the positions are the surface's own or the deformed copy, laid out alike. Never clustered
+	// (the mesh storage clusters triangle lists only) and never streamed; a deformed one refits.
+	if (geom.flags & RT_GEOM_FLAG_LSS) {
+		ERR_FAIL_COND_MSG(!attribute_buffer.is_valid() || vertex_buffer.is_null(), vformat("RT: line surface [%d] has no buffers to sweep.", p_cache_key));
+		const uint64_t format = RendererRD::MeshStorage::get_singleton()->mesh_surface_get_format(p_mesh_surface);
+		RD::AccelerationStructureGeometry as_geom;
+		as_geom.type = RD::AccelerationStructureGeometry::TYPE_LINEAR_SWEPT_SPHERES;
+		RD::AccelerationStructureGeometry::LinearSweptSpheres &lss = as_geom.geometry.linear_swept_spheres;
+		lss.vertex_buffer = vertex_buffer;
+		lss.vertex_stride = geom.position_stride;
+		lss.vertex_count = geom.vertex_count;
+		lss.vertex_format = RD::DATA_FORMAT_R32G32B32_SFLOAT;
+		lss.radius_buffer = attribute_buffer;
+		lss.radius_offset = _rt_custom0_byte_offset(format);
+		lss.radius_stride = geom.attribute_stride;
+		lss.radius_format = RD::DATA_FORMAT_R32_SFLOAT;
+		if (index_buffer.is_valid() && geom.index_format != RT_INDEX_FORMAT_NONE) {
+			lss.index_buffer = index_buffer;
+			lss.index_count = geom.primitive_count * 2;
+		}
+		lss.indexing = RD::AccelerationStructureGeometry::LINEAR_SWEPT_SPHERES_INDEXING_LIST;
+		lss.end_caps = RD::AccelerationStructureGeometry::LINEAR_SWEPT_SPHERES_END_CAPS_NONE;
+		BitField<RD::AccelerationStructureFlagBits> as_flags = p_prefer_fast_build ? RD::ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT : RD::ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT;
+		if (p_allow_update) {
+			as_flags.set_flag(RD::ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT);
+		}
+		r_surf_data->blas = RD::get_singleton()->blas_create({ &as_geom, 1 }, as_flags);
+		if (!r_surf_data->blas.is_valid()) {
+			return;
+		}
+		RD::get_singleton()->set_resource_name(r_surf_data->blas, String(p_vertex_buffer_override.is_valid() ? "RT LSS BLAS deformed [" : "RT LSS BLAS [") + itos(p_cache_key) + "]");
+		r_dirty_blas_list.push_back(r_surf_data->blas);
+		return;
 	}
 
 	uint32_t index_count = (geom.index_format != RT_INDEX_FORMAT_NONE) ? geom.primitive_count * 3 : 0;
@@ -10013,7 +10086,8 @@ bool RenderRaytracing::_plan_merged_mm(RID p_mm_rid, RID p_mm_gpu_buffer, void *
 	if (r_first) {
 		*r_first = false;
 	}
-	if (p_mm_gpu_buffer.is_null() || (mesh_storage->mesh_surface_get_format(p_mesh_surface) & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES)) {
+	// The merge bakes triangles: a line surface (D126) takes the expanded path.
+	if (p_mm_gpu_buffer.is_null() || (mesh_storage->mesh_surface_get_format(p_mesh_surface) & RSE::ARRAY_FLAG_COMPRESS_ATTRIBUTES) || mesh_storage->mesh_surface_get_primitive(p_mesh_surface) != RSE::PRIMITIVE_TRIANGLES) {
 		return false;
 	}
 	const uint32_t vertex_count = mesh_storage->mesh_surface_get_rt_vertex_count(p_mesh_surface);
@@ -10475,11 +10549,18 @@ _FORCE_INLINE_ static uint32_t _rt_indices_to_primitives(RSE::PrimitiveType p_pr
 	return (p_indices - subtractor[p_primitive]) / divisor[p_primitive];
 }
 
-bool RenderRaytracing::_skip_non_triangle_surface(RSE::PrimitiveType p_primitive) {
+bool RenderRaytracing::_surface_traced(RSE::PrimitiveType p_primitive, void *p_mesh_surface) const {
 	if (p_primitive == RSE::PRIMITIVE_TRIANGLES) {
+		return true;
+	}
+	return p_primitive == RSE::PRIMITIVE_LINES && lss_enabled && _rt_lss_surface_format(RendererRD::MeshStorage::get_singleton()->mesh_surface_get_format(p_mesh_surface));
+}
+
+bool RenderRaytracing::_skip_untraced_surface(RSE::PrimitiveType p_primitive, void *p_mesh_surface) {
+	if (_surface_traced(p_primitive, p_mesh_surface)) {
 		return false;
 	}
-	WARN_PRINT_ONCE("RT: a mesh surface that is not a triangle list (points, lines or a strip) is left out of the trace; under the traced primary ray nothing draws it.");
+	WARN_PRINT_ONCE("RT: a mesh surface the trace does not take (points, a strip, or lines without linear swept sphere support or an uncompressed float radius in CUSTOM0) is left out of the trace; under the traced primary ray nothing draws it.");
 	non_triangle_surfaces_skipped++;
 	return true;
 }
@@ -10793,7 +10874,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			const RenderForwardClustered::GeometryInstanceSurfaceDataCache *mm_surf = inst->surface_caches;
 			while (mm_surf) {
-				if ((mm_surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) || _skip_non_triangle_surface(mm_surf->primitive)) {
+				if ((mm_surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) || _skip_untraced_surface(mm_surf->primitive, mm_surf->surface)) {
 					mm_surf = mm_surf->next;
 					continue;
 				}
@@ -10857,6 +10938,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					}
 				}
 
+				// Linear swept spheres (D126), as in the instance walk below.
+				const bool lss = mm_surf->primitive == RSE::PRIMITIVE_LINES;
+				if (lss) {
+					inst_flags = RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
+				}
+
 				PendingMMSurface pending;
 				// A surface whose buffers hold its fallback level reaches the merge's bake, and an
 				// emissive material's sampling, only through an upload of its arrays (D93d), made here
@@ -10883,7 +10970,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				pending.transform_moved = transform_moved;
 				pending.mat_data = mat_data;
 				pending.inst_flags = inst_flags;
-				pending.inst_mask = RT_INSTANCE_MASK_GEOMETRY | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0) | subsurface_mask(mat_data);
+				pending.inst_mask = RT_INSTANCE_MASK_GEOMETRY | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0) | (lss ? 0 : subsurface_mask(mat_data));
 				pending.mm_aabb = mesh_storage->_multimesh_get_aabb(mm_rid);
 				pending.omm_eligible = omm_enabled && !(inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) && (mat_data->rt_sbt_offset == 0 || mat_data->omm_custom) && !mesh_storage->mesh_surface_is_geometry_streamed(mesh_surface);
 				pending_mm_surfaces.push_back(pending);
@@ -10897,8 +10984,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = inst->surface_caches;
 		bool instance_static = inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::NONE;
 		while (surf) {
-			// Skip surfaces routed to the raster alpha overlay, and those that are not triangle lists.
-			if ((surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) || _skip_non_triangle_surface(surf->primitive)) {
+			// Skip surfaces routed to the raster alpha overlay, and those the trace does not take.
+			if ((surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) || _skip_untraced_surface(surf->primitive, surf->surface)) {
 				surf = surf->next;
 				continue;
 			}
@@ -11012,7 +11099,12 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					inst_flags |= RD::ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT;
 				}
 			}
-			const uint8_t inst_mask = RT_INSTANCE_MASK_GEOMETRY | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0) | subsurface_mask(mat_data);
+			// Linear swept spheres (D126) have no facing, no any-hit (nothing alpha tests a segment) and no walk.
+			const bool lss = surf_data->geometry.flags & RT_GEOM_FLAG_LSS;
+			if (lss) {
+				inst_flags = RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT;
+			}
+			const uint8_t inst_mask = RT_INSTANCE_MASK_GEOMETRY | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0) | (lss ? 0 : subsurface_mask(mat_data));
 
 			// The cluster LOD selection (D86): an instance of a surface whose hierarchy is on the GPU
 			// traces its own BLAS over the clusters this frame's selection picks for it, built at
@@ -11960,7 +12052,8 @@ uint32_t RenderRaytracing::gather_emissive(const RenderDataRD *p_render_data, co
 		const uint32_t flags = record ? record->flags : instance_flags[i];
 		// The walk record is the standard material too (D120 SS2): an emissive walker stays in the list.
 		const bool custom_hit_group = sbt_offset != 0 && sbt_offset != SceneShaderRaytracing::HIT_SBT_WALK_RECORD;
-		if (!(mat.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT) || custom_hit_group || (geom.flags & RT_GEOM_FLAG_PROCEDURAL) || geom.primitive_count == 0) {
+		// A swept sphere's segments (D126) are no triangles to sample.
+		if (!(mat.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT) || custom_hit_group || (geom.flags & (RT_GEOM_FLAG_PROCEDURAL | RT_GEOM_FLAG_LSS)) || geom.primitive_count == 0) {
 			continue;
 		}
 		if (geom.vertex_buffer_address == 0 || (geom.index_format != RT_INDEX_FORMAT_NONE && geom.index_buffer_address == 0)) {

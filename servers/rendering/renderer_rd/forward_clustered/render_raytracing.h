@@ -391,6 +391,9 @@ enum {
 	// The attribute buffer holds compressed UVs (UNORM16). The surface's own flag: a deformed row lays out
 	// its vertex side uncompressed but reads the mesh's attribute buffer in place.
 	RT_GEOM_FLAG_ATTRIBUTES_COMPRESSED = 16u,
+	// A line list traced as linear swept spheres (D126): its BLAS's primitives are segments, two indices each, with the
+	// radius per vertex from CUSTOM0, and its hits build their frame from the segment.
+	RT_GEOM_FLAG_LSS = 32u,
 };
 
 /// Per-instance state for procedural RT geometry. Heap-allocated, only exists for procedural instances.
@@ -1553,6 +1556,8 @@ class RenderRaytracing {
 	// Static indexed surfaces build their BLAS from triangle clusters (D79): the device has
 	// VK_NV_cluster_acceleration_structure and rendering/pathtracing/cluster_blas asked for it.
 	bool cluster_blas_enabled = false;
+	// Line surfaces traced as linear swept spheres (D126): the device has SUPPORTS_LINEAR_SWEPT_SPHERES.
+	bool lss_enabled = false;
 	// The compaction of cluster BLAS into the arena (D81), rendering/pathtracing/cluster_blas_compaction; off, a
 	// surface keeps its build-time buffers for life.
 	bool cluster_compaction_enabled = false;
@@ -1733,10 +1738,12 @@ class RenderRaytracing {
 	uint64_t async_forced_drops = 0;
 	void _record_async_builds();
 
-	// Surfaces the walk leaves out of the trace: its BLAS takes triangle lists only, so points,
-	// lines, line strips and triangle strips would read as other triangles. Run total, printed at exit.
+	// Surfaces the walk leaves out of the trace: its BLAS takes triangle lists, and line lists with a float
+	// radius in CUSTOM0 as linear swept spheres where the device has them (D126); points, line strips,
+	// triangle strips and other lines would read as other primitives. Run total, printed at exit.
 	uint64_t non_triangle_surfaces_skipped = 0;
-	bool _skip_non_triangle_surface(RSE::PrimitiveType p_primitive);
+	bool _surface_traced(RSE::PrimitiveType p_primitive, void *p_mesh_surface) const;
+	bool _skip_untraced_surface(RSE::PrimitiveType p_primitive, void *p_mesh_surface);
 
 	// The cluster path on the async build queue (D98c). An admitted new surface's population runs in
 	// the walk with cluster_capture set: its CPU work and its handles are made there, and its commands

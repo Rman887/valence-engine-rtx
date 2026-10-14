@@ -379,6 +379,9 @@ enum {
 	// bit 23 converts the colour from sRGB first (vertex_color_is_srgb).
 	RT_MAT_FLAG_VERTEX_COLOR = 1u << 22,
 	RT_MAT_FLAG_VERTEX_COLOR_SRGB = 1u << 23,
+	// BaseMaterial3D's TRANSPARENCY_ALPHA_HASH (D128): the alpha test keeps a hit where alpha exceeds a number hashed per
+	// ray and per hit, stochastic transparency, in place of the fixed cut.
+	RT_MAT_FLAG_ALPHA_HASH = 1u << 24,
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).

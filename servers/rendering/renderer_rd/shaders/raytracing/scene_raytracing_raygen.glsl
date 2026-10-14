@@ -1272,7 +1272,14 @@ void main() {
 		alpha *= fetch_color(geom, i0, i1, i2, bary).a; // The vertex colour's alpha (D126 H3), as the closest hit's.
 	}
 
-	if (alpha < mat.alpha_threshold) {
+	if ((mat.flags & RT_MAT_FLAG_ALPHA_HASH) != 0u) {
+		// Hashed (D128): kept where alpha exceeds this ray's number for this triangle; a NaN alpha stays a hit, as below. A
+		// path ray (no SkipClosestHit) adds its sample's sampler state; a shadow ray hashes its ray alone, as the inline test.
+		const uint seed = (gl_IncomingRayFlagsEXT & gl_RayFlagsSkipClosestHitShaderEXT) == 0u ? payload.rng_state : 0u;
+		if (alpha <= rt_alpha_hash_u(gl_WorldRayOriginEXT, gl_WorldRayDirectionEXT, seed, geometry_idx, rt_hit_cluster_id(), uint(gl_PrimitiveID))) {
+			ignoreIntersectionEXT;
+		}
+	} else if (alpha < mat.alpha_threshold) {
 		ignoreIntersectionEXT;
 	}
 #endif

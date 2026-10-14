@@ -1055,11 +1055,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 					0xFF, spec_origin, hasHair(brdf_mat) ? RT_HAIR_TMIN : 0.001, spec_dir, 10000.0);
 			while (rayQueryProceedEXT(spec_rq)) {
 				if (rayQueryGetIntersectionTypeEXT(spec_rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
-					if (ray_query_alpha_test(
-								rayQueryGetIntersectionInstanceCustomIndexEXT(spec_rq, false),
-								rt_ray_query_cluster_id(spec_rq),
-								uint(rayQueryGetIntersectionPrimitiveIndexEXT(spec_rq, false)),
-								rayQueryGetIntersectionBarycentricsEXT(spec_rq, false))) {
+					if (ray_query_alpha_test(spec_rq)) {
 						rayQueryConfirmIntersectionEXT(spec_rq);
 					}
 				}

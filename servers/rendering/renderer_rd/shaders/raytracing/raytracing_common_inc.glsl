@@ -128,6 +128,31 @@ uint rt_pixel_seed() {
 	return pcg_hash(gl_LaunchIDEXT.x + (gl_LaunchIDEXT.y << 16u));
 }
 
+/// VAL: the hashed alpha test's threshold (D128), a number in [0, 1): a hit of a RT_MAT_FLAG_ALPHA_HASH material is kept
+/// where its alpha exceeds it (stochastic transparency), so over frames a surface covers an alpha share of its rays.
+/// It is a hash of the ray itself (its origin and direction bits), of the triangle (its geometry record, cluster and
+/// primitive), of the frame index and of [param p_seed]: the payload's per-sample sampler state for a path ray (the
+/// any-hit of a ray without SkipClosestHit), so several samples a pixel whose rays coincide still draw apart; 0 for a
+/// shadow ray and an inline query, whose ray bits alone keep the any-hit and ray_query_alpha_test in agreement (a
+/// pipeline shadow ray's payload carries no random state, the SER shadow trace passes its caller's, an inline query has
+/// none). Two layers along a ray hash different triangles and draw independently; the frame index decorrelates frames;
+/// a light sample reaches it only through the shadow ray's direction, scrambled by the hash.
+float rt_alpha_hash_u(vec3 p_origin, vec3 p_direction, uint p_seed, uint p_geometry, int p_cluster, uint p_primitive) {
+	const uvec3 o = floatBitsToUint(p_origin);
+	const uvec3 d = floatBitsToUint(p_direction);
+	uint h = pcg_hash(o.x ^ 0x9e3779b9u ^ pcg_hash(p_seed));
+	h = pcg_hash(h ^ o.y);
+	h = pcg_hash(h ^ o.z);
+	h = pcg_hash(h ^ d.x);
+	h = pcg_hash(h ^ d.y);
+	h = pcg_hash(h ^ d.z);
+	h = pcg_hash(h ^ p_geometry);
+	h = pcg_hash(h ^ uint(p_cluster));
+	h = pcg_hash(h ^ p_primitive);
+	h = pcg_hash(h ^ uint(get_rt_param(RT_PARAM_FRAME_INDEX)));
+	return float(h >> 8u) * (1.0 / 16777216.0);
+}
+
 /// Project a world-space point to UV through an unjittered VP.
 vec2 project_uv(vec3 world_pos, mat4 vp) {
 	vec4 clip = vp * vec4(world_pos, 1.0);

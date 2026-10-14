@@ -310,8 +310,14 @@ int rt_ray_query_cluster_id(rayQueryEXT q) {
 
 /// Inline alpha test for ray query candidates. Returns true if the hit is opaque (alpha >= the material's
 /// alpha_threshold, sampled at level 0 as HG0's any-hit does).
-/// Mirrors the any-hit shader logic for use with inline ray queries.
-bool ray_query_alpha_test(uint geometry_idx, int cluster_id, uint primitive, vec2 candidate_bary) {
+/// Mirrors the any-hit shader logic for use with inline ray queries, on [param p_query]'s candidate: its triangle, and for a
+/// hashed material (D128) its world ray, as the any-hit hashes a shadow ray's (no sampler state: an inline query has no
+/// payload).
+bool ray_query_alpha_test(rayQueryEXT p_query) {
+	const uint geometry_idx = rayQueryGetIntersectionInstanceCustomIndexEXT(p_query, false);
+	const int cluster_id = rt_ray_query_cluster_id(p_query);
+	const uint primitive = uint(rayQueryGetIntersectionPrimitiveIndexEXT(p_query, false));
+	const vec2 candidate_bary = rayQueryGetIntersectionBarycentricsEXT(p_query, false);
 	vec3 bary = vec3(1.0 - candidate_bary.x - candidate_bary.y, candidate_bary.x, candidate_bary.y);
 
 	GeometryData geom = geometries[geometry_idx];
@@ -327,7 +333,10 @@ bool ray_query_alpha_test(uint geometry_idx, int cluster_id, uint primitive, vec
 		alpha *= fetch_color(geom, i0, i1, i2, bary).a; // The vertex colour's alpha (D126 H3), as the any-hit's.
 	}
 
-	// As the any-hit's `alpha < threshold` ignores: a NaN alpha stays a hit in both.
+	// As the any-hit's tests ignore: a NaN alpha stays a hit in both.
+	if ((mat.flags & RT_MAT_FLAG_ALPHA_HASH) != 0u) {
+		return !(alpha <= rt_alpha_hash_u(rayQueryGetWorldRayOriginEXT(p_query), rayQueryGetWorldRayDirectionEXT(p_query), 0u, geometry_idx, cluster_id, primitive));
+	}
 	return !(alpha < mat.alpha_threshold);
 }
 
@@ -457,11 +466,7 @@ uint lights_shadow_ray_inline(vec3 origin, vec3 direction, float max_dist, uint 
 	while (rayQueryProceedEXT(shadow_rq)) {
 		if (!lights_shadow_candidate_inline(shadow_rq)) {
 			unresolved = true;
-		} else if (ray_query_alpha_test(
-						   rayQueryGetIntersectionInstanceCustomIndexEXT(shadow_rq, false),
-						   rt_ray_query_cluster_id(shadow_rq),
-						   uint(rayQueryGetIntersectionPrimitiveIndexEXT(shadow_rq, false)),
-						   rayQueryGetIntersectionBarycentricsEXT(shadow_rq, false))) {
+		} else if (ray_query_alpha_test(shadow_rq)) {
 			rayQueryConfirmIntersectionEXT(shadow_rq);
 		}
 	}

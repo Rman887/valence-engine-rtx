@@ -1733,6 +1733,11 @@ class RenderRaytracing {
 	uint64_t async_forced_drops = 0;
 	void _record_async_builds();
 
+	// Surfaces the walk leaves out of the trace: its BLAS takes triangle lists only, so points,
+	// lines, line strips and triangle strips would read as other triangles. Run total, printed at exit.
+	uint64_t non_triangle_surfaces_skipped = 0;
+	bool _skip_non_triangle_surface(RSE::PrimitiveType p_primitive);
+
 	// The cluster path on the async build queue (D98c). An admitted new surface's population runs in
 	// the walk with cluster_capture set: its CPU work and its handles are made there, and its commands
 	// are held (RTClusterAsyncPopulation) and recorded after the walk, in the scope, or on the main

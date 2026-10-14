@@ -391,6 +391,9 @@ RenderRaytracing::~RenderRaytracing() {
 		const uint64_t triangle_fallbacks = fallbacks - MIN(fallbacks, async_cluster_fallbacks + async_stream_fallbacks);
 		print_verbose(vformat("RT: async builds (D98b, D98c), run totals: %d builds on the compute queue (triangle populations %d, cluster populations %d, compactions %d); on the main queue for a source written in their frame, triangle populations %d, cluster populations %d; stream-load issues %d on the compute queue, %d on the main queue; new surfaces released to the walk the next frame %d, later %d; pulled back to the main queue for a traced instance %d, a traced instance dropped for a frame %d.", async_builds_total, async_triangle_builds_total, async_cluster_populations_total, async_compactions_total, triangle_fallbacks, async_cluster_fallbacks, async_stream_issues_total, async_stream_fallbacks, async_ready_next_frame, async_ready_later, async_pulled_back, async_forced_drops));
 	}
+	if (non_triangle_surfaces_skipped > 0) {
+		print_verbose(vformat("RT: run total: %d surface visits left a mesh surface out of the trace for not being a triangle list.", non_triangle_surfaces_skipped));
+	}
 	singleton = nullptr;
 
 	if (position_fetch_check_buffer.is_valid()) {
@@ -1938,7 +1941,8 @@ void RenderRaytracing::_build_budget_prepass(const RenderDataRD *p_render_data, 
 			const RID mm_gpu_buffer = mesh_storage->multimesh_get_gpu_buffer(mm_rid);
 			const RID mesh = mesh_storage->multimesh_get_mesh(mm_rid);
 			for (; surf; surf = surf->next) {
-				if (surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) {
+				// As the walk, which leaves out what is not a triangle list (_skip_non_triangle_surface).
+				if ((surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) || surf->primitive != RSE::PRIMITIVE_TRIANGLES) {
 					continue;
 				}
 				// The walk skips a surface whose hit group still compiles before anything is built;
@@ -1994,7 +1998,7 @@ void RenderRaytracing::_build_budget_prepass(const RenderDataRD *p_render_data, 
 			continue;
 		}
 		for (; surf; surf = surf->next) {
-			if (surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) {
+			if ((surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) || surf->primitive != RSE::PRIMITIVE_TRIANGLES) {
 				continue;
 			}
 			if (_build_budget_traced(inst, surf->surface_index, frames_drawn)) {
@@ -10471,6 +10475,15 @@ _FORCE_INLINE_ static uint32_t _rt_indices_to_primitives(RSE::PrimitiveType p_pr
 	return (p_indices - subtractor[p_primitive]) / divisor[p_primitive];
 }
 
+bool RenderRaytracing::_skip_non_triangle_surface(RSE::PrimitiveType p_primitive) {
+	if (p_primitive == RSE::PRIMITIVE_TRIANGLES) {
+		return false;
+	}
+	WARN_PRINT_ONCE("RT: a mesh surface that is not a triangle list (points, lines or a strip) is left out of the trace; under the traced primary ray nothing draws it.");
+	non_triangle_surfaces_skipped++;
+	return true;
+}
+
 RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data, uint32_t p_rt_flags, bool p_primary_from_gbuffer) {
 	if (!p_render_data || !p_render_data->rt_instances) {
 		return nullptr;
@@ -10780,7 +10793,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 
 			const RenderForwardClustered::GeometryInstanceSurfaceDataCache *mm_surf = inst->surface_caches;
 			while (mm_surf) {
-				if (mm_surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) {
+				if ((mm_surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) || _skip_non_triangle_surface(mm_surf->primitive)) {
 					mm_surf = mm_surf->next;
 					continue;
 				}
@@ -10884,8 +10897,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = inst->surface_caches;
 		bool instance_static = inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::NONE;
 		while (surf) {
-			// Skip surfaces routed to the raster alpha overlay
-			if (surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) {
+			// Skip surfaces routed to the raster alpha overlay, and those that are not triangle lists.
+			if ((surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) || _skip_non_triangle_surface(surf->primitive)) {
 				surf = surf->next;
 				continue;
 			}

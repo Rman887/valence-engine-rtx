@@ -1213,13 +1213,6 @@ int MeshStorage::mesh_surface_add_index_variant(RID p_mesh, int p_surface, const
 	auto is_hidden = [hidden](uint32_t p_triangle) -> bool {
 		return hidden[p_triangle >> 3] & (1u << (p_triangle & 7));
 	};
-	if (!s->subdivision_data.is_empty()) {
-		// A refined surface is a list of quads, two triangles each (D122): both go or neither.
-		for (uint32_t t = 0; t + 1 < triangle_count; t += 2) {
-			ERR_FAIL_COND_V_MSG(is_hidden(t) != is_hidden(t + 1), -1, vformat("A subdivided surface hides whole refined quads: triangles %d and %d differ.", t, t + 1));
-		}
-	}
-
 	const bool is_index_16 = s->vertex_count <= 65536 && s->vertex_count > 0;
 	const uint32_t index_size = is_index_16 ? 2 : 4;
 	// The surface's indices from its RAM copy where it keeps one, else read back from its buffer, which

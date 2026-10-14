@@ -342,6 +342,8 @@ const uint FLAG_CLUSTER_GEOMETRY = 8u;
 // The attribute buffer holds compressed UVs; set apart from FLAG_COMPRESSED on a deformed row, whose
 // vertex side is uncompressed.
 const uint FLAG_ATTRIBUTES_COMPRESSED = 16u;
+// A line list traced as linear swept spheres (D126): a hit's primitive is a segment between two vertices.
+const uint FLAG_LSS = 32u;
 
 // ============================================================================
 // RANDOM NUMBER GENERATION

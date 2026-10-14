@@ -643,6 +643,10 @@ void main() {
 #ifdef USE_POSITION_FETCH
 #extension GL_EXT_ray_tracing_position_fetch : require
 #endif
+#ifdef USE_LSS
+// A line list's hits (D126) read their segment's end points and radii.
+#extension GL_NV_linear_swept_spheres : require
+#endif
 #ifdef RT_SURFACE_CODEC_CHECK
 // The surface record's check counts per subgroup (P3a), an asserts build only.
 #extension GL_KHR_shader_subgroup_basic : require

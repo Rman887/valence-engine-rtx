@@ -150,6 +150,28 @@ vec3 rt_derived_tangent(GeometryData geom, uint i0, uint i1, uint i2, VertexAttr
 	return abs(n.x) > abs(n.z) ? vec3(-n.y, n.x, 0.0) : vec3(0.0, -n.z, n.y);
 }
 
+#ifdef USE_LSS
+/// A line list's segment (D126): its two vertex indices, from the surface's index pairs, or its vertex pairs without indices.
+void rt_lss_segment_indices(GeometryData geom, uint p_segment, out uint i0, out uint i1) {
+	if (geom.index_format == 2u) {
+		i0 = p_segment * 2u;
+		i1 = p_segment * 2u + 1u;
+	} else if (geom.index_address != 0ul) {
+		Uint32Buffer idx = Uint32Buffer(geom.index_address);
+		if (geom.index_format == 0u) {
+			uint pair = idx.v[p_segment]; // Two 16-bit indices, one word a segment.
+			i0 = pair & 0xFFFFu;
+			i1 = pair >> 16;
+		} else {
+			i0 = idx.v[p_segment * 2u];
+			i1 = idx.v[p_segment * 2u + 1u];
+		}
+	} else {
+		i0 = i1 = 0u;
+	}
+}
+#endif
+
 /// Fetch vertex attributes and transform to world space.
 /// Requires hitAttributeEXT HitAttribs and GeometryBuffer/MaterialBuffer bindings.
 /// p_footprint: the cone's footprint is wanted whether or not the mesh has UVs or the frame decals.
@@ -169,18 +191,41 @@ HitData compute_hit_data(bool p_footprint, bool p_gradients, bool p_uv2) {
 	GeometryData surface = geom;
 #endif
 	uint i0, i1, i2;
-	h.primitive_id = rt_resolve_hit_triangle(geom, i0, i1, i2);
-#if defined(RT_POSITION_FETCH_CHECK) && defined(USE_CLUSTER_AS)
-	position_fetch_check_hit(surface, h.primitive_id);
-	cluster_geometry_check_hit(surface, geom, h.primitive_id, i0, i1, i2);
+	vec2 fetch_bary = attribs;
+#ifdef USE_LSS
+	// A segment (D126): its two vertices as the triangle's first two and third, so the fetch's barycentrics (1 - u, u, 0)
+	// blend the segment's ends at the hit's u, the position along the midsection the traversal reports in the hit
+	// attribute: the centre of the sphere the hit point lies on, also on a tapered segment, where the axis's foot is not.
+	const bool lss = (geom.flags & FLAG_LSS) != 0u;
+	vec3 lss_a = vec3(0.0);
+	vec3 lss_b = vec3(0.0);
+	vec3 lss_obj_pos = vec3(0.0);
+	float lss_u = 0.0;
+	if (lss) {
+		h.primitive_id = uint(gl_PrimitiveID);
+		rt_lss_segment_indices(geom, h.primitive_id, i0, i1);
+		i2 = i1;
+		lss_a = gl_HitLSSPositionsNV[0];
+		lss_b = gl_HitLSSPositionsNV[1];
+		lss_obj_pos = gl_ObjectRayOriginEXT + gl_ObjectRayDirectionEXT * gl_HitTEXT;
+		lss_u = clamp(attribs.x, 0.0, 1.0);
+		fetch_bary = vec2(lss_u, 0.0);
+	} else
 #endif
+	{
+		h.primitive_id = rt_resolve_hit_triangle(geom, i0, i1, i2);
+#if defined(RT_POSITION_FETCH_CHECK) && defined(USE_CLUSTER_AS)
+		position_fetch_check_hit(surface, h.primitive_id);
+		cluster_geometry_check_hit(surface, geom, h.primitive_id, i0, i1, i2);
+#endif
+	}
 
 	// Custom hit groups may reference vertex color in their fragment code, so
 	// pull all attributes; default HGs can skip color for perf.
 #ifdef RT_CUSTOM_HIT_GROUP
-	VertexAttributes attrs = fetch_vertex_attributes(geom, i0, i1, i2, attribs, FETCH_ALL | (p_uv2 ? FETCH_UV2 : 0u));
+	VertexAttributes attrs = fetch_vertex_attributes(geom, i0, i1, i2, fetch_bary, FETCH_ALL | (p_uv2 ? FETCH_UV2 : 0u));
 #else
-	VertexAttributes attrs = fetch_vertex_attributes(geom, i0, i1, i2, attribs, FETCH_UV | FETCH_TBN | (p_uv2 ? FETCH_UV2 : 0u));
+	VertexAttributes attrs = fetch_vertex_attributes(geom, i0, i1, i2, fetch_bary, FETCH_UV | FETCH_TBN | (p_uv2 ? FETCH_UV2 : 0u));
 #endif
 	h.uv = attrs.uv;
 	h.uv2 = attrs.uv2;
@@ -204,6 +249,22 @@ HitData compute_hit_data(bool p_footprint, bool p_gradients, bool p_uv2) {
 		if (!h.is_front_face) {
 			h.geometry_normal = -h.geometry_normal;
 		}
+	} else
+#endif
+#ifdef USE_LSS
+			if (lss) {
+		// A segment (D126): the normal from the touched sphere's centre, the tangent along the axis (a direction on the
+		// surface, so through the basis), made perpendicular to the normal, which a tapered segment tilts off the axis.
+		// The surface has no inside a ray could leave by: every hit is a front face.
+		vec3 obj_normal = lss_obj_pos - mix(lss_a, lss_b, lss_u);
+		obj_normal = dot(obj_normal, obj_normal) > 0.0 ? normalize(obj_normal) : vec3(0.0, 1.0, 0.0);
+		h.geometry_normal = normalize(normal_matrix * obj_normal);
+		vec3 axis = basis * (lss_b - lss_a);
+		axis -= h.geometry_normal * dot(h.geometry_normal, axis);
+		const vec3 n = h.geometry_normal;
+		h.tangent = dot(axis, axis) > 0.0 ? normalize(axis) : normalize(abs(n.x) > abs(n.z) ? vec3(-n.y, n.x, 0.0) : vec3(0.0, -n.z, n.y));
+		h.bitangent = cross(h.geometry_normal, h.tangent) * handedness;
+		h.is_front_face = true;
 	} else
 #endif
 	{
@@ -234,7 +295,7 @@ HitData compute_hit_data(bool p_footprint, bool p_gradients, bool p_uv2) {
 	h.texture_grad = vec4(0.0);
 	h.texture_lod2 = RT_TEXTURE_LOD_BASE;
 	h.texture_grad2 = vec4(0.0);
-	if (rt_texture_lod_wanted() && (geom.flags & FLAG_PROCEDURAL) == 0u && (p_footprint || attrs.has_uv || attrs.has_uv2 || get_rt_param(RT_PARAM_DECAL_COUNT) > 0.5)) {
+	if (rt_texture_lod_wanted() && (geom.flags & (FLAG_PROCEDURAL | FLAG_LSS)) == 0u && (p_footprint || attrs.has_uv || attrs.has_uv2 || get_rt_param(RT_PARAM_DECAL_COUNT) > 0.5)) {
 		vec3 p0, p1, p2;
 		if (rt_hit_triangle_positions(geom, i0, i1, i2, p0, p1, p2)) {
 			mat3 object_to_world = mat3(gl_ObjectToWorldEXT);
@@ -543,6 +604,23 @@ void write_primary_hit_velocity(vec3 hit_pos) {
 #ifdef RT_HIT_ATTRIBS_DECLARED
 	if ((geom.flags & FLAG_DEFORMED) != 0u) {
 		uint64_t prev_addr = packUint2x32(uvec2(geom.prev_vertex_address_lo, geom.prev_vertex_address_hi));
+#ifdef USE_LSS
+		if (prev_addr != 0ul && (geom.flags & FLAG_LSS) != 0u) {
+			// A segment (D126) moves the hit with its axis point at the hit's u: the midline's motion, the azimuth ignored,
+			// as RTXCR's hair motion vectors take it.
+			uint i0, i1;
+			rt_lss_segment_indices(geom, uint(gl_PrimitiveID), i0, i1);
+			const vec3 a = gl_HitLSSPositionsNV[0];
+			const vec3 b = gl_HitLSSPositionsNV[1];
+			const float s = clamp(attribs.x, 0.0, 1.0);
+			FloatBuffer prev_vb = FloatBuffer(prev_addr);
+			uint stride_floats = geom.position_stride >> 2;
+			vec3 p0 = vec3(prev_vb.v[i0 * stride_floats + 0u], prev_vb.v[i0 * stride_floats + 1u], prev_vb.v[i0 * stride_floats + 2u]);
+			vec3 p1 = vec3(prev_vb.v[i1 * stride_floats + 0u], prev_vb.v[i1 * stride_floats + 1u], prev_vb.v[i1 * stride_floats + 2u]);
+			prev_obj_pos = obj_pos + (mix(p0, p1, s) - mix(a, b, s));
+			prev_addr = 0ul; // Settled: no triangle below.
+		}
+#endif
 		if (prev_addr != 0ul) {
 			uint i0, i1, i2;
 			rt_resolve_hit_triangle(geom, i0, i1, i2); // A deformed surface reads its own buffers.

@@ -940,6 +940,11 @@ bool SceneShaderRaytracing::_ensure_variant_compile_context(uint32_t p_rt_flags)
 	if (p_rt_flags & RT_FLAG_OMM_INDIRECT_2_STATE) {
 		inject_define(sources, "#define USE_OMM_INDIRECT_2_STATE\n");
 	}
+	// Linear swept spheres (D126): the device's, fixed for the process, so no flag bit; the hit-stage built-ins are legal
+	// only with the extension.
+	if (RD::get_singleton()->has_feature(RD::SUPPORTS_LINEAR_SWEPT_SPHERES)) {
+		inject_define(sources, "#define USE_LSS\n");
+	}
 	// Defines for the same reason: the position-fetch capability is legal only with the extension (D93).
 	if (p_rt_flags & RT_FLAG_POSITION_FETCH) {
 		inject_define(sources, "#define USE_POSITION_FETCH\n");

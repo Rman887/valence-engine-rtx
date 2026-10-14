@@ -132,7 +132,7 @@ struct alignas(16) RT_MaterialData {
 	float emission_strength;
 	float metallic;
 	float roughness;
-	float ao_strength;
+	uint32_t hair_ior_tilt; // With RT_MAT_FLAG_HAIR: packHalf2x16(hair_ior, the cuticle tilt in radians) (D126 H2).
 	uint32_t flags;
 	float uv1_scale[2];
 	float uv1_offset[2];
@@ -156,7 +156,7 @@ struct alignas(16) RT_MaterialData {
 	uint32_t detail_mask_texture_idx; // Its mask, red read linear on UV1 (0 = none: the white default, everywhere).
 	float subsurface_strength; // BaseMaterial3D's subsurf_scatter_strength, the diffuse share that walks under the surface (D120); 0 = none.
 	uint32_t subsurface_texture_idx; // Its texture, red read linear on UV1, scaling the strength (0 = none).
-	uint32_t _reserved;
+	uint32_t hair_melanin_half2; // With RT_MAT_FLAG_HAIR: packHalf2x16(hair_melanin, hair_melanin_redness) (D126 H2).
 };
 static_assert(sizeof(RT_MaterialData) == 176, "RT_MaterialData must be 176 bytes for std430");
 
@@ -371,6 +371,10 @@ enum {
 	RT_MAT_FLAG_DETAIL_UV2 = 1u << 17,
 	RT_MAT_FLAG_EMISSION_UV2 = 1u << 18, // BaseMaterial3D's emission_on_uv2: the emission texture read on UV2 (D118 MM4).
 	RT_MAT_FLAG_SUBSURFACE_SKIN = 1u << 19, // BaseMaterial3D's subsurf_scatter_skin_mode: the walk takes skin's channel ratios (D120).
+	// BaseMaterial3D's hair feature (D126 H2): a strand hit (FLAG_LSS) shades with the hair BCSDF; bit 21 takes the
+	// absorption from the albedo instead of the melanin.
+	RT_MAT_FLAG_HAIR = 1u << 20,
+	RT_MAT_FLAG_HAIR_COLOR = 1u << 21,
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).

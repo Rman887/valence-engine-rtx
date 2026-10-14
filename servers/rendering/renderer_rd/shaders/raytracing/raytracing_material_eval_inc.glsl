@@ -24,7 +24,23 @@ struct MaterialResult {
 	float rim_tint; // Godot's RIM_TINT, 0..1: how far the sheen's colour moves from white to the albedo.
 	float subsurface; // VAL: Godot's SSS_STRENGTH, 0..1: the share of the diffuse lobe that walks under the surface (D120); 0 = none.
 	bool subsurface_skin; // The walk scatters over skin's channel ratios (sss_mode_skin), else over equal distances.
+	bool hair; // VAL: a hair material on a strand (D126 H2): shade_and_bounce shades it with the hair BCSDF alone.
+	bool hair_color; // With hair: the absorption from the albedo, else from the melanin with the albedo as a dye tint.
+	float hair_melanin; // With hair: BaseMaterial3D's hair_melanin and hair_melanin_redness, 0..1.
+	float hair_redness;
+	float hair_ior; // With hair: the fibre's index of refraction.
+	float hair_tilt; // With hair: the cuticle tilt in radians.
 };
+
+/// No hair (D126 H2): the fields every producer but a strand's standard hit group writes.
+void material_clear_hair(inout MaterialResult r) {
+	r.hair = false;
+	r.hair_color = false;
+	r.hair_melanin = 0.0;
+	r.hair_redness = 0.0;
+	r.hair_ior = 1.55;
+	r.hair_tilt = 0.0;
+}
 
 /// Sensible default for a mid-grey diffuse surface.
 MaterialResult default_material_result(vec3 geometry_normal) {
@@ -51,5 +67,6 @@ MaterialResult default_material_result(vec3 geometry_normal) {
 	r.rim_tint = 0.0;
 	r.subsurface = 0.0;
 	r.subsurface_skin = false;
+	material_clear_hair(r);
 	return r;
 }

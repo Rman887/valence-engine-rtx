@@ -234,6 +234,7 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	m.rim_tint = 0.0;
 	m.subsurface = 0.0; // Nor subsurface scattering (D120).
 	m.subsurface_skin = false;
+	material_clear_hair(m); // Nor hair (D126 H2): the raster draws strands as lines.
 
 #ifdef RT_DEBUG_ENABLED
 	int vis_mode = int(get_rt_param(RT_PARAM_VIS_MODE));
@@ -880,6 +881,7 @@ void main() {
 	m.subsurface_skin = true;
 #endif
 #endif
+	material_clear_hair(m); // VAL: the hair BCSDF is BaseMaterial3D's feature (D126 H2); a custom shader has no twin yet.
 
 	// Apply normal map if it was written.
 	if (normal_map != vec3(0.5, 0.5, 1.0)) {
@@ -1085,6 +1087,20 @@ void main() {
 	// compiled in.
 	m.subsurface = 0.0;
 	m.subsurface_skin = false;
+	// VAL: hair (D126 H2): a hair material on a strand shades with the hair BCSDF, its parameters from the record, in
+	// the fibre's own frame (no normal map). On triangles (cards) the material keeps the standard lobes.
+	material_clear_hair(m);
+	if ((mat.flags & RT_MAT_FLAG_HAIR) != 0u && (geometries[h.geometry_idx].flags & FLAG_LSS) != 0u) {
+		const vec2 melanin_redness = unpackHalf2x16(mat.hair_melanin_half2);
+		const vec2 ior_tilt = unpackHalf2x16(mat.hair_ior_tilt);
+		m.hair = true;
+		m.hair_color = (mat.flags & RT_MAT_FLAG_HAIR_COLOR) != 0u;
+		m.hair_melanin = melanin_redness.x;
+		m.hair_redness = melanin_redness.y;
+		m.hair_ior = ior_tilt.x;
+		m.hair_tilt = ior_tilt.y;
+		m.normal = h.geometry_normal;
+	}
 #ifdef RT_SUBSURFACE_COMPILED
 	m.subsurface_skin = (mat.flags & (1u << 19)) != 0u;
 	if (mat.subsurface_strength > 0.0) {

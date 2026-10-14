@@ -9074,7 +9074,6 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		s_default_mat.data.emission_strength = 0.0f;
 		s_default_mat.data.roughness = 1.0f;
 		s_default_mat.data.specular = 0.5f;
-		s_default_mat.data.ao_strength = 1.0f;
 		s_default_mat.data.uv1_scale[0] = 1.0f;
 		s_default_mat.data.uv1_scale[1] = 1.0f;
 		s_default_mat.data.uv1_offset[0] = 0.0f;
@@ -9136,7 +9135,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.metallic = 0.0f;
 	mat.roughness = 1.0f;
 	mat.specular = 0.5f;
-	mat.ao_strength = 1.0f;
+	mat.hair_ior_tilt = 0;
 	mat.flags = 0;
 	mat.albedo_texture_idx = 0;
 	mat.normal_texture_idx = 0;
@@ -9167,7 +9166,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	mat.detail_mask_texture_idx = 0;
 	mat.subsurface_strength = 0.0f;
 	mat.subsurface_texture_idx = 0;
-	mat._reserved = 0;
+	mat.hair_melanin_half2 = 0;
 	bool omm_custom = false;
 	RID omm_custom_alpha_rd; // An opted-in custom shader's hint_alpha texture, with a real bindless slot.
 
@@ -9506,12 +9505,17 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat.uv1_offset[1] = o.y;
 	}
 
+	// VAL: hair (D126 H2). BaseMaterial3D declares the hair_* uniforms only while the feature is enabled, and then none of
+	// the lobes the hair BCSDF replaces on strands (back lighting, anisotropy, coat, rim, subsurface), whose properties the
+	// editor hides; their blocks below skip a hair material all the same, so it takes no bindless slot for them.
+	const bool hair = !mat_data->is_custom_shader && shader_declares("hair_melanin");
+
 	// Back lighting (D103): BaseMaterial3D declares backlight only while the feature is enabled, and its
 	// fragment writes BACKLIGHT = backlight.rgb + texture_backlight.rgb, the colour a source_color (kept
 	// sRGB here, decoded in the hit shader) and the texture hinted black but not as a colour, so read
 	// linear. The raster's light pass weighs it by the diffuse albedo; the trace takes the same product
 	// as the albedo of a thin diffuse-transmission lobe. A custom shader's BACKLIGHT is not carried.
-	if (!mat_data->is_custom_shader && shader_declares("backlight")) {
+	if (!hair && !mat_data->is_custom_shader && shader_declares("backlight")) {
 		Variant backlight_var = material_storage->material_get_param(p_material_rid, "backlight");
 		Color backlight = backlight_var.get_type() == Variant::COLOR ? (Color)backlight_var : Color(0, 0, 0);
 		RID backlight_rd = get_material_texture("texture_backlight");
@@ -9527,7 +9531,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	// VAL: anisotropy (D118 MM1). BaseMaterial3D declares anisotropy_ratio and its flow map only while the feature
 	// is enabled, and its fragment writes ANISOTROPY = anisotropy_ratio * flowmap.a and ANISOTROPY_FLOW =
 	// flowmap.rg * 2 - 1. A custom shader's ANISOTROPY reaches its hit group through the fragment instead.
-	if (!mat_data->is_custom_shader && shader_declares("anisotropy_ratio")) {
+	if (!hair && !mat_data->is_custom_shader && shader_declares("anisotropy_ratio")) {
 		Variant anisotropy_var = material_storage->material_get_param(p_material_rid, "anisotropy_ratio");
 		if (anisotropy_var.get_type() == Variant::FLOAT) {
 			mat.anisotropy = anisotropy_var;
@@ -9541,7 +9545,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	// VAL: clearcoat (D118 MM2). BaseMaterial3D declares clearcoat, clearcoat_roughness and texture_clearcoat only
 	// while the feature is enabled, and its fragment writes CLEARCOAT = clearcoat * tex.r and CLEARCOAT_ROUGHNESS =
 	// clearcoat_roughness * tex.g. A custom shader's CLEARCOAT reaches its hit group through the fragment instead.
-	if (!mat_data->is_custom_shader && shader_declares("clearcoat")) {
+	if (!hair && !mat_data->is_custom_shader && shader_declares("clearcoat")) {
 		float clearcoat = 0.0f;
 		float clearcoat_roughness = 0.0f;
 		Variant clearcoat_var = material_storage->material_get_param(p_material_rid, "clearcoat");
@@ -9564,7 +9568,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	// VAL: rim as sheen (D118 MM3). BaseMaterial3D declares rim, rim_tint and texture_rim only while the feature is
 	// enabled, and its fragment writes RIM = rim * tex.r and RIM_TINT = rim_tint * tex.g. The hit shader reads them
 	// as the colour of a sheen layer. A custom shader's RIM reaches its hit group through the fragment instead.
-	if (!mat_data->is_custom_shader && shader_declares("rim")) {
+	if (!hair && !mat_data->is_custom_shader && shader_declares("rim")) {
 		float rim = 0.0f;
 		float rim_tint = 0.0f;
 		Variant rim_var = material_storage->material_get_param(p_material_rid, "rim");
@@ -9649,7 +9653,7 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 	// into the raster's shader and published as the parameter subsurface_scattering_skin_mode. The hit shader reads
 	// the strength as the diffuse share that walks under the surface. A custom shader's SSS_STRENGTH reaches its hit
 	// group through the fragment instead.
-	if (!mat_data->is_custom_shader && shader_declares("subsurface_scattering_strength")) {
+	if (!hair && !mat_data->is_custom_shader && shader_declares("subsurface_scattering_strength")) {
 		Variant strength_var = material_storage->material_get_param(p_material_rid, "subsurface_scattering_strength");
 		if (strength_var.get_type() == Variant::FLOAT) {
 			mat.subsurface_strength = CLAMP(float(strength_var), 0.0f, 1.0f);
@@ -9664,6 +9668,29 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 				mat.flags |= RT_MAT_FLAG_SUBSURFACE_SKIN;
 			}
 		}
+	}
+
+	// VAL: hair (D126 H2): the raster draws its standard lit path, and the hit shader evaluates the hair BCSDF where the
+	// hit is a strand (FLAG_LSS). hair_absorption is 0 for melanin (the albedo a dye tint) and 1 for the albedo. The
+	// ranges are the properties' (BaseMaterial3D), so a value set past them through the shader parameter clamps here.
+	if (hair) {
+		auto hair_param = [&](const StringName &p_name, float p_default) -> float {
+			Variant value = material_storage->material_get_param(p_material_rid, p_name);
+			if (value.get_type() == Variant::FLOAT || value.get_type() == Variant::INT) {
+				return float(value);
+			}
+			return p_default;
+		};
+		const float melanin = CLAMP(hair_param("hair_melanin", 0.3f), 0.0f, 1.0f);
+		const float redness = CLAMP(hair_param("hair_melanin_redness", 0.0f), 0.0f, 1.0f);
+		const float ior = CLAMP(hair_param("hair_ior", 1.55f), 1.0f, 2.5f);
+		const float tilt = Math::deg_to_rad(CLAMP(hair_param("hair_cuticle_tilt", 2.0f), -10.0f, 10.0f));
+		mat.flags |= RT_MAT_FLAG_HAIR;
+		if (int(hair_param("hair_absorption", 0.0f)) == 1) {
+			mat.flags |= RT_MAT_FLAG_HAIR_COLOR;
+		}
+		mat.hair_melanin_half2 = (uint32_t(Math::make_half_float(redness)) << 16) | Math::make_half_float(melanin);
+		mat.hair_ior_tilt = (uint32_t(Math::make_half_float(tilt)) << 16) | Math::make_half_float(ior);
 	}
 
 	// The alpha test's cutoff, from the material's own uniform when its shader declares one

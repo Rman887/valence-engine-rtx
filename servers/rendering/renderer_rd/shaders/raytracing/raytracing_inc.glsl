@@ -19,7 +19,7 @@
 #define RT_PARAM_SAMPLE_COUNT 1 // rt_params[0].y - Samples per pixel
 #define RT_PARAM_MAX_BOUNCES 2 // rt_params[0].z - Maximum ray bounces
 #define RT_PARAM_DENOISER 3 // rt_params[0].w - Denoiser selection (0=none, 1=DLSS RR)
-#define RT_PARAM_PRIMARY_SURFACE 4 // rt_params[1].x - VAL: unused since P1e (the raygen variant RT_GBUFFER_PRIMARY), kept for the layout
+#define RT_PARAM_HAIR_BCSDF 4 // rt_params[1].x - VAL: the hair BCSDF, rendering/pathtracing/hair_bcsdf: 0 far field, 1 Chiang (D126 H2; the slot was P1e's unused primary surface)
 // The froxel volumetric fog composed over the camera segment (D37).
 #define RT_PARAM_VFOG_ENABLED 5 // rt_params[1].y - 1 when the frame carries a froxel volume
 #define RT_PARAM_VFOG_INV_LENGTH 6 // rt_params[1].z - 1 / volumetric_fog_length
@@ -68,7 +68,7 @@ const float RT_TEXTURE_LOD_BASE = -128.0;
 
 struct PathPayload {
 	uint packed_rt[3]; // 12 bytes - radiance+throughput interleaved as fp16
-	uint packed_bounces_flags; //  4 bytes - [flags:8][unused:6][subsurface exit:1, D120][back offset:1, D103][diffuse:8][total:8]
+	uint packed_bounces_flags; //  4 bytes - [flags:8][strand inset:5, D126][strand:1][subsurface exit:1, D120][back offset:1, D103][diffuse:8][total:8]
 	uint rng_state; //  4 bytes - the sampler's state (D52): the PCG chain, or the Sobol index and dimension
 	float hit_t; //  4 bytes - ray distance, used by raygen to rebuild origin
 	uint oct_offset_nrm; //  4 bytes - packUnorm2x16(vec3_to_oct(offset normal))
@@ -253,6 +253,38 @@ uint inc_diffuse_bounce(uint packed) {
 const uint BACK_OFFSET_FLAG = (1u << 16);
 // The next ray starts at PathState.exit_position, where a subsurface walk left the surface (D120).
 const uint SUBSURFACE_EXIT_FLAG = (1u << 17);
+// The next ray leaves a strand (bit 18, D126 H2): it starts inside the fibre, HitData.strand_inset under the hit along
+// -offset_normal (bits 19 to 23 hold the inset's code, rt_strand_inset_code), whichever way it leaves, and at
+// RT_HAIR_TMIN, so the neighbouring strands shadow and scatter it.
+const uint HAIR_RAY_FLAG = (1u << 18);
+const uint HAIR_INSET_SHIFT = 19u;
+const uint HAIR_INSET_MASK = (31u << 19);
+// The tmin of the rays a strand's vertex traces (D126 H2): its bounce, its shadow rays and its RR hit-distance query,
+// all from inside the fibre. A ray that starts inside a linear swept sphere reports no hit on it, so the strand cannot
+// hit itself and the interval may start almost at the origin: a neighbour touching the strand is still found.
+#define RT_HAIR_TMIN 1e-6
+
+/// VAL: the depth inside a strand its vertex's rays start at (D126 H2): half the strand's world radius at the hit,
+/// rounded down to a power of two, so the payload carries it exactly as a 5-bit code (2^-31 m to 2^-1 m) and the
+/// raygen rebuilds the bounce's origin from the very depth the shadow rays and the light selection used. The point
+/// lies between a quarter and half the radius under the surface, on the line to the touched sphere's centre: inside
+/// the fibre wherever the trace's float rounding leaves the hit point, as long as an ULP of the hit's largest
+/// coordinate stays under a quarter of the radius (D121's y axis, an open item). 0 without a radius.
+float rt_strand_inset(float p_world_radius) {
+	if (!(p_world_radius > 0.0)) {
+		return 0.0;
+	}
+	return exp2(clamp(floor(log2(0.5 * p_world_radius)), -31.0, -1.0));
+}
+
+uint rt_strand_inset_code(float p_inset) {
+	return p_inset > 0.0 ? uint(clamp(round(log2(p_inset)) + 32.0, 1.0, 31.0)) << HAIR_INSET_SHIFT : 0u;
+}
+
+float rt_strand_inset_decode(uint p_packed) {
+	const uint code = (p_packed & HAIR_INSET_MASK) >> HAIR_INSET_SHIFT;
+	return code != 0u ? exp2(float(code) - 32.0) : 0.0;
+}
 uint set_back_offset(uint packed, bool back) {
 	return back ? (packed | BACK_OFFSET_FLAG) : (packed & ~BACK_OFFSET_FLAG);
 }
@@ -376,6 +408,7 @@ const uint FLAG_LSS = 32u;
 #define RT_SOBOL_DIM_CLEARCOAT 48u // The coat's choice before the base's lobes (D118 MM2), apart so the scatter's draws keep their dimensions.
 #define RT_SOBOL_DIM_SHEEN 49u // The sheen's choice under the coat and over the base's lobes (D118 MM3), apart as the coat's is.
 #define RT_SOBOL_DIM_SUBSURFACE 50u // The diffuse lobe's choice between its direct share and the subsurface walk (D120).
+#define RT_SOBOL_DIM_HAIR 51u // A strand's hair BCSDF sample (D126 H2), four dimensions: two pairs and two singles.
 // The walk's exit vertex (D120) takes a block past the eight bounces' (512 + 64 x bounce), so its light sample and
 // direction never share dimensions with the next vertex's; the walk itself draws from a hash of its own.
 #define RT_SOBOL_DIM_SUBSURFACE_EXIT_BASE 512u

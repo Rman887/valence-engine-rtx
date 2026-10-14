@@ -439,7 +439,13 @@ bool sky_sample_direct(vec3 N, vec3 V, MaterialProperties p_material, inout uint
 	r_sample.leg_distance = 1e30;
 	r_sample.radiance = sky_radiance(sky_dir);
 	r_sample.specular_multiplier = 1.0;
-	float pdf_bsdf = brdf_pdf(N, L, V, p_material);
+	r_sample.hair_value = vec3(-1.0);
+	float pdf_bsdf;
+	if (hasHair(p_material)) {
+		evalHair(N, L, V, p_material, r_sample.hair_value, pdf_bsdf); // Its value shades the sample (D126 H2).
+	} else {
+		pdf_bsdf = brdf_pdf(N, L, V, p_material);
+	}
 	r_sample.weight = sky_mis_weight(strategy_probability * pdf, pdf_bsdf) / pdf;
 	return true;
 }

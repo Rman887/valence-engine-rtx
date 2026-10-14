@@ -38,6 +38,8 @@ struct HitData {
 	vec4 texture_grad; // The cone's elliptical footprint as the mesh's UV gradients (g1, g2) (D116), zero when the hit samples at texture_lod.
 	float texture_lod2; // The cone's level at the second UV set (D118), RT_TEXTURE_LOD_BASE when unknown.
 	vec4 texture_grad2; // And its elliptical footprint as the second set's gradients, zero as texture_grad is.
+	float strand_inset; // VAL: how deep inside a strand its rays start (D126 H2, rt_strand_inset), world metres; 0 elsewhere.
+	vec3 strand_axis; // VAL: a strand's unit axis, world space (D126 H2): the far field's frame, which tangent (orthogonal to the normal) is not on a taper; zero elsewhere.
 };
 
 // ============================================================================
@@ -278,6 +280,14 @@ void debug_visualize(
 		dbg_mat.sheenColor = vec3(0.0);
 		dbg_mat.sheenRoughness = 1.0;
 		dbg_mat.subsurface = 0.0;
+		dbg_mat.hair = false;
+		dbg_mat.hairChiang = false;
+		dbg_mat.hairT = vec3(0.0);
+		dbg_mat.hairAxis = vec3(0.0);
+		dbg_mat.hairAbsorption = vec3(0.0);
+		dbg_mat.hairIor = 1.55;
+		dbg_mat.hairTilt = 0.0;
+		dbg_mat.hairInset = 0.0;
 
 		vec3 dbg_dir;
 		vec3 dbg_weight;
@@ -419,7 +429,9 @@ void shade_direct_light(vec3 p_hit_pos, vec3 p_geometry_normal, float p_hit_t, v
 	// takes its sample here (the miss weighs against it either way).
 	bool tree_sky = light_tree_enabled() && sky_light_enabled() && sky_total > 0.0;
 	if (rt_light_count > 0u || rt_emissive_count > 0u || p_sky > 0.0 || tree_sky) {
-		vec3 hit_pos_offset = offset_ray_origin(p_hit_pos, p_geometry_normal, p_hit_t);
+		// A strand's rays start inside the fibre (D126 H2), toward a light on either side.
+		const bool strand_inside = hasHair(brdf_mat) && brdf_mat.hairInset > 0.0;
+		vec3 hit_pos_offset = strand_inside ? p_hit_pos - p_geometry_normal * brdf_mat.hairInset : offset_ray_origin(p_hit_pos, p_geometry_normal, p_hit_t);
 		bool is_indirect = (diffuse_bounces > 0u);
 		// One light sample per hit (D50): the analytic lights or the emissive list, chosen by the
 		// per-frame share, the contribution divided by its share. Nothing is drawn for the choice
@@ -467,7 +479,9 @@ void shade_direct_light(vec3 p_hit_pos, vec3 p_geometry_normal, float p_hit_t, v
 		vec3 shadow_origin = hit_pos_offset;
 		vec3 shadow_dir = light_sample.direction;
 		float shadow_distance = light_sample.shadow_distance;
-		if (diffuse_transmit_max > 0.0 && dot(N, light_sample.direction) < 0.0 && !(hasClearcoat(brdf_mat) && dot(brdf_mat.clearcoatN, light_sample.direction) > 0.0)) {
+		// A strand's already starts inside it (D126 H2), from where a light on either side is reached through the fibre, which
+		// a ray starting inside a linear swept sphere cannot hit; a strand without a radius leaves from the back.
+		if (!strand_inside && (diffuse_transmit_max > 0.0 || hasHair(brdf_mat)) && dot(N, light_sample.direction) < 0.0 && !(hasClearcoat(brdf_mat) && dot(brdf_mat.clearcoatN, light_sample.direction) > 0.0)) {
 			shadow_origin = offset_ray_origin(p_hit_pos, -p_geometry_normal, p_hit_t);
 			vec3 to_light = hit_pos_offset + light_sample.direction * light_sample.shadow_distance - shadow_origin;
 			shadow_distance = length(to_light);
@@ -481,7 +495,14 @@ void shade_direct_light(vec3 p_hit_pos, vec3 p_geometry_normal, float p_hit_t, v
 		if (shadow != RT_SHADOW_OCCLUDED) {
 			// Evaluate BRDF (diffuse + specular separately for specular_amount control).
 			vec3 brdf_diffuse, brdf_specular;
-			evalCombinedBRDFSeparate(N, light_sample.direction, V, brdf_mat, brdf_diffuse, brdf_specular);
+			if (light_sample.hair_value.x >= 0.0) {
+				// A strand's sample shades with the evaluation its MIS weight took (D126 H2), as evalCombinedBRDFSeparate
+				// would return it: all in the diffuse output.
+				brdf_diffuse = light_sample.hair_value;
+				brdf_specular = vec3(0.0);
+			} else {
+				evalCombinedBRDFSeparate(N, light_sample.direction, V, brdf_mat, brdf_diffuse, brdf_specular);
+			}
 			// NdotL is already included in the BRDF value (evalLambertian/evalMicrofacet bake it in).
 			vec3 direct_light = (brdf_diffuse + brdf_specular * light_sample.specular_multiplier) * light_sample.radiance * (light_sample.weight / strategy_probability);
 			if (in_medium) {
@@ -788,6 +809,11 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	// previous vertex's back offset (D103) is spent: only a transmission below sets it again.
 	ps.hit_t = hit_t;
 	ps.packed_bounces_flags = set_back_offset(ps.packed_bounces_flags, false);
+	// And so is a strand's origin (D126 H2): this hit's rays take their own. Whether the ray left a strand is read once
+	// more, by the emitter weight below: the light tree scored that vertex's receiver on both sides.
+	const bool incoming_strand = (ps.packed_bounces_flags & HAIR_RAY_FLAG) != 0u;
+	ps.packed_bounces_flags &= ~(HAIR_RAY_FLAG | HAIR_INSET_MASK);
+	rt_shadow_tmin = m.hair ? RT_HAIR_TMIN : RT_SHADOW_TMIN;
 #ifdef RT_SUBSURFACE_COMPILED
 	ps.packed_bounces_flags &= ~SUBSURFACE_EXIT_FLAG; // And so is the previous vertex's walk exit (D120).
 	// The raygen reads the exit only under the flag, which only a walk below sets again with its own exit, so the
@@ -838,7 +864,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 			// the ray's origin and the offset normal the payload carried from there, over the top's total
 			// the payload carried too (GPU audit light 1a).
 			uint entry = emissive_find_entry(h.geometry_idx, rt_emissive_count);
-			float p_instance = (entry < rt_emissive_count) ? light_tree_emissive_probability(entry, shade_previous_origin(h, ray_dir, hit_t), ps.offset_normal, is_light_tree_indirect(ps.packed_bounces_flags), incoming_tree_total) : 0.0;
+			float p_instance = (entry < rt_emissive_count) ? light_tree_emissive_probability(entry, shade_previous_origin(h, ray_dir, hit_t), ps.offset_normal, is_light_tree_indirect(ps.packed_bounces_flags), incoming_strand, incoming_tree_total) : 0.0;
 			pdf_light = (entry < rt_emissive_count) ? emissive_hit_pdf_entry(entry, p_instance, h.primitive_id, ray_dir, hit_t, h.is_front_face) : 0.0;
 		} else {
 			// The sky's share of the light samples (D54), 0 without a sky light; the surface lights
@@ -912,6 +938,24 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	if (m.rim > 0.0 && dot(N, V) > 0.0) {
 		brdf_mat.sheenColor = clamp(m.rim * m.albedo * mix(vec3(1.0), m.albedo, m.rim_tint) * (1.0 - m.metalness), vec3(0.0), vec3(1.0));
 	}
+	// VAL: hair (D126 H2): a hair material on a strand shades with the hair BCSDF alone, in the fibre's frame: N the
+	// strand's normal (the shading normal is the geometry normal there); Chiang's tangent the axis made orthogonal to it,
+	// the far field's the axis itself (HitData.strand_axis, which a surface record carries too).
+	brdf_mat.hair = m.hair;
+	brdf_mat.hairChiang = get_rt_param(RT_PARAM_HAIR_BCSDF) > 0.5;
+	brdf_mat.hairT = vec3(0.0);
+	brdf_mat.hairAxis = vec3(0.0);
+	brdf_mat.hairAbsorption = vec3(0.0);
+	brdf_mat.hairIor = m.hair_ior;
+	brdf_mat.hairTilt = m.hair_tilt;
+	brdf_mat.hairInset = m.hair ? h.strand_inset : 0.0;
+	if (m.hair) {
+		vec3 t = h.strand_axis - N * dot(N, h.strand_axis);
+		float t_len = length(t);
+		brdf_mat.hairT = t_len > 1e-4 ? t / t_len : normalize(abs(N.x) > abs(N.z) ? vec3(-N.y, N.x, 0.0) : vec3(0.0, -N.z, N.y));
+		brdf_mat.hairAxis = t_len > 1e-4 ? h.strand_axis : brdf_mat.hairT;
+		brdf_mat.hairAbsorption = hairAbsorptionCoefficient(m.hair_color, m.albedo, m.hair_melanin, m.hair_redness, m.roughness);
+	}
 
 	// Transmission: the surface is a dielectric interface. TRANSMISSION is the
 	// fraction (per channel) of the unreflected light that continues through
@@ -976,6 +1020,17 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 				guide_roughness = coat_roughness;
 			}
 		}
+		// VAL: a strand (D126 H2) is guided by the hair's own colour and cuticle (docs/r6-strand-hair.md, "RR guides"): the
+		// colour its absorption maps back to as the diffuse albedo (the authored colour in the colour mode, as RTXCR's sample
+		// guides with; in the melanin mode the albedo is only a dye tint), its Fresnel at the fibre's IOR as the specular
+		// (where RTXCR's sample takes the mesh material's F0), the fibre's normal and roughness.
+		if (hasHair(brdf_mat)) {
+			diffuse_albedo = hairGuideColor(brdf_mat.hairAbsorption, m.roughness);
+			float hair_f0 = (brdf_mat.hairIor - 1.0) / (brdf_mat.hairIor + 1.0);
+			specular_albedo = DLSSRR_computeSpecularAlbedo(vec3(0.0), 0.0, hair_f0 * hair_f0, m.roughness, NdotV);
+			guide_N = N;
+			guide_roughness = m.roughness;
+		}
 		imageStore(dlss_rr_diffuse_albedo, pixel, vec4(DLSSRR_encodeDiffuseAlbedo(diffuse_albedo), 1.0));
 
 		imageStore(dlss_rr_specular_albedo, pixel, vec4(clamp(specular_albedo, vec3(0.04), vec3(1.0)), 1.0)); // match UNORM8 like before - fixes some issues with garbling..
@@ -990,13 +1045,14 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 			// has almost no normal component at grazing angles, so offsetting along it left the origin
 			// on the surface and a cull-disabled one hit itself.
 			vec3 spec_dir = mirrorDirectionAcrossPlane(reflect(-V, guide_N), h.geometry_normal);
-			vec3 spec_origin = offset_ray_origin(h.hit_pos, h.geometry_normal, hit_t);
+			// A strand's starts inside the fibre (D126 H2).
+			vec3 spec_origin = brdf_mat.hairInset > 0.0 ? h.hit_pos - h.geometry_normal * brdf_mat.hairInset : offset_ray_origin(h.hit_pos, h.geometry_normal, hit_t);
 
 			rayQueryEXT spec_rq;
 			// The closest hit: terminating on the first one would record whichever surface
 			// traversal order reaches first, not the reflected one.
 			rayQueryInitializeEXT(spec_rq, tlas, RT_RAY_FLAGS,
-					0xFF, spec_origin, 0.001, spec_dir, 10000.0);
+					0xFF, spec_origin, hasHair(brdf_mat) ? RT_HAIR_TMIN : 0.001, spec_dir, 10000.0);
 			while (rayQueryProceedEXT(spec_rq)) {
 				if (rayQueryGetIntersectionTypeEXT(spec_rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
 					if (ray_query_alpha_test(
@@ -1116,8 +1172,9 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	}
 
 	int brdfType = DIFFUSE_TYPE;
-	// The sheen is a broad lobe, a diffuse bounce for the bounce budget (D74), as the raster's rim is diffuse light.
-	float brdfProbability = coat_sampled ? 1.0 : ((diffuse_transmitted || sheen_sampled) ? 0.0 : brdfSpecularProbability(specularF0, diffuseReflectance));
+	// The sheen is a broad lobe, a diffuse bounce for the bounce budget (D74), as the raster's rim is diffuse light. Hair
+	// (D126 H2) is glossy transport, a specular bounce, so the diffuse budget does not cut its multiple scattering.
+	float brdfProbability = (coat_sampled || hasHair(brdf_mat)) ? 1.0 : ((diffuse_transmitted || sheen_sampled) ? 0.0 : brdfSpecularProbability(specularF0, diffuseReflectance));
 	if (brdfProbability >= 1.0) {
 		brdfType = SPECULAR_TYPE;
 	} else if (brdfProbability <= 0.0) {
@@ -1135,7 +1192,19 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	vec2 u = rand2(ps.rng_state);
 	vec3 next_dir;
 	vec3 brdf_weight;
-	if (diffuse_transmitted) {
+	// The hair sampler's density of its direction (D126 H2), the one brdf_pdf would evaluate again below.
+	float hair_pdf = 0.0;
+	if (hasHair(brdf_mat)) {
+		// VAL: the hair BCSDF's own sample (D126 H2) on a block of dimensions of its own: its direction leaves on either
+		// side of N, so nothing is mirrored; a rejected direction ends the path, as in RTXCR's sample.
+		rng_set_dimension(ps.rng_state, get_total_bounces(ps.packed_bounces_flags) * RT_SOBOL_DIMS_PER_BOUNCE + RT_SOBOL_DIM_HAIR);
+		vec3 hair_u = vec3(rand2(ps.rng_state), rand(ps.rng_state));
+		vec3 hair_w = vec3(rand2(ps.rng_state), rand(ps.rng_state));
+		if (!sampleHair(hair_u, hair_w, N, V, brdf_mat, next_dir, brdf_weight, hair_pdf)) {
+			ps.packed_bounces_flags = set_path_terminated(ps.packed_bounces_flags);
+			return;
+		}
+	} else if (diffuse_transmitted) {
 		// Lambertian about -N: the cosine cancels its density, leaving the albedo. A direction the
 		// shading normal tilts back above the geometry plane is mirrored under it.
 		next_dir = rotatePoint(getRotationFromZAxis(-N), sampleHemisphere(u));
@@ -1170,7 +1239,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	// A base lobe's direction below N under a coat, on a surface without transmission (D118 MM2).
 	const bool base_below_coat = !coat_sampled && diffuse_transmit_max <= 0.0 && hasClearcoat(brdf_mat) && dot(N, next_dir) <= 0.0;
 	// A mirror: a zero-roughness specular lobe, or a coat below CLEARCOAT_DELTA_ALPHA (D118 MM2).
-	const bool delta_lobe = coat_sampled ? brdf_mat.clearcoatAlpha < CLEARCOAT_DELTA_ALPHA : (brdfType == SPECULAR_TYPE && brdf_mat.roughness * brdf_mat.roughness <= 0.0);
+	const bool delta_lobe = coat_sampled ? brdf_mat.clearcoatAlpha < CLEARCOAT_DELTA_ALPHA : (brdfType == SPECULAR_TYPE && !hasHair(brdf_mat) && brdf_mat.roughness * brdf_mat.roughness <= 0.0);
 
 	ps.throughput *= brdf_weight;
 
@@ -1222,6 +1291,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 			exit_mat.sheenColor = vec3(0.0);
 			exit_mat.sheenRoughness = 1.0;
 			exit_mat.subsurface = 0.0;
+			exit_mat.hair = false;
 			// The exit's light sample about its shading normal (D120), viewed along it (a Lambert is the same from every side),
 			// with the interpolated normal as the receiver the densities read and the origin's offset, as at a hit; on its own
 			// block. Past
@@ -1293,7 +1363,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 		// With no emitter listed and no sky light nothing reads the density, so both off cost no ALU here.
 		ps.bsdf_pdf = RT_BSDF_PDF_DELTA;
 	} else {
-		float pdf = brdf_pdf(pdf_N, next_dir, pdf_V, pdf_mat);
+		float pdf = hasHair(brdf_mat) ? hair_pdf : brdf_pdf(pdf_N, next_dir, pdf_V, pdf_mat);
 		// A direction the density cannot own (the below-hemisphere recovery; on a thin surface, a
 		// direction on the side of N the chosen lobe does not sample: a transmitted one mirrored back
 		// above N, a reflected one in the wedge between N and the geometry plane) is one light
@@ -1311,7 +1381,7 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	if (rt_texture_lod_enabled() && !delta_lobe) {
 		float pdf = ps.bsdf_pdf;
 		if (pdf == RT_BSDF_PDF_DELTA) {
-			pdf = brdf_pdf(pdf_N, next_dir, pdf_V, pdf_mat);
+			pdf = hasHair(brdf_mat) ? hair_pdf : brdf_pdf(pdf_N, next_dir, pdf_V, pdf_mat);
 			if (pdf_unowned) {
 				pdf = 0.0;
 			}
@@ -1323,7 +1393,11 @@ void shade_and_bounce(HitData h, MaterialResult m, vec3 ray_dir, float hit_t, in
 	// the raygen loop continues with the reconstructed origin and next_ray_dir.
 	ps.hit_t = hit_t;
 	ps.offset_normal = h.geometry_normal;
-	ps.packed_bounces_flags = set_back_offset(ps.packed_bounces_flags, diffuse_transmitted);
+	// A strand's next ray starts inside it (D126 H2) whichever way it leaves; one without a radius leaves from the back.
+	ps.packed_bounces_flags = set_back_offset(ps.packed_bounces_flags, diffuse_transmitted || (hasHair(brdf_mat) && brdf_mat.hairInset == 0.0 && dot(h.geometry_normal, next_dir) < 0.0));
+	if (hasHair(brdf_mat)) {
+		ps.packed_bounces_flags |= HAIR_RAY_FLAG | rt_strand_inset_code(brdf_mat.hairInset);
+	}
 #ifdef RT_SUBSURFACE_COMPILED
 	if (walked) {
 		// The next ray leaves from where the walk left the surface (D120), offset along its exit normal.

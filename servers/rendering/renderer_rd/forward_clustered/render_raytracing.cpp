@@ -13283,6 +13283,8 @@ RID RenderRaytracing::update_uniform_set(RTViewportState *p_state, const RenderD
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_TEXTURE_FILTERING_SIGMA] = MAX(GLOBAL_GET_CACHED(float, "rendering/pathtracing/texture_filtering_gaussian_sigma"), 0.0f);
 		// The subsurface walk's red mean free path (D120); the walk itself is compiled in by RT_FLAG_SUBSURFACE.
 		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_SUBSURFACE_SCALE] = MAX(GLOBAL_GET_CACHED(float, "rendering/pathtracing/subsurface_scale"), 1e-6f);
+		// The hair BCSDF strands shade with (D126 H2): a uniform branch, both models compiled in.
+		rt_ubo.params[SceneShaderRaytracing::RT_PARAM_HAIR_BCSDF] = GLOBAL_GET_CACHED(int, "rendering/pathtracing/hair_bcsdf") == 1 ? 1.0f : 0.0f;
 
 		// The froxel volumetric fog the raygen composes over the camera segment (D37): the froxel's
 		// depth mapping as the raster's fragment reads it, and the Environment's sky affect.

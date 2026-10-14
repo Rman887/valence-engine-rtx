@@ -180,6 +180,8 @@ void rt_lss_segment_indices(GeometryData geom, uint p_segment, out uint i0, out 
 /// p_uv2: a fetch reads the second UV set, which the hit fetches with its level (D118).
 HitData compute_hit_data(bool p_footprint, bool p_gradients, bool p_uv2) {
 	HitData h;
+	h.strand_inset = 0.0;
+	h.strand_axis = vec3(0.0);
 	h.geometry_idx = gl_InstanceCustomIndexEXT;
 #ifdef RT_CUSTOM_HIT_GROUP
 	h.custom_group = true;
@@ -254,14 +256,20 @@ HitData compute_hit_data(bool p_footprint, bool p_gradients, bool p_uv2) {
 #ifdef USE_LSS
 			if (lss) {
 		// A segment (D126): the normal from the touched sphere's centre, the tangent along the axis (a direction on the
-		// surface, so through the basis), made perpendicular to the normal, which a tapered segment tilts off the axis.
-		// The surface has no inside a ray could leave by: every hit is a front face.
+		// surface, so through the basis) made orthogonal to the normal, so the frame stays orthonormal for a normal map or a
+		// custom shader's TANGENT; a tapered segment tilts the normal off the perpendicular to the axis, so the axis itself,
+		// the far-field hair BCSDF's frame (D126 H2), is kept beside it. The surface has no inside a ray could leave by:
+		// every hit is a front face.
 		vec3 obj_normal = lss_obj_pos - mix(lss_a, lss_b, lss_u);
 		obj_normal = dot(obj_normal, obj_normal) > 0.0 ? normalize(obj_normal) : vec3(0.0, 1.0, 0.0);
 		h.geometry_normal = normalize(normal_matrix * obj_normal);
+		// Its rays start inside it (D126 H2): the touched sphere's radius, blended at u as its centre is, in world metres
+		// along the normal.
+		h.strand_inset = rt_strand_inset(mix(gl_HitLSSRadiiNV[0], gl_HitLSSRadiiNV[1], lss_u) * length(basis * obj_normal));
 		vec3 axis = basis * (lss_b - lss_a);
-		axis -= h.geometry_normal * dot(h.geometry_normal, axis);
+		h.strand_axis = dot(axis, axis) > 0.0 ? normalize(axis) : vec3(0.0);
 		const vec3 n = h.geometry_normal;
+		axis -= n * dot(n, axis);
 		h.tangent = dot(axis, axis) > 0.0 ? normalize(axis) : normalize(abs(n.x) > abs(n.z) ? vec3(-n.y, n.x, 0.0) : vec3(0.0, -n.z, n.y));
 		h.bitangent = cross(h.geometry_normal, h.tangent) * handedness;
 		h.is_front_face = true;

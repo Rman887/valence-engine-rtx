@@ -107,10 +107,22 @@ layout(set = 0, binding = 39) uniform texture3D volumetric_fog_texture;
 layout(set = 0, binding = 40) uniform texture2D gbuffer_absorption;
 layout(set = 0, binding = 41) uniform texture2D gbuffer_scattering;
 
+/// The next ray's origin from the hit it leaves: inside the fibre at a strand (D126 H2, rt_strand_inset), or offset off the
+/// surface along the payload's normal, to its back after a transmission (D103).
+vec3 path_next_origin(vec3 p_hit_pos, PathState p_ps) {
+	const float inset = (p_ps.packed_bounces_flags & HAIR_RAY_FLAG) != 0u ? rt_strand_inset_decode(p_ps.packed_bounces_flags) : 0.0;
+	if (inset > 0.0) {
+		return p_hit_pos - p_ps.offset_normal * inset;
+	}
+	return offset_ray_origin(p_hit_pos, is_back_offset(p_ps.packed_bounces_flags) ? -p_ps.offset_normal : p_ps.offset_normal, p_ps.hit_t);
+}
+
 void trace_path_ray(vec3 ray_origin, vec3 ray_dir, uint mask, float max_distance) {
+	// A ray that leaves a strand starts inside it (D126 H2).
+	const float tmin = (payload.packed_bounces_flags & HAIR_RAY_FLAG) != 0u ? RT_HAIR_TMIN : 0.001;
 #ifdef USE_SER
 	hitObjectEXT hitObject;
-	hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS | RT_OMM_RAY_FLAGS(get_diffuse_bounces(payload.packed_bounces_flags)), mask, 0, 0, 0, ray_origin, 0.001, ray_dir, max_distance, 0);
+	hitObjectTraceRayEXT(hitObject, tlas, RT_RAY_FLAGS | RT_OMM_RAY_FLAGS(get_diffuse_bounces(payload.packed_bounces_flags)), mask, 0, 0, 0, ray_origin, tmin, ray_dir, max_distance, 0);
 
 	// The reorder sorts the threads on the hit's shader by itself (the hit group, or the miss);
 	// the hint refines that order. Its form is the pipeline's (D75, RT_GET_SER_HINT(), the
@@ -146,7 +158,7 @@ void trace_path_ray(vec3 ray_origin, vec3 ray_dir, uint mask, float max_distance
 
 	hitObjectExecuteShaderEXT(hitObject, 0);
 #else
-	traceRayEXT(tlas, RT_RAY_FLAGS | RT_OMM_RAY_FLAGS(get_diffuse_bounces(payload.packed_bounces_flags)), mask, 0, 0, 0, ray_origin, 0.001, ray_dir, max_distance, 0);
+	traceRayEXT(tlas, RT_RAY_FLAGS | RT_OMM_RAY_FLAGS(get_diffuse_bounces(payload.packed_bounces_flags)), mask, 0, 0, 0, ray_origin, tmin, ray_dir, max_distance, 0);
 #endif
 }
 
@@ -210,6 +222,8 @@ bool shade_gbuffer_primary(ivec2 pixel, vec2 ndc, vec3 ray_origin, vec3 ray_dir)
 	h.texture_grad = vec4(0.0);
 	h.texture_lod2 = RT_TEXTURE_LOD_BASE;
 	h.texture_grad2 = vec4(0.0);
+	h.strand_inset = 0.0;
+	h.strand_axis = vec3(0.0);
 
 	MaterialResult m;
 	m.albedo = albedo_specular.rgb;
@@ -402,7 +416,7 @@ void main() {
 					hit_pos = ps.exit_position; // Where the subsurface walk left the surface (D120).
 				}
 #endif
-				ray_origin = offset_ray_origin(hit_pos, is_back_offset(ps.packed_bounces_flags) ? -ps.offset_normal : ps.offset_normal, ps.hit_t);
+				ray_origin = path_next_origin(hit_pos, ps);
 				ray_dir = ps.next_ray_dir;
 				continue;
 			}
@@ -424,7 +438,7 @@ void main() {
 				hit_pos = ps.exit_position; // Where the subsurface walk left the surface (D120).
 			}
 #endif
-			ray_origin = offset_ray_origin(hit_pos, is_back_offset(ps.packed_bounces_flags) ? -ps.offset_normal : ps.offset_normal, ps.hit_t);
+			ray_origin = path_next_origin(hit_pos, ps);
 			ray_dir = ps.next_ray_dir;
 		}
 

@@ -4669,6 +4669,7 @@ void RenderingServer::init() {
 	GLOBAL_DEF("rendering/pathtracing/texture_lod_anisotropic", true);
 	GLOBAL_DEF("rendering/pathtracing/subsurface", true);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/subsurface_scale", PROPERTY_HINT_RANGE, "0.0001,0.1,0.00001,or_greater,suffix:m"), 0.002);
+	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracing/hair_bcsdf", PROPERTY_HINT_ENUM, "Far Field,Chiang"), 0);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracing/texture_filtering", PROPERTY_HINT_ENUM, "Off,Bilinear,Bicubic,Gaussian"), 0);
 	GLOBAL_DEF(PropertyInfo(Variant::INT, "rendering/pathtracing/texture_filtering_magnification", PROPERTY_HINT_ENUM, "Hardware,Stochastic"), 0);
 	GLOBAL_DEF(PropertyInfo(Variant::FLOAT, "rendering/pathtracing/texture_filtering_gaussian_sigma", PROPERTY_HINT_RANGE, "0.1,2.0,0.01"), 0.7);

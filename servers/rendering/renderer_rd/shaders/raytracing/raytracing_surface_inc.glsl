@@ -15,10 +15,11 @@
 // no hit group writes both (HG0 has no TRANSMISSION, a custom hit group and the G-buffer no BACKLIGHT),
 // and RT_SURFACE_CODEC_CHECK reports a surface that would need them at once.
 //
-// A strand's hair (D126 H2) shares three words with the lobes a hair material clears: its melanin and
-// redness take anisotropy_clearcoat, its IOR and cuticle tilt clearcoat_roughness_rim, and the strand's
-// tangent, which the hair BCSDF needs and nothing else here keeps, anisotropy_tangent (under
-// RT_SURFACE_HAIR_TANGENT).
+// A strand's hair (D126 H2) shares four words with the lobes a hair material clears: its melanin and
+// redness take anisotropy_clearcoat, its IOR and cuticle tilt clearcoat_roughness_rim, the strand's
+// axis (HitData.strand_axis), which the hair BCSDF needs and nothing else here keeps, anisotropy_tangent
+// (under RT_SURFACE_HAIR_TANGENT), and the depth its rays start at inside it (HitData.strand_inset, a power of
+// two, as float bits) rim_tint_subsurface.
 //
 // Defined for a degenerate surface, so every caller shades it the same way and emission, the media and
 // the RR guides stay inside shade_and_bounce: a shading normal that is not finite or has no length
@@ -37,9 +38,9 @@
 #define RT_SURFACE_CUSTOM_GROUP 32u // HitData.custom_group: a custom hit group's surface.
 #define RT_SURFACE_INVALID 64u // The geometry normal is not a direction: it unpacks as the normal facing the ray.
 #define RT_SURFACE_SHADING_FROM_GEOMETRY 128u // The shading normal is not a direction: it unpacks as the geometry normal.
-#define RT_SURFACE_HAIR 256u // MaterialResult.hair: three words hold the hair (above), not the anisotropy, coat and rim.
+#define RT_SURFACE_HAIR 256u // MaterialResult.hair: four words hold the hair (above), not the anisotropy, coat and rim.
 #define RT_SURFACE_HAIR_COLOR 512u // MaterialResult.hair_color.
-#define RT_SURFACE_HAIR_TANGENT 1024u // Under RT_SURFACE_HAIR, anisotropy_tangent holds the strand's tangent.
+#define RT_SURFACE_HAIR_TANGENT 1024u // Under RT_SURFACE_HAIR, anisotropy_tangent holds the strand's axis.
 
 struct SurfaceRecord {
 	float hit_t;
@@ -121,7 +122,7 @@ SurfaceRecord surface_pack(HitData p_hit, MaterialResult p_mat, float p_hit_t) {
 	const bool thin = any(greaterThan(p_mat.diffuse_transmission, vec3(0.0)));
 	const bool anisotropic = p_mat.anisotropy != 0.0 && surface_is_direction(p_mat.anisotropy_tangent);
 	const bool clearcoat = p_mat.clearcoat > 0.0 && surface_is_direction(p_mat.clearcoat_normal);
-	const bool hair_tangent = p_mat.hair && surface_is_direction(p_hit.tangent);
+	const bool hair_tangent = p_mat.hair && surface_is_direction(p_hit.strand_axis);
 	r.flags = (p_hit.is_front_face ? RT_SURFACE_FRONT_FACE : 0u) | (thin ? RT_SURFACE_THIN : 0u) | (p_mat.subsurface_skin ? RT_SURFACE_SKIN : 0u) | (anisotropic ? RT_SURFACE_ANISOTROPIC : 0u) | (clearcoat ? RT_SURFACE_CLEARCOAT : 0u) | (p_hit.custom_group ? RT_SURFACE_CUSTOM_GROUP : 0u) | (geometry_valid ? 0u : RT_SURFACE_INVALID) | (shading_valid ? 0u : RT_SURFACE_SHADING_FROM_GEOMETRY) | (p_mat.hair ? RT_SURFACE_HAIR : 0u) | (p_mat.hair_color ? RT_SURFACE_HAIR_COLOR : 0u) | (hair_tangent ? RT_SURFACE_HAIR_TANGENT : 0u);
 	r.geometry_normal = surface_pack_oct(geometry_normal);
 	r.shading_normal = surface_pack_oct(shading_normal);
@@ -149,10 +150,11 @@ SurfaceRecord surface_pack(HitData p_hit, MaterialResult p_mat, float p_hit_t) {
 	r.rim_tint_subsurface = surface_pack_half2(p_mat.rim_tint, surface_subsurface_share(p_mat));
 	r.anisotropy_tangent = anisotropic ? surface_pack_oct(p_mat.anisotropy_tangent) : 0u;
 	if (p_mat.hair) {
-		// A hair material's anisotropy, coat and rim are zero (D126 H2), so their words carry the hair.
+		// A hair material's anisotropy, coat, rim and subsurface share are zero (D126 H2), so their words carry the hair.
 		r.anisotropy_clearcoat = surface_pack_half2(p_mat.hair_melanin, p_mat.hair_redness);
 		r.clearcoat_roughness_rim = surface_pack_half2(p_mat.hair_ior, p_mat.hair_tilt);
-		r.anisotropy_tangent = hair_tangent ? surface_pack_oct(p_hit.tangent) : 0u;
+		r.anisotropy_tangent = hair_tangent ? surface_pack_oct(p_hit.strand_axis) : 0u;
+		r.rim_tint_subsurface = floatBitsToUint(p_hit.strand_inset);
 	}
 	r.clearcoat_normal = clearcoat ? surface_pack_oct(p_mat.clearcoat_normal) : 0u;
 	r.geometry_idx = p_hit.geometry_idx;
@@ -181,6 +183,8 @@ void surface_unpack(SurfaceRecord p_record, vec3 p_ray_origin, vec3 p_ray_dir, o
 	r_hit.texture_grad = vec4(0.0);
 	r_hit.texture_lod2 = lods.y;
 	r_hit.texture_grad2 = vec4(0.0);
+	r_hit.strand_inset = 0.0;
+	r_hit.strand_axis = vec3(0.0);
 
 	const vec2 albedo_rg = unpackHalf2x16(p_record.albedo_rg);
 	const vec2 albedo_b_roughness = unpackHalf2x16(p_record.albedo_b_roughness);
@@ -238,7 +242,10 @@ void surface_unpack(SurfaceRecord p_record, vec3 p_ray_origin, vec3 p_ray_dir, o
 		r_mat.clearcoat = 0.0;
 		r_mat.clearcoat_roughness = 0.0;
 		r_mat.rim = 0.0;
-		r_hit.tangent = (p_record.flags & RT_SURFACE_HAIR_TANGENT) != 0u ? surface_unpack_oct(p_record.anisotropy_tangent) : vec3(0.0);
+		r_mat.rim_tint = 0.0;
+		r_mat.subsurface = 0.0;
+		r_hit.strand_axis = (p_record.flags & RT_SURFACE_HAIR_TANGENT) != 0u ? surface_unpack_oct(p_record.anisotropy_tangent) : vec3(0.0);
+		r_hit.strand_inset = uintBitsToFloat(p_record.rim_tint_subsurface);
 	}
 }
 
@@ -313,9 +320,9 @@ void surface_codec_check_hit(HitData p_hit, MaterialResult p_mat, vec3 p_ray_ori
 	bad |= (p_hit.is_front_face == h.is_front_face && p_hit.custom_group == h.custom_group) ? 0u : 16384u;
 	bad |= (p_hit.geometry_idx == h.geometry_idx && p_hit.primitive_id == h.primitive_id) ? 0u : 32768u;
 	bad |= (surface_check_half(p_hit.texture_lod, h.texture_lod) && surface_check_half(p_hit.texture_lod2, h.texture_lod2)) ? 0u : 65536u;
-	// Hair (D126 H2): the flags, its parameters and the strand's tangent (or none, when it had none).
-	const bool hair_tangent_valid = surface_is_direction(p_hit.tangent);
-	bad |= (p_mat.hair == m.hair && p_mat.hair_color == m.hair_color && (!p_mat.hair || (surface_check_half(p_mat.hair_melanin, m.hair_melanin) && surface_check_half(p_mat.hair_redness, m.hair_redness) && surface_check_half(p_mat.hair_ior, m.hair_ior) && surface_check_half(p_mat.hair_tilt, m.hair_tilt) && (hair_tangent_valid ? surface_check_direction(p_hit.tangent, h.tangent) : h.tangent == vec3(0.0))))) ? 0u : 262144u;
+	// Hair (D126 H2): the flags, its parameters, the strand's axis (or none, when it had none) and its inset, exactly.
+	const bool hair_tangent_valid = surface_is_direction(p_hit.strand_axis);
+	bad |= (p_mat.hair == m.hair && p_mat.hair_color == m.hair_color && (!p_mat.hair || (surface_check_half(p_mat.hair_melanin, m.hair_melanin) && surface_check_half(p_mat.hair_redness, m.hair_redness) && surface_check_half(p_mat.hair_ior, m.hair_ior) && surface_check_half(p_mat.hair_tilt, m.hair_tilt) && (hair_tangent_valid ? surface_check_direction(p_hit.strand_axis, h.strand_axis) : h.strand_axis == vec3(0.0)) && p_hit.strand_inset == h.strand_inset))) ? 0u : 262144u;
 	// Every lobe's gate, exactly: a transmission, a thin transmission, a medium, an emission, a coat, a sheen, a walk, an
 	// anisotropy present or not.
 	const bool gates = surface_check_gate3(p_mat.transmission, m.transmission) && surface_check_gate3(p_mat.diffuse_transmission, m.diffuse_transmission) && surface_check_gate3(p_mat.absorption, m.absorption) && surface_check_gate3(p_mat.emissive, m.emissive) && surface_check_gate3(p_mat.decal_emissive, m.decal_emissive) && surface_check_gate(p_mat.clearcoat, m.clearcoat) && surface_check_gate(p_mat.rim, m.rim) && surface_check_gate(share, m.subsurface) && ((p_mat.anisotropy != 0.0) == (m.anisotropy != 0.0));

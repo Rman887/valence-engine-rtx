@@ -163,8 +163,8 @@ float light_tree_node_falloff(RTLightTreeNode n, float d2, float r2, float inv_d
 /// where the lights are zero too; the receiver bound is floored. Every angle is kept as its
 /// cosine and sine (the sum and difference identities), so a node costs one reciprocal square
 /// root and at most four square roots (two of them for a spot's cone), no arc function: the cut
-/// is scored on every hit.
-float light_tree_node_importance(RTLightTreeNode n, vec3 x, vec3 N) {
+/// is scored on every hit. A strand's receiver (p_two_sided, D126 H2) bounds the cosine on either side of N.
+float light_tree_node_importance(RTLightTreeNode n, vec3 x, vec3 N, bool p_two_sided) {
 	vec3 to_c = n.center - x;
 	float d2 = dot(to_c, to_c);
 	float r2 = n.radius * n.radius;
@@ -187,6 +187,7 @@ float light_tree_node_importance(RTLightTreeNode n, vec3 x, vec3 N) {
 
 	// cos(max(theta_i - theta_u, 0)) at the receiver, floored.
 	float cos_i = clamp(dot(N, dir), -1.0, 1.0);
+	cos_i = p_two_sided ? abs(cos_i) : cos_i;
 	float cos_bi = 1.0;
 	if (cos_i < cos_u) {
 		cos_bi = cos_i * cos_u + sqrt(max(1.0 - cos_i * cos_i, 0.0)) * sin_u;
@@ -217,10 +218,11 @@ float light_tree_node_importance(RTLightTreeNode n, vec3 x, vec3 N) {
 
 /// A directional light's irradiance at a surface facing N, floored as the nodes' receiver bound
 /// is: the leaf sampler judges the sample on the shading normal, which can see a sun the geometry
-/// normal does not.
-float light_tree_directional_importance(RTLightData light, vec3 N) {
+/// normal does not. A strand's receiver (p_two_sided, D126 H2) takes a sun behind it as one in front.
+float light_tree_directional_importance(RTLightData light, vec3 N, bool p_two_sided) {
 	float lum = abs(dot(light.emission, vec3(0.2126, 0.7152, 0.0722)));
-	return lum * max(dot(N, -light.position), RT_LIGHT_TREE_RECEIVER_FLOOR);
+	float cos_r = dot(N, -light.position);
+	return lum * max(p_two_sided ? abs(cos_r) : cos_r, RT_LIGHT_TREE_RECEIVER_FLOOR);
 }
 
 /// The sky's importance: its concentrated light as a horizontal-surface irradiance, D54's share
@@ -261,19 +263,21 @@ struct LightTreeTop {
 /// summed in slot order. Nothing is stored per slot (a per-hit array would live in local memory
 /// and cost the trace its occupancy): a pick runs the same sum again to find its slot. A slot's
 /// interval is its node's importance, which the next vertex's density evaluates alone, against
-/// the total the payload carries there (GPU audit light 1a). `indirect` picks the cut (D59).
-LightTreeTop light_tree_top(vec3 x, vec3 N, bool indirect) {
+/// the total the payload carries there (GPU audit light 1a). `indirect` picks the cut (D59), p_two_sided a strand's
+/// receiver (D126 H2), which the directional lights and the cut score on both sides of N; the sky's share stays the
+/// hemisphere's (its table is per normal).
+LightTreeTop light_tree_top(vec3 x, vec3 N, bool indirect, bool p_two_sided) {
 	LightTreeTop t;
 	t.indirect = indirect;
 	t.directional_count = uint(get_rt_param(RT_PARAM_DIRECTIONAL_COUNT));
 	t.directional = 0.0;
 	for (uint k = 0u; k < t.directional_count; k++) {
-		t.directional += light_tree_directional_importance(rt_lights[k], N);
+		t.directional += light_tree_directional_importance(rt_lights[k], N, p_two_sided);
 	}
 	t.cut_count = light_tree_cut_count(indirect);
 	float running = 0.0;
 	for (uint s = 0u; s < t.cut_count; s++) {
-		running += light_tree_node_importance(light_tree_cut_node(s, indirect), x, N);
+		running += light_tree_node_importance(light_tree_cut_node(s, indirect), x, N, p_two_sided);
 	}
 	t.root = running;
 	// The sky last: its share by variance (D62) is judged against the rest of the top.
@@ -321,8 +325,8 @@ float light_tree_sky_probability(LightTreeTop t) {
 /// count), the expression light_tree_draw_leaf evaluates. Only the entry's own node is scored.
 /// Zero when the entry has no leaf, its cut node reads nothing there, or nothing was scored (a total of
 /// 0; a sky-only frame lists no emitter, so no chance hit asks). `indirect` is the cut the previous
-/// vertex scored, as the payload carries it (D59).
-float light_tree_emissive_probability(uint p_entry, vec3 x, vec3 N, bool indirect, float total) {
+/// vertex scored, as the payload carries it (D59), and `two_sided` whether it scored a strand's receiver (D126 H2).
+float light_tree_emissive_probability(uint p_entry, vec3 x, vec3 N, bool indirect, bool two_sided, float total) {
 	if (p_entry >= RT_LIGHT_TREE_EMISSIVE_MAX || !(total > 0.0)) {
 		return 0.0;
 	}
@@ -331,7 +335,7 @@ float light_tree_emissive_probability(uint p_entry, vec3 x, vec3 N, bool indirec
 		return 0.0;
 	}
 	RTLightTreeNode n = light_tree_cut_node(slot, indirect);
-	float interval = light_tree_node_importance(n, x, N);
+	float interval = light_tree_node_importance(n, x, N, two_sided);
 	if (!(interval > 0.0)) {
 		return 0.0;
 	}
@@ -367,7 +371,7 @@ struct LightTreeCandidate {
 /// by its importance, written to r_c and true; or the cut, false, whose slot the sampler finds
 /// with the candidate's second number in its pass over the cut (a small cut share would otherwise
 /// spend the bits the leaf pick needs). A directional pick that read nothing leaves r_c.p at 0.
-bool light_tree_draw_top(float u_top, LightTreeTop t, vec3 N, out LightTreeCandidate r_c) {
+bool light_tree_draw_top(float u_top, LightTreeTop t, vec3 N, bool p_two_sided, out LightTreeCandidate r_c) {
 	r_c.kind = RT_LIGHT_TREE_KIND_LEAF;
 	r_c.index = 0u;
 	r_c.encoded = 0u;
@@ -384,7 +388,7 @@ bool light_tree_draw_top(float u_top, LightTreeTop t, vec3 N, out LightTreeCandi
 		uint chosen = t.directional_count - 1u;
 		float running = 0.0;
 		for (uint k = 0u; k < t.directional_count; k++) {
-			running += light_tree_directional_importance(rt_lights[k], N);
+			running += light_tree_directional_importance(rt_lights[k], N, p_two_sided);
 			if (pick < running) {
 				chosen = k;
 				break;
@@ -392,7 +396,7 @@ bool light_tree_draw_top(float u_top, LightTreeTop t, vec3 N, out LightTreeCandi
 		}
 		r_c.kind = RT_LIGHT_TREE_KIND_DIRECTIONAL;
 		r_c.index = chosen;
-		r_c.p = light_tree_directional_importance(rt_lights[chosen], N) / t.total;
+		r_c.p = light_tree_directional_importance(rt_lights[chosen], N, p_two_sided) / t.total;
 		return true;
 	}
 	return false;
@@ -620,9 +624,14 @@ bool light_tree_sample_direct(
 	r_sample.radiance = vec3(0.0);
 	r_sample.weight = 0.0;
 	r_sample.specular_multiplier = 1.0;
+	r_sample.hair_value = vec3(-1.0);
 	r_probability = 1.0;
 
-	LightTreeTop t = light_tree_top(hit_pos, N_select, is_indirect_bounce);
+	// A strand (D126 H2) is lit from behind as from the front, so its proposal scores both sides of N_select: the next
+	// vertex's chance hit reads the same through the payload's strand flag (HAIR_RAY_FLAG). A thin surface and a coat
+	// keep the hemisphere's proposal; their targets below are two-sided.
+	const bool proposal_two_sided = hasHair(material);
+	LightTreeTop t = light_tree_top(hit_pos, N_select, is_indirect_bounce, proposal_two_sided);
 	r_sky_probability = light_tree_sky_probability(t);
 	r_total = t.total;
 	if (light_tree_sky_only(t)) {
@@ -633,7 +642,7 @@ bool light_tree_sample_direct(
 	}
 	candidates = clamp(candidates, 1u, uint(RT_LIGHT_TREE_MAX_CANDIDATES));
 	// A coat (D118 MM2) reflects light from below the shading normal too, so its receiver is two-sided.
-	bool two_sided = hasDiffuseTransmission(material) || hasClearcoat(material);
+	bool two_sided = hasDiffuseTransmission(material) || hasClearcoat(material) || hasHair(material); // A strand takes light from behind (D126 H2).
 	float u_res = min(rand(rng_state), 0.99999994);
 	LightTreeCandidate selected;
 	selected.kind = RT_LIGHT_TREE_KIND_LEAF;
@@ -654,7 +663,7 @@ bool light_tree_sample_direct(
 	for (uint i = 0u; i < candidates; i++) {
 		float u_top = min(rand(rng_state), 0.99999994);
 		LightTreeCandidate c;
-		if (light_tree_draw_top(u_top, t, N_select, c)) {
+		if (light_tree_draw_top(u_top, t, N_select, proposal_two_sided, c)) {
 			if (c.p > 0.0) {
 				light_tree_reservoir_offer(c, light_tree_target(c, t, hit_pos, N, two_sided) / c.p, w_sum, u_res, selected, w_selected);
 			}
@@ -682,7 +691,7 @@ bool light_tree_sample_direct(
 		// the sum before it is never drawn, yet the chance hit weighs it. No cheap exact form exists:
 		// the hit cannot know the drawn width without the whole sum. The leaf within the slot is
 		// placed on the drawn width, so the pick below the slot stays exact.
-		float interval = light_tree_node_importance(n, hit_pos, N_select);
+		float interval = light_tree_node_importance(n, hit_pos, N_select, proposal_two_sided);
 		running += interval;
 		if (!(interval > 0.0)) {
 			continue;

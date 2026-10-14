@@ -166,6 +166,7 @@ bool emissive_sample_direct(
 	r_sample.radiance = vec3(0.0);
 	r_sample.weight = 0.0;
 	r_sample.specular_multiplier = 1.0;
+	r_sample.hair_value = vec3(-1.0);
 
 	candidates = clamp(candidates, 1u, 16u);
 	// Weighted reservoir over the candidates on one random number, rescaled after every
@@ -181,7 +182,7 @@ bool emissive_sample_direct(
 		float u_sel = (float(i) + rand(rng_state)) / float(candidates);
 		uint idx = emissive_pick(u_sel, count);
 		RTEmissiveInstance c = rt_emissive[idx];
-		float w = emissive_proximity(c, hit_pos, N, hasDiffuseTransmission(material));
+		float w = emissive_proximity(c, hit_pos, N, hasDiffuseTransmission(material) || hasHair(material)); // A strand takes light from behind (D126 H2).
 		if (w <= 0.0) {
 			continue;
 		}
@@ -233,6 +234,7 @@ bool emissive_sample_instance(
 	r_sample.radiance = vec3(0.0);
 	r_sample.weight = 0.0;
 	r_sample.specular_multiplier = 1.0;
+	r_sample.hair_value = vec3(-1.0);
 	if (e.primitive_count == 0u) {
 		return false;
 	}
@@ -290,7 +292,12 @@ bool emissive_sample_instance(
 	// of the entry's global probability.
 	float pdf_sample = pdf_light * resample_factor;
 
-	float pdf_bsdf = brdf_pdf(N, L, V, material);
+	float pdf_bsdf;
+	if (hasHair(material)) {
+		evalHair(N, L, V, material, r_sample.hair_value, pdf_bsdf); // Its value shades the sample (D126 H2).
+	} else {
+		pdf_bsdf = brdf_pdf(N, L, V, material);
+	}
 	// The weight is a function of the point alone, shared with the chance-hit side, so the two
 	// strategies' weights sum to one there whatever density either really sampled with; the
 	// share of samples sent to this strategy enters it as it enters the other side.

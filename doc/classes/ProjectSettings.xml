@@ -3382,6 +3382,9 @@
 			Number of frames a skinned or vertex-displaced deformed-mesh BLAS is kept alive in the path tracer cache after its last visible frame. Once this threshold is exceeded the BLAS and its associated buffers are freed. Increase this value if deformed meshes flicker back into view after brief occlusion; decrease it to reclaim GPU memory sooner. A freed instance or a mesh swapped out of its instance releases its entries at once; the threshold applies to live instances the path tracer skips.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
+		<member name="rendering/pathtracing/hair_bcsdf" type="int" setter="" getter="" default="0">
+			The scattering model the path tracer shades strands with, where a [BaseMaterial3D] with [member BaseMaterial3D.hair_enabled] draws a line surface traced as linear swept spheres: [code]0[/code] the far-field model of NVIDIA's RTX Character Rendering, which is the less noisy, or [code]1[/code] Chiang's model, for comparison. Read every frame.
+		</member>
 		<member name="rendering/pathtracing/linear_swept_spheres" type="bool" setter="" getter="" default="true">
 			If [code]true[/code] and the device supports [code]VK_NV_ray_tracing_linear_swept_spheres[/code] with float radii, a bottom-level acceleration structure may hold linear swept spheres: segments between two vertices, each with its own radius, swept as a capsule. With this setting on, the device is also created with [code]VK_KHR_maintenance5[/code] and [code]VK_KHR_dynamic_rendering[/code] where it has them, even without linear swept spheres: ray tracing pipelines opt into the primitive through maintenance5's creation flags. Without the extension, or with this setting off, no structure holds them.
 			[b]Note:[/b] Requires a restart to take effect.

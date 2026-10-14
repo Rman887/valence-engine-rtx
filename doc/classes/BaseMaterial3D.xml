@@ -251,7 +251,7 @@
 			The tilt of the hair's cuticle scales, in degrees, which shifts the highlights along the strand.
 		</member>
 		<member name="hair_enabled" type="bool" setter="set_feature" getter="get_feature" default="false">
-			If [code]true[/code], the path tracer shades strands drawn with this material (line surfaces traced as linear swept spheres) with a hair scattering model, from NVIDIA's RTX Character Rendering. [member roughness] is the strand's longitudinal roughness. A hair material draws none of rim, clearcoat, anisotropy, subsurface scattering and its transmittance, or back lighting; their properties are kept, hidden in the editor, and apply again with this off. Triangle surfaces and the raster keep the standard shading.
+			If [code]true[/code], the path tracer shades strands drawn with this material (line surfaces traced as linear swept spheres) with a hair scattering model: the far-field model of NVIDIA's RTX Character Rendering, or its Chiang model under [member ProjectSettings.rendering/pathtracing/hair_bcsdf]. [member roughness] is the strand's longitudinal roughness. A hair material draws none of rim, clearcoat, anisotropy, subsurface scattering and its transmittance, or back lighting; their properties are kept, hidden in the editor, and apply again with this off. Triangle surfaces and the raster keep the standard shading.
 		</member>
 		<member name="hair_ior" type="float" setter="set_hair_ior" getter="get_hair_ior" default="1.55">
 			The index of refraction of the hair fiber, from 1.0 to 2.5.

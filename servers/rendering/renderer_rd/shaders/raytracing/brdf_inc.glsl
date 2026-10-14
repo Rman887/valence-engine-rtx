@@ -285,11 +285,149 @@ struct MaterialProperties {
 	float3 sheenColor; // VAL: the sheen layer's reflectivity, from Godot's RIM and RIM_TINT (D118 MM3); 0 = no sheen.
 	float sheenRoughness; // With a sheen: Estevez and Kulla's r, the surface's roughness clamped to 0.1..1, where the albedo fit holds.
 	float subsurface; // VAL: the diffuse lobe's share that walks under the surface, Godot's SSS_STRENGTH (D120); the direct lobe keeps 1 - it.
+	bool hair; // VAL: the hair BCSDF (D126 H2) in place of every other lobe: a hair material on a strand.
+	bool hairChiang; // With hair: Chiang's model (rendering/pathtracing/hair_bcsdf), else RTXCR's far-field one.
+	float3 hairT; // With hair: the strand's unit tangent, orthogonal to the N the BCSDF is given: Chiang's frame.
+	float3 hairAxis; // With hair: the strand's unit axis as the trace gives it, the far field's tangent (its own frame).
+	float3 hairAbsorption; // With hair: the fibre's absorption coefficient, RTXCR's (per unit radius).
+	float hairIor; // With hair: the fibre's index of refraction.
+	float hairTilt; // With hair: the cuticle tilt in radians.
+	float hairInset; // With hair: how deep inside the strand its rays start (HitData.strand_inset), 0 for the surface's offset.
 };
 
 // A thin surface that passes light to its other side (D103): light below N is evaluated, not rejected.
 bool hasDiffuseTransmission(MaterialProperties material) {
 	return any(greaterThan(material.diffuseTransmission, float3(0.0f, 0.0f, 0.0f)));
+}
+
+// -------------------------------------------------------------------------
+//    VAL: hair (D126 H2, docs/r6-strand-hair.md)
+// -------------------------------------------------------------------------
+
+// clang-format off
+#include "raytracing_hair_inc.glsl"
+// clang-format on
+
+bool hasHair(MaterialProperties material) {
+	return material.hair;
+}
+
+// RTXCR's absorption for a strand: from the melanin with the albedo as a dye tint (Cycles' tint, white for none), or
+// from the albedo, the colour mapping at the azimuthal roughness, which is the material's roughness.
+float3 hairAbsorptionCoefficient(bool p_color, float3 p_albedo, float p_melanin, float p_redness, float p_roughness) {
+	float3 tint = RTXCR_AbsorptionCoefficientFromColor(p_albedo, p_roughness);
+	return p_color ? tint : RTXCR_AbsorptionCoefficientFromMelanin(p_melanin, p_redness) + tint;
+}
+
+// The strand's colour the denoiser's guide takes for the absorption: the inverse of RTXCR's colour mapping.
+float3 hairGuideColor(float3 p_absorption, float p_roughness) {
+	const float betaN = p_roughness;
+	const float tmp = 5.969f - 0.215f * betaN + 2.532f * betaN * betaN - 10.73f * pow(betaN, 3.0f) + 5.574f * pow(betaN, 4.0f) + 0.245f * pow(betaN, 5.0f);
+	return exp(-sqrt(max(p_absorption, float3(0.0f, 0.0f, 0.0f))) * tmp);
+}
+
+// The hair's local frame as RTXCR's sample builds it for Chiang's model: x the tangent, y cross(N, T), z the normal.
+float3 hairToLocal(float3 v, float3 N, float3 T) {
+	return float3(dot(v, T), dot(v, cross(N, T)), dot(v, N));
+}
+
+float3 hairFromLocal(float3 v, float3 N, float3 T) {
+	return v.x * T + v.y * cross(N, T) + v.z * N;
+}
+
+// In Chiang's local frame (p_local), or in world space for the far field, whose frame is the strand's axis as the trace
+// gives it: RTXCR's far field builds its own azimuth from the tangent and wo, and reads N only where wo runs along the
+// axis, so it takes the axis unchanged (on a tapered segment the normal tilts off the perpendicular to it).
+RTXCR_HairInteractionSurface hairSurface(float3 N, float3 V, MaterialProperties material, bool p_local) {
+	RTXCR_HairInteractionSurface surface;
+	surface.incidentRayDirection = p_local ? hairToLocal(V, N, material.hairT) : V;
+	surface.shadingNormal = p_local ? float3(0.0f, 0.0f, 1.0f) : N;
+	surface.tangent = p_local ? float3(1.0f, 0.0f, 0.0f) : material.hairAxis;
+	return surface;
+}
+
+RTXCR_HairMaterialInteraction hairChiangInteraction(float3 N, float3 V, MaterialProperties material) {
+	RTXCR_HairMaterialData data;
+	data.baseColor = float3(1.0f, 1.0f, 1.0f);
+	// One roughness for both (docs/r6-strand-hair.md, H2 design). Both floored as the far field floors its own: a zero
+	// roughness gives Chiang's longitudinal variance 0 (its M_p divides by it), an IOR of 1 no refraction to invert.
+	const float roughness = max(material.roughness, 1e-4f);
+	const float ior = max(material.hairIor, 1.0001f);
+	data.longitudinalRoughness = roughness;
+	data.azimuthalRoughness = roughness;
+	data.ior = ior;
+	data.eta = 1.0f / ior;
+	data.fresnelApproximation = 0u; // The exact dielectric Fresnel.
+	data.absorptionModel = RTXCR_HairAbsorptionModel_Color;
+	data.melanin = 0.0f;
+	data.melaninRedness = 0.0f;
+	data.cuticleAngleInDegrees = degrees(material.hairTilt);
+	RTXCR_HairMaterialInteraction interaction = RTXCR_CreateHairMaterialInteraction(data, hairSurface(N, V, material, true));
+	interaction.absorptionCoefficient = material.hairAbsorption;
+	return interaction;
+}
+
+RTXCR_HairMaterialInteractionBcsdf hairFarFieldInteraction(MaterialProperties material) {
+	RTXCR_HairMaterialInteractionBcsdf interaction;
+	interaction.diffuseReflectionTint = float3(0.0f, 0.0f, 0.0f);
+	interaction.diffuseReflectionWeight = 0.0f; // RTXCR's diffuse extension is for artificial hair.
+	interaction.roughness = material.roughness;
+	interaction.absorptionCoefficient = material.hairAbsorption;
+	interaction.ior = material.hairIor;
+	interaction.cuticleAngle = material.hairTilt;
+	return interaction;
+}
+
+// The hair BCSDF for light from L seen from V at a strand of unit normal N: RTXCR's value, which carries the integration
+// measure the other lobes bake in as their cosine (so the caller multiplies by nothing), and the density the hair
+// sampler below draws L with.
+void evalHair(float3 N, float3 L, float3 V, MaterialProperties material, OUT_PARAMETER(float3) r_value, OUT_PARAMETER(float) r_pdf) {
+	if (material.hairChiang) {
+		const RTXCR_HairMaterialInteraction interaction = hairChiangInteraction(N, V, material);
+		const float3 wi = hairToLocal(L, N, material.hairT);
+		const float3 wo = hairToLocal(V, N, material.hairT);
+		r_value = RTXCR_HairChiangBsdfEval(interaction, wi, wo);
+		r_pdf = RTXCR_ChiangBsdfPdf(interaction, wi, wo);
+	} else {
+		float3 diffuse;
+		RTXCR_HairFarFieldBcsdfEval(hairSurface(N, V, material, false), hairFarFieldInteraction(material), L, V, r_value, diffuse, r_pdf);
+		r_value = r_pdf > 0.0f ? r_value + diffuse : float3(0.0f, 0.0f, 0.0f); // As RTXCR's sample weighs its light samples.
+	}
+}
+
+// A direction from the hair BCSDF and its weight, value over density, from six uniform numbers (u.xy, u.z, w.xy, w.z):
+// Chiang's lobe and azimuth pair, then its longitudinal pair; the far field's longitudinal pair, its lobe, its azimuth's
+// Gaussian pair and the cylinder offset h, uniform over [-1, 1], as RTXCR's sample draws them. False when the sampler
+// rejects the direction (a zero density).
+bool sampleHair(float3 u, float3 w, float3 N, float3 V, MaterialProperties material, OUT_PARAMETER(float3) r_direction, OUT_PARAMETER(float3) r_weight, OUT_PARAMETER(float) r_pdf) {
+	r_direction = N;
+	r_weight = float3(0.0f, 0.0f, 0.0f);
+	r_pdf = 0.0f;
+	if (material.hairChiang) {
+		const RTXCR_HairMaterialInteraction interaction = hairChiangInteraction(N, V, material);
+		float2 rnd[2];
+		rnd[0] = u.xy;
+		rnd[1] = w.xy;
+		float3 wi;
+		float3 value;
+		uint lobe;
+		if (!RTXCR_SampleChiangBsdf(interaction, hairToLocal(V, N, material.hairT), rnd, wi, r_pdf, value, lobe)) {
+			return false;
+		}
+		r_direction = hairFromLocal(wi, N, material.hairT);
+		r_weight = value / r_pdf;
+		return true;
+	}
+	float3 rnd[2];
+	rnd[0] = float3(u.xy, u.z);
+	rnd[1] = float3(w.xy, 0.0f);
+	float3 value;
+	float3 diffuse;
+	if (!RTXCR_SampleFarFieldBcsdf(hairSurface(N, V, material, false), hairFarFieldInteraction(material), V, 2.0f * w.z - 1.0f, rnd, r_direction, value, diffuse, r_pdf)) {
+		return false;
+	}
+	r_weight = (value + diffuse) / r_pdf;
+	return true;
 }
 
 // Data needed to evaluate BRDF (surface and material properties at given point + configuration of light and normal vectors)
@@ -1236,7 +1374,7 @@ float clearcoatProbability(MaterialProperties material, float3 N, float3 V, floa
 // Whether light arriving from L below the shading normal reaches the BSDF: through a thin surface's
 // transmission (D103), or off a coat whose own normal L is above. The light samplers reject the rest.
 bool brdfTakesLightBelowN(MaterialProperties material, float3 L) {
-	return hasDiffuseTransmission(material) || (hasClearcoat(material) && dot(material.clearcoatN, L) > 0.0f);
+	return hasHair(material) || hasDiffuseTransmission(material) || (hasClearcoat(material) && dot(material.clearcoatN, L) > 0.0f);
 }
 
 // Samples the coat's reflection: its VNDF about the coat's normal, or the mirror direction below
@@ -1518,6 +1656,13 @@ float3 evalCombinedBRDF(float3 N, float3 L, float3 V, MaterialProperties materia
 void evalCombinedBRDFSeparate(float3 N, float3 L, float3 V, MaterialProperties material, OUT_PARAMETER(float3) outDiffuse, OUT_PARAMETER(float3) outSpecular) {
 	outDiffuse = float3(0.0f, 0.0f, 0.0f);
 	outSpecular = float3(0.0f, 0.0f, 0.0f);
+	// VAL: hair (D126 H2) replaces every lobe, from either side of N. It goes in the diffuse output, which a light's
+	// specular amount does not scale: its highlight is part of one scattering function, not a lobe an artist dims.
+	if (hasHair(material)) {
+		float pdf;
+		evalHair(N, L, V, material, outDiffuse, pdf);
+		return;
+	}
 	// Prepare data needed for BRDF evaluation (uses shading normal N for all BRDF math).
 	const BrdfData data = prepareBRDFData(N, L, V, material);
 	// VAL: a coat (D118 MM2) adds its reflection to the specular and passes the base what it does not reflect on
@@ -1599,6 +1744,13 @@ float diffuseTransmissionProbability(float3 specularF0, float3 diffuseReflectanc
 // density here; the scatter reports RT_BSDF_PDF_DELTA for it instead. Emissive light sampling
 // weighs its samples against this (D50), so it must describe the sampler exactly.
 float brdf_pdf(float3 N, float3 L, float3 V, MaterialProperties material) {
+	// VAL: hair (D126 H2): the hair sampler's own density, from either side of N.
+	if (hasHair(material)) {
+		float3 value;
+		float pdf;
+		evalHair(N, L, V, material, value, pdf);
+		return pdf;
+	}
 	const BrdfData data = prepareBRDFData(N, L, V, material);
 	// VAL: a coat (D118 MM2) is picked first, the base's lobes below take the rest; a mirror coat adds no density.
 	float coatProbability = clearcoatProbability(material, N, V, data.specularF0, data.diffuseReflectance);

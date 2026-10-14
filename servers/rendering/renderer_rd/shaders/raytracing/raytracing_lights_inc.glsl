@@ -332,15 +332,20 @@ bool ray_query_alpha_test(uint geometry_idx, int cluster_id, uint primitive, vec
 // Shadow Ray (an inline ray query, or the traceRayEXT pipeline)
 // ============================================================================
 
-/// VAL: a shadow ray leaves from RT_SHADOW_TMIN and stops RT_SHADOW_TMIN short of the light (max_dist - RT_SHADOW_TMIN).
+/// VAL: a shadow ray stops RT_SHADOW_TMIN short of the light (max_dist - RT_SHADOW_TMIN), so it does not meet the sampled
+/// emitter itself, and leaves from rt_shadow_tmin.
 #define RT_SHADOW_TMIN 0.001
+/// VAL: the shadow rays' tmin for the vertex being shaded: RT_SHADOW_TMIN, or RT_HAIR_TMIN at a strand (D126 H2), which
+/// shade_and_bounce sets for its hit; a ray it leaves pending for the end of the hit is resolved with the same. Only the
+/// near end follows it: the far end keeps RT_SHADOW_TMIN, whatever the receiver.
+float rt_shadow_tmin = RT_SHADOW_TMIN;
 
-/// VAL: whether a shadow ray's interval is empty: a light sample closer than twice RT_SHADOW_TMIN (or a distance that
+/// VAL: whether a shadow ray's interval is empty: a light sample closer than rt_shadow_tmin + RT_SHADOW_TMIN (or a distance that
 /// is not a number). Nothing can occlude an empty interval, so the light is visible, and no trace is made: a ray whose
 /// tmin exceeds its tmax is undefined behaviour in Vulkan (VUID-RuntimeSpirv-OpRayQueryInitializeKHR-06350,
 /// OpTraceRayKHR-06357, OpHitObjectTraceRayEXT-11880), and a negative or NaN tmax breaks -06349/-06351 and their twins.
 bool lights_shadow_interval_empty(float max_dist) {
-	return !(max_dist - RT_SHADOW_TMIN >= RT_SHADOW_TMIN);
+	return !(max_dist - RT_SHADOW_TMIN >= rt_shadow_tmin);
 }
 
 /// The shadow ray through the pipeline: every candidate is decided by its hit group's any-hit (an alpha
@@ -356,7 +361,7 @@ bool lights_trace_shadow_ray_pipeline(vec3 origin, vec3 direction, float max_dis
 	hitObjectTraceRayEXT(hitObject, tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT | omm_flags,
 			RT_MASK_SHADOW, 0, 0, 0,
-			origin, RT_SHADOW_TMIN, direction, max_dist - RT_SHADOW_TMIN, 0);
+			origin, rt_shadow_tmin, direction, max_dist - RT_SHADOW_TMIN, 0);
 
 	return !(hitObjectIsHitEXT(hitObject));
 #else
@@ -387,7 +392,7 @@ bool lights_trace_shadow_ray_pipeline(vec3 origin, vec3 direction, float max_dis
 	traceRayEXT(tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT | omm_flags,
 			RT_MASK_SHADOW, 0, 0, 0,
-			origin, RT_SHADOW_TMIN, direction, max_dist - RT_SHADOW_TMIN, 0);
+			origin, rt_shadow_tmin, direction, max_dist - RT_SHADOW_TMIN, 0);
 
 	// Unpack to check visibility (miss shader packs radiance = 1.0).
 	shadow_ps = path_unpack(payload);
@@ -443,7 +448,7 @@ uint lights_shadow_ray_inline(vec3 origin, vec3 direction, float max_dist, uint 
 	rayQueryEXT shadow_rq;
 	rayQueryInitializeEXT(shadow_rq, tlas,
 			gl_RayFlagsTerminateOnFirstHitEXT | omm_flags,
-			RT_MASK_SHADOW, origin, RT_SHADOW_TMIN, direction, max_dist - RT_SHADOW_TMIN);
+			RT_MASK_SHADOW, origin, rt_shadow_tmin, direction, max_dist - RT_SHADOW_TMIN);
 
 	bool unresolved = false;
 	while (rayQueryProceedEXT(shadow_rq)) {
@@ -506,6 +511,9 @@ struct LightSampleNEE {
 	vec3 radiance;
 	float weight;
 	float specular_multiplier;
+	// VAL: a strand's hair BCSDF value toward the sample (D126 H2), from the evaluation the sampler's MIS weight read
+	// its density from, so the shading after the shadow test evaluates nothing again; x < 0 where none was taken.
+	vec3 hair_value;
 };
 
 bool lights_sample_light(RTLightData light, vec3 hit_pos, vec3 N, MaterialProperties material, vec2 u, bool is_indirect_bounce, out LightSampleNEE r_sample);
@@ -528,6 +536,7 @@ bool lights_sample_direct(
 	r_sample.radiance = vec3(0.0);
 	r_sample.weight = 0.0;
 	r_sample.specular_multiplier = 1.0;
+	r_sample.hair_value = vec3(-1.0);
 	if (light_count == 0u) {
 		return false;
 	}
@@ -605,6 +614,7 @@ bool lights_sample_light(
 	r_sample.weight = 1.0;
 	float indirect_mul = is_indirect_bounce ? light.indirect_energy : 1.0;
 	r_sample.specular_multiplier = lights_get_specular_multiplier(light.specular_amount, material.roughness);
+	r_sample.hair_value = vec3(-1.0);
 
 	// === RECTANGLE LIGHT PATH (AreaLight3D, VAL D124) ===
 	// One-sided toward its normal, its colour a radiance, as the raster's. A point drawn uniformly in the

@@ -141,7 +141,7 @@ public:
 	static constexpr int RT_PARAM_SAMPLE_COUNT = 1;
 	static constexpr int RT_PARAM_MAX_BOUNCES = 2;
 	static constexpr int RT_PARAM_DENOISER = 3;
-	static constexpr int RT_PARAM_PRIMARY_SURFACE = 4; // VAL: unused since P1e (the raygen variant RT_FLAG_GBUFFER_PRIMARY), kept for the layout.
+	static constexpr int RT_PARAM_HAIR_BCSDF = 4; // VAL: the hair BCSDF, rendering/pathtracing/hair_bcsdf: 0 far field, 1 Chiang (D126 H2; the slot was P1e's unused primary surface).
 	// The froxel volumetric fog the raygen composes over the camera segment (D37).
 	static constexpr int RT_PARAM_VFOG_ENABLED = 5;
 	static constexpr int RT_PARAM_VFOG_INV_LENGTH = 6;

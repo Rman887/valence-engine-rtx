@@ -1447,6 +1447,18 @@ public:
 		enum Type {
 			TYPE_TRIANGLES,
 			TYPE_AABBS,
+			TYPE_LINEAR_SWEPT_SPHERES,
+		};
+
+		// As RDD::AccelerationStructureGeometry's (D126).
+		enum LinearSweptSpheresIndexing {
+			LINEAR_SWEPT_SPHERES_INDEXING_LIST,
+			LINEAR_SWEPT_SPHERES_INDEXING_SUCCESSIVE,
+		};
+
+		enum LinearSweptSpheresEndCaps {
+			LINEAR_SWEPT_SPHERES_END_CAPS_NONE,
+			LINEAR_SWEPT_SPHERES_END_CAPS_CHAINED,
 		};
 
 		struct Triangles {
@@ -1476,6 +1488,31 @@ public:
 			uint32_t count = 0;
 		};
 
+		// Linear swept spheres (D126), with SUPPORTS_LINEAR_SWEPT_SPHERES: segments between two
+		// vertices, each vertex with its radius. Positions and radii come from vertex or storage
+		// buffers (the radii may share the vertex buffer at their own offset and stride), the
+		// optional indices from an index buffer without restart indices: pairs (LIST) or one index
+		// k joining k and k + 1 (SUCCESSIVE, which needs indices); without indices, vertex pairs.
+		// Positions are DATA_FORMAT_R32G32B32_SFLOAT and radii DATA_FORMAT_R32_SFLOAT; CHAINED end
+		// caps need SUCCESSIVE indexing. Radii must not be negative; a NaN radius or position makes
+		// a segment inactive, and a refit must not change which segments are.
+		struct LinearSweptSpheres {
+			RID vertex_buffer;
+			uint32_t vertex_offset = 0;
+			uint32_t vertex_stride = 0;
+			uint32_t vertex_count = 0;
+			DataFormat vertex_format = DATA_FORMAT_R32G32B32_SFLOAT;
+			RID radius_buffer;
+			uint32_t radius_offset = 0;
+			uint32_t radius_stride = sizeof(float);
+			DataFormat radius_format = DATA_FORMAT_R32_SFLOAT;
+			RID index_buffer;
+			uint32_t index_offset = 0;
+			uint32_t index_count = 0;
+			LinearSweptSpheresIndexing indexing = LINEAR_SWEPT_SPHERES_INDEXING_LIST;
+			LinearSweptSpheresEndCaps end_caps = LINEAR_SWEPT_SPHERES_END_CAPS_NONE;
+		};
+
 		// RIDs have a non-trivial destructor, so the variants live in parallel
 		// fields (not a C-style union). Only the fields matching `type` are
 		// read by `blas_create()`. Kept inside a `Geometry` sub-struct so the
@@ -1484,6 +1521,7 @@ public:
 		struct Geometry {
 			Triangles triangles;
 			Aabbs aabbs;
+			LinearSweptSpheres linear_swept_spheres;
 		};
 
 		Type type = TYPE_TRIANGLES;

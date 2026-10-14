@@ -610,6 +610,12 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 	if (GLOBAL_GET("rendering/pathtracing/opacity_micromaps")) {
 		_register_requested_device_extension(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME, false);
 	}
+	// Off, likewise: no BLAS takes linear swept spheres (D126). The format query names which
+	// formats may hold the radii.
+	if (GLOBAL_GET("rendering/pathtracing/linear_swept_spheres")) {
+		_register_requested_device_extension(VK_NV_RAY_TRACING_LINEAR_SWEPT_SPHERES_EXTENSION_NAME, false);
+		_register_requested_device_extension(VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME, false);
+	}
 	_register_requested_device_extension(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, false);
 
 	// We don't actually use this extension, but some runtime components on some platforms
@@ -954,6 +960,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR position_fetch_features = {};
 		VkPhysicalDevicePartitionedAccelerationStructureFeaturesNV partitioned_acceleration_structure_features = {};
 		VkPhysicalDeviceOpacityMicromapFeaturesEXT opacity_micromap_features = {};
+		VkPhysicalDeviceRayTracingLinearSweptSpheresFeaturesNV linear_swept_spheres_features = {};
 
 		const bool use_1_2_features = physical_device_properties.apiVersion >= VK_API_VERSION_1_2;
 		if (use_1_2_features) {
@@ -1072,6 +1079,12 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			opacity_micromap_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
 			opacity_micromap_features.pNext = next_features;
 			next_features = &opacity_micromap_features;
+		}
+
+		if (enabled_device_extension_names.has(VK_NV_RAY_TRACING_LINEAR_SWEPT_SPHERES_EXTENSION_NAME)) {
+			linear_swept_spheres_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_LINEAR_SWEPT_SPHERES_FEATURES_NV;
+			linear_swept_spheres_features.pNext = next_features;
+			next_features = &linear_swept_spheres_features;
 		}
 
 		if (enabled_device_extension_names.has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME)) {
@@ -1199,6 +1212,28 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		}
 		if (GLOBAL_GET("rendering/pathtracing/opacity_micromaps") && !opacity_micromap_capabilities.supported) {
 			print_verbose("rendering/pathtracing/opacity_micromaps is set, but this device has no opacity micromaps (VK_EXT_opacity_micromap). Alpha-tested surfaces keep the any-hit test alone.");
+		}
+
+		if (enabled_device_extension_names.has(VK_NV_RAY_TRACING_LINEAR_SWEPT_SPHERES_EXTENSION_NAME) && enabled_device_extension_names.has(VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME) && acceleration_structure_features.accelerationStructure && linear_swept_spheres_features.linearSweptSpheres) {
+			// Radii are read in a format whose features carry the radius-buffer bit, found only in
+			// the 64-bit format features.
+			const VkFormat radius_formats[2] = { VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16_SFLOAT };
+			bool *radius_supported[2] = { &linear_swept_spheres_capabilities.radius_r32_sfloat, &linear_swept_spheres_capabilities.radius_r16_sfloat };
+			for (uint32_t i = 0; i < 2; i++) {
+				VkFormatProperties3 properties_3 = {};
+				properties_3.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3;
+				VkFormatProperties2 properties_2 = {};
+				properties_2.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
+				properties_2.pNext = &properties_3;
+				vkGetPhysicalDeviceFormatProperties2(physical_device, radius_formats[i], &properties_2);
+				*radius_supported[i] = (properties_3.bufferFeatures & VK_FORMAT_FEATURE_2_ACCELERATION_STRUCTURE_RADIUS_BUFFER_BIT_NV) != 0;
+			}
+			linear_swept_spheres_capabilities.supported = linear_swept_spheres_capabilities.radius_r32_sfloat;
+		}
+		if (GLOBAL_GET("rendering/pathtracing/linear_swept_spheres") && !linear_swept_spheres_capabilities.supported) {
+			print_verbose("rendering/pathtracing/linear_swept_spheres is set, but this device has no linear swept spheres (VK_NV_ray_tracing_linear_swept_spheres) with float radii.");
+		} else if (linear_swept_spheres_capabilities.supported) {
+			print_verbose(vformat("- Vulkan Linear Swept Spheres supported (radius formats: R32_SFLOAT%s)", linear_swept_spheres_capabilities.radius_r16_sfloat ? ", R16_SFLOAT" : ""));
 		}
 	}
 
@@ -1660,6 +1695,14 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		opacity_micromap_features.pNext = create_info_next;
 		opacity_micromap_features.micromap = VK_TRUE;
 		create_info_next = &opacity_micromap_features;
+	}
+
+	VkPhysicalDeviceRayTracingLinearSweptSpheresFeaturesNV linear_swept_spheres_features = {};
+	if (linear_swept_spheres_capabilities.supported) {
+		linear_swept_spheres_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_LINEAR_SWEPT_SPHERES_FEATURES_NV;
+		linear_swept_spheres_features.pNext = create_info_next;
+		linear_swept_spheres_features.linearSweptSpheres = VK_TRUE;
+		create_info_next = &linear_swept_spheres_features;
 	}
 
 	VkPhysicalDeviceVulkan11Features vulkan_1_1_features = {};
@@ -6776,11 +6819,16 @@ RDD::AccelerationStructureID RenderingDeviceDriverVulkan::blas_create(VectorView
 	// since every build and update reads them through the geometries.
 	bool has_micromap = false;
 	uint32_t micromap_usage_total = 0;
+	// Linear swept spheres (D126) chain their data on the geometry, kept likewise.
+	bool has_linear_swept_spheres = false;
 	for (uint32_t i = 0; i < p_geometries.size(); i++) {
 		if (p_geometries[i].type == AccelerationStructureGeometry::TYPE_TRIANGLES && p_geometries[i].geometry.triangles.micromap) {
 			ERR_FAIL_COND_V_MSG(!opacity_micromap_capabilities.supported, AccelerationStructureID(), "Vulkan opacity micromaps are not supported by this device.");
 			has_micromap = true;
 			micromap_usage_total += p_geometries[i].geometry.triangles.micromap_usage_count;
+		} else if (p_geometries[i].type == AccelerationStructureGeometry::TYPE_LINEAR_SWEPT_SPHERES) {
+			ERR_FAIL_COND_V_MSG(!linear_swept_spheres_capabilities.supported, AccelerationStructureID(), "Vulkan linear swept spheres are not supported by this device.");
+			has_linear_swept_spheres = true;
 		}
 	}
 
@@ -6791,6 +6839,9 @@ RDD::AccelerationStructureID RenderingDeviceDriverVulkan::blas_create(VectorView
 	if (has_micromap) {
 		accel_info->micromap_attachments.resize(p_geometries.size());
 		accel_info->micromap_usages.resize(micromap_usage_total);
+	}
+	if (has_linear_swept_spheres) {
+		accel_info->linear_swept_spheres.resize(p_geometries.size());
 	}
 	uint32_t micromap_usage_next = 0;
 
@@ -6859,6 +6910,32 @@ RDD::AccelerationStructureID RenderingDeviceDriverVulkan::blas_create(VectorView
 				vk_geometry.geometry.aabbs.data.deviceAddress = buffer_get_device_address(a.buffer) + a.offset;
 				vk_geometry.geometry.aabbs.stride = a.stride;
 				primitive_count = a.count;
+			} break;
+
+			case AccelerationStructureGeometry::TYPE_LINEAR_SWEPT_SPHERES: {
+				const AccelerationStructureGeometry::LinearSweptSpheres &l = geometry.geometry.linear_swept_spheres;
+				vk_geometry.geometryType = VK_GEOMETRY_TYPE_LINEAR_SWEPT_SPHERES_NV;
+				VkAccelerationStructureGeometryLinearSweptSpheresDataNV &data = accel_info->linear_swept_spheres[i];
+				data = {};
+				data.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_LINEAR_SWEPT_SPHERES_DATA_NV;
+				data.vertexFormat = RD_TO_VK_FORMAT[l.vertex_format];
+				data.vertexData.deviceAddress = buffer_get_device_address(l.vertex_buffer) + l.vertex_offset;
+				data.vertexStride = l.vertex_stride;
+				data.radiusFormat = RD_TO_VK_FORMAT[l.radius_format];
+				data.radiusData.deviceAddress = buffer_get_device_address(l.radius_buffer) + l.radius_offset;
+				data.radiusStride = l.radius_stride;
+				if (l.index_buffer != BufferID()) {
+					data.indexType = (l.index_format == INDEX_BUFFER_FORMAT_UINT16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+					data.indexData.deviceAddress = buffer_get_device_address(l.index_buffer) + l.index_offset;
+					data.indexStride = (l.index_format == INDEX_BUFFER_FORMAT_UINT16 ? sizeof(uint16_t) : sizeof(uint32_t));
+				} else {
+					data.indexType = VK_INDEX_TYPE_NONE_KHR;
+				}
+				data.indexingMode = l.indexing == AccelerationStructureGeometry::LINEAR_SWEPT_SPHERES_INDEXING_SUCCESSIVE ? VK_RAY_TRACING_LSS_INDEXING_MODE_SUCCESSIVE_NV : VK_RAY_TRACING_LSS_INDEXING_MODE_LIST_NV;
+				data.endCapsMode = l.end_caps == AccelerationStructureGeometry::LINEAR_SWEPT_SPHERES_END_CAPS_CHAINED ? VK_RAY_TRACING_LSS_PRIMITIVE_END_CAPS_MODE_CHAINED_NV : VK_RAY_TRACING_LSS_PRIMITIVE_END_CAPS_MODE_NONE_NV;
+				// The data extends the geometry itself, not one of its union members.
+				vk_geometry.pNext = &data;
+				primitive_count = l.primitive_count;
 			} break;
 		}
 
@@ -8514,6 +8591,8 @@ bool RenderingDeviceDriverVulkan::has_feature(Features p_feature) {
 			return cluster_acceleration_structure_capabilities.supported && raytracing_capabilities.raytracing_pipeline_support;
 		case SUPPORTS_RAYTRACING_POSITION_FETCH:
 			return raytracing_capabilities.position_fetch;
+		case SUPPORTS_LINEAR_SWEPT_SPHERES:
+			return linear_swept_spheres_capabilities.supported && raytracing_capabilities.raytracing_pipeline_support;
 		case SUPPORTS_HDR_OUTPUT:
 #if defined(WINDOWS_ENABLED)
 			// When using a Vulkan swapchain on Windows, some configurations

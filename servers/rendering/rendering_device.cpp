@@ -590,6 +590,100 @@ RID RenderingDevice::blas_create(Span<AccelerationStructureGeometry> p_geometrie
 
 				_check_transfer_worker_buffer(aabb_buffer);
 			} break;
+
+			case AccelerationStructureGeometry::TYPE_LINEAR_SWEPT_SPHERES: {
+				const AccelerationStructureGeometry::LinearSweptSpheres &l_in = rd_geometry.geometry.linear_swept_spheres;
+				RDD::AccelerationStructureGeometry::LinearSweptSpheres &l_out = rdd_geometry.geometry.linear_swept_spheres;
+				ERR_FAIL_COND_V_MSG(!has_feature(SUPPORTS_LINEAR_SWEPT_SPHERES), RID(), "The current rendering device has no linear swept sphere support.");
+
+				// Positions and radii come from vertex or storage buffers the build may read by address.
+				auto input_buffer = [&](RID p_rid) -> Buffer * {
+					Buffer *buffer = vertex_buffer_owner.get_or_null(p_rid);
+					if (buffer == nullptr) {
+						buffer = storage_buffer_owner.get_or_null(p_rid);
+					}
+					if (buffer == nullptr || !buffer->usage.has_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT) || !buffer->usage.has_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT)) {
+						return nullptr;
+					}
+					return buffer;
+				};
+				Buffer *vertex_buffer = input_buffer(l_in.vertex_buffer);
+				ERR_FAIL_NULL_V_MSG(vertex_buffer, RID(), "The linear swept spheres' vertex buffer must be a vertex or storage buffer created with BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT and BUFFER_CREATION_DEVICE_ADDRESS_BIT.");
+				Buffer *radius_buffer = input_buffer(l_in.radius_buffer);
+				ERR_FAIL_NULL_V_MSG(radius_buffer, RID(), "The linear swept spheres' radius buffer must be a vertex or storage buffer created with BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT and BUFFER_CREATION_DEVICE_ADDRESS_BIT.");
+				ERR_FAIL_COND_V_MSG(l_in.vertex_count == 0, RID(), "A linear swept sphere geometry must have vertices.");
+				// One component format, so the stride's rule (a multiple of the component size, VUID-10421) is 4 bytes.
+				ERR_FAIL_COND_V_MSG(l_in.vertex_format != DATA_FORMAT_R32G32B32_SFLOAT, RID(), "Linear swept sphere positions must be DATA_FORMAT_R32G32B32_SFLOAT.");
+				ERR_FAIL_COND_V_MSG(l_in.vertex_stride == 0 || (l_in.vertex_stride % sizeof(float)) != 0, RID(), "The vertex stride must be a non-zero multiple of 4 bytes.");
+				ERR_FAIL_COND_V_MSG(l_in.end_caps == AccelerationStructureGeometry::LINEAR_SWEPT_SPHERES_END_CAPS_CHAINED && l_in.indexing != AccelerationStructureGeometry::LINEAR_SWEPT_SPHERES_INDEXING_SUCCESSIVE, RID(), "Chained end caps need successive indexing.");
+				ERR_FAIL_COND_V_MSG(l_in.radius_format != DATA_FORMAT_R32_SFLOAT, RID(), "Linear swept sphere radii must be DATA_FORMAT_R32_SFLOAT.");
+				ERR_FAIL_COND_V_MSG(l_in.radius_stride < sizeof(float) || (l_in.radius_stride % sizeof(float)) != 0, RID(), "The radius stride must be a non-zero multiple of 4 bytes.");
+				ERR_FAIL_COND_V_MSG(uint64_t(l_in.vertex_offset) + uint64_t(l_in.vertex_count) * l_in.vertex_stride > vertex_buffer->size, RID(), "The specified vertex offset and count are outside the range of the vertex buffer.");
+				ERR_FAIL_COND_V_MSG(uint64_t(l_in.radius_offset) + uint64_t(l_in.vertex_count) * l_in.radius_stride > radius_buffer->size, RID(), "The specified radius offset and count are outside the range of the radius buffer.");
+
+				uint32_t primitive_count = 0;
+				l_out.index_buffer = RDD::BufferID();
+				l_out.index_offset = 0;
+				l_out.index_format = INDEX_BUFFER_FORMAT_UINT32;
+				if (l_in.index_buffer.is_valid()) {
+					IndexBuffer *index_buffer = index_buffer_owner.get_or_null(l_in.index_buffer);
+					ERR_FAIL_NULL_V(index_buffer, RID());
+					ERR_FAIL_COND_V_MSG(!index_buffer->usage.has_flag(RDD::BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT) || !index_buffer->usage.has_flag(RDD::BUFFER_USAGE_DEVICE_ADDRESS_BIT), RID(), "The linear swept spheres' index buffer must be created with BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT and BUFFER_CREATION_DEVICE_ADDRESS_BIT.");
+					// A restart index would read as a vertex: the build has no primitive restart.
+					ERR_FAIL_COND_V_MSG(index_buffer->supports_restart_indices, RID(), "The linear swept spheres' index buffer must not use restart indices.");
+					const uint32_t index_stride = (index_buffer->format == INDEX_BUFFER_FORMAT_UINT32 ? sizeof(uint32_t) : sizeof(uint16_t));
+					ERR_FAIL_COND_V_MSG(uint64_t(l_in.index_offset) + uint64_t(l_in.index_count) * index_stride > index_buffer->size, RID(), "The specified index offset and count are outside the range of the index buffer.");
+					if (l_in.indexing == AccelerationStructureGeometry::LINEAR_SWEPT_SPHERES_INDEXING_LIST) {
+						ERR_FAIL_COND_V_MSG((l_in.index_count % 2) != 0, RID(), "Linear swept spheres with list indexing need an even index count.");
+						ERR_FAIL_COND_V_MSG(index_buffer->max_index != 0xFFFFFFFFu && index_buffer->max_index >= l_in.vertex_count, RID(), "The index buffer contains an index that is outside the specified vertex range.");
+						primitive_count = l_in.index_count / 2;
+					} else {
+						// Each index k reads vertices k and k + 1.
+						ERR_FAIL_COND_V_MSG(index_buffer->max_index != 0xFFFFFFFFu && index_buffer->max_index + 1 >= l_in.vertex_count, RID(), "The index buffer contains an index whose successor is outside the specified vertex range.");
+						primitive_count = l_in.index_count;
+					}
+					l_out.index_buffer = index_buffer->driver_id;
+					l_out.index_offset = l_in.index_offset;
+					l_out.index_format = index_buffer->format;
+					if (index_buffer->draw_tracker != nullptr) {
+						draw_trackers.push_back(index_buffer->draw_tracker);
+					} else {
+						untracked_buffers.insert(l_in.index_buffer);
+					}
+					_check_transfer_worker_buffer(index_buffer);
+				} else {
+					ERR_FAIL_COND_V_MSG(l_in.indexing == AccelerationStructureGeometry::LINEAR_SWEPT_SPHERES_INDEXING_SUCCESSIVE, RID(), "Linear swept spheres with successive indexing need an index buffer.");
+					ERR_FAIL_COND_V_MSG((l_in.vertex_count % 2) != 0, RID(), "Linear swept spheres without indices need an even vertex count (one pair per segment).");
+					primitive_count = l_in.vertex_count / 2;
+				}
+				ERR_FAIL_COND_V_MSG(primitive_count == 0, RID(), "A linear swept sphere geometry must have at least one segment.");
+
+				rdd_geometry.type = RDD::AccelerationStructureGeometry::TYPE_LINEAR_SWEPT_SPHERES;
+				l_out.vertex_buffer = vertex_buffer->driver_id;
+				l_out.vertex_offset = l_in.vertex_offset;
+				l_out.vertex_stride = l_in.vertex_stride;
+				l_out.vertex_count = l_in.vertex_count;
+				l_out.vertex_format = l_in.vertex_format;
+				l_out.radius_buffer = radius_buffer->driver_id;
+				l_out.radius_offset = l_in.radius_offset;
+				l_out.radius_stride = l_in.radius_stride;
+				l_out.radius_format = l_in.radius_format;
+				l_out.primitive_count = primitive_count;
+				l_out.indexing = RDD::AccelerationStructureGeometry::LinearSweptSpheresIndexing(l_in.indexing);
+				l_out.end_caps = RDD::AccelerationStructureGeometry::LinearSweptSpheresEndCaps(l_in.end_caps);
+
+				// The radii may share the vertex buffer: track each buffer once.
+				const RID input_rids[2] = { l_in.vertex_buffer, l_in.radius_buffer };
+				Buffer *inputs[2] = { vertex_buffer, radius_buffer };
+				for (uint32_t j = 0; j < (radius_buffer == vertex_buffer ? 1u : 2u); j++) {
+					if (inputs[j]->draw_tracker != nullptr) {
+						draw_trackers.push_back(inputs[j]->draw_tracker);
+					} else {
+						untracked_buffers.insert(input_rids[j]);
+					}
+					_check_transfer_worker_buffer(inputs[j]);
+				}
+			} break;
 		}
 	}
 
@@ -626,6 +720,16 @@ RID RenderingDevice::blas_create(Span<AccelerationStructureGeometry> p_geometrie
 			} break;
 			case AccelerationStructureGeometry::TYPE_AABBS: {
 				_add_dependency(id, geometry.geometry.aabbs.buffer);
+			} break;
+			case AccelerationStructureGeometry::TYPE_LINEAR_SWEPT_SPHERES: {
+				const AccelerationStructureGeometry::LinearSweptSpheres &l = geometry.geometry.linear_swept_spheres;
+				_add_dependency(id, l.vertex_buffer);
+				if (l.radius_buffer != l.vertex_buffer) {
+					_add_dependency(id, l.radius_buffer);
+				}
+				if (l.index_buffer.is_valid()) {
+					_add_dependency(id, l.index_buffer);
+				}
 			} break;
 		}
 	}

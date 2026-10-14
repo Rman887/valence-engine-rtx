@@ -1236,6 +1236,9 @@ public:
 		// and shaders may read a hit triangle's positions from the structure. Internal: not bound, as
 		// scripts cannot build a structure with that flag.
 		SUPPORTS_RAYTRACING_POSITION_FETCH,
+		// VK_NV_ray_tracing_linear_swept_spheres enabled, with float radii: a BLAS may take
+		// AccelerationStructureGeometry::TYPE_LINEAR_SWEPT_SPHERES (D126). Internal: not bound.
+		SUPPORTS_LINEAR_SWEPT_SPHERES,
 	};
 
 	enum SubgroupOperations {

@@ -759,7 +759,7 @@ public:
 
 	// ----- ACCELERATION STRUCTURE -----
 
-	// BLAS geometry entry. Describes one triangle set or one AABB set that
+	// BLAS geometry entry. Describes one triangle, AABB or linear swept sphere set that
 	// contributes to a BLAS. A single BLAS can combine multiple entries; each
 	// entry must pick exactly one variant via `type` and populate the matching
 	// fields of the `geometry` union. The variant members have no default
@@ -769,6 +769,21 @@ public:
 		enum Type {
 			TYPE_TRIANGLES,
 			TYPE_AABBS,
+			TYPE_LINEAR_SWEPT_SPHERES,
+		};
+
+		// Which vertices a linear swept sphere joins: index pairs (LIST), or an index k joining
+		// k and k + 1 (SUCCESSIVE). Without an index buffer, vertex pairs.
+		enum LinearSweptSpheresIndexing {
+			LINEAR_SWEPT_SPHERES_INDEXING_LIST,
+			LINEAR_SWEPT_SPHERES_INDEXING_SUCCESSIVE,
+		};
+
+		// End caps on every primitive (NONE: none at all), or, with successive indexing, both on a
+		// chain's first primitive and the trailing one on each after it (CHAINED).
+		enum LinearSweptSpheresEndCaps {
+			LINEAR_SWEPT_SPHERES_END_CAPS_NONE,
+			LINEAR_SWEPT_SPHERES_END_CAPS_CHAINED,
 		};
 
 		struct Triangles {
@@ -800,9 +815,31 @@ public:
 			uint32_t count;
 		};
 
+		// Linear swept spheres (D126): segments between two vertices, each with its radius.
+		// primitive_count segments: index pairs or single indices from the index buffer, or vertex
+		// pairs without one.
+		struct LinearSweptSpheres {
+			BufferID vertex_buffer;
+			uint32_t vertex_offset;
+			uint32_t vertex_stride;
+			uint32_t vertex_count;
+			DataFormat vertex_format;
+			BufferID radius_buffer;
+			uint32_t radius_offset;
+			uint32_t radius_stride;
+			DataFormat radius_format;
+			BufferID index_buffer;
+			uint32_t index_offset;
+			IndexBufferFormat index_format;
+			uint32_t primitive_count;
+			LinearSweptSpheresIndexing indexing;
+			LinearSweptSpheresEndCaps end_caps;
+		};
+
 		union Geometry {
 			Triangles triangles;
 			Aabbs aabbs;
+			LinearSweptSpheres linear_swept_spheres;
 			Geometry() {}
 		};
 

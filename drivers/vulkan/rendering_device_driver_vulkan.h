@@ -110,6 +110,13 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 		bool position_fetch = false; // VK_KHR_ray_tracing_position_fetch enabled (SUPPORTS_RAYTRACING_POSITION_FETCH).
 	};
 
+	// VK_NV_ray_tracing_linear_swept_spheres (SUPPORTS_LINEAR_SWEPT_SPHERES): supported needs float radii.
+	struct LinearSweptSpheresCapabilities {
+		bool supported = false;
+		bool radius_r32_sfloat = false;
+		bool radius_r16_sfloat = false;
+	};
+
 	struct DescriptorIndexingCapabilities {
 		bool shader_sampled_image_array_non_uniform_indexing = false;
 		bool descriptor_binding_partially_bound = false;
@@ -182,6 +189,7 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	ClusterAccelerationStructureCapabilities cluster_acceleration_structure_capabilities;
 	PartitionedAccelerationStructureCapabilities partitioned_acceleration_structure_capabilities;
 	OpacityMicromapCapabilities opacity_micromap_capabilities;
+	LinearSweptSpheresCapabilities linear_swept_spheres_capabilities;
 	DescriptorIndexingCapabilities descriptor_indexing_capabilities;
 	bool pipeline_cache_control_support = false;
 	bool device_fault_support = false;
@@ -750,6 +758,8 @@ public:
 		// Per geometry, chained into its triangles when it has an opacity micromap (D96).
 		TightLocalVector<VkAccelerationStructureTrianglesOpacityMicromapEXT> micromap_attachments;
 		TightLocalVector<VkMicromapUsageEXT> micromap_usages;
+		// Per geometry, chained on the geometry when it is linear swept spheres (D126).
+		TightLocalVector<VkAccelerationStructureGeometryLinearSweptSpheresDataNV> linear_swept_spheres;
 	};
 
 	struct MicromapInfo {

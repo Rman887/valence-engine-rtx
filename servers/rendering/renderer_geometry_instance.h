@@ -48,6 +48,7 @@ public:
 	virtual void set_material_override(RID p_override) = 0;
 	virtual void set_material_overlay(RID p_overlay) = 0;
 	virtual void set_surface_materials(const Vector<RID> &p_materials) = 0;
+	virtual void set_surface_index_variants(const Vector<int32_t> &p_variants) = 0;
 	virtual void set_mesh_instance(RID p_mesh_instance) = 0;
 	virtual void set_transform(const Transform3D &p_transform, const AABB &p_aabb, const AABB &p_transformed_aabb) = 0;
 	virtual void set_pivot_data(float p_sorting_offset, bool p_use_aabb_center) = 0;
@@ -123,6 +124,7 @@ public:
 
 		RID skeleton;
 		Vector<RID> surface_materials;
+		Vector<int32_t> surface_index_variants; // VAL (D127): per surface, -1 for none.
 		RID material_override;
 		RID material_overlay;
 		AABB aabb;
@@ -143,6 +145,7 @@ public:
 	virtual void set_material_override(RID p_override) override;
 	virtual void set_material_overlay(RID p_overlay) override;
 	virtual void set_surface_materials(const Vector<RID> &p_materials) override;
+	virtual void set_surface_index_variants(const Vector<int32_t> &p_variants) override;
 	virtual void set_mesh_instance(RID p_mesh_instance) override;
 	virtual void set_transform(const Transform3D &p_transform, const AABB &p_aabb, const AABB &p_transformed_aabb) override;
 	virtual void set_pivot_data(float p_sorting_offset, bool p_use_aabb_center) override;

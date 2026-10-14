@@ -322,6 +322,7 @@ public:
 	virtual RID mesh_surface_get_attribute_buffer_rd_rid(RID p_mesh, int p_surface) const = 0;
 	virtual RID mesh_surface_get_skin_buffer_rd_rid(RID p_mesh, int p_surface) const = 0;
 	virtual RID mesh_surface_get_index_buffer_rd_rid(RID p_mesh, int p_surface) const = 0;
+	virtual int mesh_surface_add_index_variant(RID p_mesh, int p_surface, const Vector<uint8_t> &p_hidden) = 0;
 
 	virtual void mesh_debug_usage(List<RenderingServerTypes::MeshInfo> *r_info) = 0;
 
@@ -837,6 +838,7 @@ public:
 	virtual void instance_attach_object_instance_id(RID p_instance, ObjectID p_id) = 0;
 	virtual void instance_set_blend_shape_weight(RID p_instance, int p_shape, float p_weight) = 0;
 	virtual void instance_set_surface_override_material(RID p_instance, int p_surface, RID p_material) = 0;
+	virtual void instance_set_surface_index_variant(RID p_instance, int p_surface, int p_variant) = 0;
 	virtual void instance_set_visible(RID p_instance, bool p_visible) = 0;
 	virtual RID instance_surface_get_vertex_buffer_rd_rid(RID p_instance, int p_surface) const = 0;
 

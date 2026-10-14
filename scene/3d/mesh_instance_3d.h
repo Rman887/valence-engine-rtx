@@ -54,6 +54,7 @@ protected:
 	LocalVector<float> blend_shape_tracks;
 	HashMap<StringName, int> blend_shape_properties;
 	Vector<Ref<Material>> surface_override_materials;
+	Vector<int> surface_index_variants; // VAL (D127): the mesh's own; a new mesh clears them.
 
 	void _mesh_changed();
 	void _resolve_skeleton_path();
@@ -97,6 +98,8 @@ public:
 	int get_surface_override_material_count() const;
 	void set_surface_override_material(int p_surface, const Ref<Material> &p_material);
 	Ref<Material> get_surface_override_material(int p_surface) const;
+	void set_surface_index_variant(int p_surface, int p_variant);
+	int get_surface_index_variant(int p_surface) const;
 	Ref<Material> get_active_material(int p_surface) const;
 
 #ifndef PHYSICS_3D_DISABLED

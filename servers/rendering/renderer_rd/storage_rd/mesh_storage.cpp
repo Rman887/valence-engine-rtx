@@ -998,6 +998,12 @@ void MeshStorage::_mesh_surface_clear(Mesh *p_mesh, int p_surface) {
 		memdelete_arr(s.lods);
 	}
 
+	for (const Mesh::Surface::IndexVariant &variant : s.index_variants) {
+		if (variant.index_buffer.is_valid()) {
+			RD::get_singleton()->free_rid(variant.index_buffer); // Frees its index array as a dependency.
+		}
+	}
+
 	if (s.blend_shape_buffer.is_valid()) {
 		RD::get_singleton()->free_rid(s.blend_shape_buffer);
 	}
@@ -1142,6 +1148,7 @@ void RendererRD::MeshStorage::mesh_surface_update_index_region(RID p_mesh, int p
 	ERR_FAIL_UNSIGNED_INDEX((uint32_t)p_surface, mesh->surface_count);
 	ERR_FAIL_COND(mesh->surfaces[p_surface]->index_buffer.is_null());
 	ERR_FAIL_COND_MSG(!mesh->surfaces[p_surface]->subdivision_data.is_empty(), "A subdivided surface's index order is frozen at build (D122): its payload's tangent adjacency addresses it.");
+	ERR_FAIL_COND_MSG(!mesh->surfaces[p_surface]->index_variants.is_empty(), "A surface with index variants keeps its index list (D127): each variant was made from it.");
 
 	uint64_t data_size = p_data.size();
 	const uint8_t *r = p_data.ptr();
@@ -1188,6 +1195,72 @@ RID MeshStorage::mesh_surface_get_index_buffer_rd_rid(RID p_mesh, int p_surface)
 	ERR_FAIL_NULL_V(mesh, RID());
 	ERR_FAIL_UNSIGNED_INDEX_V((uint32_t)p_surface, mesh->surface_count, RID());
 	return mesh->surfaces[p_surface]->index_buffer;
+}
+
+int MeshStorage::mesh_surface_add_index_variant(RID p_mesh, int p_surface, const Vector<uint8_t> &p_hidden) {
+	Mesh *mesh = mesh_owner.get_or_null(p_mesh);
+	ERR_FAIL_NULL_V(mesh, -1);
+	ERR_FAIL_UNSIGNED_INDEX_V((uint32_t)p_surface, mesh->surface_count, -1);
+	Mesh::Surface *s = mesh->surfaces[p_surface];
+	ERR_FAIL_COND_V_MSG(s->primitive != RSE::PRIMITIVE_TRIANGLES || s->index_count == 0, -1, "An index variant is a subset of an indexed triangle list.");
+	// A surface whose geometry streams holds its fallback level in its buffers (D93d).
+	ERR_FAIL_COND_V_MSG(mesh_surface_is_geometry_streamed(s), -1, "An index variant cannot be made of a surface that streams its geometry.");
+	// The trace keys a static variant's BLAS by its index in 16 bits.
+	ERR_FAIL_COND_V_MSG(s->index_variants.size() >= 0xFFFF, -1, "A surface holds at most 65534 index variants.");
+	const uint32_t triangle_count = s->index_count / 3;
+	ERR_FAIL_COND_V_MSG((uint32_t)p_hidden.size() != (triangle_count + 7) / 8, -1, vformat("The hidden triangles are one bit a triangle: %d bytes for %d triangles, not %d.", (triangle_count + 7) / 8, triangle_count, p_hidden.size()));
+	const uint8_t *hidden = p_hidden.ptr();
+	auto is_hidden = [hidden](uint32_t p_triangle) -> bool {
+		return hidden[p_triangle >> 3] & (1u << (p_triangle & 7));
+	};
+	if (!s->subdivision_data.is_empty()) {
+		// A refined surface is a list of quads, two triangles each (D122): both go or neither.
+		for (uint32_t t = 0; t + 1 < triangle_count; t += 2) {
+			ERR_FAIL_COND_V_MSG(is_hidden(t) != is_hidden(t + 1), -1, vformat("A subdivided surface hides whole refined quads: triangles %d and %d differ.", t, t + 1));
+		}
+	}
+
+	const bool is_index_16 = s->vertex_count <= 65536 && s->vertex_count > 0;
+	const uint32_t index_size = is_index_16 ? 2 : 4;
+	// The surface's indices from its RAM copy where it keeps one, else read back from its buffer, which
+	// waits for the GPU: a variant is made at load, not in a frame.
+	const uint32_t index_bytes = s->index_count * index_size;
+	const Vector<uint8_t> indices = (uint32_t)s->ram_index_data.size() >= index_bytes ? s->ram_index_data.slice(0, index_bytes) : RD::get_singleton()->buffer_get_data(s->index_buffer, 0, index_bytes);
+	ERR_FAIL_COND_V(indices.size() != int(index_bytes), -1);
+	Vector<uint8_t> kept;
+	kept.resize(indices.size() + index_size); // Room for the 16-bit pad below.
+	uint32_t kept_count = 0;
+	for (uint32_t t = 0; t < triangle_count; t++) {
+		if (!is_hidden(t)) {
+			memcpy(kept.ptrw() + kept_count * index_size, indices.ptr() + t * 3 * index_size, 3 * index_size);
+			kept_count += 3;
+		}
+	}
+
+	Mesh::Surface::IndexVariant variant;
+	if (kept_count > 0) {
+		// A 16-bit list of an odd count is padded to an even one, so the buffer is whole 32-bit words, as
+		// the surface's own; the array and the trace read kept_count.
+		const uint32_t buffer_count = (is_index_16 && (kept_count & 1)) ? kept_count + 1 : kept_count;
+		if (buffer_count > kept_count) {
+			memset(kept.ptrw() + kept_count * index_size, 0, index_size);
+		}
+		kept.resize(buffer_count * index_size);
+		// Usable as the surface's own index buffer is: drawn by the raster, built from and addressed by the trace.
+		BitField<RD::BufferCreationBits> flags = RD::BUFFER_CREATION_AS_STORAGE_BIT;
+		if (RD::get_singleton()->has_feature(RD::SUPPORTS_RAYTRACING_PIPELINE) || RD::get_singleton()->has_feature(RD::SUPPORTS_RAY_QUERY)) {
+			flags.set_flag(RD::BUFFER_CREATION_DEVICE_ADDRESS_BIT);
+			flags.set_flag(RD::BUFFER_CREATION_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT);
+		}
+		variant.index_buffer = RD::get_singleton()->index_buffer_create(buffer_count, is_index_16 ? RD::INDEX_BUFFER_FORMAT_UINT16 : RD::INDEX_BUFFER_FORMAT_UINT32, kept, false, flags);
+		ERR_FAIL_COND_V(variant.index_buffer.is_null(), -1);
+		variant.index_array = RD::get_singleton()->index_array_create(variant.index_buffer, 0, kept_count);
+		variant.index_count = kept_count;
+	}
+	s->index_variants.push_back(variant);
+	// Instances naming this id before it existed draw it now.
+	mesh->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_MESH);
+	return s->index_variants.size() - 1;
 }
 
 void MeshStorage::mesh_surface_set_material(RID p_mesh, int p_surface, RID p_material) {

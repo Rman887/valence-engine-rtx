@@ -604,6 +604,8 @@ void RendererSceneCull::instance_set_base(RID p_instance, RID p_base) {
 
 			instance->materials.clear();
 			geom->geometry_instance->set_surface_materials(instance->materials);
+			instance->index_variants.clear(); // A variant is its mesh's (D127).
+			geom->geometry_instance->set_surface_index_variants(instance->index_variants);
 			geom->geometry_instance->set_base(p_base);
 			instance->base = p_base;
 			if (scenario && instance->array_index >= 0) {
@@ -720,6 +722,7 @@ void RendererSceneCull::instance_set_base(RID p_instance, RID p_base) {
 		}
 
 		instance->materials.clear();
+		instance->index_variants.clear(); // A variant is its mesh's (D127).
 	}
 
 	instance->base_type = RSE::INSTANCE_NONE;
@@ -762,6 +765,7 @@ void RendererSceneCull::instance_set_base(RID p_instance, RID p_base) {
 				geom->geometry_instance->set_material_override(instance->material_override);
 				geom->geometry_instance->set_material_overlay(instance->material_overlay);
 				geom->geometry_instance->set_surface_materials(instance->materials);
+				geom->geometry_instance->set_surface_index_variants(instance->index_variants);
 				geom->geometry_instance->set_transform(instance->transform, instance->aabb, instance->transformed_aabb);
 				geom->geometry_instance->set_layer_mask(instance->layer_mask);
 				geom->geometry_instance->set_pivot_data(instance->sorting_offset, instance->use_aabb_center);
@@ -1075,6 +1079,31 @@ void RendererSceneCull::instance_set_surface_override_material(RID p_instance, i
 	instance->materials.write[p_surface] = p_material;
 
 	_instance_queue_update(instance, false, true);
+}
+
+void RendererSceneCull::instance_set_surface_index_variant(RID p_instance, int p_surface, int p_variant) {
+	Instance *instance = instance_owner.get_or_null(p_instance);
+	ERR_FAIL_NULL(instance);
+	ERR_FAIL_COND_MSG(instance->base_type != RSE::INSTANCE_MESH, "Index variants are a mesh instance's.");
+	ERR_FAIL_COND(p_variant < -1);
+	ERR_FAIL_INDEX(p_surface, RSG::mesh_storage->mesh_get_surface_count(instance->base));
+
+	if (instance->index_variants.size() <= p_surface) {
+		const int old_size = instance->index_variants.size();
+		instance->index_variants.resize(p_surface + 1);
+		for (int i = old_size; i < instance->index_variants.size(); i++) {
+			instance->index_variants.write[i] = -1;
+		}
+	}
+	if (instance->index_variants[p_surface] == p_variant) {
+		return;
+	}
+	instance->index_variants.write[p_surface] = p_variant;
+
+	InstanceGeometryData *geom = static_cast<InstanceGeometryData *>(instance->base_data);
+	if (geom && geom->geometry_instance) {
+		geom->geometry_instance->set_surface_index_variants(instance->index_variants);
+	}
 }
 
 RID RendererSceneCull::instance_surface_get_vertex_buffer_rd_rid(RID p_instance, int p_surface) const {

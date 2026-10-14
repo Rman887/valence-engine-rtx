@@ -92,6 +92,13 @@
 				Returns the internal [SkinReference] containing the skeleton's [RID] attached to this RID. See also [method Resource.get_rid], [method SkinReference.get_skeleton], and [method RenderingServer.instance_attach_skeleton].
 			</description>
 		</method>
+		<method name="get_surface_index_variant" qualifiers="const">
+			<return type="int" />
+			<param index="0" name="surface" type="int" />
+			<description>
+				Returns the index variant the specified [param surface] is drawn through, or [code]-1[/code] for its whole triangle list. See [method set_surface_index_variant].
+			</description>
+		</method>
 		<method name="get_surface_override_material" qualifiers="const">
 			<return type="Material" />
 			<param index="0" name="surface" type="int" />
@@ -112,6 +119,14 @@
 			<param index="1" name="value" type="float" />
 			<description>
 				Sets the value of the blend shape at [param blend_shape_idx] to [param value]. Produces an error if [member mesh] is [code]null[/code] or doesn't have a blend shape at that index.
+			</description>
+		</method>
+		<method name="set_surface_index_variant">
+			<return type="void" />
+			<param index="0" name="surface" type="int" />
+			<param index="1" name="variant" type="int" />
+			<description>
+				Draws and traces the specified [param surface] through one of its index variants, made with [method RenderingServer.mesh_surface_add_index_variant] on [member mesh], or through its whole triangle list with [code]-1[/code]. A variant is its mesh's: assigning another [member mesh] clears every surface's variant. See [method RenderingServer.instance_set_surface_index_variant].
 			</description>
 		</method>
 		<method name="set_surface_override_material">

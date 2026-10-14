@@ -571,7 +571,8 @@ void RenderForwardClustered::_render_list_template(RenderingDevice::DrawListID p
 
 		if (pipeline_valid) {
 			if (!emulate_point_size) {
-				index_array_rd = mesh_storage->mesh_surface_get_index_array(mesh_surface, element_info.lod_index);
+				// VAL (D127): an index variant's list, at the surface's full detail.
+				index_array_rd = surf->index_variant >= 0 ? mesh_storage->mesh_surface_get_index_variant_array(mesh_surface, surf->index_variant) : mesh_storage->mesh_surface_get_index_array(mesh_surface, element_info.lod_index);
 			} else {
 				index_array_rd = RID();
 			}
@@ -910,8 +911,9 @@ void RenderForwardClustered::_fill_instance_data(RenderListType p_render_list, i
 		scene_state.curr_gpu_ptr[p_render_list][i + p_offset] = instance_data;
 
 		const bool cant_repeat = instance_data.flags & INSTANCE_DATA_FLAG_MULTIMESH || inst->mesh_instance.is_valid();
+		// An instance repeats the previous element's draw only over the same index list (D127).
 
-		if (prev_surface != nullptr && !cant_repeat && prev_surface->sort.sort_key1 == surface->sort.sort_key1 && prev_surface->sort.sort_key2 == surface->sort.sort_key2 && inst->mirror == prev_surface->owner->mirror && repeats < RenderElementInfo::MAX_REPEATS) {
+		if (prev_surface != nullptr && !cant_repeat && prev_surface->sort.sort_key1 == surface->sort.sort_key1 && prev_surface->sort.sort_key2 == surface->sort.sort_key2 && inst->mirror == prev_surface->owner->mirror && prev_surface->index_variant == surface->index_variant && repeats < RenderElementInfo::MAX_REPEATS) {
 			//this element is the same as the previous one, count repeats to draw it using instancing
 			repeats++;
 		} else {
@@ -1158,7 +1160,7 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 			surf->sort.uses_lightmap = 0;
 
 			// LOD
-			if (p_render_data->scene_data->screen_mesh_lod_threshold > 0.0 && mesh_storage->mesh_surface_has_lod(surf->surface)) {
+			if (p_render_data->scene_data->screen_mesh_lod_threshold > 0.0 && mesh_storage->mesh_surface_has_lod(surf->surface) && surf->index_variant < 0) {
 				uint32_t indices = 0;
 				surf->sort.lod_index = mesh_storage->mesh_surface_get_lod(surf->surface, inst->lod_model_scale * inst->lod_bias, lod_distance * p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, indices);
 				if (p_render_data->render_info && !p_alpha_only) {
@@ -1173,7 +1175,8 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 				surf->sort.lod_index = 0;
 				if (p_render_data->render_info && !p_alpha_only) {
 					// This does not include primitives rendered via indirect draw calls.
-					uint32_t to_draw = mesh_storage->mesh_surface_get_vertices_drawn_count(surf->surface);
+					// An index variant draws its own list (D127).
+					uint32_t to_draw = surf->index_variant >= 0 ? mesh_storage->mesh_surface_get_index_variant_index_count(surf->surface, surf->index_variant) : mesh_storage->mesh_surface_get_vertices_drawn_count(surf->surface);
 					to_draw = _indices_to_primitives(surf->primitive, to_draw);
 					to_draw *= inst->instance_count;
 					if (p_render_list == RENDER_LIST_OPAQUE) { //opaque
@@ -4453,6 +4456,17 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 	sdcache->surface = mesh_storage->mesh_get_surface(p_mesh, p_surface);
 	sdcache->primitive = mesh_storage->mesh_surface_get_primitive(sdcache->surface);
 	sdcache->surface_index = p_surface;
+	// VAL (D127): the instance's index variant of a mesh surface. One its mesh does not have (left
+	// from another mesh, or the surface re-created) draws the whole surface.
+	sdcache->index_variant = -1;
+	if (ginstance->data->base_type == RSE::INSTANCE_MESH && p_surface < (uint32_t)ginstance->data->surface_index_variants.size() && ginstance->data->surface_index_variants[p_surface] >= 0) {
+		const int32_t variant = ginstance->data->surface_index_variants[p_surface];
+		if ((uint32_t)variant < mesh_storage->mesh_surface_get_index_variant_count(sdcache->surface)) {
+			sdcache->index_variant = variant;
+		} else {
+			WARN_PRINT(vformat("Index variant %d is not one of surface %d of this instance's mesh; the whole surface is drawn.", variant, p_surface));
+		}
+	}
 	// The path tracer's handles the cache in this place of this surface's material chain held before
 	// the rebuild (D110); the deformed one only while the instance still deforms its mesh, since a
 	// surface traced rigid never reads it and keeping it would hold its static opacity micromap off.
@@ -4483,7 +4497,8 @@ void RenderForwardClustered::_geometry_instance_add_surface_with_material(Geomet
 	sdcache->shader_shadow = material_shadow->shader_data;
 	sdcache->material_uniform_set_shadow = material_shadow->uniform_set;
 
-	sdcache->surface_shadow = surface_shadow ? surface_shadow : sdcache->surface;
+	// A shadow mesh's surface has indices of its own, which an index variant does not cover (D127).
+	sdcache->surface_shadow = (surface_shadow && sdcache->index_variant < 0) ? surface_shadow : sdcache->surface;
 
 	sdcache->owner = ginstance;
 
@@ -4606,7 +4621,20 @@ void RenderForwardClustered::_geometry_instance_update(RenderGeometryInstance *p
 				const RID *inst_materials = ginstance->data->surface_materials.ptr();
 				uint32_t surf_mat_count = ginstance->data->surface_materials.size();
 
+				// VAL (D127): the mesh is a dependency whichever surfaces are added, so an instance whose every
+				// surface an empty index variant leaves out still hears of its mesh's changes.
+				if (ginstance->data->dirty_dependencies) {
+					RSG::utilities->base_update_dependency(mesh, &ginstance->data->dependency_tracker);
+				}
 				for (uint32_t j = 0; j < surface_count; j++) {
+					// VAL (D127): an empty index variant leaves the surface out of every pass and the trace.
+					if (j < (uint32_t)ginstance->data->surface_index_variants.size() && ginstance->data->surface_index_variants[j] >= 0) {
+						void *mesh_surface = mesh_storage->mesh_get_surface(mesh, j);
+						const uint32_t variant = ginstance->data->surface_index_variants[j];
+						if (variant < mesh_storage->mesh_surface_get_index_variant_count(mesh_surface) && mesh_storage->mesh_surface_get_index_variant_index_count(mesh_surface, variant) == 0) {
+							continue;
+						}
+					}
 					RID material = (j < surf_mat_count && inst_materials[j].is_valid()) ? inst_materials[j] : materials[j];
 					_geometry_instance_add_surface(ginstance, j, material, mesh);
 				}

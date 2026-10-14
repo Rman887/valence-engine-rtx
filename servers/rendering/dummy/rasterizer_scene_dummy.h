@@ -52,6 +52,7 @@ public:
 		virtual void set_material_override(RID p_override) override {}
 		virtual void set_material_overlay(RID p_overlay) override {}
 		virtual void set_surface_materials(const Vector<RID> &p_materials) override {}
+		virtual void set_surface_index_variants(const Vector<int32_t> &p_variants) override {}
 		virtual void set_mesh_instance(RID p_mesh_instance) override {}
 		virtual void set_transform(const Transform3D &p_transform, const AABB &p_aabb, const AABB &p_transformed_aabb) override {}
 		virtual void reset_motion_vectors() override {}

@@ -71,6 +71,7 @@ public:
 	virtual RID mesh_surface_get_attribute_buffer_rd_rid(RID p_mesh, int p_surface) const = 0;
 	virtual RID mesh_surface_get_skin_buffer_rd_rid(RID p_mesh, int p_surface) const = 0;
 	virtual RID mesh_surface_get_index_buffer_rd_rid(RID p_mesh, int p_surface) const = 0;
+	virtual int mesh_surface_add_index_variant(RID p_mesh, int p_surface, const Vector<uint8_t> &p_hidden) = 0;
 
 	virtual int mesh_get_surface_count(RID p_mesh) const = 0;
 

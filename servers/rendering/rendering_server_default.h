@@ -425,6 +425,7 @@ public:
 	FUNC2RC(RID, mesh_surface_get_attribute_buffer_rd_rid, RID, int)
 	FUNC2RC(RID, mesh_surface_get_skin_buffer_rd_rid, RID, int)
 	FUNC2RC(RID, mesh_surface_get_index_buffer_rd_rid, RID, int)
+	FUNC3R(int, mesh_surface_add_index_variant, RID, int, const Vector<uint8_t> &)
 
 	FUNC1(mesh_debug_usage, List<RenderingServerTypes::MeshInfo> *)
 
@@ -968,6 +969,7 @@ public:
 	FUNC2(instance_attach_object_instance_id, RID, ObjectID)
 	FUNC3(instance_set_blend_shape_weight, RID, int, float)
 	FUNC3(instance_set_surface_override_material, RID, int, RID)
+	FUNC3(instance_set_surface_index_variant, RID, int, int)
 	FUNC2(instance_set_visible, RID, bool)
 	FUNC2RC(RID, instance_surface_get_vertex_buffer_rd_rid, RID, int)
 

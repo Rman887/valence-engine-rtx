@@ -127,6 +127,8 @@ void MeshInstance3D::set_mesh(const Ref<Mesh> &p_mesh) {
 	}
 
 	mesh = p_mesh;
+	// An index variant belongs to the mesh it was made on (D127): another mesh starts without.
+	surface_index_variants.clear();
 
 	if (mesh.is_valid()) {
 		// If mesh is a PrimitiveMesh, calling get_rid on it can trigger a changed callback
@@ -390,6 +392,20 @@ Ref<Material> MeshInstance3D::get_surface_override_material(int p_surface) const
 	return surface_override_materials[p_surface];
 }
 
+void MeshInstance3D::set_surface_index_variant(int p_surface, int p_variant) {
+	ERR_FAIL_INDEX(p_surface, surface_index_variants.size());
+	ERR_FAIL_COND(p_variant < -1);
+
+	surface_index_variants.write[p_surface] = p_variant;
+	RS::get_singleton()->instance_set_surface_index_variant(get_instance(), p_surface, p_variant);
+}
+
+int MeshInstance3D::get_surface_index_variant(int p_surface) const {
+	ERR_FAIL_INDEX_V(p_surface, surface_index_variants.size(), -1);
+
+	return surface_index_variants[p_surface];
+}
+
 Ref<Material> MeshInstance3D::get_active_material(int p_surface) const {
 	Ref<Material> mat_override = get_material_override();
 	if (mat_override.is_valid()) {
@@ -414,6 +430,11 @@ void MeshInstance3D::_mesh_changed() {
 	const int surface_count = mesh->get_surface_count();
 
 	surface_override_materials.resize(surface_count);
+	const int variants_from = surface_index_variants.size();
+	surface_index_variants.resize(surface_count);
+	for (int i = variants_from; i < surface_count; i++) {
+		surface_index_variants.write[i] = -1;
+	}
 
 	uint32_t initialize_bs_from = blend_shape_tracks.size();
 	blend_shape_tracks.resize(mesh->get_blend_shape_count());
@@ -432,6 +453,10 @@ void MeshInstance3D::_mesh_changed() {
 	for (int surface_index = 0; surface_index < surface_count; ++surface_index) {
 		if (surface_override_materials[surface_index].is_valid()) {
 			RS::get_singleton()->instance_set_surface_override_material(get_instance(), surface_index, surface_override_materials[surface_index]->get_rid());
+		}
+		// A variant id the mesh no longer has (a surface re-created) draws the whole surface.
+		if (surface_index_variants[surface_index] >= 0) {
+			RS::get_singleton()->instance_set_surface_index_variant(get_instance(), surface_index, surface_index_variants[surface_index]);
 		}
 	}
 
@@ -912,6 +937,8 @@ void MeshInstance3D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_surface_override_material_count"), &MeshInstance3D::get_surface_override_material_count);
 	ClassDB::bind_method(D_METHOD("set_surface_override_material", "surface", "material"), &MeshInstance3D::set_surface_override_material);
 	ClassDB::bind_method(D_METHOD("get_surface_override_material", "surface"), &MeshInstance3D::get_surface_override_material);
+	ClassDB::bind_method(D_METHOD("set_surface_index_variant", "surface", "variant"), &MeshInstance3D::set_surface_index_variant);
+	ClassDB::bind_method(D_METHOD("get_surface_index_variant", "surface"), &MeshInstance3D::get_surface_index_variant);
 	ClassDB::bind_method(D_METHOD("get_active_material", "surface"), &MeshInstance3D::get_active_material);
 
 #ifndef PHYSICS_3D_DISABLED

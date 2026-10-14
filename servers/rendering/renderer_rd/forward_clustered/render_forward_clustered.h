@@ -559,6 +559,7 @@ protected:
 		uint32_t rt_pass_flags = 0;
 		uint32_t surface_index = 0;
 		uint32_t color_pass_inclusion_mask = 0;
+		int32_t index_variant = -1; // VAL (D127): the mesh surface's index variant drawn and traced, -1 for the whole list.
 
 		void *surface = nullptr;
 		RID material_uniform_set;

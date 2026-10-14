@@ -3173,6 +3173,7 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("mesh_surface_get_attribute_buffer_rd_rid", "mesh", "surface"), &RenderingServer::mesh_surface_get_attribute_buffer_rd_rid);
 	ClassDB::bind_method(D_METHOD("mesh_surface_get_skin_buffer_rd_rid", "mesh", "surface"), &RenderingServer::mesh_surface_get_skin_buffer_rd_rid);
 	ClassDB::bind_method(D_METHOD("mesh_surface_get_index_buffer_rd_rid", "mesh", "surface"), &RenderingServer::mesh_surface_get_index_buffer_rd_rid);
+	ClassDB::bind_method(D_METHOD("mesh_surface_add_index_variant", "mesh", "surface", "hidden"), &RenderingServer::mesh_surface_add_index_variant);
 
 	ClassDB::bind_method(D_METHOD("mesh_set_shadow_mesh", "mesh", "shadow_mesh"), &RenderingServer::mesh_set_shadow_mesh);
 
@@ -4071,6 +4072,7 @@ void RenderingServer::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("instance_attach_object_instance_id", "instance", "id"), &RenderingServer::instance_attach_object_instance_id);
 	ClassDB::bind_method(D_METHOD("instance_set_blend_shape_weight", "instance", "shape", "weight"), &RenderingServer::instance_set_blend_shape_weight);
 	ClassDB::bind_method(D_METHOD("instance_set_surface_override_material", "instance", "surface", "material"), &RenderingServer::instance_set_surface_override_material);
+	ClassDB::bind_method(D_METHOD("instance_set_surface_index_variant", "instance", "surface", "variant"), &RenderingServer::instance_set_surface_index_variant);
 	ClassDB::bind_method(D_METHOD("instance_set_visible", "instance", "visible"), &RenderingServer::instance_set_visible);
 	ClassDB::bind_method(D_METHOD("instance_surface_get_vertex_buffer_rd_rid", "instance", "surface"), &RenderingServer::instance_surface_get_vertex_buffer_rd_rid);
 	ClassDB::bind_method(D_METHOD("instance_geometry_set_transparency", "instance", "transparency"), &RenderingServer::instance_geometry_set_transparency);

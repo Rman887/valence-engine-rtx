@@ -68,6 +68,15 @@ void RenderGeometryInstanceBase::set_surface_materials(const Vector<RID> &p_mate
 	data->dirty_dependencies = true;
 }
 
+void RenderGeometryInstanceBase::set_surface_index_variants(const Vector<int32_t> &p_variants) {
+	if (data->surface_index_variants == p_variants) {
+		return;
+	}
+	data->surface_index_variants = p_variants;
+
+	_mark_dirty();
+}
+
 void RenderGeometryInstanceBase::set_mesh_instance(RID p_mesh_instance) {
 	mesh_instance = p_mesh_instance;
 

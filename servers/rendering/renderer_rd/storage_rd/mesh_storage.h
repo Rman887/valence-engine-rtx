@@ -137,6 +137,16 @@ private:
 			LOD *lods = nullptr;
 			uint32_t lod_count = 0;
 
+			// VAL: index variants (D127): the surface's triangle list less a set of its triangles, which an
+			// instance draws and traces in place of the whole list (instance_set_surface_index_variant).
+			// An empty one holds no buffers: its instances leave the surface out.
+			struct IndexVariant {
+				RID index_buffer;
+				RID index_array;
+				uint32_t index_count = 0;
+			};
+			LocalVector<IndexVariant> index_variants;
+
 			AABB aabb;
 
 			Vector<AABB> bone_aabbs;
@@ -622,6 +632,7 @@ public:
 	virtual RID mesh_surface_get_attribute_buffer_rd_rid(RID p_mesh, int p_surface) const override;
 	virtual RID mesh_surface_get_skin_buffer_rd_rid(RID p_mesh, int p_surface) const override;
 	virtual RID mesh_surface_get_index_buffer_rd_rid(RID p_mesh, int p_surface) const override;
+	virtual int mesh_surface_add_index_variant(RID p_mesh, int p_surface, const Vector<uint8_t> &p_hidden) override;
 
 	virtual int mesh_get_surface_count(RID p_mesh) const override;
 
@@ -868,6 +879,28 @@ public:
 		} else {
 			return s->lods[p_lod - 1].index_array;
 		}
+	}
+
+	// VAL: index variants (D127).
+	_FORCE_INLINE_ uint32_t mesh_surface_get_index_variant_count(const void *p_surface) const {
+		const Mesh::Surface *s = reinterpret_cast<const Mesh::Surface *>(p_surface);
+		return s->index_variants.size();
+	}
+
+	// Its indices, 0 for a variant that hides every triangle (which has no buffers).
+	_FORCE_INLINE_ uint32_t mesh_surface_get_index_variant_index_count(const void *p_surface, uint32_t p_variant) const {
+		const Mesh::Surface *s = reinterpret_cast<const Mesh::Surface *>(p_surface);
+		return s->index_variants[p_variant].index_count;
+	}
+
+	_FORCE_INLINE_ RID mesh_surface_get_index_variant_buffer(const void *p_surface, uint32_t p_variant) const {
+		const Mesh::Surface *s = reinterpret_cast<const Mesh::Surface *>(p_surface);
+		return s->index_variants[p_variant].index_buffer;
+	}
+
+	_FORCE_INLINE_ RID mesh_surface_get_index_variant_array(const void *p_surface, uint32_t p_variant) const {
+		const Mesh::Surface *s = reinterpret_cast<const Mesh::Surface *>(p_surface);
+		return s->index_variants[p_variant].index_array;
 	}
 
 	_FORCE_INLINE_ uint32_t mesh_surface_get_rt_invalidation_counter(void *p_surface) const {

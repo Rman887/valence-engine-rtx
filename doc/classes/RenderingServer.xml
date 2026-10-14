@@ -2202,6 +2202,16 @@
 				Sets the scenario that the instance is in. The scenario is the 3D world that the objects will be displayed in.
 			</description>
 		</method>
+		<method name="instance_set_surface_index_variant">
+			<return type="void" />
+			<param index="0" name="instance" type="RID" />
+			<param index="1" name="surface" type="int" />
+			<param index="2" name="variant" type="int" />
+			<description>
+				Draws and traces a specific surface of a mesh instance through one of its index variants (see [method mesh_surface_add_index_variant]), or through its whole triangle list with [code]-1[/code]. Only what the renderer draws and the path tracer traces changes: the surface's vertices, skinning and blend shapes stay the mesh's. A variant is its mesh's: changing the instance's base clears every variant. A variant that hides every triangle leaves the surface out. Equivalent to [method MeshInstance3D.set_surface_index_variant].
+				[b]Note:[/b] Only the Forward+ renderer draws index variants; the other renderers draw the whole surface. A surface drawn through a variant draws its full detail (no mesh LODs), casts raster shadows from its own vertices rather than a shadow mesh, and is traced through a triangle acceleration structure without clusters or opacity micromaps.
+			</description>
+		</method>
 		<method name="instance_set_surface_override_material">
 			<return type="void" />
 			<param index="0" name="instance" type="RID" />
@@ -2736,6 +2746,16 @@
 			<description>
 				Sets an optional second mesh which can be used for rendering shadows and the depth prepass. Can be used to increase performance by supplying a mesh with fused vertices and only vertex position data (without normals, UVs, colors, etc.).
 				[b]Note:[/b] This mesh must have exactly the same vertex positions as the source mesh (including the source mesh's LODs, if present). If vertex positions differ, then the mesh will not draw correctly.
+			</description>
+		</method>
+		<method name="mesh_surface_add_index_variant">
+			<return type="int" />
+			<param index="0" name="mesh" type="RID" />
+			<param index="1" name="surface" type="int" />
+			<param index="2" name="hidden" type="PackedByteArray" />
+			<description>
+				Adds an index variant to a mesh surface: the surface's triangle list less the triangles [param hidden] marks, one bit a triangle in the order the surface stores them (bit [code]t % 8[/code] of byte [code]t / 8[/code], set for hidden). Triangle [code]t[/code] is indices [code]3t[/code] to [code]3t + 2[/code] of the index array [method mesh_surface_get_arrays] returns, which can differ from the arrays the surface was made from: the server may reorder triangles when it adds a surface (clustering for ray tracing). Build the bits from the arrays read back. Returns the variant's index for [method instance_set_surface_index_variant], or [code]-1[/code] on an error. The surface must be an indexed triangle list whose geometry does not stream; a subdivided surface hides whole refined quads (both triangles of a pair, or neither). A surface holds fewer than 65535 variants. The variant lives as long as the surface, whose index list is then fixed: [method mesh_surface_update_index_region] refuses it. Instances already naming the new index pick the variant up.
+				[b]Note:[/b] The call reads the surface's indices back from the GPU and waits for it: make variants at load time, not every frame.
 			</description>
 		</method>
 		<method name="mesh_surface_get_arrays" qualifiers="const">

@@ -3383,7 +3383,7 @@
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracing/linear_swept_spheres" type="bool" setter="" getter="" default="true">
-			If [code]true[/code] and the device supports [code]VK_NV_ray_tracing_linear_swept_spheres[/code] with float radii, a bottom-level acceleration structure may hold linear swept spheres: segments between two vertices, each with its own radius, swept as a capsule. Without the extension, or with this setting off, the device is created without it and no structure holds them.
+			If [code]true[/code] and the device supports [code]VK_NV_ray_tracing_linear_swept_spheres[/code] with float radii, a bottom-level acceleration structure may hold linear swept spheres: segments between two vertices, each with its own radius, swept as a capsule. With this setting on, the device is also created with [code]VK_KHR_maintenance5[/code] and [code]VK_KHR_dynamic_rendering[/code] where it has them, even without linear swept spheres: ray tracing pipelines opt into the primitive through maintenance5's creation flags. Without the extension, or with this setting off, no structure holds them.
 			[b]Note:[/b] Requires a restart to take effect.
 		</member>
 		<member name="rendering/pathtracing/multimesh_blas_cache_ttl_frames" type="int" setter="" getter="" default="3600">

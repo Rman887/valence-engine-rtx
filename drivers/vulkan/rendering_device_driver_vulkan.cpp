@@ -615,6 +615,10 @@ Error RenderingDeviceDriverVulkan::_initialize_device_extensions() {
 	if (GLOBAL_GET("rendering/pathtracing/linear_swept_spheres")) {
 		_register_requested_device_extension(VK_NV_RAY_TRACING_LINEAR_SWEPT_SPHERES_EXTENSION_NAME, false);
 		_register_requested_device_extension(VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME, false);
+		// A pipeline opts into them with a 64-bit creation flag, which only
+		// VkPipelineCreateFlags2CreateInfo carries (maintenance5, on Vulkan 1.2 with dynamic rendering).
+		_register_requested_device_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME, false);
+		_register_requested_device_extension(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, false);
 	}
 	_register_requested_device_extension(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, false);
 
@@ -961,6 +965,7 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 		VkPhysicalDevicePartitionedAccelerationStructureFeaturesNV partitioned_acceleration_structure_features = {};
 		VkPhysicalDeviceOpacityMicromapFeaturesEXT opacity_micromap_features = {};
 		VkPhysicalDeviceRayTracingLinearSweptSpheresFeaturesNV linear_swept_spheres_features = {};
+		VkPhysicalDeviceMaintenance5Features maintenance_5_features = {};
 
 		const bool use_1_2_features = physical_device_properties.apiVersion >= VK_API_VERSION_1_2;
 		if (use_1_2_features) {
@@ -1085,6 +1090,12 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			linear_swept_spheres_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_LINEAR_SWEPT_SPHERES_FEATURES_NV;
 			linear_swept_spheres_features.pNext = next_features;
 			next_features = &linear_swept_spheres_features;
+		}
+
+		if (enabled_device_extension_names.has(VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+			maintenance_5_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES;
+			maintenance_5_features.pNext = next_features;
+			next_features = &maintenance_5_features;
 		}
 
 		if (enabled_device_extension_names.has(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME)) {
@@ -1214,7 +1225,8 @@ Error RenderingDeviceDriverVulkan::_check_device_capabilities() {
 			print_verbose("rendering/pathtracing/opacity_micromaps is set, but this device has no opacity micromaps (VK_EXT_opacity_micromap). Alpha-tested surfaces keep the any-hit test alone.");
 		}
 
-		if (enabled_device_extension_names.has(VK_NV_RAY_TRACING_LINEAR_SWEPT_SPHERES_EXTENSION_NAME) && enabled_device_extension_names.has(VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME) && acceleration_structure_features.accelerationStructure && linear_swept_spheres_features.linearSweptSpheres) {
+		const bool maintenance_5 = enabled_device_extension_names.has(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) && enabled_device_extension_names.has(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME) && maintenance_5_features.maintenance5;
+		if (enabled_device_extension_names.has(VK_NV_RAY_TRACING_LINEAR_SWEPT_SPHERES_EXTENSION_NAME) && enabled_device_extension_names.has(VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME) && maintenance_5 && acceleration_structure_features.accelerationStructure && linear_swept_spheres_features.linearSweptSpheres) {
 			// Radii are read in a format whose features carry the radius-buffer bit, found only in
 			// the 64-bit format features.
 			const VkFormat radius_formats[2] = { VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16_SFLOAT };
@@ -1703,6 +1715,15 @@ Error RenderingDeviceDriverVulkan::_initialize_device(const LocalVector<VkDevice
 		linear_swept_spheres_features.pNext = create_info_next;
 		linear_swept_spheres_features.linearSweptSpheres = VK_TRUE;
 		create_info_next = &linear_swept_spheres_features;
+	}
+
+	// For VkPipelineCreateFlags2CreateInfo, which ray tracing pipelines take with linear swept spheres.
+	VkPhysicalDeviceMaintenance5Features maintenance_5_features = {};
+	if (linear_swept_spheres_capabilities.supported) {
+		maintenance_5_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES;
+		maintenance_5_features.pNext = create_info_next;
+		maintenance_5_features.maintenance5 = VK_TRUE;
+		create_info_next = &maintenance_5_features;
 	}
 
 	VkPhysicalDeviceVulkan11Features vulkan_1_1_features = {};
@@ -7776,6 +7797,18 @@ RDD::RaytracingPipelineID RenderingDeviceDriverVulkan::raytracing_pipeline_creat
 	// use them whenever the extension is enabled.
 	if (opacity_micromap_capabilities.supported) {
 		pipeline_create_info.flags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+	}
+	// Every 32-bit flag must be set above this point: the block below copies them.
+	// Linear swept spheres (D126) take a flag only VkPipelineCreateFlags2CreateInfo carries. When it
+	// is chained, its flags are used instead of pipeline_create_info.flags, so it carries those too
+	// (the 32-bit flag bits keep their values in the 64-bit set).
+	static_assert(VkPipelineCreateFlags2(VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT) == VK_PIPELINE_CREATE_2_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT);
+	VkPipelineCreateFlags2CreateInfo flags_2_create_info = {};
+	if (linear_swept_spheres_capabilities.supported) {
+		flags_2_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO;
+		flags_2_create_info.flags = VkPipelineCreateFlags2(pipeline_create_info.flags) | VK_PIPELINE_CREATE_2_RAY_TRACING_ALLOW_SPHERES_AND_LINEAR_SWEPT_SPHERES_BIT_NV;
+		flags_2_create_info.pNext = pipeline_create_info.pNext;
+		pipeline_create_info.pNext = &flags_2_create_info;
 	}
 
 	VkPipeline vk_pipeline = VK_NULL_HANDLE;

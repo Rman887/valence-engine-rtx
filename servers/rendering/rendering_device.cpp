@@ -618,8 +618,10 @@ RID RenderingDevice::blas_create(Span<AccelerationStructureGeometry> p_geometrie
 				ERR_FAIL_COND_V_MSG(l_in.end_caps == AccelerationStructureGeometry::LINEAR_SWEPT_SPHERES_END_CAPS_CHAINED && l_in.indexing != AccelerationStructureGeometry::LINEAR_SWEPT_SPHERES_INDEXING_SUCCESSIVE, RID(), "Chained end caps need successive indexing.");
 				ERR_FAIL_COND_V_MSG(l_in.radius_format != DATA_FORMAT_R32_SFLOAT, RID(), "Linear swept sphere radii must be DATA_FORMAT_R32_SFLOAT.");
 				ERR_FAIL_COND_V_MSG(l_in.radius_stride < sizeof(float) || (l_in.radius_stride % sizeof(float)) != 0, RID(), "The radius stride must be a non-zero multiple of 4 bytes.");
-				ERR_FAIL_COND_V_MSG(uint64_t(l_in.vertex_offset) + uint64_t(l_in.vertex_count) * l_in.vertex_stride > vertex_buffer->size, RID(), "The specified vertex offset and count are outside the range of the vertex buffer.");
-				ERR_FAIL_COND_V_MSG(uint64_t(l_in.radius_offset) + uint64_t(l_in.vertex_count) * l_in.radius_stride > radius_buffer->size, RID(), "The specified radius offset and count are outside the range of the radius buffer.");
+				// The last element ends one element past its start, not a stride: radii interleaved in an attribute buffer
+				// sit at an offset inside each vertex's stride.
+				ERR_FAIL_COND_V_MSG(uint64_t(l_in.vertex_offset) + uint64_t(l_in.vertex_count - 1) * l_in.vertex_stride + sizeof(float) * 3 > vertex_buffer->size, RID(), "The specified vertex offset and count are outside the range of the vertex buffer.");
+				ERR_FAIL_COND_V_MSG(uint64_t(l_in.radius_offset) + uint64_t(l_in.vertex_count - 1) * l_in.radius_stride + sizeof(float) > radius_buffer->size, RID(), "The specified radius offset and count are outside the range of the radius buffer.");
 
 				uint32_t primitive_count = 0;
 				l_out.index_buffer = RDD::BufferID();

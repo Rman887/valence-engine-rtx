@@ -480,6 +480,8 @@ private:
 		StringName detail_uv_layer;
 		StringName emission_on_uv2;
 		StringName subsurface_scattering_skin_mode;
+		StringName vertex_color_use_as_albedo;
+		StringName vertex_color_is_srgb;
 		StringName normal_scale;
 		StringName rim;
 		StringName rim_tint;

@@ -178,7 +178,9 @@ void rt_lss_segment_indices(GeometryData geom, uint p_segment, out uint i0, out 
 /// p_gradients: a fetch reads the elliptical footprint's UV gradients (D116), with the anisotropic switch on, until the
 /// path's first diffuse bounce (GPU audit hot 8).
 /// p_uv2: a fetch reads the second UV set, which the hit fetches with its level (D118).
-HitData compute_hit_data(bool p_footprint, bool p_gradients, bool p_uv2) {
+/// p_color: the standard hit group reads the vertex colour (FETCH_COLOR, with FETCH_COLOR_SRGB converted per corner;
+/// D126 H3), 0 for none; a custom one always reads it as stored.
+HitData compute_hit_data(bool p_footprint, bool p_gradients, bool p_uv2, uint p_color) {
 	HitData h;
 	h.strand_inset = 0.0;
 	h.strand_axis = vec3(0.0);
@@ -227,7 +229,7 @@ HitData compute_hit_data(bool p_footprint, bool p_gradients, bool p_uv2) {
 #ifdef RT_CUSTOM_HIT_GROUP
 	VertexAttributes attrs = fetch_vertex_attributes(geom, i0, i1, i2, fetch_bary, FETCH_ALL | (p_uv2 ? FETCH_UV2 : 0u));
 #else
-	VertexAttributes attrs = fetch_vertex_attributes(geom, i0, i1, i2, fetch_bary, FETCH_UV | FETCH_TBN | (p_uv2 ? FETCH_UV2 : 0u));
+	VertexAttributes attrs = fetch_vertex_attributes(geom, i0, i1, i2, fetch_bary, FETCH_UV | FETCH_TBN | (p_uv2 ? FETCH_UV2 : 0u) | p_color);
 #endif
 	h.uv = attrs.uv;
 	h.uv2 = attrs.uv2;

@@ -825,10 +825,14 @@ void main() {
 #else
 	const bool fetch_uv2 = (materials[gl_InstanceCustomIndexEXT].flags & ((1u << 17) | (1u << 18))) != 0u;
 #endif
+	// The vertex colour where HG0's material multiplies by it (D126 H3), converted per corner as BaseMaterial3D's vertex()
+	// does with vertex_color_is_srgb; a custom hit group fetches every attribute.
+	const uint hg0_flags = materials[gl_InstanceCustomIndexEXT].flags;
+	const uint color_fetch = (hg0_flags & RT_MAT_FLAG_VERTEX_COLOR) != 0u ? (FETCH_COLOR | ((hg0_flags & RT_MAT_FLAG_VERTEX_COLOR_SRGB) != 0u ? FETCH_COLOR_SRGB : 0u)) : 0u;
 #ifdef RT_CUSTOM_PROJECTED_LOD
-	HitData h = compute_hit_data(true, gradients, fetch_uv2);
+	HitData h = compute_hit_data(true, gradients, fetch_uv2, color_fetch);
 #else
-	HitData h = compute_hit_data(false, gradients, fetch_uv2);
+	HitData h = compute_hit_data(false, gradients, fetch_uv2, color_fetch);
 #endif
 	write_primary_hit_depth(h.hit_pos);
 	write_primary_hit_velocity(h.hit_pos);
@@ -971,6 +975,11 @@ void main() {
 
 	// Texture sampling.
 	vec4 albedo_tex = sample_material_texture(mat.albedo_texture_idx, uv, mat.flags, lod, grad, stf_u);
+	// VAL: BaseMaterial3D's vertex colour as albedo (D126 H3), its alpha included, as its fragment() multiplies
+	// albedo_tex by COLOR (fetched linear where its vertex() converts it, compute_hit_data's p_color).
+	if ((mat.flags & RT_MAT_FLAG_VERTEX_COLOR) != 0u) {
+		albedo_tex *= h.color;
+	}
 	vec3 albedo = albedo_tex.rgb * mat.albedo_color.rgb;
 
 	// VAL: the detail layer (D118 MM4) as BaseMaterial3D's fragment writes it, last: the detail albedo blended by the
@@ -1259,6 +1268,9 @@ void main() {
 	// The base level, explicitly: an opacity micromap is baked from it (D96).
 	float alpha = textureLod(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, 0.0).a;
 	alpha *= mat.albedo_color.a;
+	if ((mat.flags & RT_MAT_FLAG_VERTEX_COLOR) != 0u) {
+		alpha *= fetch_color(geom, i0, i1, i2, bary).a; // The vertex colour's alpha (D126 H3), as the closest hit's.
+	}
 
 	if (alpha < mat.alpha_threshold) {
 		ignoreIntersectionEXT;

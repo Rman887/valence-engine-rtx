@@ -9693,6 +9693,20 @@ RTMaterialData *RenderRaytracing::process_material(RID p_material_rid, uint16_t 
 		mat.hair_ior_tilt = (uint32_t(Math::make_half_float(tilt)) << 16) | Math::make_half_float(ior);
 	}
 
+	// VAL: BaseMaterial3D's vertex colour as albedo (D126 H3): its fragment() multiplies the albedo and alpha by COLOR,
+	// and its vertex() converts COLOR from sRGB when vertex_color_is_srgb. Both are baked into the raster's shader and
+	// published as parameters of the same names.
+	if (!mat_data->is_custom_shader) {
+		Variant vertex_color_var = material_storage->material_get_param(p_material_rid, "vertex_color_use_as_albedo");
+		if (vertex_color_var.get_type() == Variant::BOOL && bool(vertex_color_var)) {
+			mat.flags |= RT_MAT_FLAG_VERTEX_COLOR;
+			Variant srgb_var = material_storage->material_get_param(p_material_rid, "vertex_color_is_srgb");
+			if (srgb_var.get_type() == Variant::BOOL && bool(srgb_var)) {
+				mat.flags |= RT_MAT_FLAG_VERTEX_COLOR_SRGB;
+			}
+		}
+	}
+
 	// The alpha test's cutoff, from the material's own uniform when its shader declares one
 	// (BaseMaterial3D does in alpha scissor mode); 0.5 otherwise.
 	if (shader_declares("alpha_scissor_threshold")) {
@@ -10999,7 +11013,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				pending.inst_flags = inst_flags;
 				pending.inst_mask = RT_INSTANCE_MASK_GEOMETRY | (inst->data->cast_shadows ? RT_INSTANCE_MASK_SHADOW : 0) | (lss ? 0 : subsurface_mask(mat_data));
 				pending.mm_aabb = mesh_storage->_multimesh_get_aabb(mm_rid);
-				pending.omm_eligible = omm_enabled && !(inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) && (mat_data->rt_sbt_offset == 0 || mat_data->omm_custom) && !mesh_storage->mesh_surface_is_geometry_streamed(mesh_surface);
+				// No micromap where the vertex colour's alpha joins the test (D126 H3): the baker reads only the texture.
+				pending.omm_eligible = omm_enabled && !(inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) && (mat_data->rt_sbt_offset == 0 || mat_data->omm_custom) && !(mat_data->data.flags & RT_MAT_FLAG_VERTEX_COLOR) && !mesh_storage->mesh_surface_is_geometry_streamed(mesh_surface);
 				pending_mm_surfaces.push_back(pending);
 
 				mm_surf = mm_surf->next;
@@ -11146,8 +11161,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			// render_mode opacity_micromap, traces its surface's micromap, once baked. Only such an
 			// instance: a micromap's transparent states cull even where FORCE_OPAQUE is set.
 			if (omm_enabled) {
+				// Not where the vertex colour's alpha joins the test (D126 H3): the baker reads only the texture.
 				const bool omm_material = !(inst_flags & RD::ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT) && (mat_data->rt_sbt_offset == 0 || mat_data->omm_custom) &&
-						surf->owner->data->base_type == RSE::INSTANCE_MESH;
+						!(mat_data->data.flags & RT_MAT_FLAG_VERTEX_COLOR) && surf->owner->data->base_type == RSE::INSTANCE_MESH;
 				if (!surf->rt_deformed_handle.is_valid() && !(surf_data->geometry.flags & RT_GEOM_FLAG_DEFORMED)) {
 					// A static BLAS is shared by every instance of the surface: such an instance
 					// traces the surface's second BLAS, which carries the micromap. On the cluster

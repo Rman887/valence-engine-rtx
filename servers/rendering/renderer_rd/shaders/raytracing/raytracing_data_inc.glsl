@@ -100,7 +100,7 @@ struct MaterialData {
 	float metallic;
 	float roughness;
 	uint hair_ior_tilt; // With flag bit 20: packHalf2x16(hair_ior, the cuticle tilt in radians) (D126 H2).
-	uint flags; // Bit 0: has_normal_map, Bit 1: has_emission_tex, Bit 2: point_filter, Bit 3: emission_multiply, Bit 4: emissive_constant (an emissive mesh light, D50), Bit 5: diffuse_transmission (backlight, D103), Bits 8-10 and 11-13: the roughness and metallic textures' channels (D118), Bit 14: detail layer, Bits 15-16: its blend mode, Bit 17: its textures on UV2, Bit 18: the emission texture on UV2 (D118 MM4), Bit 19: subsurface skin mode (D120), Bit 20: hair (RT_MAT_FLAG_HAIR, D126 H2), Bit 21: its absorption from the albedo (RT_MAT_FLAG_HAIR_COLOR)
+	uint flags; // Bit 0: has_normal_map, Bit 1: has_emission_tex, Bit 2: point_filter, Bit 3: emission_multiply, Bit 4: emissive_constant (an emissive mesh light, D50), Bit 5: diffuse_transmission (backlight, D103), Bits 8-10 and 11-13: the roughness and metallic textures' channels (D118), Bit 14: detail layer, Bits 15-16: its blend mode, Bit 17: its textures on UV2, Bit 18: the emission texture on UV2 (D118 MM4), Bit 19: subsurface skin mode (D120), Bit 20: hair (RT_MAT_FLAG_HAIR, D126 H2), Bit 21: its absorption from the albedo (RT_MAT_FLAG_HAIR_COLOR), Bit 22: the vertex colour as albedo (RT_MAT_FLAG_VERTEX_COLOR, D126 H3), Bit 23: that colour in sRGB
 
 	vec2 uv1_scale; // UV1 scale (default 1,1)
 	vec2 uv1_offset; // UV1 offset (default 0,0)
@@ -130,3 +130,5 @@ struct MaterialData {
 
 #define RT_MAT_FLAG_HAIR (1u << 20) // BaseMaterial3D's hair feature (D126 H2): a strand hit shades with the hair BCSDF.
 #define RT_MAT_FLAG_HAIR_COLOR (1u << 21) // Its absorption from the albedo instead of the melanin.
+#define RT_MAT_FLAG_VERTEX_COLOR (1u << 22) // BaseMaterial3D's vertex_color_use_as_albedo (D126 H3): albedo and alpha times the vertex colour.
+#define RT_MAT_FLAG_VERTEX_COLOR_SRGB (1u << 23) // Its vertex_color_is_srgb: the colour converted to linear first.

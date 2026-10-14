@@ -571,6 +571,8 @@ void BaseMaterial3D::init_shaders() {
 	shader_names->detail_uv_layer = "detail_uv_layer";
 	shader_names->emission_on_uv2 = "emission_on_uv2";
 	shader_names->subsurface_scattering_skin_mode = "subsurface_scattering_skin_mode";
+	shader_names->vertex_color_use_as_albedo = "vertex_color_use_as_albedo";
+	shader_names->vertex_color_is_srgb = "vertex_color_is_srgb";
 	shader_names->normal_scale = "normal_scale";
 	shader_names->rim = "rim";
 	shader_names->rim_tint = "rim_tint";
@@ -2548,6 +2550,14 @@ void BaseMaterial3D::set_flag(Flags p_flag, bool p_enabled) {
 	if (p_flag == FLAG_SUBSURFACE_MODE_SKIN) {
 		// As above: the raster bakes it as render_mode sss_mode_skin.
 		_material_set_param(shader_names->subsurface_scattering_skin_mode, p_enabled);
+	}
+	if (p_flag == FLAG_ALBEDO_FROM_VERTEX_COLOR) {
+		// As above: the raster bakes it as albedo_tex *= COLOR.
+		_material_set_param(shader_names->vertex_color_use_as_albedo, p_enabled);
+	}
+	if (p_flag == FLAG_SRGB_VERTEX_COLOR) {
+		// As above: the raster bakes it as vertex()'s conversion of COLOR.
+		_material_set_param(shader_names->vertex_color_is_srgb, p_enabled);
 	}
 
 	if (

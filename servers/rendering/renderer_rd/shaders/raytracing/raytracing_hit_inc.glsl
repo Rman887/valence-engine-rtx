@@ -225,7 +225,9 @@ vec2 fetch_uv2(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
 // ============================================================================
 // VERTEX COLOR FETCHING (RGBA8 packed in uint32)
 // ============================================================================
-vec4 fetch_color(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
+/// p_srgb: each corner's colour converted from sRGB to linear before the blend, as BaseMaterial3D's vertex() converts
+/// COLOR with vertex_color_is_srgb (D126 H3).
+vec4 fetch_color(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary, bool p_srgb) {
 	if (geom.color_byte_offset == OFFSET_NONE || geom.attribute_address == 0ul) {
 		return vec4(1.0);
 	}
@@ -237,8 +239,17 @@ vec4 fetch_color(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
 	vec4 col0 = unpackUnorm4x8(attr.v[i0 * stride_words + color_word_off]);
 	vec4 col1 = unpackUnorm4x8(attr.v[i1 * stride_words + color_word_off]);
 	vec4 col2 = unpackUnorm4x8(attr.v[i2 * stride_words + color_word_off]);
+	if (p_srgb) {
+		col0.rgb = mix(col0.rgb / 12.92, pow((col0.rgb + 0.055) / 1.055, vec3(2.4)), greaterThan(col0.rgb, vec3(0.04045)));
+		col1.rgb = mix(col1.rgb / 12.92, pow((col1.rgb + 0.055) / 1.055, vec3(2.4)), greaterThan(col1.rgb, vec3(0.04045)));
+		col2.rgb = mix(col2.rgb / 12.92, pow((col2.rgb + 0.055) / 1.055, vec3(2.4)), greaterThan(col2.rgb, vec3(0.04045)));
+	}
 
 	return bary.x * col0 + bary.y * col1 + bary.z * col2;
+}
+
+vec4 fetch_color(in GeometryData geom, uint i0, uint i1, uint i2, vec3 bary) {
+	return fetch_color(geom, i0, i1, i2, bary, false);
 }
 
 // ============================================================================
@@ -370,6 +381,7 @@ bool rt_basis_has_uniform_scale(mat3 basis) {
 #define FETCH_COLOR (1u << 2)
 #define FETCH_ALL (FETCH_UV | FETCH_TBN | FETCH_COLOR)
 #define FETCH_UV2 (1u << 3) // The second UV set, only where something reads it (D118).
+#define FETCH_COLOR_SRGB (1u << 4) // With FETCH_COLOR: each corner's colour from sRGB to linear (D126 H3).
 
 #ifdef RT_HIT_ATTRIBS_DECLARED
 /// geom and the indices as rt_resolve_hit_triangle returned them.
@@ -406,7 +418,7 @@ VertexAttributes fetch_vertex_attributes(in GeometryData geom, uint i0, uint i1,
 	}
 
 	if ((fetch_flags & FETCH_COLOR) != 0u && geom.color_byte_offset != OFFSET_NONE) {
-		attrs.color = fetch_color(geom, i0, i1, i2, bary);
+		attrs.color = fetch_color(geom, i0, i1, i2, bary, (fetch_flags & FETCH_COLOR_SRGB) != 0u);
 		attrs.has_color = true;
 	}
 

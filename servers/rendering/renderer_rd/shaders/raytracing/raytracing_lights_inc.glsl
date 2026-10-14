@@ -323,6 +323,9 @@ bool ray_query_alpha_test(uint geometry_idx, int cluster_id, uint primitive, vec
 	uv = uv * mat.uv1_scale + mat.uv1_offset;
 	float alpha = textureLod(sampler2D(bindless_textures[nonuniformEXT(mat.albedo_texture_idx)], SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT), uv, 0.0).a;
 	alpha *= mat.albedo_color.a;
+	if ((mat.flags & RT_MAT_FLAG_VERTEX_COLOR) != 0u) {
+		alpha *= fetch_color(geom, i0, i1, i2, bary).a; // The vertex colour's alpha (D126 H3), as the any-hit's.
+	}
 
 	// As the any-hit's `alpha < threshold` ignores: a NaN alpha stays a hit in both.
 	return !(alpha < mat.alpha_threshold);

@@ -375,6 +375,10 @@ enum {
 	// absorption from the albedo instead of the melanin.
 	RT_MAT_FLAG_HAIR = 1u << 20,
 	RT_MAT_FLAG_HAIR_COLOR = 1u << 21,
+	// BaseMaterial3D's vertex_color_use_as_albedo (D126 H3): the albedo and its alpha multiplied by the vertex colour;
+	// bit 23 converts the colour from sRGB first (vertex_color_is_srgb).
+	RT_MAT_FLAG_VERTEX_COLOR = 1u << 22,
+	RT_MAT_FLAG_VERTEX_COLOR_SRGB = 1u << 23,
 };
 
 // Index format for RT geometry (matches GLSL fetch_indices).

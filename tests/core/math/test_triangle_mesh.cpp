@@ -62,8 +62,10 @@ TEST_CASE("[SceneTree][TriangleMesh] BVH creation and intersection") {
 		CHECK(point.is_equal_approx(Vector3(0.0, 0.5, 0.0)));
 		CHECK(normal.is_equal_approx(Vector3(0.0, 1.0, 0.0)));
 		CHECK(surf_index == nullptr);
-		REQUIRE(face_index != -1);
-		CHECK(face_index == 8);
+		REQUIRE(face_index >= 0);
+		REQUIRE(face_index < faces.size());
+		CHECK(faces[face_index].get_closest_point_to(point).is_equal_approx(point));
+		CHECK(faces[face_index].get_plane().get_normal().is_equal_approx(normal));
 	}
 
 	{
@@ -77,8 +79,10 @@ TEST_CASE("[SceneTree][TriangleMesh] BVH creation and intersection") {
 		CHECK(point.is_equal_approx(Vector3(0.0, 0.5, 0.0)));
 		CHECK(normal.is_equal_approx(Vector3(0.0, 1.0, 0.0)));
 		CHECK(surf_index == nullptr);
-		REQUIRE(face_index != -1);
-		CHECK(face_index == 8);
+		REQUIRE(face_index >= 0);
+		REQUIRE(face_index < faces.size());
+		CHECK(faces[face_index].get_closest_point_to(point).is_equal_approx(point));
+		CHECK(faces[face_index].get_plane().get_normal().is_equal_approx(normal));
 	}
 }
 

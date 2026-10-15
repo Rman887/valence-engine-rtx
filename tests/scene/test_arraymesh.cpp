@@ -535,7 +535,17 @@ TEST_CASE("[SceneTree][ArrayMesh] Triangle clusters partition the index buffer (
 	arrays.resize(RSE::ARRAY_MAX);
 	arrays[RSE::ARRAY_VERTEX] = positions;
 	arrays[RSE::ARRAY_INDEX] = original;
-	const Variant setting_before = GLOBAL_GET("rendering/pathtracing/cluster_blas");
+	struct FlatClusterSettings {
+		Variant blas_before = GLOBAL_GET("rendering/pathtracing/cluster_blas");
+		Variant lod_before = GLOBAL_GET("rendering/pathtracing/cluster_lod");
+		FlatClusterSettings() {
+			ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_lod", false);
+		}
+		~FlatClusterSettings() {
+			ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", blas_before);
+			ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_lod", lod_before);
+		}
+	} settings;
 	{
 		ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", false);
 		RenderingServerTypes::SurfaceData surface;
@@ -572,7 +582,6 @@ TEST_CASE("[SceneTree][ArrayMesh] Triangle clusters partition the index buffer (
 		}
 		CHECK(same == original.size());
 	}
-	ProjectSettings::get_singleton()->set_setting("rendering/pathtracing/cluster_blas", setting_before);
 }
 
 TEST_CASE("[SceneTree][ArrayMesh] A skinned surface is clustered with its skin in vertex order (D82).") {

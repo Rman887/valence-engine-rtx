@@ -1087,7 +1087,7 @@ TEST_CASE("[SceneTree][SubdivisionBuilder] Triangle faces refine as Catmull-Clar
 			cage_vertex.push_back(faces[3 * f + c]);
 			vertices.push_back(corners[faces[3 * f + c]]);
 			uv_weld.push_back(uv_values.size());
-			uv_values.push_back(square[c]);
+			uv_values.push_back(square[c] + Vector2(2 * f, 0));
 		}
 		glTF_faces.push_back(-1);
 		uv_weld.push_back(-1);
@@ -1109,9 +1109,29 @@ TEST_CASE("[SceneTree][SubdivisionBuilder] Triangle faces refine as Catmull-Clar
 	CHECK(int(builder->get_report()["refined_quads"]) == 48);
 	const Ref<ArrayMesh> mesh = builder->get_owner_mesh(0);
 	REQUIRE(mesh.is_valid());
+	const Array ancestry = builder->get_owner_triangle_sources(0);
+	REQUIRE(ancestry.size() == 1);
+	const Dictionary triangle_source = ancestry[0];
+	const PackedInt32Array parent_faces = triangle_source["source_faces"];
+	REQUIRE(parent_faces.size() == 96);
+	int parent_counts[4] = {};
+	for (int32_t face : parent_faces) {
+		REQUIRE(face >= 0);
+		REQUIRE(face < 4);
+		parent_counts[face]++;
+	}
+	for (int count : parent_counts) {
+		CHECK(count == 24); // A coarse triangle becomes three quads, then twelve, then 24 triangles.
+	}
 	const Array refined = mesh->surface_get_arrays(0);
 	const PackedVector3Array positions = refined[Mesh::ARRAY_VERTEX];
 	const PackedVector3Array normals = refined[Mesh::ARRAY_NORMAL];
+	const PackedVector2Array parent_uvs = refined[Mesh::ARRAY_TEX_UV];
+	const PackedInt32Array parent_indices = refined[Mesh::ARRAY_INDEX];
+	for (int t = 0; t < parent_faces.size(); t++) {
+		const float u = (parent_uvs[parent_indices[3 * t]].x + parent_uvs[parent_indices[3 * t + 1]].x + parent_uvs[parent_indices[3 * t + 2]].x) / 3;
+		CHECK(parent_faces[t] == int(Math::floor(u / 2)));
+	}
 	for (int i = 0; i < positions.size(); i++) {
 		CHECK(normals[i].dot(positions[i]) > 0.0f);
 	}
@@ -1167,6 +1187,108 @@ TEST_CASE("[SceneTree][SubdivisionBuilder] An owner of several surfaces: the own
 	CHECK(payload_section<uint32_t>(payload, RenderingServerTypes::MESH_SUBDIVISION_SECTION_OWNER_INFO, count) == nullptr);
 	check_payload_reproduces_surface(mesh, 0);
 	check_payload_reproduces_surface(mesh, 1);
+}
+
+TEST_CASE("[SceneTree][SubdivisionBuilder] Triangle ancestry follows the final indices and source surfaces") {
+	TestCage cube = make_cube();
+	for (int f = 0; f < 6; f++) {
+		cube.owner[f] = f / 2; // Three input primitives, two of them assigned to output owner 0.
+	}
+	for (bool blend_shapes : { false, true }) {
+		PackedVector2Array uv_values;
+		TestPrimitive primitives[3];
+		for (int s = 0; s < 3; s++) {
+			primitives[s] = make_primitive(cube, s, uv_values);
+		}
+		// Each source face has a distinct UV island. The final triangle's UVs provide an
+		// independent oracle for ancestry, unaffected by meshlet reordering or tangent splits.
+		for (int s = 0; s < 3; s++) {
+			for (int f = 0; f < 2; f++) {
+				for (int c = 0; c < 4; c++) {
+					uv_values.write[8 * s + 4 * f + c] += Vector2(2 * f, 3 * s);
+				}
+			}
+		}
+		Ref<SubdivisionBuilder> builder;
+		builder.instantiate();
+		builder->set_cage_vertex_count(8);
+		builder->add_face_varying_layer(uv_values, Mesh::ARRAY_TEX_UV);
+		builder->set_owner_bone_names(0, test_bone_names());
+		builder->set_owner_bone_names(1, test_bone_names());
+		PackedStringArray names;
+		LocalVector<HashMap<int, Vector3>> shapes;
+		if (blend_shapes) {
+			names.push_back("shape");
+			shapes.resize(1);
+			shapes[0][0] = Vector3(0.01, 0, 0);
+		}
+		for (int s = 0; s < 3; s++) {
+			Array weld;
+			weld.push_back(primitives[s].uv_weld);
+			builder->add_surface(s < 2 ? 0 : 1, primitives[s].arrays, make_blend_arrays(primitives[s], shapes), names, primitives[s].cage_vertex, primitives[s].faces, weld, Ref<Material>());
+		}
+		for (int level : { 1, 3 }) { // Level 3 also reaches the hierarchy builder without blend shapes.
+			REQUIRE(builder->build(level) == OK);
+			for (int owner = 0; owner < 2; owner++) {
+				const Ref<ArrayMesh> mesh = builder->get_owner_mesh(owner);
+				Array sources = builder->get_owner_triangle_sources(owner);
+				REQUIRE(sources.size() == mesh->get_surface_count());
+				for (int s = 0; s < sources.size(); s++) {
+					const Dictionary entry = sources[s];
+					const int source_surface = owner == 0 ? s : 2;
+					CHECK(int(entry["source_surface"]) == source_surface);
+					const PackedInt32Array faces = entry["source_faces"];
+					const Array arrays = mesh->surface_get_arrays(s);
+					const PackedInt32Array indices = arrays[Mesh::ARRAY_INDEX];
+					const PackedVector2Array uvs = arrays[Mesh::ARRAY_TEX_UV];
+					if (level == 3 && RenderingServer::build_clusters_func != nullptr && RenderingServer::build_cluster_lod_func != nullptr) {
+						const Dictionary stored = Array(mesh->get("_surfaces"))[s];
+						const Vector<uint8_t> clusters = stored.get("cluster_data", Vector<uint8_t>());
+						REQUIRE(clusters.size() >= int(sizeof(uint32_t)));
+						uint32_t version;
+						memcpy(&version, clusters.ptr(), sizeof(uint32_t));
+						CHECK(version == (blend_shapes ? RenderingServerTypes::MESH_CLUSTER_DATA_VERSION : RenderingServerTypes::MESH_CLUSTER_LOD_DATA_VERSION));
+					}
+					REQUIRE(faces.size() == indices.size() / 3);
+					int counts[2] = {};
+					for (int t = 0; t < faces.size(); t++) {
+						const Vector2 uv = (uvs[indices[3 * t]] + uvs[indices[3 * t + 1]] + uvs[indices[3 * t + 2]]) / 3;
+						const int expected = int(Math::floor(uv.x / 2));
+						REQUIRE(expected >= 0);
+						REQUIRE(expected < 2);
+						CHECK(faces[t] == expected);
+						CHECK(int(Math::floor((1 - uv.y) / 3)) == source_surface);
+						counts[expected]++;
+					}
+					CHECK(counts[0] == 2 * (1 << (2 * level)));
+					CHECK(counts[1] == counts[0]);
+				}
+				// The outer dictionaries and packed arrays cannot mutate the builder's result.
+				Dictionary changed = sources[0];
+				PackedInt32Array changed_faces = changed["source_faces"];
+				changed_faces.set(0, -1);
+				changed["source_faces"] = changed_faces;
+				sources.clear();
+				const Dictionary unchanged = builder->get_owner_triangle_sources(owner)[0];
+				CHECK(PackedInt32Array(unchanged["source_faces"])[0] >= 0);
+			}
+		}
+		builder->set_blend_shape_mode(Mesh::BLEND_SHAPE_MODE_NORMALIZED);
+		ERR_PRINT_OFF;
+		CHECK(builder->get_owner_triangle_sources(0).is_empty());
+		ERR_PRINT_ON;
+		REQUIRE(builder->build(2) == OK);
+		ERR_PRINT_OFF;
+		CHECK(builder->build(0) == ERR_INVALID_PARAMETER);
+		CHECK(builder->get_owner_triangle_sources(0).is_empty());
+		CHECK(builder->get_owner_mesh(0).is_null());
+		ERR_PRINT_ON;
+		REQUIRE(builder->build(2) == OK);
+		builder->clear();
+		ERR_PRINT_OFF;
+		CHECK(builder->get_owner_triangle_sources(0).is_empty());
+		ERR_PRINT_ON;
+	}
 }
 
 // What a runtime pass computes from an owner's payload alone, per welded refined vertex: the

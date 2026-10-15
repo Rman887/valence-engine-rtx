@@ -389,6 +389,7 @@ struct SubdivisionBuilder::Work {
 	// Coarse faces, every surface's in add order; corners flattened, without a triangle's fourth.
 	LocalVector<int> face_size;
 	LocalVector<int> face_surface;
+	LocalVector<int> face_local;
 	LocalVector<int> corners;
 	LocalVector<int> corner_weld[MAX_FACE_VARYING_LAYERS];
 	bool has_color = false;
@@ -448,6 +449,8 @@ struct SubdivisionBuilder::Work {
 void SubdivisionBuilder::set_cage_vertex_count(int p_count) {
 	ERR_FAIL_COND(p_count < 0);
 	cage_vertex_count = p_count;
+	owner_meshes.clear();
+	owner_triangle_sources.clear();
 }
 
 int SubdivisionBuilder::get_cage_vertex_count() const {
@@ -456,6 +459,8 @@ int SubdivisionBuilder::get_cage_vertex_count() const {
 
 void SubdivisionBuilder::set_blend_shape_mode(Mesh::BlendShapeMode p_mode) {
 	blend_shape_mode = p_mode;
+	owner_meshes.clear();
+	owner_triangle_sources.clear();
 }
 
 Mesh::BlendShapeMode SubdivisionBuilder::get_blend_shape_mode() const {
@@ -473,6 +478,7 @@ int SubdivisionBuilder::add_face_varying_layer(const PackedVector2Array &p_value
 	layer.slot = p_array_slot;
 	layers.push_back(layer);
 	owner_meshes.clear();
+	owner_triangle_sources.clear();
 	return layers.size() - 1;
 }
 
@@ -494,6 +500,7 @@ int SubdivisionBuilder::add_surface(int p_owner, const Array &p_arrays, const Ar
 	surface.material = p_material;
 	surfaces.push_back(surface);
 	owner_meshes.clear();
+	owner_triangle_sources.clear();
 	return surfaces.size() - 1;
 }
 
@@ -505,6 +512,7 @@ void SubdivisionBuilder::set_owner_bone_names(int p_owner, const PackedStringArr
 	}
 	owner_bone_names[p_owner] = names;
 	owner_meshes.clear();
+	owner_triangle_sources.clear();
 }
 
 PackedStringArray SubdivisionBuilder::get_owner_bone_names(int p_owner) const {
@@ -551,12 +559,14 @@ Error SubdivisionBuilder::set_owner_displacement(int p_owner, const PackedInt32A
 	displacement.shape_name = p_shape_name;
 	owner_displacements[p_owner] = displacement;
 	owner_meshes.clear();
+	owner_triangle_sources.clear();
 	return OK;
 }
 
 void SubdivisionBuilder::clear_owner_displacement(int p_owner) {
 	owner_displacements.erase(p_owner);
 	owner_meshes.clear();
+	owner_triangle_sources.clear();
 }
 
 float SubdivisionBuilder::displacement_height(const Ref<Image> &p_height_map, const Ref<Image> &p_mask, const Vector2 &p_uv, float p_min_height, float p_max_height) {
@@ -576,6 +586,19 @@ Ref<ArrayMesh> SubdivisionBuilder::get_owner_mesh(int p_owner) const {
 	return *mesh;
 }
 
+Array SubdivisionBuilder::get_owner_triangle_sources(int p_owner) const {
+	const Vector<TriangleSources> *sources = owner_triangle_sources.getptr(p_owner);
+	ERR_FAIL_NULL_V_MSG(sources, Array(), vformat("No triangle sources for owner %d: build() first.", p_owner));
+	Array result;
+	for (const TriangleSources &source : *sources) {
+		Dictionary entry;
+		entry["source_surface"] = source.source_surface;
+		entry["source_faces"] = source.source_faces;
+		result.push_back(entry);
+	}
+	return result;
+}
+
 Dictionary SubdivisionBuilder::get_report() const {
 	return report;
 }
@@ -588,6 +611,7 @@ void SubdivisionBuilder::clear() {
 	owner_bone_names.clear();
 	owner_displacements.clear();
 	owner_meshes.clear();
+	owner_triangle_sources.clear();
 	report = Dictionary();
 }
 
@@ -660,6 +684,7 @@ Error SubdivisionBuilder::_gather(Work &r_work) {
 			}
 			r_work.face_size.push_back(size);
 			r_work.face_surface.push_back(s);
+			r_work.face_local.push_back(f);
 		}
 	}
 	// The faces' vertices in welded order, so that the compact cage does not depend on face order.
@@ -1617,6 +1642,7 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 	uint64_t render_vertices = 0;
 	uint64_t triangles_total = 0;
 	Array surface_tangent_splits; // Per surface of the owner: the render vertices MikkTSpace's grouping added.
+	Vector<TriangleSources> triangle_sources;
 
 	// MikkTSpace's frames, as Blender gives the refined mesh its tangents: once over all the owner's own quads,
 	// as Blender's calc_tangents runs over a whole mesh (several surfaces share a UV0 island, so they share
@@ -2016,10 +2042,16 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 		}
 		LocalVector<uint32_t> tangent_entries;
 		tangent_entries.resize(triangles.size());
+		PackedInt32Array source_faces;
+		source_faces.resize(surface_data.index_count / 3);
+		source_faces.fill(-1);
 		LocalVector<uint32_t> fill(tangent_offsets);
 		for (uint32_t t = 0; t < triangles.size() / 3; t++) {
 			const uint32_t *found = final_triangle.getptr(triple_key(triangles[3 * t], triangles[3 * t + 1], triangles[3 * t + 2]));
 			ERR_FAIL_NULL_V_MSG(found, ERR_BUG, "A refined triangle is missing from the surface's final indices.");
+			const int coarse_face = r_work.quad_face[part.own_quads[quad_own[t / 2]]];
+			ERR_FAIL_COND_V(r_work.face_surface[coarse_face] != int(s) || source_faces[*found] != -1, ERR_BUG);
+			source_faces.set(*found, r_work.face_local[coarse_face]);
 			for (int c = 0; c < 3; c++) {
 				const uint32_t r = triangles[3 * t + c];
 				uint32_t corner = 0;
@@ -2029,6 +2061,11 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 				ERR_FAIL_COND_V(corner == 3, ERR_BUG);
 				tangent_entries[fill[r]++] = 3 * *found + corner;
 			}
+		}
+
+		// Every final triangle must have exactly one source face, including after clustering.
+		for (int32_t face : source_faces) {
+			ERR_FAIL_COND_V(face < 0 || uint32_t(face) >= surfaces[s].faces.size() / 4, ERR_BUG);
 		}
 
 		// The payload: the surface sections, and the owner sections on the owner's first surface,
@@ -2081,6 +2118,10 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 		mesh->add_surface(surface_data.format, Mesh::PrimitiveType(surface_data.primitive), surface_data.vertex_data, surface_data.attribute_data, surface_data.skin_data, surface_data.vertex_count, surface_data.index_data, surface_data.index_count, surface_data.aabb, Vector<uint8_t>(), surface_data.bone_aabbs, surface_data.lods, surface_data.uv_scale, surface_data.cluster_data, surface_data.subdivision_data);
 		// ArrayMesh counts its own surface before the server accepts it, so the server's count is the one asked.
 		ERR_FAIL_COND_V_MSG(RS::get_singleton()->mesh_get_surface_count(mesh->get_rid()) != surface_index + 1, ERR_BUG, vformat("Surface %d was not accepted by the rendering server.", s));
+		TriangleSources source;
+		source.source_surface = s;
+		source.source_faces = source_faces;
+		triangle_sources.push_back(source);
 		if (surfaces[s].material.is_valid()) {
 			mesh->surface_set_material(surface_index, surfaces[s].material);
 			mesh->surface_set_name(surface_index, surfaces[s].material->get_name());
@@ -2088,6 +2129,7 @@ Error SubdivisionBuilder::_owner_surfaces(Work &r_work, uint32_t p_part) {
 	}
 	ERR_FAIL_COND_V_MSG(mesh->get_surface_count() == 0, ERR_INVALID_DATA, vformat("Owner %d has no refined faces.", part.owner));
 	owner_meshes.insert(part.owner, mesh);
+	owner_triangle_sources.insert(part.owner, triangle_sources);
 
 	Dictionary owner_report;
 	owner_report["surfaces"] = mesh->get_surface_count();
@@ -2144,10 +2186,11 @@ bool SubdivisionBuilder::mikktspace_quad_frames(const LocalVector<Vector3> &p_po
 }
 
 Error SubdivisionBuilder::build(int p_level) {
-	ERR_FAIL_COND_V_MSG(p_level < 1 || p_level > 4, ERR_INVALID_PARAMETER, "The level is 1 to 4.");
 	const uint64_t begin = OS::get_singleton()->get_ticks_usec();
 	owner_meshes.clear();
+	owner_triangle_sources.clear();
 	report = Dictionary();
+	ERR_FAIL_COND_V_MSG(p_level < 1 || p_level > 4, ERR_INVALID_PARAMETER, "The level is 1 to 4.");
 	Work work;
 	Error err = _gather(work);
 	if (err == OK) {
@@ -2179,6 +2222,7 @@ Error SubdivisionBuilder::build(int p_level) {
 	}
 	if (err != OK) {
 		owner_meshes.clear();
+		owner_triangle_sources.clear();
 		return err;
 	}
 	report["level"] = p_level;
@@ -2425,6 +2469,7 @@ void SubdivisionBuilder::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("clear_owner_displacement", "owner"), &SubdivisionBuilder::clear_owner_displacement);
 	ClassDB::bind_method(D_METHOD("build", "level"), &SubdivisionBuilder::build, DEFVAL(2));
 	ClassDB::bind_method(D_METHOD("get_owner_mesh", "owner"), &SubdivisionBuilder::get_owner_mesh);
+	ClassDB::bind_method(D_METHOD("get_owner_triangle_sources", "owner"), &SubdivisionBuilder::get_owner_triangle_sources);
 	ClassDB::bind_method(D_METHOD("get_report"), &SubdivisionBuilder::get_report);
 	ClassDB::bind_method(D_METHOD("clear"), &SubdivisionBuilder::clear);
 	ClassDB::bind_static_method("SubdivisionBuilder", D_METHOD("get_fingerprint"), &SubdivisionBuilder::get_fingerprint);

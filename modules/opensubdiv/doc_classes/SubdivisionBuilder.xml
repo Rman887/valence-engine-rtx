@@ -10,6 +10,13 @@
 	<tutorials>
 	</tutorials>
 	<methods>
+		<method name="get_owner_triangle_sources" qualifiers="const">
+			<return type="Array" />
+			<param index="0" name="owner" type="int" />
+			<description>
+				Returns one dictionary per output mesh surface, in surface order. Each holds [code]source_surface[/code] (the input id returned by [method add_surface]) and [code]source_faces[/code] (a [PackedInt32Array], one local input-face ordinal per triangle in the output surface's stored index order, after clustering). Ordinals index groups of four entries in that input surface's [code]faces[/code] array. This CPU build result allows authored coverage to follow subdivision without changing geometry or the GPU payload. The returned containers are independent snapshots. Results are cleared by input changes, [method clear] and rebuilds; returns an empty array after an error if the owner has no successful build.
+			</description>
+		</method>
 		<method name="add_face_varying_layer">
 			<return type="int" />
 			<param index="0" name="values" type="PackedVector2Array" />

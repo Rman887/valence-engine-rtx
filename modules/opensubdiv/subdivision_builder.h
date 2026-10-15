@@ -91,6 +91,11 @@ private:
 	HashMap<int, OwnerDisplacement> owner_displacements;
 
 	HashMap<int, Ref<ArrayMesh>> owner_meshes;
+	struct TriangleSources {
+		int source_surface = 0;
+		PackedInt32Array source_faces;
+	};
+	HashMap<int, Vector<TriangleSources>> owner_triangle_sources;
 	Dictionary report;
 	// Set only while build_fingerprint_probe() builds: every owner mesh's blend shapes and every built
 	// surface's data are appended to it.
@@ -136,6 +141,8 @@ public:
 	void clear_owner_displacement(int p_owner);
 	Error build(int p_level = 2);
 	Ref<ArrayMesh> get_owner_mesh(int p_owner) const;
+	// Per output surface, its add_surface() id and one source-face ordinal per final triangle.
+	Array get_owner_triangle_sources(int p_owner) const;
 	Dictionary get_report() const;
 	void clear();
 

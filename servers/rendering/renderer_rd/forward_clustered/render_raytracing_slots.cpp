@@ -100,19 +100,21 @@ void RenderRaytracing::_slot_interval_free(uint32_t p_first, uint32_t p_count) {
 // ---------------------------------------------------------------------------
 
 uint32_t RenderRaytracing::_slot_range_acquire(RTViewportState *p_state, RTSlotOwner &r_owner, uint32_t p_key, uint32_t p_count) {
-	uint32_t range_id = UINT32_MAX;
-	for (uint32_t i = 0; i < r_owner.ranges.size(); i++) {
-		if (uint32_t(r_owner.ranges[i] >> 32) == p_key) {
-			range_id = uint32_t(r_owner.ranges[i] & 0xFFFFFFFFu);
-			if (slot_ranges[range_id].count != p_count) {
-				// A MultiMesh merged or expanded, or its visible count changed: new slots, the old
-				// ones disabled by every viewport's sweep before they return.
-				_slot_range_release(range_id);
-				r_owner.ranges.remove_at_unordered(i);
-				range_id = UINT32_MAX;
-			}
-			break;
+	uint32_t *entry = &r_owner.procedural;
+	if (p_key != RT_SLOT_KEY_PROCEDURAL) {
+		DEV_ASSERT(p_key < RSE::MAX_MESH_SURFACES);
+		if (p_key >= r_owner.surfaces.size()) {
+			r_owner.surfaces.resize_initialized(p_key + 1); // Grows only when a surface is first reached.
 		}
+		entry = &r_owner.surfaces[p_key];
+	}
+	uint32_t range_id = *entry != 0 ? *entry - 1 : UINT32_MAX;
+	if (range_id != UINT32_MAX && slot_ranges[range_id].count != p_count) {
+		// A MultiMesh merged or expanded, or its visible count changed: new slots, the old ones
+		// disabled by every viewport's sweep before they return.
+		_slot_range_release(range_id);
+		*entry = 0;
+		range_id = UINT32_MAX;
 	}
 	if (range_id == UINT32_MAX) {
 		if (!slot_range_free_ids.is_empty()) {
@@ -130,7 +132,7 @@ uint32_t RenderRaytracing::_slot_range_acquire(RTViewportState *p_state, RTSlotO
 		range.released = false;
 		range.enabled_viewports = 0;
 		slot_live += p_count;
-		r_owner.ranges.push_back((uint64_t(p_key) << 32) | range_id);
+		*entry = range_id + 1;
 	}
 
 	RTSlotRange &range = slot_ranges[range_id];
@@ -175,22 +177,28 @@ void RenderRaytracing::_slot_range_try_free(uint32_t p_range) {
 }
 
 void RenderRaytracing::release_slot_ranges(RTSlotOwner &r_owner) {
-	for (uint64_t entry : r_owner.ranges) {
-		_slot_range_release(uint32_t(entry & 0xFFFFFFFFu));
+	for (uint32_t entry : r_owner.surfaces) {
+		if (entry != 0) {
+			_slot_range_release(entry - 1);
+		}
 	}
-	r_owner.ranges.clear();
+	if (r_owner.procedural != 0) {
+		_slot_range_release(r_owner.procedural - 1);
+	}
+	r_owner.surfaces.clear();
+	r_owner.procedural = 0;
 }
 
 void RenderRaytracing::release_slot_ranges_from(RTSlotOwner &r_owner, uint32_t p_surface_count) {
-	for (uint32_t i = 0; i < r_owner.ranges.size();) {
-		const uint32_t key = uint32_t(r_owner.ranges[i] >> 32);
-		if (key >= p_surface_count && key != RT_SLOT_KEY_PROCEDURAL) {
-			_slot_range_release(uint32_t(r_owner.ranges[i] & 0xFFFFFFFFu));
-			r_owner.ranges.remove_at_unordered(i);
-		} else {
-			i++;
+	if (r_owner.surfaces.size() <= p_surface_count) {
+		return;
+	}
+	for (uint32_t key = p_surface_count; key < r_owner.surfaces.size(); key++) {
+		if (r_owner.surfaces[key] != 0) {
+			_slot_range_release(r_owner.surfaces[key] - 1);
 		}
 	}
+	r_owner.surfaces.resize(p_surface_count);
 }
 
 void RenderRaytracing::_release_viewport_slots(RTViewportState *p_state) {

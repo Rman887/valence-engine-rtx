@@ -1344,9 +1344,11 @@ struct RTSlotLocalRow {
 	uint64_t generation = 0;
 };
 
-// The ranges a geometry instance owns: (key << 32) | range id, the key its surface index.
+// The ranges a geometry instance owns, found by key at once: a surface's at its surface index
+// (below RSE::MAX_MESH_SURFACES), a procedural instance's apart; each its range id + 1, 0 for none.
 struct RTSlotOwner {
-	LocalVector<uint64_t> ranges;
+	LocalVector<uint32_t> surfaces;
+	uint32_t procedural = 0;
 };
 
 // What a viewport's PTLAS holds in one slot, and the rows its buffers hold there: the change test.

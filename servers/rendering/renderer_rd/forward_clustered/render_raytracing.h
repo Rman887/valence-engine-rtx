@@ -1779,18 +1779,11 @@ class RenderRaytracing {
 	RTClusterAsyncPopulation *cluster_capture = nullptr;
 	LocalVector<RTClusterAsyncPopulation *> cluster_async_populations; // In the walk's order.
 
-	// Index variants (D127). The walk sets the variant of the surface it processes, read where that
-	// surface's BLAS is populated: a variant's BLAS is a triangle BLAS over its own list, never
+	// Index variants (D127). The variant of the surface whose BLAS is populated is passed to
+	// _populate_surface_blas: a variant's BLAS is a triangle BLAS over its own list, never
 	// clustered. A static surface drawn through a variant keeps its BLAS in a cache of its own, keyed
 	// by mesh, surface and variant, as the surface's whole list keeps its in the chunks.
-	struct WalkIndexVariant {
-		const void *mesh_surface = nullptr;
-		int32_t id = -1;
-		RID index_buffer;
-		uint32_t index_count = 0;
-	} walk_index_variant;
 	HashMap<uint64_t, RTCacheEntry *> variant_surface_cache;
-	void _set_walk_index_variant(const void *p_surf);
 	RTCacheEntry *_variant_surface_cache_entry(RID p_mesh, uint32_t p_surface_index, int32_t p_variant);
 	bool walk_in_compute_list = false; // Phase 2's merges: no build records here, a pull-back included.
 	uint64_t async_triangle_builds_total = 0;
@@ -2198,8 +2191,9 @@ class RenderRaytracing {
 	bool _refit_light_tree(RTLightTree &r_tree, uint32_t p_emissive_count, uint32_t p_cut_size, uint32_t p_cut_indirect_size, bool p_power_pick); // P2i: false when the structure changed.
 	void _release_deformed_blas(RTDeformedCacheEntry &p_entry);
 	void _free_deformed_entry(RTDeformedCacheEntry &p_entry);
-	// The deformed triangle BLAS over owned_vb_full, carrying the micromap the walk wants (D96 OMMc).
-	void _build_deformed_triangle_blas(RID p_handle, RTDeformedCacheEntry &r_entry, void *p_mesh_surface, uint32_t p_cache_key, uint32_t p_surface_counter, LocalVector<RID> &r_dirty_blas_list);
+	// The deformed triangle BLAS over owned_vb_full, over its index variant's list (D127), carrying
+	// the micromap the walk wants (D96 OMMc).
+	void _build_deformed_triangle_blas(RID p_handle, RTDeformedCacheEntry &r_entry, void *p_mesh_surface, int32_t p_index_variant, uint32_t p_cache_key, uint32_t p_surface_counter, LocalVector<RID> &r_dirty_blas_list);
 	// The deformed cluster layout, its CLAS carrying the micromap the walk wants (D96 OMMd); as _populate_deformed_cluster_layout.
 	bool _build_deformed_cluster_layout(RID p_handle, RTDeformedCacheEntry &r_entry, void *p_mesh_surface, uint32_t p_cache_key, uint32_t p_surface_counter);
 	// The hit row's deformed flag and previous-position address, which a build's row fill clears.
@@ -2457,6 +2451,7 @@ class RenderRaytracing {
 			bool p_lod_select); // The frame selects (D87): an entry with a hierarchy defers its rebuild to the TLAS push.
 	void _populate_surface_blas(
 			void *p_mesh_surface,
+			int32_t p_index_variant, // The surface's index variant (D127), or -1 for its whole list.
 			RID p_vertex_buffer_override,
 			bool p_force_uncompressed,
 			bool p_prefer_fast_build,

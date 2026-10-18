@@ -1037,18 +1037,6 @@ RTCacheEntry *RenderRaytracing::get_surface_cache_entry(uint32_t p_index) {
 	return &surface_chunks[chunk_idx][entry_idx];
 }
 
-void RenderRaytracing::_set_walk_index_variant(const void *p_surf) {
-	const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = static_cast<const RenderForwardClustered::GeometryInstanceSurfaceDataCache *>(p_surf);
-	walk_index_variant = WalkIndexVariant();
-	if (surf->index_variant >= 0) {
-		const RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
-		walk_index_variant.mesh_surface = surf->surface;
-		walk_index_variant.id = surf->index_variant;
-		walk_index_variant.index_buffer = mesh_storage->mesh_surface_get_index_variant_buffer(surf->surface, surf->index_variant);
-		walk_index_variant.index_count = mesh_storage->mesh_surface_get_index_variant_index_count(surf->surface, surf->index_variant);
-	}
-}
-
 RTCacheEntry *RenderRaytracing::_variant_surface_cache_entry(RID p_mesh, uint32_t p_surface_index, int32_t p_variant) {
 	const uint64_t key = (uint64_t(p_mesh.get_local_index()) << 32) | (uint64_t(p_surface_index & 0xFFFF) << 16) | uint64_t(p_variant & 0xFFFF);
 	RTCacheEntry **found = variant_surface_cache.getptr(key);
@@ -2155,8 +2143,6 @@ RTSurfaceData *RenderRaytracing::process_surface(
 		LocalVector<RID> &r_dirty_blas_list) {
 	const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf =
 			static_cast<const RenderForwardClustered::GeometryInstanceSurfaceDataCache *>(p_surf);
-	_set_walk_index_variant(surf); // Its own, or none (D127).
-
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 
 	RID mesh_rid = surf->owner->data->base;
@@ -2268,7 +2254,7 @@ RTSurfaceData *RenderRaytracing::process_surface(
 	// An admitted new surface's cluster population holds its commands for the compute queue (D98c).
 	RTClusterAsyncPopulation *capture = budgeted && rd->has_async_builds() ? memnew(RTClusterAsyncPopulation) : nullptr;
 	cluster_capture = capture;
-	_populate_surface_blas(p_mesh_surface, RID(), false, false, false, cache_key, surf_data, r_dirty_blas_list);
+	_populate_surface_blas(p_mesh_surface, surf->index_variant, RID(), false, false, false, cache_key, surf_data, r_dirty_blas_list);
 	cluster_capture = nullptr;
 	if (capture && !(capture->captured && surf_data->blas.is_valid() && surf_data->cluster_count > 0)) {
 		memdelete(capture); // The triangle path, or nothing built.
@@ -2323,7 +2309,6 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 		bool p_lod_select) {
 	const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf =
 			static_cast<const RenderForwardClustered::GeometryInstanceSurfaceDataCache *>(p_surf);
-	_set_walk_index_variant(surf); // Its own, or none (D127).
 
 	if (!p_source.current_vb.is_valid()) {
 		return nullptr;
@@ -2452,7 +2437,7 @@ RTSurfaceData *RenderRaytracing::process_deformed_surface(
 		} else if (clustered) {
 			_queue_deformed_cluster_rebuild(entry, RTDeformedCacheEntry::CLUSTER_QUEUED_FIRST_BUILD);
 		} else {
-			_build_deformed_triangle_blas(surf->rt_deformed_handle, entry, p_mesh_surface, static_cast<uint32_t>(p_source.cache_key), p_source.surface_counter, r_dirty_blas_list);
+			_build_deformed_triangle_blas(surf->rt_deformed_handle, entry, p_mesh_surface, surf->index_variant, static_cast<uint32_t>(p_source.cache_key), p_source.surface_counter, r_dirty_blas_list);
 		}
 		entry.blas_built_once = entry.ptr->blas.is_valid();
 	} else if (entry.cluster_count > 0 && p_lod_select && entry.cluster_lod_table_offset != UINT32_MAX) {
@@ -2508,12 +2493,12 @@ void RenderRaytracing::_mark_deformed_geometry(RTDeformedCacheEntry &r_entry) {
 	}
 }
 
-void RenderRaytracing::_build_deformed_triangle_blas(RID p_handle, RTDeformedCacheEntry &r_entry, void *p_mesh_surface, uint32_t p_cache_key, uint32_t p_surface_counter, LocalVector<RID> &r_dirty_blas_list) {
+void RenderRaytracing::_build_deformed_triangle_blas(RID p_handle, RTDeformedCacheEntry &r_entry, void *p_mesh_surface, int32_t p_index_variant, uint32_t p_cache_key, uint32_t p_surface_counter, LocalVector<RID> &r_dirty_blas_list) {
 	// Opacity micromaps (D96 OMMc): the BLAS carries the micromap its instance's walk wants, once
 	// baked over the surface's current contents; refits keep it, as the build info does.
 	RTOmmEntry *omm = _omm_deformed_entry(r_entry.omm_wanted_serial, p_surface_counter);
 	bool omm_attached = false;
-	_populate_surface_blas(p_mesh_surface, r_entry.owned_vb_full, true, true, true, p_cache_key, r_entry.ptr, r_dirty_blas_list, omm, &omm_attached);
+	_populate_surface_blas(p_mesh_surface, p_index_variant, r_entry.owned_vb_full, true, true, true, p_cache_key, r_entry.ptr, r_dirty_blas_list, omm, &omm_attached);
 	if (omm_attached) {
 		_omm_deformed_attached(p_handle, r_entry, omm);
 	} else if (omm != nullptr) {
@@ -2726,6 +2711,7 @@ void RendererSceneRenderImplementation::_fill_surface_triangle_geometry(RID p_ve
 
 void RenderRaytracing::_populate_surface_blas(
 		void *p_mesh_surface,
+		int32_t p_index_variant,
 		RID p_vertex_buffer_override,
 		bool p_force_uncompressed,
 		bool p_prefer_fast_build,
@@ -2736,11 +2722,17 @@ void RenderRaytracing::_populate_surface_blas(
 		const RTOmmEntry *p_omm,
 		bool *r_omm_attached) {
 	RID vertex_buffer, attribute_buffer, index_buffer;
-	// The walk's surface drawn through an index variant (D127): its list, on the triangle path.
-	const bool index_variant = walk_index_variant.id >= 0 && walk_index_variant.mesh_surface == p_mesh_surface;
+	// A surface drawn through an index variant (D127): its list, on the triangle path.
+	const bool index_variant = p_index_variant >= 0;
+	RID variant_index_buffer;
+	uint32_t variant_index_count = 0;
+	if (index_variant) {
+		const RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+		variant_index_buffer = mesh_storage->mesh_surface_get_index_variant_buffer(p_mesh_surface, p_index_variant);
+		variant_index_count = mesh_storage->mesh_surface_get_index_variant_index_count(p_mesh_surface, p_index_variant);
+	}
 	_fill_surface_geometry_data(p_mesh_surface, p_force_uncompressed, r_surf_data,
-			&vertex_buffer, &attribute_buffer, &index_buffer,
-			index_variant ? walk_index_variant.index_buffer : RID(), index_variant ? walk_index_variant.index_count : 0);
+			&vertex_buffer, &attribute_buffer, &index_buffer, variant_index_buffer, variant_index_count);
 
 	if (p_vertex_buffer_override.is_valid()) {
 		vertex_buffer = p_vertex_buffer_override;
@@ -11313,7 +11305,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 								dirty_blas_list.resize(pre_slot_build_size);
 								dirty_blas_update_list.resize(pre_slot_refit_size);
 								_release_deformed_blas(*deformed);
-								_build_deformed_triangle_blas(surf->rt_deformed_handle, *deformed, mesh_surface, deformed_cache_key, surface_counter, dirty_blas_list);
+								_build_deformed_triangle_blas(surf->rt_deformed_handle, *deformed, mesh_surface, surf->index_variant, deformed_cache_key, surface_counter, dirty_blas_list);
 							}
 							deformed->blas_built_once = surf_data->blas.is_valid();
 							_mark_deformed_geometry(*deformed);

@@ -601,14 +601,17 @@ bool RendererSceneCull::_instance_swap_compatible_mesh(Instance *p_instance, RID
 	if (RSG::mesh_storage->mesh_needs_instance(p_base, p_instance->skeleton.is_valid())) {
 		return false;
 	}
+	Dependency *old_dependency = RSG::mesh_storage->mesh_get_dependency(p_instance->base);
+	Dependency *new_dependency = RSG::mesh_storage->mesh_get_dependency(p_base);
+	if (old_dependency == nullptr || new_dependency == nullptr) {
+		return false;
+	}
 	InstanceGeometryData *geom = static_cast<InstanceGeometryData *>(p_instance->base_data);
 	if (!geom->geometry_instance->swap_mesh(p_base)) {
 		return false;
 	}
-	p_instance->dependency_tracker.update_begin();
-	RSG::utilities->base_update_dependency(p_instance->base, &p_instance->dependency_tracker);
-	p_instance->dependency_tracker.erase_updated();
-	RSG::utilities->base_update_dependency(p_base, &p_instance->dependency_tracker);
+	p_instance->dependency_tracker.remove_dependency(old_dependency);
+	p_instance->dependency_tracker.update_dependency(new_dependency);
 	p_instance->base = p_base;
 	if (p_instance->scenario && p_instance->array_index >= 0) {
 		p_instance->scenario->instance_data[p_instance->array_index].base_rid = p_base;

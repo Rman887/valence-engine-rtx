@@ -669,6 +669,14 @@ public:
 		return mesh->material_cache.ptr();
 	}
 
+	// VAL: every surface of the mesh in one lookup.
+	_FORCE_INLINE_ void *const *mesh_get_surfaces(RID p_mesh, uint32_t &r_surface_count) {
+		Mesh *mesh = mesh_owner.get_or_null(p_mesh);
+		ERR_FAIL_NULL_V(mesh, nullptr);
+		r_surface_count = mesh->surface_count;
+		return reinterpret_cast<void *const *>(mesh->surfaces);
+	}
+
 	_FORCE_INLINE_ void *mesh_get_surface(RID p_mesh, uint32_t p_surface_index) {
 		Mesh *mesh = mesh_owner.get_or_null(p_mesh);
 		ERR_FAIL_NULL_V(mesh, nullptr);
@@ -1037,7 +1045,7 @@ public:
 		return _mesh_surface_generate_vertex_format(s->format, p_input_mask, p_instanced_surface, p_input_motion_vectors, p_point_size_emulated, position_stride);
 	}
 
-	Dependency *mesh_get_dependency(RID p_mesh) const;
+	virtual Dependency *mesh_get_dependency(RID p_mesh) const override;
 
 	/* MESH INSTANCE API */
 

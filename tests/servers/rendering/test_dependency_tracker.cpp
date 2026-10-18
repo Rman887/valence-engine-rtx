@@ -42,7 +42,7 @@ static void count_changed(Dependency::DependencyChangedNotification p_notificati
 	changed_count++;
 }
 
-TEST_CASE("[DependencyTracker] erase_updated drops only the dependencies updated since update_begin") {
+TEST_CASE("[DependencyTracker] remove_dependency drops only the dependency it is given") {
 	Dependency kept;
 	Dependency dropped;
 	DependencyTracker tracker;
@@ -53,15 +53,37 @@ TEST_CASE("[DependencyTracker] erase_updated drops only the dependencies updated
 	tracker.update_dependency(&dropped);
 	tracker.update_end();
 
-	tracker.update_begin();
-	tracker.update_dependency(&dropped);
-	tracker.erase_updated();
+	tracker.remove_dependency(&dropped);
+	tracker.remove_dependency(&dropped); // Not tracked any more: nothing changes.
 
 	changed_count = 0;
 	dropped.changed_notify(Dependency::DEPENDENCY_CHANGED_MESH);
-	CHECK_MESSAGE(changed_count == 0, "The dependency updated since update_begin no longer reaches the tracker.");
+	CHECK_MESSAGE(changed_count == 0, "The removed dependency no longer reaches the tracker.");
 	kept.changed_notify(Dependency::DEPENDENCY_CHANGED_MESH);
-	CHECK_MESSAGE(changed_count == 1, "The dependency not updated since update_begin still reaches the tracker.");
+	CHECK_MESSAGE(changed_count == 1, "The other dependency still reaches the tracker.");
+
+	// A compatible mesh swap's sequence: the old mesh removed, the new one added outside an
+	// update_begin/update_end pair.
+	Dependency added;
+	tracker.update_dependency(&added);
+	changed_count = 0;
+	added.changed_notify(Dependency::DEPENDENCY_CHANGED_MESH);
+	CHECK_MESSAGE(changed_count == 1, "A dependency added outside an update reaches the tracker.");
+
+	// A later full update that re-registers it keeps it; one that does not drops it.
+	tracker.update_begin();
+	tracker.update_dependency(&kept);
+	tracker.update_dependency(&added);
+	tracker.update_end();
+	changed_count = 0;
+	added.changed_notify(Dependency::DEPENDENCY_CHANGED_MESH);
+	CHECK_MESSAGE(changed_count == 1, "A full update that re-registers it keeps it.");
+	tracker.update_begin();
+	tracker.update_dependency(&kept);
+	tracker.update_end();
+	changed_count = 0;
+	added.changed_notify(Dependency::DEPENDENCY_CHANGED_MESH);
+	CHECK_MESSAGE(changed_count == 0, "A full update that does not re-register it drops it.");
 
 	// A later full update keeps what it updates and drops the rest, as before.
 	tracker.update_begin();

@@ -90,6 +90,9 @@ public:
 	virtual void mesh_debug_usage(List<RenderingServerTypes::MeshInfo> *r_info) = 0;
 
 	virtual bool mesh_needs_instance(RID p_mesh, bool p_has_skeleton) = 0;
+	// VAL: the mesh's own dependency, for a tracker to drop or take it alone; nullptr where the
+	// storage does not expose it.
+	virtual Dependency *mesh_get_dependency(RID p_mesh) const { return nullptr; }
 
 	/* MESH INSTANCE */
 

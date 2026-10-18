@@ -113,23 +113,10 @@ public:
 		}
 	}
 
-	// VAL: drops the dependencies updated since update_begin() and keeps the others, a narrow removal
-	// (update_begin(), update the one to drop, erase_updated()) that re-tracks nothing else.
-	void erase_updated() {
-		List<Dependency *> to_erase;
-
-		for (Dependency *dep : dependencies) {
-			HashMap<DependencyTracker *, uint32_t>::Iterator F = dep->instances.find(this);
-			ERR_CONTINUE(!F);
-			if (F->value == instance_version) {
-				to_erase.push_back(dep);
-			}
-		}
-
-		while (to_erase.size()) {
-			to_erase.front()->get()->instances.erase(this);
-			dependencies.erase(to_erase.front()->get());
-			to_erase.pop_front();
+	// VAL: drops one dependency and keeps the others, without re-tracking them.
+	void remove_dependency(Dependency *p_dependency) {
+		if (dependencies.erase(p_dependency)) {
+			p_dependency->instances.erase(this);
 		}
 	}
 

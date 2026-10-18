@@ -46,6 +46,21 @@
 #include "servers/rendering/rendering_server_globals.h"
 #include "servers/rendering/storage/environment_storage.h"
 
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <xmmintrin.h>
+#endif
+
+// VAL: asks for the cache line holding an address the walk reads soon (a hint, never a fault).
+static _FORCE_INLINE_ void _rt_prefetch(const void *p_address) {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+	_mm_prefetch(static_cast<const char *>(p_address), _MM_HINT_T0);
+#elif defined(__GNUC__) || defined(__clang__)
+	__builtin_prefetch(p_address);
+#else
+	(void)p_address;
+#endif
+}
+
 using namespace RendererSceneRenderImplementation;
 
 RenderRaytracing *RenderRaytracing::singleton = nullptr;
@@ -10908,10 +10923,45 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 	const bool build_budget_publishes = build_budget.enabled && build_budget.prepass_frame != RD::get_singleton()->get_frames_drawn();
 	_build_budget_prepass(p_render_data, p_rt_flags);
 
+	// The walk waits on the first touch of each instance and surface, so it hints the lines it reads
+	// next. A surface's: its pass flags, shader, cached final transform (the static path reads its last
+	// row and its valid flag), RT material and link. Caches are 16-byte aligned, so each field is hinted
+	// rather than the struct's start.
+	const auto prefetch_surface = [](const RenderForwardClustered::GeometryInstanceSurfaceDataCache *p_surf) {
+		_rt_prefetch(&p_surf->rt_pass_flags);
+		_rt_prefetch(&p_surf->shader);
+		_rt_prefetch(&p_surf->cached_final_transform.basis.rows[2]);
+		_rt_prefetch(&p_surf->cached_final_transform_valid);
+		_rt_prefetch(&p_surf->rt_material_data);
+		_rt_prefetch(&p_surf->next);
+	};
 	const PagedArray<RenderGeometryInstance *> &rt_instances = *p_render_data->rt_instances;
 	for (uint32_t i = 0; i < (uint32_t)rt_instances.size(); i++) {
 		const RenderForwardClustered::GeometryInstanceForwardClustered *inst =
 				static_cast<const RenderForwardClustered::GeometryInstanceForwardClustered *>(rt_instances[i]);
+		// The instance after next, and the next one's data and first surface, whose addresses its own
+		// lines hold: read one iteration early, they are its own pointers.
+		if (i + 2 < (uint32_t)rt_instances.size()) {
+			const RenderForwardClustered::GeometryInstanceForwardClustered *ahead =
+					static_cast<const RenderForwardClustered::GeometryInstanceForwardClustered *>(rt_instances[i + 2]);
+			if (ahead) {
+				_rt_prefetch(&ahead->transform);
+				_rt_prefetch(&ahead->data);
+				_rt_prefetch(&ahead->transform_status);
+				_rt_prefetch(&ahead->surface_caches);
+			}
+		}
+		if (i + 1 < (uint32_t)rt_instances.size()) {
+			const RenderForwardClustered::GeometryInstanceForwardClustered *next_inst =
+					static_cast<const RenderForwardClustered::GeometryInstanceForwardClustered *>(rt_instances[i + 1]);
+			if (next_inst && next_inst->data) {
+				_rt_prefetch(&next_inst->data->base_type);
+				_rt_prefetch(&next_inst->data->cast_shadows);
+			}
+			if (next_inst && next_inst->surface_caches) {
+				prefetch_surface(next_inst->surface_caches);
+			}
+		}
 		if (!inst || !inst->data) {
 			continue;
 		}
@@ -11158,6 +11208,9 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 		const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = inst->surface_caches;
 		bool instance_static = inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::NONE;
 		while (surf) {
+			if (surf->next) {
+				prefetch_surface(surf->next);
+			}
 			// Skip surfaces routed to the raster alpha overlay, and those the trace does not take.
 			if ((surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) || _skip_untraced_surface(surf->primitive, surf->surface)) {
 				surf = surf->next;

@@ -4787,6 +4787,8 @@ void RenderForwardClustered::_geometry_instance_update(RenderGeometryInstance *p
 	ginstance->store_transform_cache = store_transform;
 	ginstance->can_sdfgi = false;
 
+	ginstance->rt_budget_surface_mask = RenderRaytracing::_build_budget_surface_mask(ginstance); // D97.
+
 	if (!RendererRD::LightStorage::get_singleton()->lightmap_instance_is_valid(ginstance->lightmap_instance)) {
 		if (ginstance->voxel_gi_instances[0].is_null() && (ginstance->data->use_baked_light || ginstance->data->use_dynamic_gi)) {
 			ginstance->can_sdfgi = true;

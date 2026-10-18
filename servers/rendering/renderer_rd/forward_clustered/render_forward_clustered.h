@@ -604,6 +604,10 @@ protected:
 		mutable uint64_t rt_traced_frame = UINT64_MAX;
 		mutable uint64_t rt_traced_mask = 0;
 		mutable uint64_t rt_traced_prev_mask = 0;
+		/// The same bits of its caches the build budget pre-pass's gate can admit (D97): not on the
+		/// alpha pass, triangles or lines. Set where the caches are built; an instance that traced all
+		/// of them the frame before has nothing to hold back, and the pass skips it whole.
+		uint64_t rt_budget_surface_mask = 0;
 		/// The path tracer's per-cache handles (a deformed entry, a cluster LOD slot), kept while
 		/// _mark_dirty rebuilds the surface caches that hold them (D110): a raster change (a light's
 		/// projector or soft shadow paired, a material) is no reason to build the surface's BLAS

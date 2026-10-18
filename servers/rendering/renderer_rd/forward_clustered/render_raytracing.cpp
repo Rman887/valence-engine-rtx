@@ -1764,15 +1764,33 @@ void RenderRaytracing::_build_budget_stamp(const void *p_instance, uint32_t p_su
 	p_inst->rt_traced_mask |= _build_budget_surface_bit(p_surface_index);
 }
 
-bool RenderRaytracing::_build_budget_traced(const void *p_instance, uint32_t p_surface_index, uint64_t p_frames_drawn) {
+// The surfaces the instance traced the frame before.
+uint64_t RenderRaytracing::_build_budget_traced_before(const void *p_instance, uint64_t p_frames_drawn) {
 	const RenderForwardClustered::GeometryInstanceForwardClustered *p_inst = static_cast<const RenderForwardClustered::GeometryInstanceForwardClustered *>(p_instance);
-	uint64_t previous = 0;
 	if (p_inst->rt_traced_frame == p_frames_drawn) {
-		previous = p_inst->rt_traced_prev_mask;
+		return p_inst->rt_traced_prev_mask;
 	} else if (p_inst->rt_traced_frame != UINT64_MAX && p_inst->rt_traced_frame + 1 == p_frames_drawn) {
-		previous = p_inst->rt_traced_mask;
+		return p_inst->rt_traced_mask;
 	}
-	return (previous & _build_budget_surface_bit(p_surface_index)) != 0;
+	return 0;
+}
+
+bool RenderRaytracing::_build_budget_traced(const void *p_instance, uint32_t p_surface_index, uint64_t p_frames_drawn) {
+	return (_build_budget_traced_before(p_instance, p_frames_drawn) & _build_budget_surface_bit(p_surface_index)) != 0;
+}
+
+// The bits of the instance's caches the pre-pass's gate can admit: not on the alpha pass, and
+// triangles or lines, which covers _surface_traced (a line surface the tracer does not take is
+// never stamped, which only keeps its instance from being skipped).
+uint64_t RenderRaytracing::_build_budget_surface_mask(const void *p_instance) {
+	const RenderForwardClustered::GeometryInstanceForwardClustered *p_inst = static_cast<const RenderForwardClustered::GeometryInstanceForwardClustered *>(p_instance);
+	uint64_t mask = 0;
+	for (const RenderForwardClustered::GeometryInstanceSurfaceDataCache *surf = p_inst->surface_caches; surf; surf = surf->next) {
+		if (!(surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) && (surf->primitive == RSE::PRIMITIVE_TRIANGLES || surf->primitive == RSE::PRIMITIVE_LINES)) {
+			mask |= _build_budget_surface_bit(surf->surface_index);
+		}
+	}
+	return mask;
 }
 
 // An instance's projected size: its bounding sphere's radius over its distance, at most 1.
@@ -1971,7 +1989,7 @@ void RenderRaytracing::_build_budget_prepass(const RenderDataRD *p_render_data, 
 			continue; // A procedural AABB BLAS builds when it is dirty, as before.
 		}
 		// Taken for an instance with something to admit only: on a settled frame none has, and the
-		// pass is a walk over the surfaces' traced bits.
+		// pass tests each instance's traced bits against the ones its gate can admit.
 		float priority = -1.0f;
 		auto instance_priority = [&]() {
 			if (priority < 0.0f) {
@@ -2048,11 +2066,19 @@ void RenderRaytracing::_build_budget_prepass(const RenderDataRD *p_render_data, 
 			}
 			continue;
 		}
+		// An instance that traced every surface the pass looks at the frame before has none to hold
+		// back: the test below for each of them, at once, without reading its surfaces.
+		const uint64_t traced_before = _build_budget_traced_before(inst, frames_drawn);
+		const uint64_t considered = inst->rt_budget_surface_mask;
+		if ((traced_before & considered) == considered) {
+			continue;
+		}
 		for (; surf; surf = surf->next) {
+			// The gate: rt_budget_surface_mask (_build_budget_surface_mask) must cover what it admits.
 			if ((surf->rt_pass_flags & RenderForwardClustered::GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA) || !_surface_traced(surf->primitive, surf->surface)) {
 				continue;
 			}
-			if (_build_budget_traced(inst, surf->surface_index, frames_drawn)) {
+			if ((traced_before & _build_budget_surface_bit(surf->surface_index)) != 0) {
 				continue; // Its instance traced it the frame before: whatever it misses is forced.
 			}
 			if (inst->mesh_instance.is_valid() && mesh_storage->mesh_instance_get_vertex_buffer(inst->mesh_instance, surf->surface_index).is_valid()) {

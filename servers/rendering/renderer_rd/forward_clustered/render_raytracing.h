@@ -2475,6 +2475,8 @@ class RenderRaytracing {
 	// A GeometryInstanceForwardClustered's traced surfaces (D97), passed untyped as process_surface's surface is.
 	static void _build_budget_stamp(const void *p_instance, uint32_t p_surface_index, uint64_t p_frames_drawn);
 	static bool _build_budget_traced(const void *p_instance, uint32_t p_surface_index, uint64_t p_frames_drawn);
+	static uint64_t _build_budget_traced_before(const void *p_instance, uint64_t p_frames_drawn);
+	static uint64_t _build_budget_surface_mask(const void *p_instance);
 	bool _build_budget_fits(uint64_t p_cost, bool p_carry) const;
 	void _build_budget_spend(uint64_t p_cost, bool p_carry);
 	BuildBudgetTake _build_budget_take(uint64_t p_cost, bool p_carry, bool p_force);

@@ -647,6 +647,7 @@ struct RTLodInstanceEntry {
 	uint32_t last_used_frame = 0;
 	uint64_t pushed_frame = 0; // frames_drawn when it last entered the TLAS; a second viewport in the frame traces frame_blas.
 	RID frame_blas; // What it traced at pushed_frame: its own BLAS, or the one it shares (D89).
+	RTSurfaceData *frame_surface = nullptr; // The surface frame_blas was settled for: a slot a swapped-in mesh took over never reuses another's.
 	uint32_t last_built_frame = 0; // An instance tracing another's build keeps its slot under the slot budget (D113).
 	RID blas;
 	uint64_t blas_address = 0;

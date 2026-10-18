@@ -7280,6 +7280,7 @@ void RenderRaytracing::_release_lod_entry(RTLodInstanceEntry &p_entry) {
 	p_entry.blas_address = 0;
 	p_entry.pushed_frame = 0;
 	p_entry.frame_blas = RID();
+	p_entry.frame_surface = nullptr;
 	if (p_entry.arena_chunk >= 0) {
 		_cluster_arena_retire(uint32_t(p_entry.arena_chunk), p_entry.arena_offset, p_entry.arena_size);
 		cluster_lod_slot_bytes -= p_entry.arena_size;
@@ -7393,6 +7394,7 @@ void RenderRaytracing::_queue_lod_instance(RTLodInstanceEntry &p_entry, const Tr
 	}
 	p_entry.pushed_frame = RD::get_singleton()->get_frames_drawn();
 	p_entry.frame_blas = p_entry.blas;
+	p_entry.frame_surface = p_entry.ptr;
 }
 
 // The record's first sixteen words, shared by both kinds of item: the object-to-trace transform
@@ -7994,6 +7996,7 @@ void RenderRaytracing::_resolve_lod_candidates(const RenderDataRD *p_render_data
 			blass[candidate.slot] = blas;
 			candidate.entry->pushed_frame = frames_drawn;
 			candidate.entry->frame_blas = blas;
+			candidate.entry->frame_surface = candidate.surface;
 			batch.shared_slots.push_back(candidate.slot);
 			batch.shared_surfaces.push_back(candidate.surface);
 			batch.cached_count++;
@@ -8005,6 +8008,7 @@ void RenderRaytracing::_resolve_lod_candidates(const RenderDataRD *p_render_data
 		if (target == LOD0) {
 			candidate.entry->pushed_frame = frames_drawn;
 			candidate.entry->frame_blas = candidate.surface->blas;
+			candidate.entry->frame_surface = candidate.surface;
 			batch.lod0_count++;
 			continue;
 		}
@@ -8015,6 +8019,7 @@ void RenderRaytracing::_resolve_lod_candidates(const RenderDataRD *p_render_data
 		blass[candidate.slot] = shared.entry->blas;
 		candidate.entry->pushed_frame = frames_drawn;
 		candidate.entry->frame_blas = shared.entry->blas;
+		candidate.entry->frame_surface = candidate.surface;
 		batch.shared_slots.push_back(candidate.slot);
 		batch.shared_surfaces.push_back(candidate.surface);
 		batch.shared_count++;
@@ -8664,7 +8669,7 @@ bool RenderRaytracing::_record_lod_batch(const RenderDataRD *p_render_data, cons
 		}
 #ifdef TOOLS_ENABLED
 		// The device's counts are read back in tools builds only.
-		print_verbose(vformat("RT: persistent static selection (D113): %d of %d selections rebuilt over the run (the device's counts, a frame queue late; first builds apart), %d first builds this frame, %s; slots %d KB live of %d KB, %d evicted over the run.", lod_static_rebuilds_total, lod_static_instances_total, batch.static_first_builds, static_persistent ? "digests kept" : "built whole, untemplated deformed items among them", cluster_lod_slot_bytes / 1024, cluster_lod_slot_budget / 1024, cluster_lod_slot_evictions_total));
+		print_verbose(vformat("RT: persistent static selection (D113): %d of %d selections rebuilt over the run (the device's counts, a frame queue late; first builds apart), %d first builds this frame, %s; slots %d KB live of %d KB in %d instance entries, %d evicted over the run.", lod_static_rebuilds_total, lod_static_instances_total, batch.static_first_builds, static_persistent ? "digests kept" : "built whole, untemplated deformed items among them", cluster_lod_slot_bytes / 1024, cluster_lod_slot_budget / 1024, lod_pool.get_rid_count(), cluster_lod_slot_evictions_total));
 #endif
 		if (!lod_select_gpu_us.is_empty()) {
 			LocalVector<float> sorted(lod_select_gpu_us);
@@ -11318,8 +11323,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				slot_rebuilt = true;
 				RTLodInstanceEntry *lod_entry = _access_lod_slot(surf->rt_lod_handle);
 				lod_entry->last_used_frame = RSG::rasterizer->get_frame_number();
-				if (lod_entry->pushed_frame == RD::get_singleton()->get_frames_drawn()) {
-					blas_handle = lod_entry->frame_blas; // Settled for an earlier viewport of this frame.
+				if (lod_entry->pushed_frame == RD::get_singleton()->get_frames_drawn() && lod_entry->frame_surface == surf_data) {
+					blas_handle = lod_entry->frame_blas; // Settled for an earlier viewport of this frame, on this surface.
 				} else {
 					RTLodSelectBatch::Candidate candidate;
 					candidate.entry = lod_entry;

@@ -1610,9 +1610,10 @@ public:
 	// build that breaks either is refused and changes nothing.
 	Error ptlas_build(RID p_ptlas, Span<PartitionedInstanceWrite> p_writes, Span<PartitionTranslationWrite> p_translations, bool p_from_scratch = false);
 	// The BLASes rebuilt since the last build whose slots the next build writes again: their
-	// count, and whether one is among them (D94b).
+	// count, and the set itself (nullptr for an invalid structure), valid until the structure's
+	// next build (D94b).
 	uint32_t ptlas_get_stale_blas_count(RID p_ptlas);
-	bool ptlas_is_blas_stale(RID p_ptlas, RID p_blas);
+	const HashSet<RID> *ptlas_get_stale_blases(RID p_ptlas);
 	// The last build's instance writes, the slots it wrote again for a rebuilt BLAS and those it
 	// disabled for a freed one, and the time its scan for them took (D94b's counters).
 	void ptlas_get_last_build_counts(RID p_ptlas, uint32_t &r_writes, uint32_t &r_stale_rewrites, uint32_t &r_dangling_disables, uint64_t &r_scan_usec);

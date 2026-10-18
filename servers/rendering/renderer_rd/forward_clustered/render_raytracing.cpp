@@ -1547,6 +1547,7 @@ void RenderRaytracing::prepare_frame() {
 	frame_slots.clear();
 	frame_geometry_generations.clear();
 	frame_material_generations.clear();
+	frame_slot_verify.clear();
 	deformed_active_this_frame.clear();
 	merged_mm_active_this_frame.clear();
 
@@ -11312,6 +11313,8 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			// A slot-resident instance (D94b) whose BLAS this frame builds or may build after the walk
 			// is never proven unchanged here: the commit sees the BLAS it ends on.
 			bool slot_rebuilt = dirty_blas_list.size() != pre_slot_build_size || dirty_blas_update_list.size() != pre_slot_refit_size;
+			// A cluster LOD candidate's BLAS is the selection's, after the walk: the commit tests it then.
+			bool slot_after_resolve = false;
 			// An emissive material samples the surface's own triangles (D50), which a surface whose
 			// buffers hold its fallback level has only as an upload (D93d).
 			if (surf_data->geometry_streamed && (mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT)) {
@@ -11320,7 +11323,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			if (lod_select_frame && surf_data->cluster_lod_stream && (mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT)) {
 				blas_handle = _lod_stream_pinned_blas(surf_data); // A streamed surface's LOD 0 is its cached level 0 (D92).
 			} else if (lod_select_frame && surf_data->cluster_lod_table_offset != UINT32_MAX && !(mat_data->data.flags & RT_MAT_FLAG_EMISSIVE_CONSTANT)) {
-				slot_rebuilt = true;
+				slot_after_resolve = true;
 				RTLodInstanceEntry *lod_entry = _access_lod_slot(surf->rt_lod_handle);
 				lod_entry->last_used_frame = RSG::rasterizer->get_frame_number();
 				if (lod_entry->pushed_frame == RD::get_singleton()->get_frames_drawn() && lod_entry->frame_surface == surf_data) {
@@ -11414,11 +11417,16 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 				const uint32_t slot = slot_ranges[range].first;
 				const uint64_t geometry_generation = _layer_row_generation(_surface_row_generation(surf_data), inst->layer_mask);
 				const uint64_t material_generation = _material_row_generation(mat_data);
-				if (!slot_rebuilt && !_slot_moved(inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED, prev_instance_transform, instance_transform) && _slot_unchanged(state, slot, blas_handle, final_transform, inst_flags, inst_mask, instance_sbt(mat_data, inst_mask), geometry_generation, material_generation, instance_static)) {
+				const bool slot_moved = _slot_moved(inst->transform_status == RenderForwardClustered::GeometryInstanceForwardClustered::TransformStatus::MOVED, prev_instance_transform, instance_transform);
+				if (!slot_rebuilt && !slot_after_resolve && !slot_moved && _slot_unchanged(state, slot, blas_handle, final_transform, inst_flags, inst_mask, instance_sbt(mat_data, inst_mask), geometry_generation, material_generation, instance_static)) {
 					surf = surf->next;
 					continue;
 				}
-				_slot_emit(slot, geometry_generation, material_generation);
+				uint8_t verify = 0;
+				if (slot_after_resolve && !slot_rebuilt && !slot_moved) {
+					verify = RT_SLOT_VERIFY_AFTER_RESOLVE | (instance_static ? RT_SLOT_VERIFY_STATIC : 0);
+				}
+				_slot_emit(slot, geometry_generation, material_generation, verify);
 			}
 
 			blas_transforms.push_back(final_transform);

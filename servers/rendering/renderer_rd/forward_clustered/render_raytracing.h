@@ -1541,6 +1541,8 @@ struct RTViewportState {
 		uint64_t global_entries_total = 0; // Over the run: slots placed in the global partition.
 		uint32_t global_peak = 0;
 		uint32_t stale_rewrites = 0; // The PTLAS's own rewrites of a rebuilt BLAS's slots.
+		uint32_t entries = 0; // The instances the walk pushed.
+		uint32_t verified = 0; // Of those, the cluster LOD ones proven unchanged after their selection.
 		uint32_t dangling_disables = 0; // Over the run: the PTLAS's safety net.
 		uint32_t dangling_last = 0;
 		uint32_t builds = 0; // The build calls of the commit: one, or one per chunk.
@@ -2288,6 +2290,15 @@ class RenderRaytracing {
 	LocalVector<uint32_t> frame_slots;
 	LocalVector<uint64_t> frame_geometry_generations;
 	LocalVector<uint64_t> frame_material_generations;
+	// Per pushed instance, what the commit may still prove unchanged: an instance that did not move
+	// and whose BLAS the walk could not know (a cluster LOD candidate, D86) is tested once the
+	// frame's selection has settled it, as the walk tests the others (_slot_unchanged), with whether
+	// its transform was left unset since the frame before.
+	enum {
+		RT_SLOT_VERIFY_AFTER_RESOLVE = 1,
+		RT_SLOT_VERIFY_STATIC = 2,
+	};
+	LocalVector<uint8_t> frame_slot_verify;
 	LocalVector<RTSlotRange> slot_ranges;
 	LocalVector<uint32_t> slot_range_free_ids;
 	struct SlotInterval {
@@ -2381,7 +2392,7 @@ class RenderRaytracing {
 	static _FORCE_INLINE_ bool _slot_moved(bool p_status_moved, const Transform3D &p_prev, const Transform3D &p_current) {
 		return p_status_moved && p_prev != p_current;
 	}
-	void _slot_emit(uint32_t p_slot, uint64_t p_geometry_generation, uint64_t p_material_generation);
+	void _slot_emit(uint32_t p_slot, uint64_t p_geometry_generation, uint64_t p_material_generation, uint8_t p_verify = 0);
 	bool _commit_slots(RTViewportState *p_state);
 	bool _flush_slot_writes(RTViewportState *p_state, bool p_from_scratch, bool p_translations = false);
 	void _reset_viewport_slots(RTViewportState *p_state);

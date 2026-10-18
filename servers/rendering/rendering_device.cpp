@@ -1521,10 +1521,11 @@ uint32_t RenderingDevice::ptlas_get_stale_blas_count(RID p_ptlas) {
 	return ptlas->stale_blas.size();
 }
 
-bool RenderingDevice::ptlas_is_blas_stale(RID p_ptlas, RID p_blas) {
+const HashSet<RID> *RenderingDevice::ptlas_get_stale_blases(RID p_ptlas) {
+	ERR_RENDER_THREAD_GUARD_V(nullptr);
 	AccelerationStructure *ptlas = acceleration_structure_owner.get_or_null(p_ptlas);
-	ERR_FAIL_NULL_V(ptlas, false);
-	return !ptlas->stale_blas.is_empty() && ptlas->stale_blas.has(p_blas);
+	ERR_FAIL_NULL_V(ptlas, nullptr);
+	return &ptlas->stale_blas;
 }
 
 void RenderingDevice::ptlas_get_last_build_counts(RID p_ptlas, uint32_t &r_writes, uint32_t &r_stale_rewrites, uint32_t &r_dangling_disables, uint64_t &r_scan_usec) {

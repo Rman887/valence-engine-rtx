@@ -820,16 +820,24 @@ static constexpr uint64_t RT_LOD_CLAS_REGION_CEILING = uint64_t(1) << 30;
 // cached levels built this frame (D90). Every list is grow-only across frames.
 struct RTLodSelectBatch {
 	// The static instances of the frame before the sharing resolves them (D89): each one's slot,
-	// the surface its slot is for, its trace-space transform, and the depth range its selection
-	// could fall in, classified at the resolve.
+	// the surface its slot is for, its instance, and the depth range its selection could fall in,
+	// classified at the resolve. An instance's candidates share its trace-space transform and the
+	// terms of the classification that hold for each of its surfaces and depths.
+	struct CandidateInstance {
+		Transform3D transform;
+		float scale = 1.0f; // The basis's largest column norm, as the record's.
+		double stretch = 0.0; // Its Frobenius norm, at least the scale.
+		double origin_length = 0.0;
+	};
 	struct Candidate {
 		RTLodInstanceEntry *entry = nullptr;
 		RTSurfaceData *surface = nullptr;
-		Transform3D transform;
+		uint32_t instance = 0;
 		uint32_t slot = 0;
 		uint32_t level_min = 0;
 		uint32_t level_max = 0;
 	};
+	LocalVector<CandidateInstance> candidate_instances;
 	LocalVector<Candidate> candidates;
 	// The instances that trace another's build this frame (D89): their slots and surfaces, for the
 	// fallback, and how many there were, for the report, with those on the surface's LOD 0 BLAS.
@@ -2603,12 +2611,14 @@ class RenderRaytracing {
 	// selection could fall in, and the resolve that queues each surface's builds before the flush.
 	struct LodView {
 		Vector3 camera;
+		double camera_length = 0.0;
 		float threshold = 0.0f;
 		float near_distance = 1e-3f;
 		bool orthogonal = false;
 	};
 	static LodView _lod_view(const RenderDataRD *p_render_data, const RTViewportState *p_state, float p_pixel_error);
-	static void _classify_lod_instance(const RTSurfaceData *p_surf_data, const Transform3D &p_transform, const LodView &p_view, uint32_t &r_level_min, uint32_t &r_level_max);
+	static RTLodSelectBatch::CandidateInstance _lod_candidate_instance(const Transform3D &p_transform);
+	static void _classify_lod_instance(const RTSurfaceData *p_surf_data, const RTLodSelectBatch::CandidateInstance &p_instance, const LodView &p_view, uint32_t &r_level_min, uint32_t &r_level_max);
 	void _resolve_lod_candidates(const RenderDataRD *p_render_data, const RTViewportState *p_state);
 	bool _queue_lod_candidate(const RTLodSelectBatch::Candidate &p_candidate);
 	// Cached levels (D90): placing the candidates on them, a level's slot, its item in the batch

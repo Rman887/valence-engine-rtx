@@ -7545,9 +7545,25 @@ RenderRaytracing::LodView RenderRaytracing::_lod_view(const RenderDataRD *p_rend
 		view.threshold = 2.0f * p_pixel_error / (projection_scale * float(target_height));
 	}
 	view.camera = scene_data->cam_transform.origin - p_state->rt_origin;
+	view.camera_length = double(view.camera.length());
 	view.near_distance = MAX(scene_data->z_near, 1e-3f);
 	view.orthogonal = scene_data->cam_orthogonal;
 	return view;
+}
+
+// The terms of an instance's classification that hold for each of its surfaces and depths, once
+// per instance; p_transform is in trace space.
+RTLodSelectBatch::CandidateInstance RenderRaytracing::_lod_candidate_instance(const Transform3D &p_transform) {
+	RTLodSelectBatch::CandidateInstance instance;
+	instance.transform = p_transform;
+	const Basis &basis = p_transform.basis;
+	const Vector3 column_0 = basis.get_column(0);
+	const Vector3 column_1 = basis.get_column(1);
+	const Vector3 column_2 = basis.get_column(2);
+	instance.scale = MAX(MAX(float(column_0.length()), MAX(float(column_1.length()), float(column_2.length()))), 1e-6f); // As the record's.
+	instance.stretch = MAX(Math::sqrt(double(column_0.length_squared() + column_1.length_squared() + column_2.length_squared())), double(instance.scale));
+	instance.origin_length = double(p_transform.origin.length());
+	return instance;
 }
 
 // The depths an instance's selection can fall in (D89), from each depth's bounds instead of its
@@ -7559,7 +7575,7 @@ RenderRaytracing::LodView RenderRaytracing::_lod_view(const RenderDataRD *p_rend
 // no cluster past depth j can be selected, and level_max is the first such j. The bounds move a
 // point at most the basis's Frobenius norm times its distance, which holds under shear, where the
 // selection's largest-axis scale would not; the margins cover the shader's float arithmetic.
-void RenderRaytracing::_classify_lod_instance(const RTSurfaceData *p_surf_data, const Transform3D &p_transform, const LodView &p_view, uint32_t &r_level_min, uint32_t &r_level_max) {
+void RenderRaytracing::_classify_lod_instance(const RTSurfaceData *p_surf_data, const RTLodSelectBatch::CandidateInstance &p_instance, const LodView &p_view, uint32_t &r_level_min, uint32_t &r_level_max) {
 	const LocalVector<RTLodLevelBound> &levels = p_surf_data->cluster_lod_levels;
 	const uint32_t level_count = levels.size();
 	r_level_min = 0;
@@ -7567,12 +7583,9 @@ void RenderRaytracing::_classify_lod_instance(const RTSurfaceData *p_surf_data, 
 	if (level_count == 0) {
 		return;
 	}
-	const Basis &basis = p_transform.basis;
-	const Vector3 column_0 = basis.get_column(0);
-	const Vector3 column_1 = basis.get_column(1);
-	const Vector3 column_2 = basis.get_column(2);
-	const float scale = MAX(MAX(float(column_0.length()), MAX(float(column_1.length()), float(column_2.length()))), 1e-6f); // As the record's.
-	const double stretch = MAX(Math::sqrt(double(column_0.length_squared() + column_1.length_squared() + column_2.length_squared())), double(scale));
+	const Transform3D &transform = p_instance.transform;
+	const float scale = p_instance.scale;
+	const double stretch = p_instance.stretch;
 	const double threshold = p_view.threshold;
 	const double near_distance = p_view.orthogonal ? 0.0 : double(p_view.near_distance); // The shader clamps a perspective distance alone.
 	const double error_up = 1.0 + 1.0 / 1024.0;
@@ -7586,9 +7599,9 @@ void RenderRaytracing::_classify_lod_instance(const RTSurfaceData *p_surf_data, 
 		bool may_pass = false;
 		bool must_pass = true;
 		if (!level.empty) {
-			const Vector3 center = p_transform.xform(level.center);
+			const Vector3 center = transform.xform(level.center);
 			const double distance = double((center - p_view.camera).length());
-			const double magnitude = double(p_transform.origin.length()) + stretch * (double(level.center.length()) + double(level.enclosing_radius)) + double(p_view.camera.length());
+			const double magnitude = p_instance.origin_length + stretch * (double(level.center.length()) + double(level.enclosing_radius)) + p_view.camera_length;
 			const double slack = magnitude * (1.0 / 65536.0);
 			double nearest = distance - stretch * double(level.enclosing_radius) - slack;
 			double farthest = distance + stretch * double(level.center_spread) - double(scale) * double(level.min_radius) + slack;
@@ -7622,7 +7635,7 @@ bool RenderRaytracing::_queue_lod_candidate(const RTLodSelectBatch::Candidate &p
 	if (lod_batch.entries.size() + lod_batch.cache_builds.size() >= cluster_lod_max_instances || !_prepare_lod_entry(*p_candidate.entry, p_candidate.surface)) {
 		return false;
 	}
-	_queue_lod_instance(*p_candidate.entry, p_candidate.transform, p_candidate.slot);
+	_queue_lod_instance(*p_candidate.entry, lod_batch.candidate_instances[p_candidate.instance].transform, p_candidate.slot);
 	p_candidate.entry->last_built_frame = RSG::rasterizer->get_frame_number();
 	blass[p_candidate.slot] = p_candidate.entry->blas;
 	return true;
@@ -7878,6 +7891,7 @@ void RenderRaytracing::_resolve_lod_candidates(const RenderDataRD *p_render_data
 			_queue_lod_candidate(batch.candidates[i]); // Past the limit, the slot keeps LOD 0 this frame.
 		}
 		batch.candidates.clear();
+		batch.candidate_instances.clear();
 		return;
 	}
 
@@ -7889,7 +7903,7 @@ void RenderRaytracing::_resolve_lod_candidates(const RenderDataRD *p_render_data
 	batch.targets.resize(candidate_count);
 	for (uint32_t i = 0; i < candidate_count; i++) {
 		RTLodSelectBatch::Candidate &candidate = batch.candidates[i];
-		_classify_lod_instance(candidate.surface, candidate.transform, view, candidate.level_min, candidate.level_max);
+		_classify_lod_instance(candidate.surface, batch.candidate_instances[candidate.instance], view, candidate.level_min, candidate.level_max);
 		batch.targets[i] = NONE;
 	}
 	if (cluster_lod_cache_enabled) {
@@ -8026,6 +8040,7 @@ void RenderRaytracing::_resolve_lod_candidates(const RenderDataRD *p_render_data
 		batch.shared_count++;
 	}
 	batch.candidates.clear();
+	batch.candidate_instances.clear();
 }
 
 // Records the frame's selection and builds. Returns false with nothing the TLAS may take: the
@@ -10862,6 +10877,7 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 			continue;
 		}
 		const Transform3D &instance_transform = inst->transform;
+		uint32_t lod_candidate_instance = UINT32_MAX; // Its entry in the LOD candidates' instances, once one is pushed.
 
 		// Determine previous-frame transform for motion vectors.
 		const Transform3D &prev_instance_transform =
@@ -11332,8 +11348,13 @@ RTViewportState *RenderRaytracing::build_tlas(const RenderDataRD *p_render_data,
 					RTLodSelectBatch::Candidate candidate;
 					candidate.entry = lod_entry;
 					candidate.surface = surf_data;
-					candidate.transform = instance_transform;
-					candidate.transform.origin -= state->rt_origin;
+					if (lod_candidate_instance == UINT32_MAX) {
+						Transform3D trace_transform = instance_transform;
+						trace_transform.origin -= state->rt_origin;
+						lod_candidate_instance = lod_batch.candidate_instances.size();
+						lod_batch.candidate_instances.push_back(_lod_candidate_instance(trace_transform));
+					}
+					candidate.instance = lod_candidate_instance;
 					candidate.slot = blass.size();
 					lod_batch.candidates.push_back(candidate);
 				}

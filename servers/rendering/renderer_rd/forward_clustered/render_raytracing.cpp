@@ -7646,6 +7646,18 @@ void RenderRaytracing::_classify_lod_instance(const RTSurfaceData *p_surf_data, 
 	r_level_max = MAX(MIN(certain_from, level_count - 1), r_level_min);
 }
 
+void RenderRaytracing::LodClassifyJob::classify_chunk(void *p_job, uint32_t p_chunk) {
+	const LodClassifyJob &job = *static_cast<const LodClassifyJob *>(p_job);
+	RTLodSelectBatch &batch = *job.batch;
+	const uint32_t from = p_chunk * RT_LOD_CLASSIFY_CHUNK;
+	const uint32_t to = MIN(from + RT_LOD_CLASSIFY_CHUNK, job.count);
+	for (uint32_t i = from; i < to; i++) {
+		RTLodSelectBatch::Candidate &candidate = batch.candidates[i];
+		_classify_lod_instance(candidate.surface, batch.candidate_instances[candidate.instance], job.view, candidate.level_min, candidate.level_max);
+		batch.targets[i] = UINT32_MAX; // NONE: no target yet.
+	}
+}
+
 // A static instance's own build: its slot prepared, its record queued and its slot in the TLAS on
 // it. False with the slot left on the surface's LOD 0 BLAS, past the dispatch's instance limit or
 // with no room in the arena.
@@ -7917,12 +7929,21 @@ void RenderRaytracing::_resolve_lod_candidates(const RenderDataRD *p_render_data
 	const uint32_t NONE = UINT32_MAX;
 	const uint32_t LOD0 = UINT32_MAX - 1;
 	const uint32_t CACHED = RTLodSelectBatch::TARGET_CACHED;
-	const LodView view = _lod_view(p_render_data, p_state, lod_frame_pixel_error);
 	batch.targets.resize(candidate_count);
-	for (uint32_t i = 0; i < candidate_count; i++) {
-		RTLodSelectBatch::Candidate &candidate = batch.candidates[i];
-		_classify_lod_instance(candidate.surface, batch.candidate_instances[candidate.instance], view, candidate.level_min, candidate.level_max);
-		batch.targets[i] = NONE;
+	LodClassifyJob job;
+	job.batch = &batch;
+	job.view = _lod_view(p_render_data, p_state, lod_frame_pixel_error);
+	job.count = candidate_count;
+	const uint32_t chunks = (candidate_count + RT_LOD_CLASSIFY_CHUNK - 1) / RT_LOD_CLASSIFY_CHUNK;
+	WorkerThreadPool *pool = WorkerThreadPool::get_singleton();
+	if (candidate_count >= RT_LOD_CLASSIFY_THREADED_MIN && pool->get_thread_count() > 1) {
+		// A native group task: the dispatch allocates nothing, and the job outlives it on this stack.
+		const WorkerThreadPool::GroupID group = pool->add_native_group_task(&LodClassifyJob::classify_chunk, &job, int(chunks), MIN(int(chunks), pool->get_thread_count()), true);
+		pool->wait_for_group_task_completion(group);
+	} else {
+		for (uint32_t c = 0; c < chunks; c++) {
+			LodClassifyJob::classify_chunk(&job, c);
+		}
 	}
 	if (cluster_lod_cache_enabled) {
 		_place_lod_cached_levels(); // The cached levels first (D90): what they cover builds nothing.

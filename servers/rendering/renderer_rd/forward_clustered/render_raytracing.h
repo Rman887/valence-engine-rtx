@@ -2616,6 +2616,20 @@ class RenderRaytracing {
 	static LodView _lod_view(const RenderDataRD *p_render_data, const RTViewportState *p_state, float p_pixel_error);
 	static RTLodSelectBatch::CandidateInstance _lod_candidate_instance(const Transform3D &p_transform);
 	static void _classify_lod_instance(const RTSurfaceData *p_surf_data, const RTLodSelectBatch::CandidateInstance &p_instance, const LodView &p_view, uint32_t &r_level_min, uint32_t &r_level_max);
+	// The classification of a frame's candidates on the worker pool, in contiguous chunks, past
+	// RT_LOD_CLASSIFY_THREADED_MIN of them: each reads only its candidates, their instance records,
+	// their surfaces' level bounds (cluster_lod_levels) and the view, and writes only its candidates'
+	// ranges and targets, so the order does not matter. The bounds and the candidate arrays are
+	// written on the render thread alone (_populate_surface_cluster_lod, D98c's finish included,
+	// before the walk; _release_surface_cluster_lod), never while the job runs.
+	struct LodClassifyJob {
+		RTLodSelectBatch *batch = nullptr;
+		LodView view;
+		uint32_t count = 0;
+		static void classify_chunk(void *p_job, uint32_t p_chunk);
+	};
+	static constexpr uint32_t RT_LOD_CLASSIFY_CHUNK = 256;
+	static constexpr uint32_t RT_LOD_CLASSIFY_THREADED_MIN = 2048;
 	void _resolve_lod_candidates(const RenderDataRD *p_render_data, const RTViewportState *p_state);
 	bool _queue_lod_candidate(const RTLodSelectBatch::Candidate &p_candidate);
 	// Cached levels (D90): placing the candidates on them, a level's slot, its item in the batch

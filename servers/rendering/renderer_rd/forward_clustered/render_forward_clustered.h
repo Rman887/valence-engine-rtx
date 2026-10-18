@@ -676,6 +676,7 @@ protected:
 		virtual void set_softshadow_projector_pairing(bool p_softshadow, bool p_projector) override;
 
 		virtual void set_base(RID p_base) override;
+		virtual bool swap_mesh(RID p_mesh) override;
 
 		void age_out_motion(uint64_t p_frame);
 	};

@@ -5281,6 +5281,88 @@ void RenderForwardClustered::GeometryInstanceForwardClustered::set_base(RID p_ba
 	RenderForwardClustered::get_singleton()->_geometry_instance_base_changed(this);
 }
 
+bool RenderForwardClustered::GeometryInstanceForwardClustered::swap_mesh(RID p_mesh) {
+	// VAL: a mesh swapped for one of the same layout keeps its surface caches, where set_base frees
+	// them and rebuilds each with its pipelines, dependencies and RT material, though only the
+	// geometry changed: a far crowd changes poses this way (val_population). Every surface must
+	// resolve to the same material, format and primitive, a shadow mesh's surfaces too, and the
+	// caches must be current, with nothing an index variant, a surface override or a mesh instance
+	// decided. The path tracer's handles and slots stay with the caches, the LOD slot prepared again
+	// for the new surface at its next build (as a rebuilt cache's is).
+	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
+	const RID old_mesh = data->base;
+	if (data->base_type != RSE::INSTANCE_MESH || p_mesh == old_mesh || RSG::utilities->get_base_type(p_mesh) != RSE::INSTANCE_MESH) {
+		return false;
+	}
+	if (dirty_list_element.in_list() || data->dirty_dependencies || surface_caches == nullptr || mesh_instance.is_valid()) {
+		return false;
+	}
+	for (int i = 0; i < data->surface_materials.size(); i++) {
+		if (data->surface_materials[i].is_valid()) {
+			return false;
+		}
+	}
+	for (int i = 0; i < data->surface_index_variants.size(); i++) {
+		if (data->surface_index_variants[i] >= 0) {
+			return false;
+		}
+	}
+	const uint32_t surface_count = uint32_t(mesh_storage->mesh_get_surface_count(p_mesh));
+	if (surface_count != uint32_t(mesh_storage->mesh_get_surface_count(old_mesh)) || surface_count == 0) {
+		return false;
+	}
+	const RID old_shadow = mesh_storage->mesh_get_shadow_mesh(old_mesh);
+	const RID new_shadow = mesh_storage->mesh_get_shadow_mesh(p_mesh);
+	if (old_shadow.is_valid() != new_shadow.is_valid()) {
+		return false;
+	}
+	if (old_shadow.is_valid()) {
+		if (uint32_t(mesh_storage->mesh_get_surface_count(old_shadow)) != surface_count || uint32_t(mesh_storage->mesh_get_surface_count(new_shadow)) != surface_count) {
+			return false;
+		}
+		for (uint32_t i = 0; i < surface_count; i++) {
+			void *old_surface = mesh_storage->mesh_get_surface(old_shadow, i);
+			void *new_surface = mesh_storage->mesh_get_surface(new_shadow, i);
+			if (mesh_storage->mesh_surface_get_format(old_surface) != mesh_storage->mesh_surface_get_format(new_surface) || mesh_storage->mesh_surface_get_primitive(old_surface) != mesh_storage->mesh_surface_get_primitive(new_surface)) {
+				return false;
+			}
+		}
+	}
+	for (uint32_t i = 0; i < surface_count; i++) {
+		void *old_surface = mesh_storage->mesh_get_surface(old_mesh, i);
+		void *new_surface = mesh_storage->mesh_get_surface(p_mesh, i);
+		if (mesh_storage->mesh_surface_get_format(old_surface) != mesh_storage->mesh_surface_get_format(new_surface) || mesh_storage->mesh_surface_get_primitive(old_surface) != mesh_storage->mesh_surface_get_primitive(new_surface) || mesh_storage->mesh_surface_get_material(old_mesh, i) != mesh_storage->mesh_surface_get_material(p_mesh, i)) {
+			return false;
+		}
+	}
+	for (const GeometryInstanceSurfaceDataCache *surf = surface_caches; surf; surf = surf->next) {
+		if (surf->surface_index >= surface_count || surf->index_variant >= 0 || surf->rt_deformed_handle.is_valid() || surf->surface != mesh_storage->mesh_get_surface(old_mesh, surf->surface_index)) {
+			return false;
+		}
+	}
+
+	for (GeometryInstanceSurfaceDataCache *surf = surface_caches; surf; surf = surf->next) {
+		surf->surface = mesh_storage->mesh_get_surface(p_mesh, surf->surface_index);
+		surf->primitive = mesh_storage->mesh_surface_get_primitive(surf->surface);
+		void *surface_shadow = nullptr;
+		if ((surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_SHARED_SHADOW_MATERIAL) && new_shadow.is_valid()) {
+			surface_shadow = mesh_storage->mesh_get_surface(new_shadow, surf->surface_index);
+		}
+		surf->surface_shadow = surface_shadow ? surface_shadow : surf->surface;
+		surf->sort.geometry_id = p_mesh.get_local_index();
+		surf->cached_final_transform_valid = false;
+	}
+
+	// The mesh is the one dependency that changes: the materials are the same.
+	data->dependency_tracker.update_begin();
+	RSG::utilities->base_update_dependency(old_mesh, &data->dependency_tracker);
+	data->dependency_tracker.erase_updated();
+	RSG::utilities->base_update_dependency(p_mesh, &data->dependency_tracker);
+	data->base = p_mesh;
+	RenderForwardClustered::get_singleton()->_geometry_instance_base_changed(this);
+	return true;
+}
+
 void RenderForwardClustered::GeometryInstanceForwardClustered::reset_motion_vectors() {
 	prev_transform = transform;
 	transform_status = TransformStatus::TELEPORTED;

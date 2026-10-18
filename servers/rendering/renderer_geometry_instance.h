@@ -44,6 +44,9 @@ public:
 	virtual void _mark_dirty() = 0;
 
 	virtual void set_base(RID p_base) = 0;
+	// VAL: swaps a mesh base for a mesh whose surfaces resolve to the same layout and materials,
+	// keeping what was built over the old one; false, with nothing changed, where it cannot.
+	virtual bool swap_mesh(RID p_mesh) { return false; }
 	virtual void set_skeleton(RID p_skeleton) = 0;
 	virtual void set_material_override(RID p_override) = 0;
 	virtual void set_material_overlay(RID p_overlay) = 0;

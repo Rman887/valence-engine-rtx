@@ -578,6 +578,45 @@ void RendererSceneCull::_instance_update_mesh_instance(Instance *p_instance) con
 	}
 }
 
+// VAL: a mesh swapped for one of the same layout and materials keeps its surface caches as well:
+// the renderer rebinds them to the new mesh's surfaces, and here only the bounds and the mesh
+// dependency change. Its materials are its mesh's (no override on a surface) and resolve
+// the same, so the materials' dependencies, instance uniforms and shadow casting stand; an instance
+// with a mesh instance, an index variant or a surface override, or a mesh that needs an instance,
+// takes the full swap.
+bool RendererSceneCull::_instance_swap_compatible_mesh(Instance *p_instance, RID p_base) {
+	if (p_instance->mesh_instance.is_valid() || p_base == p_instance->base) {
+		return false;
+	}
+	for (int i = 0; i < p_instance->materials.size(); i++) {
+		if (p_instance->materials[i].is_valid()) {
+			return false;
+		}
+	}
+	for (int i = 0; i < p_instance->index_variants.size(); i++) {
+		if (p_instance->index_variants[i] >= 0) {
+			return false;
+		}
+	}
+	if (RSG::mesh_storage->mesh_needs_instance(p_base, p_instance->skeleton.is_valid())) {
+		return false;
+	}
+	InstanceGeometryData *geom = static_cast<InstanceGeometryData *>(p_instance->base_data);
+	if (!geom->geometry_instance->swap_mesh(p_base)) {
+		return false;
+	}
+	p_instance->dependency_tracker.update_begin();
+	RSG::utilities->base_update_dependency(p_instance->base, &p_instance->dependency_tracker);
+	p_instance->dependency_tracker.erase_updated();
+	RSG::utilities->base_update_dependency(p_base, &p_instance->dependency_tracker);
+	p_instance->base = p_base;
+	if (p_instance->scenario && p_instance->array_index >= 0) {
+		p_instance->scenario->instance_data[p_instance->array_index].base_rid = p_base;
+	}
+	_instance_queue_update(p_instance, true, false);
+	return true;
+}
+
 void RendererSceneCull::instance_set_base(RID p_instance, RID p_base) {
 	Instance *instance = instance_owner.get_or_null(p_instance);
 	ERR_FAIL_NULL(instance);
@@ -592,6 +631,9 @@ void RendererSceneCull::instance_set_base(RID p_instance, RID p_base) {
 			// A mesh swapped for a mesh keeps its geometry instance, its pairs and its place in the
 			// scenario. Recreating it lost the previous transform (a motion vector from the origin for
 			// a frame) and the instance's path-tracing slots (D95).
+			if (_instance_swap_compatible_mesh(instance, p_base)) {
+				return;
+			}
 			if (instance->mesh_instance.is_valid()) {
 				// A mesh instance is made for one mesh.
 				RSG::mesh_storage->mesh_instance_free(instance->mesh_instance);

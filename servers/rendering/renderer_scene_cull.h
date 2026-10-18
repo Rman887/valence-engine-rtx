@@ -619,6 +619,7 @@ public:
 
 	mutable SelfList<Instance>::List _instance_update_list;
 	void _instance_queue_update(Instance *p_instance, bool p_update_aabb, bool p_update_dependencies = false) const;
+	bool _instance_swap_compatible_mesh(Instance *p_instance, RID p_base);
 
 	struct InstanceGeometryData : public InstanceBaseData {
 		RenderGeometryInstance *geometry_instance = nullptr;

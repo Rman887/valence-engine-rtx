@@ -4992,6 +4992,25 @@ static RD::FramebufferFormatID _get_reflection_probe_depth_framebuffer_format_fo
 	return RD::get_singleton()->framebuffer_format_create(Vector<RD::AttachmentFormat>(attachments));
 }
 
+template <typename T>
+RD::FramebufferFormatID RenderForwardClustered::_pipeline_framebuffer_format(PipelineFramebufferFormatKind p_kind, uint64_t p_arguments, const T &p_create) {
+	const uint64_t key = (uint64_t(p_kind) << 56) | p_arguments;
+	{
+		MutexLock lock(pipeline_framebuffer_formats_mutex);
+		const RD::FramebufferFormatID *found = pipeline_framebuffer_formats.getptr(key);
+		if (found != nullptr) {
+			return *found;
+		}
+	}
+	const RD::FramebufferFormatID format = p_create();
+	if (format == RD::INVALID_ID) {
+		return format; // A failure is not kept: the next call tries again.
+	}
+	MutexLock lock(pipeline_framebuffer_formats_mutex);
+	pipeline_framebuffer_formats.insert(key, format); // Two threads making one make the same format.
+	return format;
+}
+
 void RenderForwardClustered::_mesh_compile_pipeline_for_surface(SceneShaderForwardClustered::ShaderData *p_shader, void *p_mesh_surface, bool p_ubershader, bool p_instanced_surface, RSE::PipelineSource p_source, SceneShaderForwardClustered::ShaderData::PipelineKey &r_pipeline_key, Vector<ShaderPipelinePair> *r_pipeline_pairs) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	uint64_t input_mask = p_shader->get_vertex_input_mask(r_pipeline_key.version, r_pipeline_key.color_pass_flags, p_ubershader);
@@ -5015,6 +5034,17 @@ void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePi
 	const bool multiview_enabled = p_global.use_multiview && scene_shader.is_multiview_shader_group_enabled();
 	const RD::DataFormat buffers_color_format = _render_buffers_get_preferred_color_format();
 	const bool buffers_can_be_storage = _render_buffers_can_be_storage();
+	const RD::TextureSamples samples = RD::TextureSamples(p_global.texture_samples);
+
+	// The framebuffer formats, each made once for its arguments (_pipeline_framebuffer_format).
+	auto color_format = [&](bool p_specular, bool p_velocity, uint32_t p_view_count) {
+		const uint64_t arguments = uint64_t(buffers_color_format) | (uint64_t(buffers_can_be_storage) << 32) | (uint64_t(samples) << 33) | (uint64_t(p_specular) << 40) | (uint64_t(p_velocity) << 41) | (uint64_t(p_view_count) << 42);
+		return _pipeline_framebuffer_format(PIPELINE_FRAMEBUFFER_COLOR, arguments, [&]() { return _get_color_framebuffer_format_for_pipeline(buffers_color_format, buffers_can_be_storage, samples, p_specular, p_velocity, p_view_count); });
+	};
+	auto depth_format = [&](bool p_normal_roughness, bool p_voxelgi) {
+		const uint64_t arguments = uint64_t(buffers_can_be_storage) | (uint64_t(samples) << 1) | (uint64_t(p_normal_roughness) << 8) | (uint64_t(p_voxelgi) << 9);
+		return _pipeline_framebuffer_format(PIPELINE_FRAMEBUFFER_DEPTH, arguments, [&]() { return _get_depth_framebuffer_format_for_pipeline(buffers_can_be_storage, samples, p_normal_roughness, p_voxelgi); });
+	};
 
 	// Set the attributes common to all pipelines.
 	SceneShaderForwardClustered::ShaderData::PipelineKey pipeline_key;
@@ -5045,13 +5075,13 @@ void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePi
 					pipeline_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MULTIVIEW;
 				} else if (p_global.use_reflection_probes) {
 					// Reflection probe can't be rendered in multiview.
-					pipeline_key.framebuffer_format_id = _get_reflection_probe_color_framebuffer_format_for_pipeline(octmap_use_storage);
+					pipeline_key.framebuffer_format_id = _pipeline_framebuffer_format(PIPELINE_FRAMEBUFFER_REFLECTION_PROBE_COLOR, uint64_t(octmap_use_storage) | (uint64_t(buffers_color_format) << 1), [&]() { return _get_reflection_probe_color_framebuffer_format_for_pipeline(octmap_use_storage); });
 					_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 				}
 
 				// View count is assumed to be 2 as the configuration is dependent on the viewport. It's likely a safe assumption for stereo rendering.
 				uint32_t view_count = multiview ? 2 : 1;
-				pipeline_key.framebuffer_format_id = _get_color_framebuffer_format_for_pipeline(buffers_color_format, buffers_can_be_storage, RD::TextureSamples(p_global.texture_samples), false, false, view_count);
+				pipeline_key.framebuffer_format_id = color_format(false, false, view_count);
 				_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 
 				// Generate all the possible variants used during the advanced color passes.
@@ -5075,7 +5105,7 @@ void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePi
 							pipeline_key.color_pass_flags |= SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS;
 						}
 
-						pipeline_key.framebuffer_format_id = _get_color_framebuffer_format_for_pipeline(buffers_color_format, buffers_can_be_storage, RD::TextureSamples(p_global.texture_samples), separate_specular, motion_vectors, view_count);
+						pipeline_key.framebuffer_format_id = color_format(separate_specular, motion_vectors, view_count);
 						_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 					}
 				}
@@ -5093,7 +5123,7 @@ void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePi
 	if (p_global.use_normal_and_roughness) {
 		// A lot of different effects rely on normal and roughness being written to during the depth pass.
 		pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS;
-		pipeline_key.framebuffer_format_id = _get_depth_framebuffer_format_for_pipeline(buffers_can_be_storage, RD::TextureSamples(p_global.texture_samples), true, false);
+		pipeline_key.framebuffer_format_id = depth_format(true, false);
 		_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 	}
 
@@ -5101,7 +5131,7 @@ void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePi
 		// The path tracer's G-buffer pass draws the opaque surfaces in the variant that writes motion vectors.
 		pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_GBUFFER_PASS;
 		pipeline_key.color_pass_flags = SceneShaderForwardClustered::PIPELINE_COLOR_PASS_FLAG_MOTION_VECTORS;
-		pipeline_key.framebuffer_format_id = _get_gbuffer_framebuffer_format_for_pipeline(buffers_can_be_storage);
+		pipeline_key.framebuffer_format_id = _pipeline_framebuffer_format(PIPELINE_FRAMEBUFFER_GBUFFER, buffers_can_be_storage, [&]() { return _get_gbuffer_framebuffer_format_for_pipeline(buffers_can_be_storage); });
 		_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 		pipeline_key.color_pass_flags = 0;
 	}
@@ -5109,25 +5139,25 @@ void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePi
 	if (p_global.use_voxelgi) {
 		// Depth pass with VoxelGI support.
 		pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_NORMAL_AND_ROUGHNESS_AND_VOXEL_GI;
-		pipeline_key.framebuffer_format_id = _get_depth_framebuffer_format_for_pipeline(buffers_can_be_storage, RD::TextureSamples(p_global.texture_samples), true, true);
+		pipeline_key.framebuffer_format_id = depth_format(true, true);
 		_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 	}
 
 	if (p_global.use_sdfgi) {
 		// Depth pass with SDFGI support.
 		pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS_WITH_SDF;
-		pipeline_key.framebuffer_format_id = _get_depth_framebuffer_format_for_pipeline(buffers_can_be_storage, RD::TextureSamples(p_global.texture_samples), false, false);
+		pipeline_key.framebuffer_format_id = depth_format(false, false);
 		_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 
 		// Depth pass with SDFGI support for an empty framebuffer.
-		pipeline_key.framebuffer_format_id = RD::get_singleton()->framebuffer_format_create_empty();
+		pipeline_key.framebuffer_format_id = _pipeline_framebuffer_format(PIPELINE_FRAMEBUFFER_EMPTY, 0, []() { return RD::get_singleton()->framebuffer_format_create_empty(); });
 		_mesh_compile_pipeline_for_surface(p_surface.shader, p_surface.mesh_surface, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 	}
 
 	// The dedicated depth passes use a different version of the surface and the shader.
 	pipeline_key.primitive_type = mesh_storage->mesh_surface_get_primitive(p_surface.mesh_surface_shadow);
 	pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS;
-	pipeline_key.framebuffer_format_id = _get_depth_framebuffer_format_for_pipeline(buffers_can_be_storage, RD::TextureSamples(p_global.texture_samples), false, false);
+	pipeline_key.framebuffer_format_id = depth_format(false, false);
 	_mesh_compile_pipeline_for_surface(p_surface.shader_shadow, p_surface.mesh_surface_shadow, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 
 	if (p_global.use_shadow_dual_paraboloid) {
@@ -5137,7 +5167,7 @@ void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePi
 
 	if (p_global.use_shadow_cubemaps) {
 		pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS;
-		pipeline_key.framebuffer_format_id = _get_shadow_cubemap_framebuffer_format_for_pipeline();
+		pipeline_key.framebuffer_format_id = _pipeline_framebuffer_format(PIPELINE_FRAMEBUFFER_SHADOW_CUBEMAP, 0, [&]() { return _get_shadow_cubemap_framebuffer_format_for_pipeline(); });
 		_mesh_compile_pipeline_for_surface(p_surface.shader_shadow, p_surface.mesh_surface_shadow, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 	}
 
@@ -5146,7 +5176,7 @@ void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePi
 	const uint32_t use_16_bits_iterations = p_global.use_16_bit_shadows ? 2 : 1;
 	for (uint32_t use_16_bits = use_16_bits_start; use_16_bits < use_16_bits_iterations; use_16_bits++) {
 		pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS;
-		pipeline_key.framebuffer_format_id = _get_shadow_atlas_framebuffer_format_for_pipeline(use_16_bits);
+		pipeline_key.framebuffer_format_id = _pipeline_framebuffer_format(PIPELINE_FRAMEBUFFER_SHADOW_ATLAS, use_16_bits, [&]() { return _get_shadow_atlas_framebuffer_format_for_pipeline(use_16_bits); });
 		_mesh_compile_pipeline_for_surface(p_surface.shader_shadow, p_surface.mesh_surface_shadow, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 
 		if (p_global.use_shadow_dual_paraboloid) {
@@ -5158,7 +5188,7 @@ void RenderForwardClustered::_mesh_compile_pipelines_for_surface(const SurfacePi
 	if (p_global.use_reflection_probes) {
 		// Depth pass for reflection probes. Normally this will be redundant as the format is the exact same as the shadow cubemap.
 		pipeline_key.version = SceneShaderForwardClustered::PIPELINE_VERSION_DEPTH_PASS;
-		pipeline_key.framebuffer_format_id = _get_reflection_probe_depth_framebuffer_format_for_pipeline();
+		pipeline_key.framebuffer_format_id = _pipeline_framebuffer_format(PIPELINE_FRAMEBUFFER_REFLECTION_PROBE_DEPTH, 0, [&]() { return _get_reflection_probe_depth_framebuffer_format_for_pipeline(); });
 		_mesh_compile_pipeline_for_surface(p_surface.shader_shadow, p_surface.mesh_surface_shadow, true, p_surface.instanced, p_source, pipeline_key, r_pipeline_pairs);
 	}
 }

@@ -30,6 +30,8 @@
 
 #pragma once
 
+#include "core/os/mutex.h"
+#include "core/templates/a_hash_map.h"
 #include "core/templates/local_vector.h"
 #include "core/templates/rid_owner.h"
 #include "core/templates/safe_refcount.h"
@@ -320,6 +322,27 @@ private:
 	};
 
 	RD::VertexFormatID _mesh_surface_generate_vertex_format(uint64_t p_surface_format, uint64_t p_input_mask, bool p_instanced_surface, bool p_input_motion_vectors, bool p_point_size_emulated, uint32_t &r_position_stride);
+
+	// VAL: the vertex formats a pipeline precompile asks for, by surface format and pipeline inputs:
+	// a pure function of them, made once, since the device never frees a vertex format. Keyed by
+	// value, so no surface's change or release can leave an entry stale.
+	struct PipelineVertexFormatKey {
+		uint64_t surface_format = 0;
+		uint64_t input_mask = 0;
+		uint32_t flags = 0; // Instanced, motion vectors, emulated point size.
+
+		bool operator==(const PipelineVertexFormatKey &p_other) const {
+			return surface_format == p_other.surface_format && input_mask == p_other.input_mask && flags == p_other.flags;
+		}
+		uint32_t hash() const {
+			uint32_t h = hash_murmur3_one_64(surface_format);
+			h = hash_murmur3_one_64(input_mask, h);
+			h = hash_murmur3_one_32(flags, h);
+			return hash_fmix32(h);
+		}
+	};
+	BinaryMutex pipeline_vertex_formats_mutex;
+	AHashMap<PipelineVertexFormatKey, RD::VertexFormatID> pipeline_vertex_formats;
 	void _mesh_surface_generate_version_for_input_mask(Mesh::Surface::Version &v, Mesh::Surface *s, uint64_t p_input_mask, bool p_input_motion_vectors, bool p_point_size_emulated, MeshInstance::Surface *mis = nullptr, uint32_t p_current_buffer = 0, uint32_t p_previous_buffer = 0);
 	void _mesh_surface_clear(Mesh *p_mesh, int p_surface);
 	void _mesh_surface_set_subdivision(Mesh *p_mesh, Mesh::Surface *p_surface, const RenderingServerTypes::SurfaceData &p_data);
@@ -1039,11 +1062,7 @@ public:
 		return s->particles_render_index;
 	}
 
-	_FORCE_INLINE_ RD::VertexFormatID mesh_surface_get_vertex_format(void *p_surface, uint64_t p_input_mask, bool p_instanced_surface, bool p_input_motion_vectors, bool p_point_size_emulated) {
-		Mesh::Surface *s = reinterpret_cast<Mesh::Surface *>(p_surface);
-		uint32_t position_stride = 0;
-		return _mesh_surface_generate_vertex_format(s->format, p_input_mask, p_instanced_surface, p_input_motion_vectors, p_point_size_emulated, position_stride);
-	}
+	RD::VertexFormatID mesh_surface_get_vertex_format(void *p_surface, uint64_t p_input_mask, bool p_instanced_surface, bool p_input_motion_vectors, bool p_point_size_emulated);
 
 	virtual Dependency *mesh_get_dependency(RID p_mesh) const override;
 

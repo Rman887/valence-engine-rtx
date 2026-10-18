@@ -2571,6 +2571,29 @@ RD::VertexFormatID MeshStorage::_mesh_surface_generate_vertex_format(uint64_t p_
 	return RD::get_singleton()->vertex_format_create(attributes);
 }
 
+RD::VertexFormatID MeshStorage::mesh_surface_get_vertex_format(void *p_surface, uint64_t p_input_mask, bool p_instanced_surface, bool p_input_motion_vectors, bool p_point_size_emulated) {
+	const Mesh::Surface *s = reinterpret_cast<const Mesh::Surface *>(p_surface);
+	PipelineVertexFormatKey key;
+	key.surface_format = s->format;
+	key.input_mask = p_input_mask;
+	key.flags = (p_instanced_surface ? 1 : 0) | (p_input_motion_vectors ? 2 : 0) | (p_point_size_emulated ? 4 : 0);
+	{
+		MutexLock lock(pipeline_vertex_formats_mutex);
+		const RD::VertexFormatID *found = pipeline_vertex_formats.getptr(key);
+		if (found != nullptr) {
+			return *found;
+		}
+	}
+	uint32_t position_stride = 0;
+	const RD::VertexFormatID vertex_format = _mesh_surface_generate_vertex_format(s->format, p_input_mask, p_instanced_surface, p_input_motion_vectors, p_point_size_emulated, position_stride);
+	if (vertex_format == RD::INVALID_ID || vertex_format == 0) {
+		return vertex_format; // A failure is not kept: the next call tries again.
+	}
+	MutexLock lock(pipeline_vertex_formats_mutex);
+	pipeline_vertex_formats.insert(key, vertex_format); // Two threads making one make the same format.
+	return vertex_format;
+}
+
 void MeshStorage::_mesh_surface_generate_version_for_input_mask(Mesh::Surface::Version &v, Mesh::Surface *s, uint64_t p_input_mask, bool p_input_motion_vectors, bool p_point_size_emulated, MeshInstance::Surface *mis, uint32_t p_current_buffer, uint32_t p_previous_buffer) {
 	uint32_t position_stride = 0;
 	v.vertex_format = _mesh_surface_generate_vertex_format(s->format, p_input_mask, mis != nullptr, p_input_motion_vectors, p_point_size_emulated, position_stride);

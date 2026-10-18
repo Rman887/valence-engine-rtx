@@ -749,6 +749,22 @@ protected:
 	void _geometry_instance_update(RenderGeometryInstance *p_geometry_instance);
 	void _mesh_compile_pipeline_for_surface(SceneShaderForwardClustered::ShaderData *p_shader, void *p_mesh_surface, bool p_ubershader, bool p_instanced_surface, RSE::PipelineSource p_source, SceneShaderForwardClustered::ShaderData::PipelineKey &r_pipeline_key, Vector<ShaderPipelinePair> *r_pipeline_pairs = nullptr);
 	void _mesh_compile_pipelines_for_surface(const SurfacePipelineData &p_surface, const GlobalPipelineData &p_global, RSE::PipelineSource p_source, Vector<ShaderPipelinePair> *r_pipeline_pairs = nullptr);
+	// VAL: the framebuffer formats the pipeline precompile asks for, by kind and arguments: each a pure
+	// function of them, made once, since the device never frees or reuses a format.
+	enum PipelineFramebufferFormatKind : uint64_t {
+		PIPELINE_FRAMEBUFFER_COLOR = 1,
+		PIPELINE_FRAMEBUFFER_DEPTH,
+		PIPELINE_FRAMEBUFFER_GBUFFER,
+		PIPELINE_FRAMEBUFFER_REFLECTION_PROBE_COLOR,
+		PIPELINE_FRAMEBUFFER_REFLECTION_PROBE_DEPTH,
+		PIPELINE_FRAMEBUFFER_SHADOW_CUBEMAP,
+		PIPELINE_FRAMEBUFFER_SHADOW_ATLAS,
+		PIPELINE_FRAMEBUFFER_EMPTY,
+	};
+	BinaryMutex pipeline_framebuffer_formats_mutex;
+	AHashMap<uint64_t, RD::FramebufferFormatID> pipeline_framebuffer_formats;
+	template <typename T>
+	RD::FramebufferFormatID _pipeline_framebuffer_format(PipelineFramebufferFormatKind p_kind, uint64_t p_arguments, const T &p_create);
 	void _mesh_generate_all_pipelines_for_surface_cache(GeometryInstanceSurfaceDataCache *p_surface_cache, const GlobalPipelineData &p_global);
 	void _update_dirty_geometry_instances();
 	void _update_dirty_geometry_pipelines();
